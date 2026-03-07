@@ -37,6 +37,15 @@ fn extract_sapisid(cookie: &str) -> Option<String> {
         .map(|s| s.trim_start_matches("SAPISID=").to_string())
 }
 
+fn generate_cpn() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let hash = Sha1::digest(nanos.to_le_bytes());
+    format!("{:x}", hash)[..16].to_string()
+}
+
 fn generate_sapisidhash(sapisid: &str, origin: &str) -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -148,6 +157,23 @@ impl YtMusicClient {
         })
     }
 
+    pub fn get_history(&self) -> Result<Vec<Track>> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["browseId"] = json!("FEmusic_history");
+
+            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to fetch history")?;
+
+            let json: Value = resp.json().await.context("Failed to parse history response")?;
+            let sections = parsers::parse_home(&json)?;
+            Ok(sections.into_iter().flat_map(|s| s.contents).collect())
+        })
+    }
+
     pub fn search(&self, query: &str) -> Result<Vec<Track>> {
         self.rt.block_on(async {
             let mut body = Self::client_context();
@@ -194,6 +220,7 @@ impl YtMusicClient {
             let vr_err = match self.try_android_vr_audio(video_id).await {
                 Ok(url) => {
                     eprintln!("[PLAYER] got direct URL via Android VR");
+                    self.spawn_playback_report(video_id);
                     return Ok(url);
                 }
                 Err(e) => {
@@ -212,6 +239,7 @@ impl YtMusicClient {
             if let Ok(audio) = Self::best_audio_format(&json) {
                 if let Some(url) = audio.get("url").and_then(|u| u.as_str()) {
                     eprintln!("[PLAYER] got direct URL via web client");
+                    Self::fire_tracking_urls(&self.http, self.auth_header(), &json);
                     return Ok(url.to_string());
                 }
             }
@@ -219,6 +247,65 @@ impl YtMusicClient {
             // If we get here, neither path gave a direct URL
             bail!("Could not get audio URL: {vr_err}")
         })
+    }
+
+    /// Report playback to YouTube for history tracking.
+    /// Makes an authenticated WEB_REMIX player request to get tracking URLs,
+    /// then fires them. Runs in background — doesn't block audio playback.
+    fn spawn_playback_report(&self, video_id: &str) {
+        let http = self.http.clone();
+        let auth = self.auth_header();
+        let video_id = video_id.to_string();
+
+        tokio::spawn(async move {
+            let mut body = json!({
+                "context": {
+                    "client": {
+                        "clientName": "WEB_REMIX",
+                        "clientVersion": "1.20240101.01.00",
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                }
+            });
+            body["videoId"] = json!(&video_id);
+
+            let mut req = http.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"));
+            if let Some(auth) = auth {
+                req = req.header("authorization", auth);
+            }
+
+            let Ok(resp) = req.json(&body).send().await else { return };
+            let Ok(json): Result<Value, _> = resp.json().await else { return };
+
+            Self::fire_tracking_urls(&http, None, &json);
+        });
+    }
+
+    /// Fire the videostatsPlaybackUrl from a player response (background, best-effort).
+    fn fire_tracking_urls(http: &reqwest::Client, auth: Option<String>, player_json: &Value) {
+        let Some(url) = player_json
+            .pointer("/playbackTracking/videostatsPlaybackUrl/baseUrl")
+            .and_then(|u| u.as_str())
+        else {
+            return;
+        };
+
+        let cpn = generate_cpn();
+        let full_url = format!("{url}&cpn={cpn}&ver=2&cmt=0");
+
+        let http = http.clone();
+        tokio::spawn(async move {
+            eprintln!("[TRACKING] reporting playback...");
+            let mut req = http.get(&full_url);
+            if let Some(auth) = auth {
+                req = req.header("authorization", auth);
+            }
+            match req.send().await {
+                Ok(r) => eprintln!("[TRACKING] reported ({})", r.status()),
+                Err(e) => eprintln!("[TRACKING] failed: {e}"),
+            }
+        });
     }
 
     /// Fetch visitorData from YouTube (cached per session).

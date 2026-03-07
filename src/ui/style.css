@@ -1,24 +1,43 @@
-/* --- Base window --- */
+/* =============================================
+   BASE
+   ============================================= */
+
 window {
-    background-color: rgba(18, 18, 24, 0.92);
+    background-color: #0e0e14;
     color: #e0e0e8;
 }
 
-/* --- Glass panels --- */
-.glass-panel {
-    background-color: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 12px;
-    padding: 12px;
+separator {
+    background-color: rgba(255, 255, 255, 0.05);
+    min-height: 1px;
 }
 
-/* ===========================================
+/* =============================================
+   SCROLLBAR
+   ============================================= */
+
+scrollbar {
+    background-color: transparent;
+}
+
+scrollbar slider {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 999px;
+    min-width: 4px;
+    min-height: 4px;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+}
+
+/* =============================================
    ONBOARDING
-   =========================================== */
+   ============================================= */
 
 .onboarding-card {
-    background-color: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 20px;
     padding: 40px 36px;
 }
@@ -32,21 +51,19 @@ window {
 
 .onboarding-subtitle {
     font-size: 14px;
-    color: rgba(255, 255, 255, 0.45);
-    font-weight: 400;
+    color: rgba(255, 255, 255, 0.4);
     margin-bottom: 8px;
 }
 
 .onboarding-instructions {
     font-size: 13px;
-    color: rgba(255, 255, 255, 0.6);
+    color: rgba(255, 255, 255, 0.55);
     font-weight: 500;
 }
 
 .onboarding-steps {
     font-size: 12px;
-    color: rgba(255, 255, 255, 0.35);
-    line-height: 1.6;
+    color: rgba(255, 255, 255, 0.3);
     margin-bottom: 8px;
 }
 
@@ -59,14 +76,14 @@ window {
     min-height: 42px;
     font-size: 15px;
     font-weight: 700;
-    background-color: rgba(130, 160, 255, 0.25);
-    border: 1px solid rgba(130, 160, 255, 0.35);
+    background-color: rgba(130, 160, 255, 0.22);
+    border: 1px solid rgba(130, 160, 255, 0.3);
     color: #c0d4ff;
     border-radius: 12px;
 }
 
 .connect-btn:hover {
-    background-color: rgba(130, 160, 255, 0.38);
+    background-color: rgba(130, 160, 255, 0.35);
     border-color: rgba(130, 160, 255, 0.5);
     color: #e0ecff;
 }
@@ -77,46 +94,13 @@ window {
     min-height: 20px;
 }
 
-/* ===========================================
-   MAIN APP
-   =========================================== */
+/* =============================================
+   ENTRIES (global)
+   ============================================= */
 
-/* --- Header area --- */
-.header-area {
-    background-color: rgba(255, 255, 255, 0.04);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 12px 16px;
-}
-
-/* --- Title --- */
-.app-title {
-    font-size: 20px;
-    font-weight: 800;
-    color: #ffffff;
-    letter-spacing: 1px;
-}
-
-/* --- Logout button --- */
-.logout-btn {
-    background-color: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    color: rgba(255, 255, 255, 0.45);
-    padding: 4px 14px;
-    min-height: 28px;
-    font-size: 12px;
-    font-weight: 500;
-}
-
-.logout-btn:hover {
-    background-color: rgba(255, 90, 90, 0.15);
-    border-color: rgba(255, 90, 90, 0.3);
-    color: rgba(255, 150, 150, 0.8);
-}
-
-/* --- Entries --- */
 entry {
-    background-color: rgba(255, 255, 255, 0.07);
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 8px;
     color: #e0e0e8;
     padding: 6px 12px;
@@ -124,180 +108,309 @@ entry {
 }
 
 entry:focus {
-    border-color: rgba(130, 160, 255, 0.5);
-    background-color: rgba(255, 255, 255, 0.10);
-    box-shadow: 0 0 0 2px rgba(130, 160, 255, 0.15);
+    border-color: rgba(130, 160, 255, 0.4);
+    background-color: rgba(255, 255, 255, 0.08);
 }
 
 entry > text > placeholder {
+    color: rgba(255, 255, 255, 0.25);
+}
+
+/* =============================================
+   SIDEBAR (glass)
+   ============================================= */
+
+.sidebar {
+    background-color: rgba(255, 255, 255, 0.025);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 0;
+}
+
+.sidebar-search {
+    margin: 16px 12px 12px 12px;
+    border-radius: 10px;
+    min-height: 36px;
+    font-size: 13px;
+}
+
+.nav-section {
+    padding: 4px 8px;
+}
+
+.nav-item {
+    background: none;
+    border: none;
+    border-radius: 8px;
+    padding: 9px 12px;
+    min-height: 20px;
+    font-weight: 500;
+    font-size: 13px;
+    color: rgba(255, 255, 255, 0.45);
+}
+
+.nav-item:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.nav-item:disabled {
+    color: rgba(255, 255, 255, 0.2);
+    background: none;
+    border: none;
+}
+
+.nav-item-active {
+    background-color: rgba(130, 160, 255, 0.1);
+    color: #a0baff;
+}
+
+.nav-item-active:hover {
+    background-color: rgba(130, 160, 255, 0.16);
+    color: #b8ccff;
+}
+
+.sidebar-section-header {
+    font-size: 11px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.3);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+.sidebar-dim {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.18);
+    margin: 8px 12px;
+}
+
+.sidebar-bottom {
+    padding: 10px 8px;
+}
+
+/* Sidebar recent items */
+.sidebar-recent-item {
+    background: none;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 8px;
+    min-height: 10px;
+}
+
+.sidebar-recent-item:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar-recent-title {
+    font-size: 12px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.65);
+}
+
+.sidebar-recent-artist {
+    font-size: 10px;
     color: rgba(255, 255, 255, 0.3);
 }
 
-/* --- Buttons (scoped to app content, not window decorations) --- */
-.header-area button,
-.onboarding-card button,
-.track-card button,
-.now-playing-bar button,
-box > button {
-    background-color: rgba(130, 160, 255, 0.18);
-    border: 1px solid rgba(130, 160, 255, 0.25);
-    border-radius: 8px;
-    color: #b0c4ff;
-    padding: 6px 16px;
-    min-height: 32px;
-    font-weight: 600;
-}
+/* =============================================
+   SETTINGS POPOVER
+   ============================================= */
 
-.header-area button:hover,
-.onboarding-card button:hover,
-.track-card button:hover,
-.now-playing-bar button:hover,
-box > button:hover {
-    background-color: rgba(130, 160, 255, 0.28);
-    border-color: rgba(130, 160, 255, 0.4);
-    color: #d0ddff;
-}
-
-.header-area button:active,
-.onboarding-card button:active,
-.track-card button:active,
-.now-playing-bar button:active,
-box > button:active {
-    background-color: rgba(130, 160, 255, 0.35);
-}
-
-.header-area button:disabled,
-.onboarding-card button:disabled,
-.track-card button:disabled,
-.now-playing-bar button:disabled,
-box > button:disabled {
-    background-color: rgba(255, 255, 255, 0.04);
-    border-color: rgba(255, 255, 255, 0.06);
-    color: rgba(255, 255, 255, 0.2);
-}
-
-/* --- Track cards --- */
-.track-card {
-    background-color: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.07);
+popover > contents {
+    background-color: #1a1a24;
+    border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 10px;
-    padding: 10px 14px;
-    margin-top: 3px;
-    margin-bottom: 3px;
+    padding: 4px;
 }
 
-.track-card:hover {
-    background-color: rgba(255, 255, 255, 0.09);
+.popover-logout-btn {
+    background: none;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    min-height: 20px;
+    font-size: 13px;
+    font-weight: 500;
+    color: rgba(255, 120, 120, 0.8);
+}
+
+.popover-logout-btn:hover {
+    background-color: rgba(255, 90, 90, 0.12);
+    color: #ffaaaa;
+}
+
+/* =============================================
+   CONTENT AREA (not glass)
+   ============================================= */
+
+.content-area {
+    background-color: transparent;
+}
+
+.content-header-bar {
+    padding: 14px 28px;
+    background-color: rgba(0, 0, 0, 0.15);
+}
+
+.content-header {
+    font-size: 18px;
+    font-weight: 800;
+    color: rgba(255, 255, 255, 0.5);
+    letter-spacing: 10px;
+}
+
+/* =============================================
+   SECTION HEADERS
+   ============================================= */
+
+.section-header {
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: 700;
+    margin-top: 4px;
+    margin-bottom: 4px;
+}
+
+/* =============================================
+   COVER ART CARDS (horizontal scroll)
+   ============================================= */
+
+.cards-scroll {
+    min-content-height: 230;
+}
+
+.cover-card {
+    background: none;
+    border: none;
+    border-radius: 14px;
+    padding: 8px;
+    min-height: 0;
+}
+
+.cover-card:hover {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.cover-card:hover .cover-art {
     border-color: rgba(130, 160, 255, 0.2);
+}
+
+.cover-art {
+    background-image: linear-gradient(160deg, rgba(100, 140, 255, 0.1), rgba(180, 120, 255, 0.06), rgba(80, 200, 160, 0.05));
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.cover-art-letter {
+    font-size: 36px;
+    font-weight: 800;
+    color: rgba(255, 255, 255, 0.1);
+}
+
+.cover-card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: #f0f0f5;
+    margin-top: 4px;
+}
+
+.cover-card-artist {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.35);
+}
+
+/* =============================================
+   TRACK ROWS (2-column grid)
+   ============================================= */
+
+.track-row {
+    background-color: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+    border-radius: 10px;
+    padding: 6px 10px;
+    min-height: 0;
+}
+
+.track-row:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+    border-color: rgba(130, 160, 255, 0.15);
+}
+
+.track-art {
+    background-image: linear-gradient(135deg, rgba(130, 160, 255, 0.1), rgba(160, 100, 255, 0.06));
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.track-art-letter {
+    font-size: 16px;
+    font-weight: 700;
+    color: rgba(255, 255, 255, 0.12);
 }
 
 .track-title {
     color: #f0f0f5;
     font-weight: 600;
-    font-size: 14px;
+    font-size: 13px;
 }
 
 .track-artist {
-    color: rgba(255, 255, 255, 0.45);
-    font-size: 12px;
+    color: rgba(255, 255, 255, 0.38);
+    font-size: 11px;
 }
 
 .track-duration {
-    color: rgba(255, 255, 255, 0.35);
-    font-size: 12px;
-}
-
-.track-id {
-    color: rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.25);
     font-size: 11px;
     font-family: monospace;
 }
 
-/* --- Section headers --- */
-.section-header {
-    color: #ffffff;
-    font-size: 16px;
-    font-weight: 700;
-    margin-top: 16px;
-    margin-bottom: 6px;
-}
+/* =============================================
+   NOW PLAYING BAR
+   ============================================= */
 
-/* --- Status label --- */
-.status-label {
-    color: rgba(130, 160, 255, 0.7);
-    font-size: 12px;
-}
-
-/* --- Separator --- */
-separator {
-    background-color: rgba(255, 255, 255, 0.06);
-    min-height: 1px;
-}
-
-/* --- Scrollbar --- */
-scrollbar {
-    background-color: transparent;
-}
-
-scrollbar slider {
-    background-color: rgba(255, 255, 255, 0.12);
-    border-radius: 999px;
-    min-width: 6px;
-    min-height: 6px;
-}
-
-scrollbar slider:hover {
-    background-color: rgba(255, 255, 255, 0.2);
-}
-
-/* --- Play button --- */
-.play-btn {
-    background-color: rgba(80, 220, 140, 0.2);
-    border: 1px solid rgba(80, 220, 140, 0.3);
-    color: #6ee7a0;
-    padding: 4px 14px;
-    min-height: 28px;
-    border-radius: 8px;
-    font-weight: 700;
-}
-
-.play-btn:hover {
-    background-color: rgba(80, 220, 140, 0.32);
-    border-color: rgba(80, 220, 140, 0.5);
-    color: #a0ffc8;
-}
-
-/* --- Stop button --- */
-.stop-btn {
-    background-color: rgba(255, 90, 90, 0.2);
-    border: 1px solid rgba(255, 90, 90, 0.3);
-    color: #ff8a8a;
-    padding: 4px 14px;
-    min-height: 28px;
-    border-radius: 8px;
-    font-weight: 700;
-}
-
-.stop-btn:hover {
-    background-color: rgba(255, 90, 90, 0.32);
-    border-color: rgba(255, 90, 90, 0.5);
-    color: #ffb0b0;
-}
-
-/* --- Now Playing bar --- */
 .now-playing-bar {
-    background-color: rgba(255, 255, 255, 0.06);
-    border-top: 1px solid rgba(255, 255, 255, 0.1);
-    padding: 10px 16px;
+    background-color: rgba(255, 255, 255, 0.04);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 10px 20px;
 }
 
 .now-playing-text {
-    color: rgba(130, 220, 180, 0.85);
+    color: rgba(110, 231, 160, 0.8);
     font-size: 13px;
     font-weight: 600;
 }
 
-/* --- Dim label override --- */
+/* =============================================
+   STOP BUTTON
+   ============================================= */
+
+.stop-btn {
+    background-color: rgba(255, 90, 90, 0.15);
+    border: 1px solid rgba(255, 90, 90, 0.22);
+    color: rgba(255, 140, 140, 0.8);
+    padding: 4px 14px;
+    min-height: 28px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.stop-btn:hover {
+    background-color: rgba(255, 90, 90, 0.28);
+    border-color: rgba(255, 90, 90, 0.4);
+    color: #ffb0b0;
+}
+
+.stop-btn:disabled {
+    background-color: rgba(255, 255, 255, 0.03);
+    border-color: rgba(255, 255, 255, 0.05);
+    color: rgba(255, 255, 255, 0.15);
+}
+
+/* =============================================
+   DIM LABEL
+   ============================================= */
+
 .dim-label {
-    color: rgba(255, 255, 255, 0.4);
+    color: rgba(255, 255, 255, 0.3);
 }

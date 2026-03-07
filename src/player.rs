@@ -20,8 +20,8 @@ impl Player {
 
         let mut cmd = Command::new("ffplay");
         cmd.args([
-            "-nodisp",     // no video window
-            "-autoexit",   // exit when done
+            "-nodisp",
+            "-autoexit",
             "-loglevel", "error",
             url,
         ])

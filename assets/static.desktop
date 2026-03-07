@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Static
+Comment=YouTube Music client
+Exec=static
+Icon=com.static.music
+Terminal=false
+Type=Application
+Categories=Audio;Music;Player;
+Keywords=youtube;music;streaming;
+StartupWMClass=com.static.music

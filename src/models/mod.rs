@@ -16,6 +16,7 @@ pub struct Artist {
     pub id: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Playlist {
     pub playlist_id: String,
@@ -25,6 +26,7 @@ pub struct Playlist {
     pub thumbnail_url: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub tracks: Vec<Track>,

@@ -41,6 +41,7 @@ impl Player {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
         let mut guard = self.process.lock().unwrap();
         if let Some(child) = guard.as_mut() {

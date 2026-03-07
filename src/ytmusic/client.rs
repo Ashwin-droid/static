@@ -17,6 +17,7 @@ const YTM_ORIGIN: &str = "https://music.youtube.com";
 
 pub struct YtMusicClient {
     http: reqwest::Client,
+    #[allow(dead_code)]
     cookie: String,
     rt: tokio::runtime::Runtime,
     sapisid: Option<String>,
@@ -86,6 +87,7 @@ impl YtMusicClient {
         self.sapisid.as_ref().map(|id| generate_sapisidhash(id, YTM_ORIGIN))
     }
 
+    #[allow(dead_code)]
     fn auth_header_for_origin(&self, origin: &str) -> Option<String> {
         self.sapisid.as_ref().map(|id| generate_sapisidhash(id, origin))
     }
@@ -161,6 +163,7 @@ impl YtMusicClient {
         })
     }
 
+    #[allow(dead_code)]
     pub fn get_playlist(&self, playlist_id: &str) -> Result<Vec<Track>> {
         self.rt.block_on(async {
             let mut body = Self::client_context();

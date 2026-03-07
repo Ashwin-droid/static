@@ -234,6 +234,7 @@ pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
     Ok(tracks)
 }
 
+#[allow(dead_code)]
 pub fn parse_playlist_tracks(json: &Value) -> Result<Vec<Track>> {
     let mut tracks = Vec::new();
 

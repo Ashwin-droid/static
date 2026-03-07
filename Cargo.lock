@@ -1372,24 +1372,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-ytm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "gtk4",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
-]
-
-[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1627,6 +1609,24 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gtk4",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+]
 
 [[package]]
 name = "subtle"

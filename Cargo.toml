@@ -2,6 +2,20 @@
 name = "static"
 version = "0.1.0"
 edition = "2024"
+description = "A YouTube Music client built with Rust and GTK4"
+authors = ["Ashwin Mhaskar"]
+license = "MIT"
+
+[package.metadata.deb]
+maintainer = "Ashwin Mhaskar"
+depends = "$auto, ffmpeg"
+section = "sound"
+priority = "optional"
+assets = [
+    ["target/release/static", "usr/bin/", "755"],
+    ["assets/static.desktop", "usr/share/applications/com.static.music.desktop", "644"],
+    ["assets/static.png", "usr/share/icons/hicolor/256x256/apps/com.static.music.png", "644"],
+]
 
 [dependencies]
 # GTK4 UI

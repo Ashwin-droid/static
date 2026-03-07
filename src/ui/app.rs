@@ -3,7 +3,7 @@ use gtk::{gdk, Application, CssProvider};
 
 use super::window;
 
-const APP_ID: &str = "com.rustytm.app";
+const APP_ID: &str = "com.static.music";
 
 pub fn build_app() -> Application {
     let app = Application::builder().application_id(APP_ID).build();

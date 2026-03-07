@@ -18,7 +18,7 @@ struct AppState {
 pub fn build_window(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Rusty YT Music")
+        .title("Static")
         .default_width(900)
         .default_height(650)
         .build();
@@ -29,7 +29,7 @@ pub fn build_window(app: &Application) {
     let header_box = GtkBox::new(Orientation::Vertical, 8);
     header_box.add_css_class("header-area");
 
-    let title_label = Label::new(Some("Rusty YT Music"));
+    let title_label = Label::new(Some("Static"));
     title_label.add_css_class("app-title");
     header_box.append(&title_label);
 

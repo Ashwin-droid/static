@@ -1,0 +1,201 @@
+/* --- Base window --- */
+window {
+    background-color: rgba(18, 18, 24, 0.92);
+    color: #e0e0e8;
+}
+
+/* --- Glass panels --- */
+.glass-panel {
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 12px;
+    padding: 12px;
+}
+
+/* --- Header area --- */
+.header-area {
+    background-color: rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 16px;
+}
+
+/* --- Title --- */
+.app-title {
+    font-size: 22px;
+    font-weight: 800;
+    color: #ffffff;
+    letter-spacing: 1px;
+}
+
+/* --- Entries --- */
+entry {
+    background-color: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 8px;
+    color: #e0e0e8;
+    padding: 6px 12px;
+    min-height: 32px;
+}
+
+entry:focus {
+    border-color: rgba(130, 160, 255, 0.5);
+    background-color: rgba(255, 255, 255, 0.10);
+    box-shadow: 0 0 0 2px rgba(130, 160, 255, 0.15);
+}
+
+entry > text > placeholder {
+    color: rgba(255, 255, 255, 0.3);
+}
+
+/* --- Buttons --- */
+button {
+    background-color: rgba(130, 160, 255, 0.18);
+    border: 1px solid rgba(130, 160, 255, 0.25);
+    border-radius: 8px;
+    color: #b0c4ff;
+    padding: 6px 16px;
+    min-height: 32px;
+    font-weight: 600;
+}
+
+button:hover {
+    background-color: rgba(130, 160, 255, 0.28);
+    border-color: rgba(130, 160, 255, 0.4);
+    color: #d0ddff;
+}
+
+button:active {
+    background-color: rgba(130, 160, 255, 0.35);
+}
+
+button:disabled {
+    background-color: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.2);
+}
+
+/* --- Track cards --- */
+.track-card {
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-top: 3px;
+    margin-bottom: 3px;
+}
+
+.track-card:hover {
+    background-color: rgba(255, 255, 255, 0.09);
+    border-color: rgba(130, 160, 255, 0.2);
+}
+
+.track-title {
+    color: #f0f0f5;
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.track-artist {
+    color: rgba(255, 255, 255, 0.45);
+    font-size: 12px;
+}
+
+.track-duration {
+    color: rgba(255, 255, 255, 0.35);
+    font-size: 12px;
+}
+
+.track-id {
+    color: rgba(255, 255, 255, 0.2);
+    font-size: 11px;
+    font-family: monospace;
+}
+
+/* --- Section headers --- */
+.section-header {
+    color: #ffffff;
+    font-size: 16px;
+    font-weight: 700;
+    margin-top: 16px;
+    margin-bottom: 6px;
+}
+
+/* --- Status label --- */
+.status-label {
+    color: rgba(130, 160, 255, 0.7);
+    font-size: 12px;
+}
+
+/* --- Separator --- */
+separator {
+    background-color: rgba(255, 255, 255, 0.06);
+    min-height: 1px;
+}
+
+/* --- Scrollbar --- */
+scrollbar {
+    background-color: transparent;
+}
+
+scrollbar slider {
+    background-color: rgba(255, 255, 255, 0.12);
+    border-radius: 999px;
+    min-width: 6px;
+    min-height: 6px;
+}
+
+scrollbar slider:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+/* --- Play button --- */
+.play-btn {
+    background-color: rgba(80, 220, 140, 0.2);
+    border: 1px solid rgba(80, 220, 140, 0.3);
+    color: #6ee7a0;
+    padding: 4px 14px;
+    min-height: 28px;
+    border-radius: 8px;
+    font-weight: 700;
+}
+
+.play-btn:hover {
+    background-color: rgba(80, 220, 140, 0.32);
+    border-color: rgba(80, 220, 140, 0.5);
+    color: #a0ffc8;
+}
+
+/* --- Stop button --- */
+.stop-btn {
+    background-color: rgba(255, 90, 90, 0.2);
+    border: 1px solid rgba(255, 90, 90, 0.3);
+    color: #ff8a8a;
+    padding: 4px 14px;
+    min-height: 28px;
+    border-radius: 8px;
+    font-weight: 700;
+}
+
+.stop-btn:hover {
+    background-color: rgba(255, 90, 90, 0.32);
+    border-color: rgba(255, 90, 90, 0.5);
+    color: #ffb0b0;
+}
+
+/* --- Now Playing bar --- */
+.now-playing-bar {
+    background-color: rgba(255, 255, 255, 0.06);
+    border-top: 1px solid rgba(255, 255, 255, 0.1);
+    padding: 10px 16px;
+}
+
+.now-playing-text {
+    color: rgba(130, 220, 180, 0.85);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+/* --- Dim label override --- */
+.dim-label {
+    color: rgba(255, 255, 255, 0.4);
+}

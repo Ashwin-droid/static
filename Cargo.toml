@@ -1,0 +1,33 @@
+[package]
+name = "rust-ytm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GTK4 UI
+gtk = { package = "gtk4", version = "0.9" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SAPISIDHASH auth
+sha1 = "0.10"
+
+# Cipher extraction
+regex = "1"
+url = "2"
+urlencoding = "2"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"

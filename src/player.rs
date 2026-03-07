@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};
 use std::sync::Mutex;
 
@@ -17,17 +18,26 @@ impl Player {
     pub fn play(&self, url: &str) -> Result<()> {
         self.stop();
 
-        let child = Command::new("ffplay")
-            .args([
-                "-nodisp",     // no video window
-                "-autoexit",   // exit when done
-                "-loglevel", "error",
-                url,
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        let mut cmd = Command::new("ffplay");
+        cmd.args([
+            "-nodisp",     // no video window
+            "-autoexit",   // exit when done
+            "-loglevel", "error",
+            url,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+
+        // Kill ffplay when parent dies (even on SIGKILL)
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn()
             .context("Failed to launch ffplay — is ffmpeg installed?")?;
 
         *self.process.lock().unwrap() = Some(child);
@@ -45,9 +55,8 @@ impl Player {
     pub fn is_playing(&self) -> bool {
         let mut guard = self.process.lock().unwrap();
         if let Some(child) = guard.as_mut() {
-            // Check if still running
             match child.try_wait() {
-                Ok(None) => true,       // still running
+                Ok(None) => true,
                 _ => {
                     *guard = None;
                     false

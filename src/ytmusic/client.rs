@@ -22,6 +22,7 @@ pub struct YtMusicClient {
     rt: tokio::runtime::Runtime,
     sapisid: Option<String>,
     visitor_data: std::sync::Mutex<Option<String>>,
+    #[allow(dead_code)]
     cipher: std::sync::Mutex<Option<Cipher>>,
 }
 
@@ -114,6 +115,7 @@ impl YtMusicClient {
     }
 
     /// Get or fetch the cipher (cached per session).
+    #[allow(dead_code)]
     async fn ensure_cipher(&self) -> Result<Cipher> {
         {
             let guard = self.cipher.lock().unwrap();
@@ -189,45 +191,33 @@ impl YtMusicClient {
         self.rt.block_on(async {
             // Try Android VR client first — returns direct URLs (no cipher needed)
             eprintln!("[PLAYER] trying Android VR client for {video_id}...");
-            match self.try_android_vr_audio(video_id).await {
+            let vr_err = match self.try_android_vr_audio(video_id).await {
                 Ok(url) => {
                     eprintln!("[PLAYER] got direct URL via Android VR");
                     return Ok(url);
                 }
                 Err(e) => {
-                    eprintln!("[PLAYER] Android VR failed: {e}, falling back to web client...");
+                    eprintln!("[PLAYER] Android VR failed: {e}, trying web client...");
+                    e
                 }
-            }
+            };
 
-            // Fallback: web client (may need cipher)
-            let cipher = self.ensure_cipher().await?;
-
+            // Fallback: web client (may return direct URL without cipher)
             let mut body = Self::client_context();
             body["videoId"] = json!(video_id);
-            body["playbackContext"] = json!({
-                "contentPlaybackContext": {
-                    "signatureTimestamp": cipher.signature_timestamp
-                }
-            });
 
+            // Try without cipher first — some streams have direct URLs
             let json = self.player_request(&body).await?;
 
-            let audio = Self::best_audio_format(&json)?;
-
-            if let Some(url) = audio.get("url").and_then(|u| u.as_str()) {
-                eprintln!("[PLAYER] got direct URL via web client");
-                return Ok(url.to_string());
+            if let Ok(audio) = Self::best_audio_format(&json) {
+                if let Some(url) = audio.get("url").and_then(|u| u.as_str()) {
+                    eprintln!("[PLAYER] got direct URL via web client");
+                    return Ok(url.to_string());
+                }
             }
 
-            let cipher_str = audio
-                .get("signatureCipher")
-                .and_then(|s| s.as_str())
-                .context("No url or signatureCipher in stream")?;
-
-            eprintln!("[PLAYER] deciphering signature...");
-            let final_url = cipher.decipher_url(cipher_str)?;
-            eprintln!("[PLAYER] deciphered URL ready");
-            Ok(final_url)
+            // If we get here, neither path gave a direct URL
+            bail!("Could not get audio URL: {vr_err}")
         })
     }
 

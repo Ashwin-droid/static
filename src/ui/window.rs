@@ -3,16 +3,35 @@ use std::sync::{Arc, Mutex};
 use gtk::prelude::*;
 use gtk::{
     gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label,
-    Orientation, ScrolledWindow, Separator,
+    Orientation, Picture, ScrolledWindow, Separator, Stack, StackTransitionType,
 };
 
 use crate::models::{HomeSection, Track};
 use crate::player::Player;
 use crate::ytmusic::YtMusicClient;
 
+const KEYRING_SERVICE: &str = "com.static.music";
+const KEYRING_USER: &str = "cookie";
+
 struct AppState {
     client: Option<YtMusicClient>,
     player: Player,
+}
+
+fn store_cookie(cookie: &str) -> Result<(), keyring::Error> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
+    entry.set_password(cookie)
+}
+
+fn get_cookie() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
+    entry.get_password().ok()
+}
+
+fn delete_cookie() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        let _ = entry.delete_credential();
+    }
 }
 
 pub fn build_window(app: &Application) {
@@ -23,34 +42,230 @@ pub fn build_window(app: &Application) {
         .default_height(650)
         .build();
 
-    let main_box = GtkBox::new(Orientation::Vertical, 0);
+    let stack = Stack::new();
+    stack.set_transition_type(StackTransitionType::Crossfade);
+    stack.set_transition_duration(300);
 
-    // --- Header / Cookie input ---
-    let header_box = GtkBox::new(Orientation::Vertical, 8);
+    // --- Shared state ---
+    let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
+        client: None,
+        player: Player::new(),
+    }));
+
+    // --- Build both pages ---
+    let onboarding = build_onboarding_page(&stack, &state);
+    let main_page = build_main_page(&stack, &state);
+
+    stack.add_named(&onboarding, Some("onboarding"));
+    stack.add_named(&main_page, Some("main"));
+
+    // Start on a blank page while we check keyring
+    stack.set_visible_child_name("onboarding");
+
+    window.set_child(Some(&stack));
+    window.present();
+
+    // --- Check keyring on startup ---
+    {
+        let stack = stack.clone();
+        let state = state.clone();
+        glib::spawn_future_local(async move {
+            let cookie = gio::spawn_blocking(get_cookie).await;
+
+            if let Ok(Some(cookie)) = cookie {
+                match YtMusicClient::new(&cookie) {
+                    Ok(ytm) => {
+                        state.lock().unwrap().client = Some(ytm);
+                        stack.set_visible_child_name("main");
+                    }
+                    Err(_) => {
+                        // Stored cookie is invalid, clear it
+                        let _ = gio::spawn_blocking(delete_cookie).await;
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox {
+    let page = GtkBox::new(Orientation::Vertical, 0);
+    page.set_valign(Align::Center);
+    page.set_halign(Align::Center);
+    page.set_width_request(480);
+
+    let content = GtkBox::new(Orientation::Vertical, 16);
+    content.add_css_class("onboarding-card");
+
+    // Logo
+    let logo_bytes = glib::Bytes::from_static(include_bytes!("../../assets/static.png"));
+    let stream = gio::MemoryInputStream::from_bytes(&logo_bytes);
+    if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, 96, 96, true, gio::Cancellable::NONE) {
+        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+        let logo = Picture::for_paintable(&texture);
+        logo.set_size_request(96, 96);
+        logo.set_halign(Align::Center);
+        logo.set_margin_bottom(4);
+        content.append(&logo);
+    }
+
+    // Title
+    let title = Label::new(Some("Static"));
+    title.add_css_class("onboarding-title");
+    content.append(&title);
+
+    // Subtitle
+    let subtitle = Label::new(Some("YouTube Music, natively."));
+    subtitle.add_css_class("onboarding-subtitle");
+    content.append(&subtitle);
+
+    content.append(&Separator::new(Orientation::Horizontal));
+
+    // Instructions
+    let instructions = Label::new(Some(
+        "To get started, paste your YouTube Music cookie:"
+    ));
+    instructions.add_css_class("onboarding-instructions");
+    instructions.set_halign(Align::Start);
+    instructions.set_wrap(true);
+    content.append(&instructions);
+
+    // Steps
+    let steps_label = Label::new(Some(
+        "1. Open music.youtube.com in your browser\n\
+         2. Open DevTools (F12) \u{2192} Network tab\n\
+         3. Reload the page\n\
+         4. Click any request to music.youtube.com\n\
+         5. Copy the \u{2018}Cookie\u{2019} header value"
+    ));
+    steps_label.add_css_class("onboarding-steps");
+    steps_label.set_halign(Align::Start);
+    steps_label.set_wrap(true);
+    content.append(&steps_label);
+
+    // Cookie entry
+    let cookie_entry = Entry::builder()
+        .placeholder_text("Paste cookie header here...")
+        .hexpand(true)
+        .visibility(false)
+        .build();
+    cookie_entry.add_css_class("onboarding-entry");
+    content.append(&cookie_entry);
+
+    // Connect button
+    let connect_btn = Button::with_label("Connect");
+    connect_btn.add_css_class("connect-btn");
+    content.append(&connect_btn);
+
+    // Status
+    let status_label = Label::new(None);
+    status_label.add_css_class("onboarding-status");
+    content.append(&status_label);
+
+    page.append(&content);
+
+    // --- Connect handler ---
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let cookie_entry_for_click = cookie_entry.clone();
+        let cookie_entry_for_activate = cookie_entry.clone();
+        let status_label = status_label.clone();
+        let connect_btn_inner = connect_btn.clone();
+
+        let do_connect = move || {
+            let cookie_text = cookie_entry_for_click.text().to_string();
+            if cookie_text.is_empty() {
+                status_label.set_text("Please paste a cookie first");
+                return;
+            }
+
+            connect_btn_inner.set_sensitive(false);
+            connect_btn_inner.set_label("Connecting...");
+            status_label.set_text("");
+
+            match YtMusicClient::new(&cookie_text) {
+                Ok(ytm) => {
+                    state.lock().unwrap().client = Some(ytm);
+
+                    let state = state.clone();
+                    let stack = stack.clone();
+                    let status_label = status_label.clone();
+                    let connect_btn = connect_btn_inner.clone();
+                    let cookie_text = cookie_text.clone();
+
+                    glib::spawn_future_local(async move {
+                        let state_bg = state.clone();
+                        let result = gio::spawn_blocking(move || {
+                            let guard = state_bg.lock().unwrap();
+                            guard.client.as_ref().unwrap().check_auth()
+                        }).await;
+
+                        match result {
+                            Ok(Ok(true)) => {
+                                // Save to keyring
+                                let cookie_for_save = cookie_text.clone();
+                                let _ = gio::spawn_blocking(move || {
+                                    let _ = store_cookie(&cookie_for_save);
+                                }).await;
+                                stack.set_visible_child_name("main");
+                            }
+                            Ok(Ok(false)) => {
+                                // Still usable, save and proceed
+                                let cookie_for_save = cookie_text.clone();
+                                let _ = gio::spawn_blocking(move || {
+                                    let _ = store_cookie(&cookie_for_save);
+                                }).await;
+                                stack.set_visible_child_name("main");
+                            }
+                            Ok(Err(e)) => {
+                                status_label.set_text(&format!("Auth check failed: {e}"));
+                                connect_btn.set_sensitive(true);
+                                connect_btn.set_label("Connect");
+                            }
+                            Err(e) => {
+                                status_label.set_text(&format!("Error: {e:?}"));
+                                connect_btn.set_sensitive(true);
+                                connect_btn.set_label("Connect");
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    status_label.set_text(&format!("Invalid cookie: {e}"));
+                    connect_btn_inner.set_sensitive(true);
+                    connect_btn_inner.set_label("Connect");
+                }
+            }
+        };
+
+        let do_connect_click = do_connect.clone();
+        connect_btn.connect_clicked(move |_| do_connect_click());
+        cookie_entry_for_activate.connect_activate(move |_| do_connect());
+    }
+
+    page
+}
+
+fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox {
+    let page = GtkBox::new(Orientation::Vertical, 0);
+
+    // --- Header ---
+    let header_box = GtkBox::new(Orientation::Horizontal, 12);
     header_box.add_css_class("header-area");
 
     let title_label = Label::new(Some("Static"));
     title_label.add_css_class("app-title");
+    title_label.set_hexpand(true);
+    title_label.set_halign(Align::Start);
     header_box.append(&title_label);
 
-    let cookie_box = GtkBox::new(Orientation::Horizontal, 8);
-    let cookie_entry = Entry::builder()
-        .placeholder_text("Paste your music.youtube.com cookie header here...")
-        .hexpand(true)
-        .visibility(false)
-        .build();
-    let connect_btn = Button::with_label("Connect");
-    cookie_box.append(&cookie_entry);
-    cookie_box.append(&connect_btn);
-    header_box.append(&cookie_box);
+    let logout_btn = Button::with_label("Log out");
+    logout_btn.add_css_class("logout-btn");
+    header_box.append(&logout_btn);
 
-    let status_label = Label::new(Some("Not connected"));
-    status_label.set_halign(Align::Start);
-    status_label.add_css_class("status-label");
-    header_box.append(&status_label);
-
-    main_box.append(&header_box);
-    main_box.append(&Separator::new(Orientation::Horizontal));
+    page.append(&header_box);
+    page.append(&Separator::new(Orientation::Horizontal));
 
     // --- Search bar ---
     let search_box = GtkBox::new(Orientation::Horizontal, 8);
@@ -62,18 +277,15 @@ pub fn build_window(app: &Application) {
     let search_entry = Entry::builder()
         .placeholder_text("Search songs...")
         .hexpand(true)
-        .sensitive(false)
         .build();
     let search_btn = Button::with_label("Search");
-    search_btn.set_sensitive(false);
     let home_btn = Button::with_label("Home / Recommendations");
-    home_btn.set_sensitive(false);
 
     search_box.append(&search_entry);
     search_box.append(&search_btn);
     search_box.append(&home_btn);
-    main_box.append(&search_box);
-    main_box.append(&Separator::new(Orientation::Horizontal));
+    page.append(&search_box);
+    page.append(&Separator::new(Orientation::Horizontal));
 
     // --- Results area ---
     let scrolled = ScrolledWindow::builder()
@@ -87,16 +299,15 @@ pub fn build_window(app: &Application) {
     results_box.set_margin_start(16);
     results_box.set_margin_end(16);
 
-    let placeholder = Label::new(Some("Connect with your cookie to get started.\n\nHow to get your cookie:\n1. Open music.youtube.com in your browser\n2. Open DevTools (F12) -> Network tab\n3. Reload the page\n4. Click any request to music.youtube.com\n5. Copy the 'Cookie' header value from Request Headers"));
-    placeholder.set_wrap(true);
-    placeholder.set_margin_top(40);
-    placeholder.add_css_class("dim-label");
-    results_box.append(&placeholder);
+    let welcome = Label::new(Some("Search for music or browse your recommendations."));
+    welcome.add_css_class("dim-label");
+    welcome.set_margin_top(40);
+    results_box.append(&welcome);
 
     scrolled.set_child(Some(&results_box));
-    main_box.append(&scrolled);
+    page.append(&scrolled);
 
-    // --- Now Playing bar (bottom) ---
+    // --- Now Playing bar ---
     let np_bar = GtkBox::new(Orientation::Horizontal, 12);
     np_bar.add_css_class("now-playing-bar");
 
@@ -112,15 +323,34 @@ pub fn build_window(app: &Application) {
 
     np_bar.append(&np_label);
     np_bar.append(&stop_btn);
-    main_box.append(&np_bar);
+    page.append(&np_bar);
 
-    window.set_child(Some(&main_box));
+    // --- Logout handler ---
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let np_label = np_label.clone();
+        let stop_btn = stop_btn.clone();
+        let results_box = results_box.clone();
 
-    // --- Shared state ---
-    let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
-        client: None,
-        player: Player::new(),
-    }));
+        logout_btn.connect_clicked(move |_| {
+            // Stop playback
+            state.lock().unwrap().player.stop();
+            state.lock().unwrap().client = None;
+            np_label.set_text("Nothing playing");
+            stop_btn.set_sensitive(false);
+            clear_results(&results_box);
+
+            // Clear keyring
+            glib::spawn_future_local({
+                let stack = stack.clone();
+                async move {
+                    let _ = gio::spawn_blocking(delete_cookie).await;
+                    stack.set_visible_child_name("onboarding");
+                }
+            });
+        });
+    }
 
     // --- Stop button ---
     {
@@ -134,58 +364,10 @@ pub fn build_window(app: &Application) {
         });
     }
 
-    // --- Connect button handler ---
-    {
-        let state = state.clone();
-        let status_label = status_label.clone();
-        let search_entry = search_entry.clone();
-        let search_btn = search_btn.clone();
-        let home_btn = home_btn.clone();
-        let cookie_entry = cookie_entry.clone();
-
-        connect_btn.connect_clicked(move |_| {
-            let cookie_text = cookie_entry.text().to_string();
-            if cookie_text.is_empty() {
-                status_label.set_text("Please paste a cookie first");
-                return;
-            }
-
-            match YtMusicClient::new(&cookie_text) {
-                Ok(ytm) => {
-                    state.lock().unwrap().client = Some(ytm);
-                    status_label.set_text("Connected! Checking auth...");
-                    search_entry.set_sensitive(true);
-                    search_btn.set_sensitive(true);
-                    home_btn.set_sensitive(true);
-
-                    let state = state.clone();
-                    let status_label = status_label.clone();
-                    glib::spawn_future_local(async move {
-                        let result = gio::spawn_blocking(move || {
-                            let guard = state.lock().unwrap();
-                            guard.client.as_ref().unwrap().check_auth()
-                        }).await;
-
-                        match result {
-                            Ok(Ok(true)) => status_label.set_text("Authenticated successfully!"),
-                            Ok(Ok(false)) => status_label.set_text("Connected (not signed in - recommendations may be limited)"),
-                            Ok(Err(e)) => status_label.set_text(&format!("Auth check failed: {e}")),
-                            Err(e) => status_label.set_text(&format!("Thread error: {e:?}")),
-                        }
-                    });
-                }
-                Err(e) => {
-                    status_label.set_text(&format!("Invalid cookie: {e}"));
-                }
-            }
-        });
-    }
-
     // --- Search handler ---
     {
         let state = state.clone();
         let results_box = results_box.clone();
-        let search_entry = search_entry.clone();
         let np_label = np_label.clone();
         let stop_btn = stop_btn.clone();
 
@@ -285,7 +467,7 @@ pub fn build_window(app: &Application) {
         });
     }
 
-    window.present();
+    page
 }
 
 fn clear_results(container: &GtkBox) {
@@ -357,7 +539,6 @@ fn build_track_row(
     let row = GtkBox::new(Orientation::Horizontal, 12);
     row.add_css_class("track-card");
 
-    // Play button
     let play_btn = Button::with_label("Play");
     play_btn.add_css_class("play-btn");
     play_btn.set_valign(Align::Center);
@@ -398,7 +579,6 @@ fn build_track_row(
         row.append(&dur_label);
     }
 
-    // Wire up play button
     let video_id = track.video_id.clone();
     let display_title = format!("{} - {}", track.title, artist_str);
     {
@@ -407,7 +587,6 @@ fn build_track_row(
         let stop_btn = stop_btn.clone();
 
         play_btn.connect_clicked(move |btn| {
-            eprintln!("[PLAY] clicked: {video_id}");
             btn.set_label("...");
             btn.set_sensitive(false);
             np_label.set_text(&format!("Loading: {display_title}"));
@@ -420,14 +599,10 @@ fn build_track_row(
             let btn = btn.clone();
 
             glib::spawn_future_local(async move {
-                eprintln!("[PLAY] fetching audio URL for {video_id}...");
                 let result = gio::spawn_blocking(move || {
-                    eprintln!("[PLAY] inside spawn_blocking, getting URL...");
                     let guard = state.lock().unwrap();
                     let url = guard.client.as_ref().unwrap().get_audio_url(&video_id)?;
-                    eprintln!("[PLAY] got URL, launching ffplay...");
                     guard.player.play(&url)?;
-                    eprintln!("[PLAY] ffplay launched!");
                     Ok::<_, anyhow::Error>(())
                 }).await;
 

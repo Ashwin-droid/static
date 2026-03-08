@@ -391,8 +391,6 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     scrolled.set_child(Some(&content_box));
     content_outer.append(&scrolled);
-    hbox.append(&content_outer);
-    page.append(&hbox);
 
     // ======= NOW PLAYING BAR =======
     let np_bar = GtkBox::new(Orientation::Horizontal, 12);
@@ -410,7 +408,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     np_bar.append(&np_label);
     np_bar.append(&stop_btn);
-    page.append(&np_bar);
+    content_outer.append(&np_bar);
+
+    hbox.append(&content_outer);
+    page.append(&hbox);
 
     // ======= WIRE SIGNALS =======
 

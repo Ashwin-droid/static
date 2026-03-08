@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
-use crate::models::{HomeSection, RadioQueue, Track};
+use crate::models::{HomeSection, PlaylistSummary, RadioQueue, Track};
 
 use super::cipher::Cipher;
 use super::parsers;
@@ -242,7 +242,6 @@ impl YtMusicClient {
         })
     }
 
-    #[allow(dead_code)]
     pub fn get_playlist(&self, playlist_id: &str) -> Result<Vec<Track>> {
         self.rt.block_on(async {
             let mut body = Self::client_context();
@@ -261,6 +260,22 @@ impl YtMusicClient {
 
             let json: Value = resp.json().await.context("Failed to parse playlist response")?;
             parsers::parse_playlist_tracks(&json)
+        })
+    }
+
+    pub fn get_library_playlists(&self) -> Result<Vec<PlaylistSummary>> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["browseId"] = json!("FEmusic_liked_playlists");
+
+            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to fetch library playlists")?;
+
+            let json: Value = resp.json().await.context("Failed to parse library playlists response")?;
+            parsers::parse_library_playlists(&json)
         })
     }
 

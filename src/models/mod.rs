@@ -39,6 +39,15 @@ pub struct HomeSection {
     pub contents: Vec<Track>,
 }
 
+/// Lightweight summary for a playlist in the user's library listing (no embedded tracks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistSummary {
+    pub playlist_id: String,
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+    pub subtitle: Option<String>,
+}
+
 /// A single filter chip from a radio queue (e.g. "All", "Discover", "J-pop").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioChip {

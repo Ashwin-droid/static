@@ -26,7 +26,7 @@ const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 
 use crate::cache::MusicCache;
-use crate::models::{Artist, HomeSection, RadioChip, Track};
+use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, Track};
 use crate::player::Player;
 use crate::ytmusic::client::TrackingInfo;
 use crate::ytmusic::YtMusicClient;
@@ -376,11 +376,11 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     let home_btn = nav_button("Home", true);
     nav_box.append(&home_btn);
 
-    for label in ["Likes", "Playlists"] {
-        let btn = nav_button(label, false);
-        btn.set_sensitive(false);
-        nav_box.append(&btn);
-    }
+    let likes_btn = nav_button("Likes", false);
+    nav_box.append(&likes_btn);
+
+    let playlists_btn = nav_button("Playlists", false);
+    nav_box.append(&playlists_btn);
 
     let offline_btn = nav_button("Offline", false);
     nav_box.append(&offline_btn);
@@ -842,6 +842,30 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    // Likes button
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+
+        likes_btn.connect_clicked(move |_| {
+            load_likes(&state, &content_box, &ps, &recent_list);
+        });
+    }
+
+    // Playlists button
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+
+        playlists_btn.connect_clicked(move |_| {
+            load_playlists(&state, &content_box, &ps, &recent_list);
+        });
+    }
+
     // Offline button
     {
         let state = state.clone();
@@ -1107,6 +1131,335 @@ fn load_offline(
     }
 
     content_box.append(&grid);
+}
+
+fn load_likes(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+    let loading = Label::new(Some("Loading liked songs..."));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().map(|ytm| ytm.get_playlist("LM"))
+        }).await;
+
+        clear_box(&content_box);
+
+        match result {
+            Ok(Some(Ok(tracks))) => {
+                let header = Label::new(Some("Liked Songs"));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(20);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if tracks.is_empty() {
+                    let msg = Label::new(Some("No liked songs yet."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
+
+                let count_label = Label::new(Some(&format!("{} liked songs", tracks.len())));
+                count_label.add_css_class("dim-label");
+                count_label.set_halign(Align::Start);
+                count_label.set_margin_start(28);
+                count_label.set_margin_bottom(12);
+                content_box.append(&count_label);
+
+                let grid = gtk::Grid::new();
+                grid.set_column_spacing(12);
+                grid.set_row_spacing(8);
+                grid.set_column_homogeneous(true);
+                grid.set_margin_top(4);
+                grid.set_margin_start(20);
+                grid.set_margin_end(20);
+
+                for (i, track) in tracks.iter().enumerate() {
+                    let row = build_track_row(track, &state, &ps, &recent_list);
+                    grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                }
+
+                content_box.append(&grid);
+            }
+            Ok(Some(Err(e))) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e}"))));
+            }
+            Ok(None) => {
+                content_box.append(&Label::new(Some("Not connected.")));
+            }
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
+            }
+        }
+    });
+}
+
+fn load_playlists(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+    let loading = Label::new(Some("Loading playlists..."));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().map(|ytm| ytm.get_library_playlists())
+        }).await;
+
+        clear_box(&content_box);
+
+        match result {
+            Ok(Some(Ok(playlists))) => {
+                let header = Label::new(Some("Your Playlists"));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(20);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if playlists.is_empty() {
+                    let msg = Label::new(Some("No playlists found."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
+
+                let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+                cards_box.set_margin_top(4);
+                cards_box.set_margin_bottom(8);
+                cards_box.set_halign(Align::Start);
+
+                let flow = gtk::FlowBox::new();
+                flow.set_homogeneous(false);
+                flow.set_column_spacing(14);
+                flow.set_row_spacing(14);
+                flow.set_max_children_per_line(6);
+                flow.set_min_children_per_line(2);
+                flow.set_margin_start(24);
+                flow.set_margin_end(24);
+                flow.set_margin_top(8);
+                flow.set_selection_mode(gtk::SelectionMode::None);
+
+                for playlist in &playlists {
+                    let card = build_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
+                    flow.insert(&card, -1);
+                }
+
+                content_box.append(&flow);
+            }
+            Ok(Some(Err(e))) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e}"))));
+            }
+            Ok(None) => {
+                content_box.append(&Label::new(Some("Not connected.")));
+            }
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
+            }
+        }
+    });
+}
+
+fn build_playlist_card(
+    playlist: &PlaylistSummary,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> Button {
+    let card_btn = Button::new();
+    card_btn.add_css_class("cover-card");
+
+    let card = GtkBox::new(Orientation::Vertical, 6);
+    card.set_size_request(150, -1);
+
+    let art_container = GtkBox::new(Orientation::Vertical, 0);
+    art_container.add_css_class("cover-art");
+    art_container.set_size_request(150, 150);
+    art_container.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = &playlist.thumbnail_url {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(false);
+        picture.set_size_request(150, 150);
+        art_container.append(&picture);
+        load_thumbnail_into(&picture, url, 300);
+    } else {
+        let initial = playlist.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("cover-art-letter");
+        letter.set_vexpand(true);
+        letter.set_valign(Align::Center);
+        art_container.append(&letter);
+    }
+
+    card.append(&art_container);
+
+    let name = Label::new(Some(&playlist.title));
+    name.add_css_class("cover-card-title");
+    name.set_halign(Align::Start);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.set_max_width_chars(18);
+    card.append(&name);
+
+    if let Some(sub) = &playlist.subtitle {
+        let subtitle = Label::new(Some(sub));
+        subtitle.add_css_class("cover-card-artist");
+        subtitle.set_halign(Align::Start);
+        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        subtitle.set_max_width_chars(18);
+        card.append(&subtitle);
+    }
+
+    card_btn.set_child(Some(&card));
+
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let playlist_id = playlist.playlist_id.clone();
+        let playlist_title = playlist.title.clone();
+
+        card_btn.connect_clicked(move |_| {
+            load_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, &ps, &recent_list);
+        });
+    }
+
+    card_btn
+}
+
+fn load_playlist_detail(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    playlist_id: &str,
+    playlist_title: &str,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+    let loading = Label::new(Some(&format!("Loading \"{}\"...", playlist_title)));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let playlist_id = playlist_id.to_string();
+    let playlist_title = playlist_title.to_string();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let pid = playlist_id.clone();
+        let result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().map(|ytm| ytm.get_playlist(&pid))
+        }).await;
+
+        clear_box(&content_box);
+
+        match result {
+            Ok(Some(Ok(tracks))) => {
+                // Back button
+                let back_btn = Button::with_label("\u{2190} Back to Playlists");
+                back_btn.add_css_class("nav-item");
+                back_btn.set_halign(Align::Start);
+                back_btn.set_margin_start(24);
+                back_btn.set_margin_top(12);
+                {
+                    let state = state.clone();
+                    let content_box = content_box.clone();
+                    let ps = ps.clone();
+                    let recent_list = recent_list.clone();
+                    back_btn.connect_clicked(move |_| {
+                        load_playlists(&state, &content_box, &ps, &recent_list);
+                    });
+                }
+                content_box.append(&back_btn);
+
+                let header = Label::new(Some(&playlist_title));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(12);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if tracks.is_empty() {
+                    let msg = Label::new(Some("This playlist is empty."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
+
+                let count_label = Label::new(Some(&format!("{} tracks", tracks.len())));
+                count_label.add_css_class("dim-label");
+                count_label.set_halign(Align::Start);
+                count_label.set_margin_start(28);
+                count_label.set_margin_bottom(12);
+                content_box.append(&count_label);
+
+                let grid = gtk::Grid::new();
+                grid.set_column_spacing(12);
+                grid.set_row_spacing(8);
+                grid.set_column_homogeneous(true);
+                grid.set_margin_top(4);
+                grid.set_margin_start(20);
+                grid.set_margin_end(20);
+
+                for (i, track) in tracks.iter().enumerate() {
+                    let row = build_track_row(track, &state, &ps, &recent_list);
+                    grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                }
+
+                content_box.append(&grid);
+            }
+            Ok(Some(Err(e))) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e}"))));
+            }
+            Ok(None) => {
+                content_box.append(&Label::new(Some("Not connected.")));
+            }
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
+            }
+        }
+    });
 }
 
 fn load_sidebar_history(

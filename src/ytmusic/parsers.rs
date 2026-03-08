@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::models::{Artist, HomeSection, RadioChip, RadioQueue, Track};
+use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, RadioQueue, Track};
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
 pub fn parse_home(json: &Value) -> Result<Vec<HomeSection>> {
@@ -351,7 +351,6 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
     Ok(RadioQueue { playlist_id, tracks, chips, continuation })
 }
 
-#[allow(dead_code)]
 pub fn parse_playlist_tracks(json: &Value) -> Result<Vec<Track>> {
     let mut tracks = Vec::new();
 
@@ -374,4 +373,71 @@ pub fn parse_playlist_tracks(json: &Value) -> Result<Vec<Track>> {
     }
 
     Ok(tracks)
+}
+
+pub fn parse_library_playlists(json: &Value) -> Result<Vec<PlaylistSummary>> {
+    let mut playlists = Vec::new();
+
+    // The library playlists page uses gridRenderer/items with musicTwoRowItemRenderer
+    let items = json
+        .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/gridRenderer/items")
+        .or_else(|| json.pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicShelfRenderer/contents"))
+        .and_then(|c| c.as_array());
+
+    let Some(items) = items else {
+        tracing::warn!("No library playlists found");
+        return Ok(playlists);
+    };
+
+    for item in items {
+        let renderer = if let Some(r) = item.get("musicTwoRowItemRenderer") {
+            r
+        } else if let Some(r) = item.get("musicResponsiveListItemRenderer") {
+            r
+        } else {
+            continue;
+        };
+
+        // Extract playlist ID from navigation endpoint
+        let playlist_id = renderer
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(|b| b.as_str())
+            .map(|id| id.strip_prefix("VL").unwrap_or(id).to_string());
+
+        let Some(playlist_id) = playlist_id else { continue };
+
+        let title = renderer
+            .pointer("/title/runs/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("Untitled")
+            .to_string();
+
+        let thumbnail_url = renderer
+            .pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+            .or_else(|| renderer.pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails"))
+            .and_then(|t| t.as_array())
+            .and_then(|thumbs| thumbs.last())
+            .and_then(|t| t.get("url"))
+            .and_then(|u| u.as_str())
+            .map(String::from);
+
+        let subtitle = renderer
+            .pointer("/subtitle/runs")
+            .and_then(|r| r.as_array())
+            .map(|runs| {
+                runs.iter()
+                    .filter_map(|run| run.get("text")?.as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            });
+
+        playlists.push(PlaylistSummary {
+            playlist_id,
+            title,
+            thumbnail_url,
+            subtitle,
+        });
+    }
+
+    Ok(playlists)
 }

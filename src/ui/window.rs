@@ -20,6 +20,7 @@ const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
 const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
 
+use crate::cache::MusicCache;
 use crate::models::{Artist, HomeSection, RadioChip, Track};
 use crate::player::Player;
 use crate::ytmusic::YtMusicClient;
@@ -36,6 +37,7 @@ static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
 
 struct AppState {
     client: Option<YtMusicClient>,
+    cache: MusicCache,
 }
 
 #[allow(dead_code)]
@@ -110,8 +112,10 @@ pub fn build_window(app: &Application) {
     stack.set_transition_type(StackTransitionType::Crossfade);
     stack.set_transition_duration(300);
 
+    let cache = MusicCache::new().expect("Failed to initialise music cache");
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
+        cache,
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -1432,6 +1436,9 @@ fn play_track(
     thumb_url: Option<&str>,
     ps: &Rc<PlayerState>,
 ) {
+    // Stop immediately so stale position data can't trigger auto-advance
+    ps.player.stop();
+
     // Immediately flush all UI state for the new track
     ps.np_title.set_text(title);
     ps.np_artist.set_text(artist);
@@ -1458,14 +1465,27 @@ fn play_track(
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
-        let state_bg = state.clone();
+        // Check offline cache first
+        let state_c = state.clone();
         let vid = video_id.clone();
-        let url_result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().unwrap().get_audio_url(&vid)
-        }).await;
+        let cached_path = gio::spawn_blocking(move || {
+            let guard = state_c.lock().unwrap();
+            guard.cache.get_cached_audio(&vid)
+        }).await.ok().flatten();
 
-        match url_result {
+        let play_uri = if let Some(path) = cached_path {
+            eprintln!("[CACHE] playing from offline: {}", path.display());
+            Ok(Ok(format!("file://{}", path.display())))
+        } else {
+            let state_bg = state.clone();
+            let vid = video_id.clone();
+            gio::spawn_blocking(move || {
+                let guard = state_bg.lock().unwrap();
+                guard.client.as_ref().unwrap().get_audio_url(&vid)
+            }).await
+        };
+
+        match play_uri {
             Ok(Ok(url)) => {
                 ps.player.play_uri(&url);
                 ps.np_title.set_text(&title);
@@ -1476,6 +1496,20 @@ fn play_track(
                 ps.like_btn.set_sensitive(true);
                 ps.dislike_btn.set_sensitive(true);
                 ps.menu_btn.set_sensitive(true);
+
+                // Record play + trigger background sync
+                let state_bg = state.clone();
+                let vid = video_id.clone();
+                let t = title.clone();
+                let a = artist.clone();
+                let tu = thumb_url.clone();
+                gio::spawn_blocking(move || {
+                    {
+                        let guard = state_bg.lock().unwrap();
+                        let _ = guard.cache.record_play(&vid, &t, &a, tu.as_deref());
+                    } // lock released before sync
+                    sync_offline_cache(&state_bg);
+                });
             }
             Ok(Err(e)) => {
                 ps.np_title.set_text(&format!("Playback failed: {e}"));
@@ -1536,6 +1570,9 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     let thumb_url = track.thumbnail_url.clone();
     drop(queue);
 
+    // Stop immediately so stale position data can't trigger auto-advance
+    ps.player.stop();
+
     // Flush UI
     ps.np_title.set_text(&title);
     ps.np_artist.set_text(&artist);
@@ -1558,14 +1595,27 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
-        let state_bg = state.clone();
+        // Check offline cache first
+        let state_c = state.clone();
         let vid = video_id.clone();
-        let url_result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().unwrap().get_audio_url(&vid)
-        }).await;
+        let cached_path = gio::spawn_blocking(move || {
+            let guard = state_c.lock().unwrap();
+            guard.cache.get_cached_audio(&vid)
+        }).await.ok().flatten();
 
-        match url_result {
+        let play_uri = if let Some(path) = cached_path {
+            eprintln!("[CACHE] playing from offline: {}", path.display());
+            Ok(Ok(format!("file://{}", path.display())))
+        } else {
+            let state_bg = state.clone();
+            let vid = video_id.clone();
+            gio::spawn_blocking(move || {
+                let guard = state_bg.lock().unwrap();
+                guard.client.as_ref().unwrap().get_audio_url(&vid)
+            }).await
+        };
+
+        match play_uri {
             Ok(Ok(url)) => {
                 ps.player.play_uri(&url);
                 ps.np_title.set_text(&title);
@@ -1576,6 +1626,20 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                 ps.like_btn.set_sensitive(true);
                 ps.dislike_btn.set_sensitive(true);
                 ps.menu_btn.set_sensitive(true);
+
+                // Record play + trigger background sync
+                let state_bg = state.clone();
+                let vid = video_id.clone();
+                let t = title.clone();
+                let a = artist.clone();
+                let tu = thumb_url.clone();
+                gio::spawn_blocking(move || {
+                    {
+                        let guard = state_bg.lock().unwrap();
+                        let _ = guard.cache.record_play(&vid, &t, &a, tu.as_deref());
+                    } // lock released before sync
+                    sync_offline_cache(&state_bg);
+                });
             }
             Ok(Err(e)) => {
                 ps.np_title.set_text(&format!("Playback failed: {e}"));
@@ -1753,6 +1817,78 @@ fn add_to_recent(
             recent_list.remove(&c);
         }
         child = next;
+    }
+}
+
+/// Sync the offline cache: download top-100 most played songs, evict the rest.
+/// Acquires the AppState lock briefly per-operation so playback is never blocked.
+fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
+    let (top, cached) = {
+        let guard = state.lock().unwrap();
+        let top = match guard.cache.top_played(100) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[CACHE] failed to get top played: {e}");
+                return;
+            }
+        };
+        let cached = guard.cache.cached_ids().unwrap_or_default();
+        (top, cached)
+    }; // lock released
+
+    // Evict songs no longer in top 100
+    for id in &cached {
+        if !top.contains(id) {
+            let guard = state.lock().unwrap();
+            let _ = guard.cache.remove_cached(id);
+        }
+    }
+
+    // Download songs that are in top 100 but not cached
+    let to_download: Vec<String> = top.into_iter()
+        .filter(|id| !cached.contains(id))
+        .collect();
+
+    if to_download.is_empty() {
+        return;
+    }
+
+    for vid in to_download {
+        // Get streaming URL (brief lock)
+        let url = {
+            let guard = state.lock().unwrap();
+            let Some(client) = guard.client.as_ref() else { return };
+            match client.get_audio_url(&vid) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("[CACHE] failed to get URL for {vid}: {e}");
+                    continue;
+                }
+            }
+        }; // lock released
+
+        // Download audio bytes (no lock held)
+        eprintln!("[CACHE] downloading {vid} for offline...");
+        let audio = match THUMB_CLIENT.get(&url).send().and_then(|r| r.bytes()) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("[CACHE] download failed for {vid}: {e}");
+                continue;
+            }
+        };
+
+        // Download artwork (no lock held)
+        let thumb_url = {
+            let guard = state.lock().unwrap();
+            guard.cache.get_thumbnail_url(&vid)
+        };
+        let art = thumb_url.and_then(|url| {
+            THUMB_CLIENT.get(&url).send().ok()?.bytes().ok()
+        });
+
+        // Store to disk + DB (brief lock)
+        let guard = state.lock().unwrap();
+        let _ = guard.cache.store_audio(&vid, &audio, art.as_deref());
     }
 }
 

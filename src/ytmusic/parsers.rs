@@ -172,24 +172,53 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
 }
 
 fn extract_artists_from_subtitle(renderer: &Value) -> Vec<Artist> {
-    renderer
+    let Some(runs) = renderer
         .pointer("/subtitle/runs")
         .and_then(|r| r.as_array())
-        .map(|runs| {
-            runs.iter()
-                .filter(|run| run.get("navigationEndpoint").is_some())
-                .filter_map(|run| {
-                    Some(Artist {
-                        name: run.get("text")?.as_str()?.to_string(),
-                        id: run
-                            .pointer("/navigationEndpoint/browseEndpoint/browseId")
-                            .and_then(|b| b.as_str())
-                            .map(String::from),
-                    })
-                })
-                .collect()
+    else {
+        return vec![];
+    };
+
+    // First try: artists with navigation endpoints (clickable)
+    let navigable: Vec<Artist> = runs
+        .iter()
+        .filter(|run| run.get("navigationEndpoint").is_some())
+        .filter_map(|run| {
+            Some(Artist {
+                name: run.get("text")?.as_str()?.to_string(),
+                id: run
+                    .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                    .and_then(|b| b.as_str())
+                    .map(String::from),
+            })
         })
-        .unwrap_or_default()
+        .collect();
+
+    if !navigable.is_empty() {
+        return navigable;
+    }
+
+    // Fallback: concatenate all non-separator subtitle runs as artist name.
+    // Subtitle format is typically "Artist • Album • Duration" — take the first segment.
+    let full_text: String = runs
+        .iter()
+        .filter_map(|run| run.get("text")?.as_str())
+        .collect::<Vec<_>>()
+        .join("");
+
+    // Split on " • " and take the first part as artist
+    let artist_name = full_text
+        .split(" \u{2022} ")
+        .next()
+        .unwrap_or(&full_text)
+        .trim()
+        .to_string();
+
+    if artist_name.is_empty() {
+        vec![]
+    } else {
+        vec![Artist { name: artist_name, id: None }]
+    }
 }
 
 fn extract_thumbnail(renderer: &Value) -> Option<String> {

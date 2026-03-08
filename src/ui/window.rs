@@ -41,6 +41,15 @@ static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Separate client for downloading full audio files — longer timeout and proper user-agent.
+static DOWNLOAD_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
+        .build()
+        .unwrap()
+});
+
 struct AppState {
     client: Option<YtMusicClient>,
     cache: MusicCache,
@@ -494,6 +503,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     controls_box.set_margin_top(2);
     controls_box.set_margin_bottom(6);
     controls_box.set_valign(Align::Center);
+    controls_box.set_size_request(-1, 62);
 
     // -- Left: Transport controls --
     let transport_box = GtkBox::new(Orientation::Horizontal, 0);
@@ -540,17 +550,18 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     let text_box = GtkBox::new(Orientation::Vertical, 0);
     text_box.set_valign(Align::Center);
+    text_box.set_size_request(-1, 58);
 
     let np_title = Label::new(Some("Nothing playing"));
     np_title.add_css_class("np-track-title");
     np_title.set_halign(Align::Start);
-    let np_title_sw = label_scroller(&np_title, 18);
+    let np_title_sw = label_scroller(&np_title, 22);
     text_box.append(&np_title_sw);
 
     let np_artist = Label::new(None);
     np_artist.add_css_class("np-track-artist");
     np_artist.set_halign(Align::Start);
-    let np_artist_sw = label_scroller(&np_artist, 15);
+    let np_artist_sw = label_scroller(&np_artist, 18);
     text_box.append(&np_artist_sw);
 
     track_info_box.append(&text_box);
@@ -1318,12 +1329,19 @@ fn build_track_row(
 /// Wrap an existing label in a ScrolledWindow with marquee scrolling.
 /// Restarts the scroll animation whenever the label text changes.
 fn label_scroller(label: &Label, height: i32) -> ScrolledWindow {
+    // Prevent the label from wrapping — it must stay single-line for marquee to work
+    // and to avoid GTK height-for-width mismatches.
+    label.set_wrap(false);
+    label.set_single_line_mode(true);
+
     let sw = ScrolledWindow::new();
     sw.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
     sw.set_hexpand(true);
     sw.set_size_request(1, height);
+    sw.set_min_content_height(height);
     sw.set_vexpand(false);
     sw.set_propagate_natural_width(false);
+    sw.set_propagate_natural_height(false);
     sw.set_min_content_width(0);
     sw.set_child(Some(label));
 
@@ -1477,11 +1495,11 @@ fn build_sidebar_recent_item(
     let row = GtkBox::new(Orientation::Vertical, 1);
     row.set_hexpand(true);
 
-    let title_sw = scrolling_label(&track.title, "sidebar-recent-title", 18);
+    let title_sw = scrolling_label(&track.title, "sidebar-recent-title", 22);
     row.append(&title_sw);
 
     let artist_str = artist_string(track);
-    let artist_sw = scrolling_label(&artist_str, "sidebar-recent-artist", 15);
+    let artist_sw = scrolling_label(&artist_str, "sidebar-recent-artist", 18);
     row.append(&artist_sw);
 
     btn.set_child(Some(&row));
@@ -2019,9 +2037,21 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         }; // lock released
 
         // Download audio bytes (no lock held)
+        // YouTube often requires a Range header to start sending data.
         eprintln!("[CACHE] downloading {vid} for offline...");
-        let audio = match THUMB_CLIENT.get(&url).send().and_then(|r| r.bytes()) {
-            Ok(b) => b,
+        let audio = match DOWNLOAD_CLIENT
+            .get(&url)
+            .header("Range", "bytes=0-")
+            .send()
+            .and_then(|r| {
+                let status = r.status();
+                eprintln!("[CACHE] {vid} response: {status}, content-length: {:?}", r.content_length());
+                r.bytes()
+            }) {
+            Ok(b) => {
+                eprintln!("[CACHE] {vid} downloaded {} KB", b.len() / 1024);
+                b
+            }
             Err(e) => {
                 eprintln!("[CACHE] download failed for {vid}: {e}");
                 continue;

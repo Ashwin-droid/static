@@ -5,6 +5,12 @@
 window {
     background-color: transparent;
     color: #e0e0e8;
+    --accent-color: rgba(130, 160, 255, 0.4);
+    --accent-bg-color: rgba(130, 160, 255, 0.15);
+}
+
+*:focus-visible {
+    outline-color: rgba(130, 160, 255, 0.4);
 }
 
 separator {
@@ -198,6 +204,14 @@ entry > text > placeholder {
 
 .sidebar-recent-item:hover {
     background-color: rgba(255, 255, 255, 0.05);
+}
+
+.sidebar-recent-item:focus,
+.sidebar-recent-item:active,
+.sidebar-recent-item:checked {
+    background-color: rgba(130, 160, 255, 0.1);
+    outline: none;
+    box-shadow: none;
 }
 
 .sidebar-recent-title {
@@ -506,4 +520,74 @@ popover > contents {
 
 .dim-label {
     color: rgba(255, 255, 255, 0.3);
+}
+
+/* =============================================
+   QUEUE PANEL
+   ============================================= */
+
+.queue-panel {
+    background-color: #1a1a1a;
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.queue-header {
+    font-size: 15px;
+    font-weight: 700;
+    color: #ffffff;
+}
+
+.queue-chip {
+    border-radius: 16px;
+    padding: 4px 14px;
+    font-size: 12px;
+    background-color: rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.8);
+    border: none;
+    min-height: 0;
+}
+.queue-chip:hover {
+    background-color: rgba(255, 255, 255, 0.2);
+    color: #ffffff;
+}
+
+.queue-row-btn {
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 0;
+}
+.queue-row-btn:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.queue-row {
+    padding: 4px 8px;
+}
+.queue-row-active {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+}
+
+.queue-thumb {
+    border-radius: 4px;
+}
+
+.queue-track-title {
+    font-size: 13px;
+    color: #ffffff;
+}
+.queue-row-active .queue-track-title {
+    color: #ff0000;
+}
+
+.queue-track-artist {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.queue-track-duration {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    margin-right: 4px;
 }

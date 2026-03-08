@@ -20,7 +20,7 @@ const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
 const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
 
-use crate::models::{HomeSection, Track};
+use crate::models::{Artist, HomeSection, RadioChip, Track};
 use crate::player::Player;
 use crate::ytmusic::YtMusicClient;
 
@@ -63,6 +63,15 @@ struct PlayerState {
     // Modes
     repeat_btn: Button,
     shuffle_btn: Button,
+    // Queue / Radio
+    queue: RefCell<Vec<Track>>,
+    queue_index: Cell<usize>,
+    chips: RefCell<Vec<RadioChip>>,
+    seed_video_id: RefCell<String>,
+    // Queue panel widgets
+    queue_list_box: GtkBox,
+    chip_bar: GtkBox,
+    queue_panel: GtkBox,
 }
 
 struct MainPageWidgets {
@@ -92,9 +101,10 @@ pub fn build_window(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Static")
-        .default_width(1100)
-        .default_height(700)
+        .default_width(1532)
+        .default_height(760)
         .build();
+
 
     let stack = Stack::new();
     stack.set_transition_type(StackTransitionType::Crossfade);
@@ -487,7 +497,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     np_thumb_frame.set_valign(Align::Center);
 
     let np_thumb = Picture::new();
-    np_thumb.set_keep_aspect_ratio(false);
+    np_thumb.set_keep_aspect_ratio(true);
     np_thumb.set_size_request(40, 40);
     np_thumb_frame.append(&np_thumb);
     track_info_box.append(&np_thumb_frame);
@@ -567,6 +577,45 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     content_outer.append(&np_bar);
 
     hbox.append(&content_outer);
+
+    // ======= QUEUE PANEL (right side, like YTM's "Up Next") =======
+    let queue_panel = GtkBox::new(Orientation::Vertical, 0);
+    queue_panel.add_css_class("queue-panel");
+    queue_panel.set_width_request(300);
+    queue_panel.set_visible(false);
+
+    let queue_header = Label::new(Some("Up Next"));
+    queue_header.add_css_class("queue-header");
+    queue_header.set_halign(Align::Start);
+    queue_header.set_margin_start(16);
+    queue_header.set_margin_top(12);
+    queue_header.set_margin_bottom(8);
+    queue_panel.append(&queue_header);
+
+    // Chip filter bar (horizontal scrollable)
+    let chip_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    chip_scroll.set_size_request(-1, 40);
+
+    let chip_bar = GtkBox::new(Orientation::Horizontal, 6);
+    chip_bar.set_margin_start(16);
+    chip_bar.set_margin_end(16);
+    chip_scroll.set_child(Some(&chip_bar));
+    queue_panel.append(&chip_scroll);
+
+    // Scrollable queue list
+    let queue_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    let queue_list_box = GtkBox::new(Orientation::Vertical, 0);
+    queue_list_box.set_margin_top(4);
+    queue_scroll.set_child(Some(&queue_list_box));
+    queue_panel.append(&queue_scroll);
+
+    hbox.append(&queue_panel);
     page.append(&hbox);
 
     // ======= PLAYER STATE =======
@@ -587,6 +636,13 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         volume_slider: volume_slider.clone(),
         repeat_btn: repeat_btn.clone(),
         shuffle_btn: shuffle_btn.clone(),
+        queue: RefCell::new(Vec::new()),
+        queue_index: Cell::new(0),
+        chips: RefCell::new(Vec::new()),
+        seed_video_id: RefCell::new(String::new()),
+        queue_list_box: queue_list_box.clone(),
+        chip_bar: chip_bar.clone(),
+        queue_panel: queue_panel.clone(),
     });
 
     // ======= WIRE SIGNALS =======
@@ -600,6 +656,31 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                 set_button_icon(btn, ICON_PLAY, 28);
             } else {
                 set_button_icon(btn, ICON_PAUSE, 28);
+            }
+        });
+    }
+
+    // Next track
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        next_btn.connect_clicked(move |_| {
+            let idx = ps.queue_index.get();
+            let len = ps.queue.borrow().len();
+            if len > 0 && idx + 1 < len {
+                play_from_queue(&state, &ps, idx + 1);
+            }
+        });
+    }
+
+    // Previous track
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        prev_btn.connect_clicked(move |_| {
+            let idx = ps.queue_index.get();
+            if idx > 0 {
+                play_from_queue(&state, &ps, idx - 1);
             }
         });
     }
@@ -626,9 +707,11 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
-    // Position update timer (250ms)
+    // Position update timer (250ms) + auto-advance
     {
         let ps = ps.clone();
+        let state = state.clone();
+        let auto_advancing = Rc::new(Cell::new(false));
         glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             if ps.is_seeking.get() {
                 return glib::ControlFlow::Continue;
@@ -640,7 +723,24 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             if let (Some(pos), Some(dur)) = (pos, dur) {
                 let dur_ns = dur.nseconds();
                 if dur_ns > 0 {
-                    ps.progress_slider.set_value(pos.nseconds() as f64 / dur_ns as f64);
+                    let frac = pos.nseconds() as f64 / dur_ns as f64;
+                    ps.progress_slider.set_value(frac);
+
+                    // Auto-advance: when within 500ms of the end
+                    if !auto_advancing.get() && pos.nseconds() + 500_000_000 >= dur_ns && dur_ns > 1_000_000_000 {
+                        let idx = ps.queue_index.get();
+                        let len = ps.queue.borrow().len();
+                        if len > 0 && idx + 1 < len {
+                            auto_advancing.set(true);
+                            let ps2 = ps.clone();
+                            let state2 = state.clone();
+                            let aa = auto_advancing.clone();
+                            glib::idle_add_local_once(move || {
+                                play_from_queue(&state2, &ps2, idx + 1);
+                                aa.set(false);
+                            });
+                        }
+                    }
                 }
                 ps.time_label.set_text(&format!(
                     "{} / {}",
@@ -1117,7 +1217,7 @@ fn build_track_row(
 
     if let Some(url) = &track.thumbnail_url {
         let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
+        picture.set_keep_aspect_ratio(true);
         picture.set_size_request(44, 44);
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, 88);
@@ -1179,6 +1279,74 @@ fn build_track_row(
     row_btn
 }
 
+/// Wrap a label in a ScrolledWindow that auto-scrolls (marquee) after 1 s if the text overflows.
+fn scrolling_label(text: &str, css_class: &str, height: i32) -> ScrolledWindow {
+    let sw = ScrolledWindow::new();
+    sw.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    sw.set_hexpand(true);
+    sw.set_size_request(-1, height);
+    sw.set_vexpand(false);
+
+    let label = Label::new(Some(text));
+    label.add_css_class(css_class);
+    label.set_halign(Align::Start);
+    sw.set_child(Some(&label));
+
+    // After 1 s, if text overflows, start a smooth scroll loop
+    let sw_c = sw.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_secs(1), move || {
+        let adj = sw_c.hadjustment();
+        if adj.upper() - adj.page_size() <= 0.0 {
+            return; // text fits — nothing to do
+        }
+        // State machine: 0 = scrolling right, 1 = pause at end, 2 = pause at start
+        let state = Rc::new(Cell::new(0u8));
+        let pause = Rc::new(Cell::new(0i32));
+        let sw_ref = sw_c;
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if !sw_ref.is_mapped() {
+                return glib::ControlFlow::Break;
+            }
+            let adj = sw_ref.hadjustment();
+            let max = adj.upper() - adj.page_size();
+            if max <= 0.0 {
+                return glib::ControlFlow::Break;
+            }
+            match state.get() {
+                0 => {
+                    let v = adj.value() + 0.6;
+                    if v >= max {
+                        adj.set_value(max);
+                        state.set(1);
+                        pause.set(50); // ~1.5 s pause at end
+                    } else {
+                        adj.set_value(v);
+                    }
+                }
+                1 => {
+                    let t = pause.get() - 1;
+                    pause.set(t);
+                    if t <= 0 {
+                        adj.set_value(0.0);
+                        state.set(2);
+                        pause.set(33); // ~1 s pause at start
+                    }
+                }
+                _ => {
+                    let t = pause.get() - 1;
+                    pause.set(t);
+                    if t <= 0 {
+                        state.set(0);
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    });
+
+    sw
+}
+
 fn build_sidebar_recent_item(
     track: &Track,
     state: &Arc<Mutex<AppState>>,
@@ -1189,18 +1357,12 @@ fn build_sidebar_recent_item(
 
     let row = GtkBox::new(Orientation::Vertical, 1);
 
-    let title = Label::new(Some(&track.title));
-    title.set_halign(Align::Start);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.add_css_class("sidebar-recent-title");
-    row.append(&title);
+    let title_sw = scrolling_label(&track.title, "sidebar-recent-title", 18);
+    row.append(&title_sw);
 
     let artist_str = artist_string(track);
-    let artist = Label::new(Some(&artist_str));
-    artist.set_halign(Align::Start);
-    artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    artist.add_css_class("sidebar-recent-artist");
-    row.append(&artist);
+    let artist_sw = scrolling_label(&artist_str, "sidebar-recent-artist", 15);
+    row.append(&artist_sw);
 
     btn.set_child(Some(&row));
 
@@ -1237,10 +1399,25 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
         if let Ok(Ok(bytes)) = result {
             let gbytes = glib::Bytes::from(&bytes);
             let stream = gio::MemoryInputStream::from_bytes(&gbytes);
-            if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(
-                &stream, size, size, true, gio::Cancellable::NONE,
+            // Load at original size first so we can compute aspect ratio
+            if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream(
+                &stream, gio::Cancellable::NONE,
             ) {
-                let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+                let w = pixbuf.width();
+                let h = pixbuf.height();
+                // Scale so the shorter side == size, then center-crop to square
+                let (sw, sh) = if w < h {
+                    (size, (h as f64 * size as f64 / w as f64) as i32)
+                } else {
+                    ((w as f64 * size as f64 / h as f64) as i32, size)
+                };
+                let scaled = pixbuf
+                    .scale_simple(sw, sh, gtk::gdk_pixbuf::InterpType::Bilinear)
+                    .unwrap_or(pixbuf);
+                let ox = (scaled.width() - size).max(0) / 2;
+                let oy = (scaled.height() - size).max(0) / 2;
+                let cropped = scaled.new_subpixbuf(ox, oy, size.min(scaled.width()), size.min(scaled.height()));
+                let texture = gtk::gdk::Texture::for_pixbuf(&cropped);
                 picture.set_paintable(Some(&texture));
             }
         }
@@ -1276,6 +1453,8 @@ fn play_track(
     let state = state.clone();
     let video_id = video_id.to_string();
     let title = title.to_string();
+    let artist = artist.to_string();
+    let thumb_url = thumb_url.map(String::from);
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
@@ -1292,6 +1471,8 @@ fn play_track(
                 ps.np_title.set_text(&title);
                 set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
                 ps.play_pause_btn.set_sensitive(true);
+                ps.prev_btn.set_sensitive(true);
+                ps.next_btn.set_sensitive(true);
                 ps.like_btn.set_sensitive(true);
                 ps.dislike_btn.set_sensitive(true);
                 ps.menu_btn.set_sensitive(true);
@@ -1304,6 +1485,251 @@ fn play_track(
                 ps.np_title.set_text(&format!("Error: {e:?}"));
                 ps.np_artist.set_text("");
             }
+        }
+
+        // Fetch radio queue in background
+        let state_bg = state.clone();
+        let vid = video_id.clone();
+        let radio_result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().map(|ytm| ytm.get_radio(&vid, None, None))
+        }).await;
+
+        if let Ok(Some(Ok(mut radio))) = radio_result {
+            // Ensure the seed track is always first in the queue
+            let idx = radio.tracks.iter().position(|t| t.video_id == video_id);
+            if let Some(i) = idx {
+                // Move it to front if not already there
+                if i > 0 {
+                    let seed_track = radio.tracks.remove(i);
+                    radio.tracks.insert(0, seed_track);
+                }
+            } else {
+                // Not in queue at all — prepend it
+                radio.tracks.insert(0, Track {
+                    video_id: video_id.clone(),
+                    title: title.clone(),
+                    artists: vec![Artist { name: artist.clone(), id: None }],
+                    album: None,
+                    duration: None,
+                    thumbnail_url: thumb_url.clone(),
+                });
+            }
+            *ps.queue.borrow_mut() = radio.tracks;
+            ps.queue_index.set(0);
+            *ps.chips.borrow_mut() = radio.chips;
+            *ps.seed_video_id.borrow_mut() = video_id.clone();
+            render_queue_panel(&ps, &state);
+        }
+    });
+}
+
+/// Play a track from the queue by index (no radio re-fetch).
+fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: usize) {
+    let queue = ps.queue.borrow();
+    let Some(track) = queue.get(index) else { return };
+    ps.queue_index.set(index);
+
+    let video_id = track.video_id.clone();
+    let title = track.title.clone();
+    let artist = artist_string(track);
+    let thumb_url = track.thumbnail_url.clone();
+    drop(queue);
+
+    // Flush UI
+    ps.np_title.set_text(&title);
+    ps.np_artist.set_text(&artist);
+    ps.time_label.set_text("0:00 / 0:00");
+    ps.progress_slider.set_value(0.0);
+    ps.progress_slider.set_fill_level(0.0);
+    set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
+    ps.play_pause_btn.set_sensitive(false);
+
+    if let Some(url) = &thumb_url {
+        load_thumbnail_into(&ps.np_thumb, url, 80);
+    } else {
+        ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
+    }
+
+    // Re-render queue to highlight current track
+    render_queue_panel(ps, state);
+
+    let state = state.clone();
+    let ps = ps.clone();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let vid = video_id.clone();
+        let url_result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().unwrap().get_audio_url(&vid)
+        }).await;
+
+        match url_result {
+            Ok(Ok(url)) => {
+                ps.player.play_uri(&url);
+                ps.np_title.set_text(&title);
+                set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
+                ps.play_pause_btn.set_sensitive(true);
+                ps.prev_btn.set_sensitive(true);
+                ps.next_btn.set_sensitive(true);
+                ps.like_btn.set_sensitive(true);
+                ps.dislike_btn.set_sensitive(true);
+                ps.menu_btn.set_sensitive(true);
+            }
+            Ok(Err(e)) => {
+                ps.np_title.set_text(&format!("Playback failed: {e}"));
+                ps.np_artist.set_text("");
+            }
+            Err(e) => {
+                ps.np_title.set_text(&format!("Error: {e:?}"));
+                ps.np_artist.set_text("");
+            }
+        }
+    });
+}
+
+/// Render the queue panel with chip filters and track list.
+fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    ps.queue_panel.set_visible(true);
+
+    // -- Chips --
+    clear_box(&ps.chip_bar);
+    let chips = ps.chips.borrow();
+    for chip in chips.iter() {
+        let btn = Button::with_label(&chip.label);
+        btn.add_css_class("queue-chip");
+
+        let state_c = state.clone();
+        let ps_c = ps.clone();
+        let playlist_id = chip.playlist_id.clone();
+        let params = chip.params.clone();
+
+        btn.connect_clicked(move |_| {
+            load_radio_filter(&state_c, &ps_c, &playlist_id, params.as_deref());
+        });
+        ps.chip_bar.append(&btn);
+    }
+    drop(chips);
+
+    // -- Track list --
+    clear_box(&ps.queue_list_box);
+    let queue = ps.queue.borrow();
+    let current_idx = ps.queue_index.get();
+
+    for (i, track) in queue.iter().enumerate() {
+        let row = GtkBox::new(Orientation::Horizontal, 8);
+        row.add_css_class("queue-row");
+        row.set_margin_start(8);
+        row.set_margin_end(8);
+        row.set_margin_top(2);
+        row.set_margin_bottom(2);
+
+        if i == current_idx {
+            row.add_css_class("queue-row-active");
+        }
+
+        // Small thumbnail
+        let art = GtkBox::new(Orientation::Vertical, 0);
+        art.add_css_class("queue-thumb");
+        art.set_size_request(40, 40);
+        art.set_valign(Align::Center);
+        art.set_overflow(gtk::Overflow::Hidden);
+
+        if let Some(url) = &track.thumbnail_url {
+            let pic = Picture::new();
+            pic.set_keep_aspect_ratio(true);
+            pic.set_size_request(40, 40);
+            art.append(&pic);
+            load_thumbnail_into(&pic, url, 80);
+        }
+        row.append(&art);
+
+        let info = GtkBox::new(Orientation::Vertical, 0);
+        info.set_hexpand(true);
+        info.set_valign(Align::Center);
+
+        let title_lbl = Label::new(Some(&track.title));
+        title_lbl.set_halign(Align::Start);
+        title_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title_lbl.set_max_width_chars(30);
+        title_lbl.add_css_class("queue-track-title");
+        info.append(&title_lbl);
+
+        let artist_str = artist_string(track);
+        let artist_lbl = Label::new(Some(&artist_str));
+        artist_lbl.set_halign(Align::Start);
+        artist_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        artist_lbl.set_max_width_chars(30);
+        artist_lbl.add_css_class("queue-track-artist");
+        info.append(&artist_lbl);
+
+        row.append(&info);
+
+        if let Some(dur) = &track.duration {
+            let dur_lbl = Label::new(Some(dur));
+            dur_lbl.add_css_class("queue-track-duration");
+            dur_lbl.set_valign(Align::Center);
+            row.append(&dur_lbl);
+        }
+
+        let row_btn = Button::new();
+        row_btn.add_css_class("queue-row-btn");
+        row_btn.set_child(Some(&row));
+
+        {
+            let state = state.clone();
+            let ps = ps.clone();
+            row_btn.connect_clicked(move |_| {
+                play_from_queue(&state, &ps, i);
+            });
+        }
+
+        ps.queue_list_box.append(&row_btn);
+    }
+}
+
+/// Switch radio filter (chip click).
+fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlist_id: &str, params: Option<&str>) {
+    let state = state.clone();
+    let ps = ps.clone();
+    let seed = ps.seed_video_id.borrow().clone();
+    // Grab current seed track from queue so we can prepend if API omits it
+    let seed_track = {
+        let q = ps.queue.borrow();
+        q.iter().find(|t| t.video_id == seed).cloned()
+    };
+    let playlist_id = playlist_id.to_string();
+    let params = params.map(String::from);
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let vid = seed.clone();
+        let plid = playlist_id.clone();
+        let p = params.clone();
+        let result = gio::spawn_blocking(move || {
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().map(|ytm| ytm.get_radio(&vid, Some(&plid), p.as_deref()))
+        }).await;
+
+        if let Ok(Some(Ok(mut radio))) = result {
+            // Ensure seed track is always first
+            let idx = radio.tracks.iter().position(|t| t.video_id == seed);
+            if let Some(i) = idx {
+                if i > 0 {
+                    let t = radio.tracks.remove(i);
+                    radio.tracks.insert(0, t);
+                }
+            } else if let Some(t) = seed_track {
+                radio.tracks.insert(0, t);
+            }
+            *ps.queue.borrow_mut() = radio.tracks;
+            ps.queue_index.set(0);
+            // Only update chips if the response included them (filtered responses often don't)
+            if !radio.chips.is_empty() {
+                *ps.chips.borrow_mut() = radio.chips;
+            }
+            render_queue_panel(&ps, &state);
         }
     });
 }

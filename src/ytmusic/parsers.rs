@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use crate::models::{Artist, HomeSection, Track};
+use crate::models::{Artist, HomeSection, RadioChip, RadioQueue, Track};
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
 pub fn parse_home(json: &Value) -> Result<Vec<HomeSection>> {
@@ -232,6 +232,94 @@ pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
     }
 
     Ok(tracks)
+}
+
+/// Parse the `/next` response into a RadioQueue with tracks, chips, and continuation token.
+pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
+    let mqr = json.pointer(
+        "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer\
+         /watchNextTabbedResultsRenderer/tabs/0/tabRenderer/content/musicQueueRenderer",
+    );
+
+    let playlist = mqr
+        .and_then(|m| m.pointer("/content/playlistPanelRenderer"));
+
+    let playlist_id = playlist
+        .and_then(|p| p["playlistId"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // --- tracks ---
+    let tracks: Vec<Track> = playlist
+        .and_then(|p| p["contents"].as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let r = item.get("playlistPanelVideoRenderer")?;
+                    let video_id = r["videoId"].as_str()?.to_string();
+                    let title = r.pointer("/title/runs/0/text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("Unknown")
+                        .to_string();
+                    let artists: Vec<Artist> = r["shortBylineText"]["runs"]
+                        .as_array()
+                        .map(|runs| {
+                            runs.iter()
+                                .filter(|run| run.get("text").is_some())
+                                .map(|run| Artist {
+                                    name: run["text"].as_str().unwrap_or("").to_string(),
+                                    id: run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                                        .and_then(|b| b.as_str())
+                                        .map(String::from),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let duration = r.pointer("/lengthText/runs/0/text")
+                        .and_then(|d| d.as_str())
+                        .map(String::from);
+                    let thumbnail_url = r.pointer("/thumbnail/thumbnails")
+                        .and_then(|t| t.as_array())
+                        .and_then(|a| a.last())
+                        .and_then(|t| t["url"].as_str())
+                        .map(String::from);
+
+                    Some(Track { video_id, title, artists, album: None, duration, thumbnail_url })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // --- chips ---
+    let chips: Vec<RadioChip> = mqr
+        .and_then(|m| m.pointer("/subHeaderChipCloud/chipCloudRenderer/chips"))
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|chip| {
+                    let r = chip.get("chipCloudChipRenderer")?;
+                    let label = r.pointer("/text/runs/0/text")
+                        .and_then(|t| t.as_str())?
+                        .to_string();
+                    let watch_ep = r.pointer(
+                        "/navigationEndpoint/queueUpdateCommand/fetchContentsCommand/watchEndpoint",
+                    )?;
+                    let playlist_id = watch_ep["playlistId"].as_str()?.to_string();
+                    let params = watch_ep["params"].as_str().map(String::from);
+                    Some(RadioChip { label, playlist_id, params })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // --- continuation ---
+    let continuation = playlist
+        .and_then(|p| p.pointer("/continuations/0/nextRadioContinuationData/continuation"))
+        .and_then(|c| c.as_str())
+        .map(String::from);
+
+    Ok(RadioQueue { playlist_id, tracks, chips, continuation })
 }
 
 #[allow(dead_code)]

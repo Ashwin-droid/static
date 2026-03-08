@@ -38,3 +38,22 @@ pub struct HomeSection {
     pub title: String,
     pub contents: Vec<Track>,
 }
+
+/// A single filter chip from a radio queue (e.g. "All", "Discover", "J-pop").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadioChip {
+    pub label: String,
+    pub playlist_id: String,
+    /// Opaque params blob required by the API to activate this filter.
+    pub params: Option<String>,
+}
+
+/// The result of starting or switching a radio queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadioQueue {
+    pub playlist_id: String,
+    pub tracks: Vec<Track>,
+    pub chips: Vec<RadioChip>,
+    /// Opaque token for loading more tracks.
+    pub continuation: Option<String>,
+}

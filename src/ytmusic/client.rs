@@ -6,7 +6,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
-use crate::models::{HomeSection, Track};
+use crate::models::{HomeSection, RadioQueue, Track};
 
 use super::cipher::Cipher;
 use super::parsers;
@@ -213,6 +213,38 @@ impl YtMusicClient {
         })
     }
 
+    /// Start a radio from a video, or switch to a different radio filter.
+    ///
+    /// - To start the default radio: `get_radio("VIDEO_ID", None, None)`
+    /// - To switch filter: `get_radio("VIDEO_ID", Some(chip.playlist_id), Some(chip.params))`
+    pub fn get_radio(
+        &self,
+        video_id: &str,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
+    ) -> Result<RadioQueue> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["videoId"] = json!(video_id);
+            body["playlistId"] = json!(playlist_id.unwrap_or(&format!("RDAMVM{video_id}")));
+            body["isAudioOnly"] = json!(true);
+            body["tunerSettingValue"] = json!("AUTOMIX_SETTING_NORMAL");
+            if let Some(p) = params {
+                body["params"] = json!(p);
+            }
+
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/next?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to fetch radio")?;
+
+            let json: Value = resp.json().await.context("Failed to parse radio response")?;
+            parsers::parse_radio(&json)
+        })
+    }
+
     pub fn get_audio_url(&self, video_id: &str) -> Result<String> {
         self.rt.block_on(async {
             // Try Android VR client first — returns direct URLs (no cipher needed)
@@ -233,7 +265,6 @@ impl YtMusicClient {
             let mut body = Self::client_context();
             body["videoId"] = json!(video_id);
 
-            // Try without cipher first — some streams have direct URLs
             let json = self.player_request(&body).await?;
 
             if let Ok(audio) = Self::best_audio_format(&json) {

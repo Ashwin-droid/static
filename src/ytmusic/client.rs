@@ -251,7 +251,7 @@ impl YtMusicClient {
 
     /// Report playback to YouTube for history tracking.
     /// Makes an authenticated WEB_REMIX player request to get tracking URLs,
-    /// then fires them. Runs in background — doesn't block audio playback.
+    /// then fires both playback + watchtime URLs so the play counts in history.
     fn spawn_playback_report(&self, video_id: &str) {
         let http = self.http.clone();
         let auth = self.auth_header();
@@ -271,39 +271,94 @@ impl YtMusicClient {
             body["videoId"] = json!(&video_id);
 
             let mut req = http.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"));
-            if let Some(auth) = auth {
-                req = req.header("authorization", auth);
+            if let Some(ref auth) = auth {
+                req = req.header("authorization", auth.clone());
             }
 
             let Ok(resp) = req.json(&body).send().await else { return };
             let Ok(json): Result<Value, _> = resp.json().await else { return };
 
-            Self::fire_tracking_urls(&http, None, &json);
+            Self::fire_tracking_urls(&http, auth, &json);
         });
     }
 
-    /// Fire the videostatsPlaybackUrl from a player response (background, best-effort).
+    /// Fire playback + watchtime URLs so the play registers in history.
+    /// Rewrites tracking URLs to use music.youtube.com (matching the real web player)
+    /// and adds required client metadata.
     fn fire_tracking_urls(http: &reqwest::Client, auth: Option<String>, player_json: &Value) {
-        let Some(url) = player_json
-            .pointer("/playbackTracking/videostatsPlaybackUrl/baseUrl")
-            .and_then(|u| u.as_str())
-        else {
-            return;
+        let tracking = &player_json["playbackTracking"];
+
+        let rewrite_url = |key: &str| -> Option<String> {
+            tracking
+                .get(key)
+                .and_then(|u| u["baseUrl"].as_str())
+                .map(|s| s.replace("https://s.youtube.com/", "https://music.youtube.com/"))
         };
 
-        let cpn = generate_cpn();
-        let full_url = format!("{url}&cpn={cpn}&ver=2&cmt=0");
+        let playback_url = rewrite_url("videostatsPlaybackUrl");
+        let watchtime_url = rewrite_url("videostatsWatchtimeUrl");
 
+        if playback_url.is_none() && watchtime_url.is_none() {
+            eprintln!("[TRACKING] no tracking URLs in player response");
+            return;
+        }
+
+        let length = player_json
+            .pointer("/videoDetails/lengthSeconds")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+
+        let cpn = generate_cpn();
         let http = http.clone();
+        let referer = "https://music.youtube.com/".to_string();
+
+        // Client metadata matching real WEB_REMIX player
+        let client_params = format!(
+            "&cbr=Static&cbrver=0.1.0&c=WEB_REMIX&cver=1.20260304.03.00\
+             &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP"
+        );
+
         tokio::spawn(async move {
-            eprintln!("[TRACKING] reporting playback...");
-            let mut req = http.get(&full_url);
-            if let Some(auth) = auth {
-                req = req.header("authorization", auth);
+            // 1. Fire playback URL
+            if let Some(url) = &playback_url {
+                let full = format!(
+                    "{url}&cpn={cpn}&ver=2&cmt=0&fmt=251&afmt=251\
+                     &muted=0&volume=100&vis=1{client_params}"
+                );
+
+                let mut req = http.get(&full).header("referer", &referer);
+                if let Some(ref auth) = auth {
+                    req = req.header("authorization", auth.clone());
+                }
+                match req.send().await {
+                    Ok(r) => eprintln!("[TRACKING] playback reported ({})", r.status()),
+                    Err(e) => eprintln!("[TRACKING] playback failed: {e}"),
+                }
             }
-            match req.send().await {
-                Ok(r) => eprintln!("[TRACKING] reported ({})", r.status()),
-                Err(e) => eprintln!("[TRACKING] failed: {e}"),
+
+            // Small delay like real player
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // 2. Fire watchtime URL
+            if let Some(url) = &watchtime_url {
+                let watched = length.min(30);
+                let full = format!(
+                    "{url}&cpn={cpn}&ver=2&st=0&et={watched}&cmt={watched}\
+                     &fmt=251&afmt=251&muted=0&volume=100&vis=1\
+                     &rt={watched}&state=playing&rtn={}\
+                     &referrer=https%3A%2F%2Fmusic.youtube.com%2F{client_params}",
+                    watched + 5
+                );
+
+                let mut req = http.get(&full).header("referer", &referer);
+                if let Some(ref auth) = auth {
+                    req = req.header("authorization", auth.clone());
+                }
+                match req.send().await {
+                    Ok(r) => eprintln!("[TRACKING] watchtime reported ({})", r.status()),
+                    Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
+                }
             }
         });
     }

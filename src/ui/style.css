@@ -3,7 +3,7 @@
    ============================================= */
 
 window {
-    background-color: transparent;
+    background-color: #0e0e14;
     color: #e0e0e8;
 }
 
@@ -36,7 +36,7 @@ scrollbar slider:hover {
    ============================================= */
 
 .onboarding-card {
-    background-color: #151520;
+    background-color: rgba(255, 255, 255, 0.04);
     border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 20px;
     padding: 40px 36px;
@@ -121,8 +121,8 @@ entry > text > placeholder {
    ============================================= */
 
 .sidebar {
-    background-color: rgba(14, 14, 20, 0.6);
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.025);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
     padding: 0;
 }
 
@@ -243,7 +243,7 @@ popover > contents {
    ============================================= */
 
 .content-area {
-    background-color: #0e0e14;
+    background-color: transparent;
 }
 
 .content-header-bar {
@@ -369,7 +369,7 @@ popover > contents {
    ============================================= */
 
 .now-playing-bar {
-    background-color: #12121a;
+    background-color: rgba(255, 255, 255, 0.04);
     border-top: 1px solid rgba(255, 255, 255, 0.06);
     padding: 10px 20px;
 }

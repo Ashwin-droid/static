@@ -1,75 +1,73 @@
-use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::cell::Cell;
 
-use anyhow::{Context, Result};
+use gstreamer::ClockTime;
+use gstreamer_play as gst_play;
 
 pub struct Player {
-    process: Mutex<Option<Child>>,
+    inner: gst_play::Play,
+    paused: Cell<bool>,
 }
 
 impl Player {
     pub fn new() -> Self {
+        let inner = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
         Self {
-            process: Mutex::new(None),
+            inner,
+            paused: Cell::new(false),
         }
     }
 
-    pub fn play(&self, url: &str) -> Result<()> {
-        self.stop();
+    pub fn play_uri(&self, uri: &str) {
+        self.inner.set_uri(Some(uri));
+        self.inner.play();
+        self.paused.set(false);
+    }
 
-        let mut cmd = Command::new("ffplay");
-        cmd.args([
-            "-nodisp",
-            "-autoexit",
-            "-loglevel", "error",
-            url,
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
+    pub fn pause(&self) {
+        self.inner.pause();
+        self.paused.set(true);
+    }
 
-        // Kill ffplay when parent dies (even on SIGKILL)
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                Ok(())
-            });
+    pub fn resume(&self) {
+        self.inner.play();
+        self.paused.set(false);
+    }
+
+    pub fn toggle_pause(&self) {
+        if self.paused.get() {
+            self.resume();
+        } else {
+            self.pause();
         }
+    }
 
-        let child = cmd.spawn()
-            .context("Failed to launch ffplay — is ffmpeg installed?")?;
-
-        *self.process.lock().unwrap() = Some(child);
-        Ok(())
+    pub fn is_paused(&self) -> bool {
+        self.paused.get()
     }
 
     pub fn stop(&self) {
-        if let Some(mut child) = self.process.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.inner.stop();
+        self.paused.set(false);
+    }
+
+    pub fn seek(&self, position: ClockTime) {
+        self.inner.seek(position);
+    }
+
+    pub fn set_volume(&self, volume: f64) {
+        self.inner.set_volume(volume);
     }
 
     #[allow(dead_code)]
-    pub fn is_playing(&self) -> bool {
-        let mut guard = self.process.lock().unwrap();
-        if let Some(child) = guard.as_mut() {
-            match child.try_wait() {
-                Ok(None) => true,
-                _ => {
-                    *guard = None;
-                    false
-                }
-            }
-        } else {
-            false
-        }
+    pub fn volume(&self) -> f64 {
+        self.inner.volume()
     }
-}
 
-impl Drop for Player {
-    fn drop(&mut self) {
-        self.stop();
+    pub fn position(&self) -> Option<ClockTime> {
+        self.inner.position()
+    }
+
+    pub fn duration(&self) -> Option<ClockTime> {
+        self.inner.duration()
     }
 }

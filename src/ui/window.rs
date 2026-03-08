@@ -1,12 +1,24 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
 
+use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
-    gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label,
-    Orientation, Picture, Popover, ScrolledWindow, Separator, Stack, StackTransitionType,
+    gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Image, Label,
+    Orientation, Picture, Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType,
 };
+
+const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
+const ICON_PLAY: &[u8] = include_bytes!("../../assets/icons/play.svg");
+const ICON_PAUSE: &[u8] = include_bytes!("../../assets/icons/pause.svg");
+const ICON_NEXT: &[u8] = include_bytes!("../../assets/icons/next.svg");
+const ICON_LIKE: &[u8] = include_bytes!("../../assets/icons/like.svg");
+const ICON_DISLIKE: &[u8] = include_bytes!("../../assets/icons/dislike.svg");
+const ICON_MENU: &[u8] = include_bytes!("../../assets/icons/menu.svg");
+const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
+const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
+const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
 
 use crate::models::{HomeSection, Track};
 use crate::player::Player;
@@ -24,14 +36,39 @@ static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
 
 struct AppState {
     client: Option<YtMusicClient>,
+}
+
+#[allow(dead_code)]
+struct PlayerState {
     player: Player,
+    // Progress
+    progress_slider: Scale,
+    is_seeking: Cell<bool>,
+    // Transport
+    prev_btn: Button,
+    play_pause_btn: Button,
+    next_btn: Button,
+    // Time
+    time_label: Label,
+    // Track info
+    np_thumb: Picture,
+    np_title: Label,
+    np_artist: Label,
+    // Actions
+    dislike_btn: Button,
+    like_btn: Button,
+    menu_btn: Button,
+    // Volume
+    volume_slider: Scale,
+    // Modes
+    repeat_btn: Button,
+    shuffle_btn: Button,
 }
 
 struct MainPageWidgets {
     page: GtkBox,
     content_box: GtkBox,
-    np_label: Label,
-    stop_btn: Button,
+    player_state: Rc<PlayerState>,
     recent_list: GtkBox,
 }
 
@@ -65,7 +102,6 @@ pub fn build_window(app: &Application) {
 
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
-        player: Player::new(),
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -82,16 +118,15 @@ pub fn build_window(app: &Application) {
     {
         let state = state.clone();
         let content_box = main_widgets.content_box.clone();
-        let np_label = main_widgets.np_label.clone();
-        let stop_btn = main_widgets.stop_btn.clone();
+        let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
         let loaded = Rc::new(RefCell::new(false));
 
         stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
             if stack.visible_child_name().as_deref() == Some("main") && !*loaded.borrow() {
                 *loaded.borrow_mut() = true;
-                load_home(&state, &content_box, &np_label, &stop_btn, &recent_list);
-                load_sidebar_history(&state, &recent_list, &np_label, &stop_btn);
+                load_home(&state, &content_box, &ps, &recent_list);
+                load_sidebar_history(&state, &recent_list, &ps);
             }
         });
     }
@@ -392,44 +427,241 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     scrolled.set_child(Some(&content_box));
     content_outer.append(&scrolled);
 
-    // ======= NOW PLAYING BAR =======
-    let np_bar = GtkBox::new(Orientation::Horizontal, 12);
+    // ======= NOW PLAYING BAR (YTM-style) =======
+    let np_bar = GtkBox::new(Orientation::Vertical, 0);
     np_bar.add_css_class("now-playing-bar");
 
-    let np_label = Label::new(Some("Nothing playing"));
-    np_label.add_css_class("now-playing-text");
-    np_label.set_hexpand(true);
-    np_label.set_halign(Align::Start);
-    np_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    // Row 1: Progress slider (full width)
+    let progress_slider = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.01);
+    progress_slider.set_draw_value(false);
+    progress_slider.set_hexpand(true);
+    progress_slider.add_css_class("progress-slider");
+    np_bar.append(&progress_slider);
 
-    let stop_btn = Button::with_label("Stop");
-    stop_btn.add_css_class("stop-btn");
-    stop_btn.set_sensitive(false);
+    // Row 2: All controls
+    let controls_box = GtkBox::new(Orientation::Horizontal, 0);
+    controls_box.set_margin_start(8);
+    controls_box.set_margin_end(8);
+    controls_box.set_margin_top(2);
+    controls_box.set_margin_bottom(6);
+    controls_box.set_valign(Align::Center);
 
-    np_bar.append(&np_label);
-    np_bar.append(&stop_btn);
+    // -- Left: Transport controls --
+    let transport_box = GtkBox::new(Orientation::Horizontal, 0);
+    transport_box.set_valign(Align::Center);
+
+    let prev_btn = icon_button(ICON_PREV, 20, "np-icon-btn");
+    prev_btn.set_sensitive(false);
+    transport_box.append(&prev_btn);
+
+    let play_pause_btn = icon_button(ICON_PLAY, 28, "np-icon-btn");
+    play_pause_btn.add_css_class("np-play-btn");
+    play_pause_btn.set_sensitive(false);
+    transport_box.append(&play_pause_btn);
+
+    let next_btn = icon_button(ICON_NEXT, 20, "np-icon-btn");
+    next_btn.set_sensitive(false);
+    transport_box.append(&next_btn);
+
+    controls_box.append(&transport_box);
+
+    // -- Time --
+    let time_label = Label::new(Some("0:00 / 0:00"));
+    time_label.add_css_class("time-label");
+    time_label.set_margin_start(12);
+    time_label.set_margin_end(16);
+    controls_box.append(&time_label);
+
+    // -- Center: Track info (expands) --
+    let track_info_box = GtkBox::new(Orientation::Horizontal, 10);
+    track_info_box.set_hexpand(true);
+    track_info_box.set_valign(Align::Center);
+
+    let np_thumb_frame = GtkBox::new(Orientation::Vertical, 0);
+    np_thumb_frame.add_css_class("np-thumb-frame");
+    np_thumb_frame.set_size_request(40, 40);
+    np_thumb_frame.set_overflow(gtk::Overflow::Hidden);
+    np_thumb_frame.set_valign(Align::Center);
+
+    let np_thumb = Picture::new();
+    np_thumb.set_keep_aspect_ratio(false);
+    np_thumb.set_size_request(40, 40);
+    np_thumb_frame.append(&np_thumb);
+    track_info_box.append(&np_thumb_frame);
+
+    let text_box = GtkBox::new(Orientation::Vertical, 0);
+    text_box.set_valign(Align::Center);
+
+    let np_title = Label::new(Some("Nothing playing"));
+    np_title.add_css_class("np-track-title");
+    np_title.set_halign(Align::Start);
+    np_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    np_title.set_max_width_chars(45);
+    text_box.append(&np_title);
+
+    let np_artist = Label::new(None);
+    np_artist.add_css_class("np-track-artist");
+    np_artist.set_halign(Align::Start);
+    np_artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    np_artist.set_max_width_chars(45);
+    text_box.append(&np_artist);
+
+    track_info_box.append(&text_box);
+    controls_box.append(&track_info_box);
+
+    // -- Right: Actions --
+    let actions_box = GtkBox::new(Orientation::Horizontal, 0);
+    actions_box.set_valign(Align::Center);
+
+    let dislike_btn = icon_button(ICON_DISLIKE, 18, "np-icon-btn");
+    dislike_btn.set_sensitive(false);
+    actions_box.append(&dislike_btn);
+
+    let like_btn = icon_button(ICON_LIKE, 18, "np-icon-btn");
+    like_btn.set_sensitive(false);
+    actions_box.append(&like_btn);
+
+    let menu_btn = icon_button(ICON_MENU, 18, "np-icon-btn");
+    menu_btn.set_sensitive(false);
+    actions_box.append(&menu_btn);
+
+    controls_box.append(&actions_box);
+
+    // -- Volume --
+    let vol_box = GtkBox::new(Orientation::Horizontal, 4);
+    vol_box.set_valign(Align::Center);
+    vol_box.set_margin_start(12);
+
+    let vol_icon = svg_image(ICON_VOLUME, 18);
+    vol_icon.set_opacity(0.5);
+    vol_box.append(&vol_icon);
+
+    let volume_slider = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.05);
+    volume_slider.set_value(1.0);
+    volume_slider.set_draw_value(false);
+    volume_slider.set_size_request(90, -1);
+    volume_slider.add_css_class("volume-slider");
+    vol_box.append(&volume_slider);
+
+    controls_box.append(&vol_box);
+
+    // -- Modes --
+    let modes_box = GtkBox::new(Orientation::Horizontal, 0);
+    modes_box.set_valign(Align::Center);
+    modes_box.set_margin_start(8);
+
+    let repeat_btn = icon_button(ICON_REPEAT, 18, "np-icon-btn");
+    repeat_btn.set_sensitive(false);
+    modes_box.append(&repeat_btn);
+
+    let shuffle_btn = icon_button(ICON_SHUFFLE, 18, "np-icon-btn");
+    shuffle_btn.set_sensitive(false);
+    modes_box.append(&shuffle_btn);
+
+    controls_box.append(&modes_box);
+
+    np_bar.append(&controls_box);
     content_outer.append(&np_bar);
 
     hbox.append(&content_outer);
     page.append(&hbox);
 
+    // ======= PLAYER STATE =======
+    let ps = Rc::new(PlayerState {
+        player: Player::new(),
+        progress_slider: progress_slider.clone(),
+        is_seeking: Cell::new(false),
+        prev_btn: prev_btn.clone(),
+        play_pause_btn: play_pause_btn.clone(),
+        next_btn: next_btn.clone(),
+        time_label: time_label.clone(),
+        np_thumb: np_thumb.clone(),
+        np_title: np_title.clone(),
+        np_artist: np_artist.clone(),
+        dislike_btn: dislike_btn.clone(),
+        like_btn: like_btn.clone(),
+        menu_btn: menu_btn.clone(),
+        volume_slider: volume_slider.clone(),
+        repeat_btn: repeat_btn.clone(),
+        shuffle_btn: shuffle_btn.clone(),
+    });
+
     // ======= WIRE SIGNALS =======
+
+    // Play/Pause toggle
+    {
+        let ps = ps.clone();
+        play_pause_btn.connect_clicked(move |btn| {
+            ps.player.toggle_pause();
+            if ps.player.is_paused() {
+                set_button_icon(btn, ICON_PLAY, 28);
+            } else {
+                set_button_icon(btn, ICON_PAUSE, 28);
+            }
+        });
+    }
+
+    // Seek (progress slider)
+    {
+        let ps = ps.clone();
+        progress_slider.connect_change_value(move |_, _, value| {
+            ps.is_seeking.set(true);
+            if let Some(duration) = ps.player.duration() {
+                let target = ClockTime::from_nseconds((value * duration.nseconds() as f64) as u64);
+                ps.player.seek(target);
+            }
+            ps.is_seeking.set(false);
+            glib::Propagation::Proceed
+        });
+    }
+
+    // Volume
+    {
+        let ps = ps.clone();
+        volume_slider.connect_value_changed(move |slider| {
+            ps.player.set_volume(slider.value());
+        });
+    }
+
+    // Position update timer (250ms)
+    {
+        let ps = ps.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            if ps.is_seeking.get() {
+                return glib::ControlFlow::Continue;
+            }
+
+            let pos = ps.player.position();
+            let dur = ps.player.duration();
+
+            if let (Some(pos), Some(dur)) = (pos, dur) {
+                let dur_ns = dur.nseconds();
+                if dur_ns > 0 {
+                    ps.progress_slider.set_value(pos.nseconds() as f64 / dur_ns as f64);
+                }
+                ps.time_label.set_text(&format!(
+                    "{} / {}",
+                    format_clock_time(pos),
+                    format_clock_time(dur),
+                ));
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
 
     // Logout (inside settings popover)
     {
         let state = state.clone();
         let stack = stack.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let content_box = content_box.clone();
         let settings_popover = settings_popover.clone();
 
         logout_btn.connect_clicked(move |_| {
             settings_popover.popdown();
-            state.lock().unwrap().player.stop();
+            reset_player_ui(&ps);
             state.lock().unwrap().client = None;
-            np_label.set_text("Nothing playing");
-            stop_btn.set_sensitive(false);
             clear_box(&content_box);
 
             glib::spawn_future_local({
@@ -442,28 +674,15 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
-    // Stop
-    {
-        let state = state.clone();
-        let np_label = np_label.clone();
-        let stop_btn_inner = stop_btn.clone();
-        stop_btn.connect_clicked(move |_| {
-            state.lock().unwrap().player.stop();
-            np_label.set_text("Nothing playing");
-            stop_btn_inner.set_sensitive(false);
-        });
-    }
-
     // Home button
     {
         let state = state.clone();
         let content_box = content_box.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let recent_list = recent_list.clone();
 
         home_btn.connect_clicked(move |_| {
-            load_home(&state, &content_box, &np_label, &stop_btn, &recent_list);
+            load_home(&state, &content_box, &ps, &recent_list);
         });
     }
 
@@ -471,8 +690,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     {
         let state = state.clone();
         let content_box = content_box.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let recent_list = recent_list.clone();
 
         search_entry.connect_activate(move |entry| {
@@ -480,15 +698,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             if query.is_empty() {
                 return;
             }
-            load_search(&state, &content_box, &query, &np_label, &stop_btn, &recent_list);
+            load_search(&state, &content_box, &query, &ps, &recent_list);
         });
     }
 
     MainPageWidgets {
         page,
         content_box,
-        np_label,
-        stop_btn,
+        player_state: ps,
         recent_list,
     }
 }
@@ -505,6 +722,55 @@ fn nav_button(text: &str, active: bool) -> Button {
     btn
 }
 
+fn svg_image(svg_bytes: &[u8], size: i32) -> Image {
+    let gbytes = glib::Bytes::from(svg_bytes);
+    let stream = gio::MemoryInputStream::from_bytes(&gbytes);
+    if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(
+        &stream, size, size, true, gio::Cancellable::NONE,
+    ) {
+        let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
+        let image = Image::from_paintable(Some(&texture));
+        image.set_pixel_size(size);
+        image
+    } else {
+        Image::new()
+    }
+}
+
+fn icon_button(svg_bytes: &[u8], size: i32, css_class: &str) -> Button {
+    let btn = Button::new();
+    btn.set_child(Some(&svg_image(svg_bytes, size)));
+    btn.add_css_class(css_class);
+    btn
+}
+
+fn set_button_icon(btn: &Button, svg_bytes: &[u8], size: i32) {
+    btn.set_child(Some(&svg_image(svg_bytes, size)));
+}
+
+fn reset_player_ui(ps: &PlayerState) {
+    ps.player.stop();
+    ps.np_title.set_text("Nothing playing");
+    ps.np_artist.set_text("");
+    ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
+    ps.time_label.set_text("0:00 / 0:00");
+    ps.progress_slider.set_value(0.0);
+    set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
+    ps.play_pause_btn.set_sensitive(false);
+    ps.prev_btn.set_sensitive(false);
+    ps.next_btn.set_sensitive(false);
+    ps.like_btn.set_sensitive(false);
+    ps.dislike_btn.set_sensitive(false);
+    ps.menu_btn.set_sensitive(false);
+}
+
+fn format_clock_time(t: ClockTime) -> String {
+    let total_secs = t.seconds();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins}:{secs:02}")
+}
+
 // ============================================================
 // DATA LOADING
 // ============================================================
@@ -512,8 +778,7 @@ fn nav_button(text: &str, active: bool) -> Button {
 fn load_home(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
     clear_box(content_box);
@@ -524,8 +789,7 @@ fn load_home(
 
     let state = state.clone();
     let content_box = content_box.clone();
-    let np_label = np_label.clone();
-    let stop_btn = stop_btn.clone();
+    let ps = ps.clone();
     let recent_list = recent_list.clone();
 
     glib::spawn_future_local(async move {
@@ -542,7 +806,7 @@ fn load_home(
 
         match result {
             Ok(Some(Ok(sections))) => {
-                render_home_view(&content_box, &sections, &state, &np_label, &stop_btn, &recent_list);
+                render_home_view(&content_box, &sections, &state, &ps, &recent_list);
             }
             Ok(Some(Err(e))) => {
                 content_box.append(&Label::new(Some(&format!("Error: {e}"))));
@@ -561,8 +825,7 @@ fn load_search(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
     query: &str,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
     clear_box(content_box);
@@ -574,8 +837,7 @@ fn load_search(
     let state = state.clone();
     let content_box = content_box.clone();
     let query = query.to_string();
-    let np_label = np_label.clone();
-    let stop_btn = stop_btn.clone();
+    let ps = ps.clone();
     let recent_list = recent_list.clone();
 
     glib::spawn_future_local(async move {
@@ -593,7 +855,7 @@ fn load_search(
 
         match result {
             Ok(Some(Ok(tracks))) => {
-                render_search_view(&content_box, &query, &tracks, &state, &np_label, &stop_btn, &recent_list);
+                render_search_view(&content_box, &query, &tracks, &state, &ps, &recent_list);
             }
             Ok(Some(Err(e))) => {
                 content_box.append(&Label::new(Some(&format!("Search error: {e}"))));
@@ -611,13 +873,11 @@ fn load_search(
 fn load_sidebar_history(
     state: &Arc<Mutex<AppState>>,
     recent_list: &GtkBox,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
 ) {
     let state = state.clone();
     let recent_list = recent_list.clone();
-    let np_label = np_label.clone();
-    let stop_btn = stop_btn.clone();
+    let ps = ps.clone();
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
@@ -629,7 +889,7 @@ fn load_sidebar_history(
         if let Ok(Some(Ok(tracks))) = result {
             clear_box(&recent_list);
             for track in tracks.iter().take(15) {
-                let item = build_sidebar_recent_item(track, &state, &np_label, &stop_btn);
+                let item = build_sidebar_recent_item(track, &state, &ps);
                 recent_list.append(&item);
             }
             if tracks.is_empty() {
@@ -654,8 +914,7 @@ fn render_home_view(
     content_box: &GtkBox,
     sections: &[HomeSection],
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
     if sections.is_empty() {
@@ -666,7 +925,7 @@ fn render_home_view(
         return;
     }
 
-    // First section → horizontal cover art cards
+    // First section -> horizontal cover art cards
     if let Some(first) = sections.first() {
         let header = Label::new(Some(&first.title));
         header.add_css_class("section-header");
@@ -684,14 +943,14 @@ fn render_home_view(
         cards_box.set_margin_bottom(8);
 
         for track in &first.contents {
-            cards_box.append(&build_cover_card(track, state, np_label, stop_btn, recent_list));
+            cards_box.append(&build_cover_card(track, state, ps, recent_list));
         }
 
         cards_scroll.set_child(Some(&cards_box));
         content_box.append(&cards_scroll);
     }
 
-    // Remaining sections → 2-column grid
+    // Remaining sections -> 2-column grid
     for section in sections.iter().skip(1) {
         content_box.append(&Separator::new(Orientation::Horizontal));
 
@@ -708,7 +967,7 @@ fn render_home_view(
         grid.set_margin_top(4);
 
         for (i, track) in section.contents.iter().enumerate() {
-            let row = build_track_row(track, state, np_label, stop_btn, recent_list);
+            let row = build_track_row(track, state, ps, recent_list);
             grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
         }
 
@@ -721,8 +980,7 @@ fn render_search_view(
     query: &str,
     tracks: &[Track],
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
     let header = Label::new(Some(&format!(
@@ -749,7 +1007,7 @@ fn render_search_view(
     grid.set_margin_top(8);
 
     for (i, track) in tracks.iter().enumerate() {
-        let row = build_track_row(track, state, np_label, stop_btn, recent_list);
+        let row = build_track_row(track, state, ps, recent_list);
         grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
     }
 
@@ -763,8 +1021,7 @@ fn render_search_view(
 fn build_cover_card(
     track: &Track,
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) -> Button {
     let card_btn = Button::new();
@@ -815,16 +1072,17 @@ fn build_cover_card(
 
     {
         let state = state.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let recent_list = recent_list.clone();
         let track = track.clone();
         let video_id = track.video_id.clone();
-        let display = format!("{} - {}", track.title, artist_str);
+        let title = track.title.clone();
+        let artist_str = artist_str.clone();
+        let thumb_url = track.thumbnail_url.clone();
 
         card_btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &display, &np_label, &stop_btn);
-            add_to_recent(&recent_list, &track, &state, &np_label, &stop_btn);
+            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
+            add_to_recent(&recent_list, &track, &state, &ps);
         });
     }
 
@@ -834,8 +1092,7 @@ fn build_cover_card(
 fn build_track_row(
     track: &Track,
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) -> Button {
     let row_btn = Button::new();
@@ -897,16 +1154,17 @@ fn build_track_row(
 
     {
         let state = state.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let recent_list = recent_list.clone();
         let track = track.clone();
         let video_id = track.video_id.clone();
-        let display = format!("{} - {}", track.title, artist_str);
+        let title = track.title.clone();
+        let artist_str = artist_str.clone();
+        let thumb_url = track.thumbnail_url.clone();
 
         row_btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &display, &np_label, &stop_btn);
-            add_to_recent(&recent_list, &track, &state, &np_label, &stop_btn);
+            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
+            add_to_recent(&recent_list, &track, &state, &ps);
         });
     }
 
@@ -916,8 +1174,7 @@ fn build_track_row(
 fn build_sidebar_recent_item(
     track: &Track,
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
 ) -> Button {
     let btn = Button::new();
     btn.add_css_class("sidebar-recent-item");
@@ -941,13 +1198,14 @@ fn build_sidebar_recent_item(
 
     {
         let state = state.clone();
-        let np_label = np_label.clone();
-        let stop_btn = stop_btn.clone();
+        let ps = ps.clone();
         let video_id = track.video_id.clone();
-        let display = format!("{} - {}", track.title, artist_str);
+        let title = track.title.clone();
+        let artist_str = artist_str.clone();
+        let thumb_url = track.thumbnail_url.clone();
 
         btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &display, &np_label, &stop_btn);
+            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
         });
     }
 
@@ -984,44 +1242,50 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
 fn play_track(
     state: &Arc<Mutex<AppState>>,
     video_id: &str,
-    display_title: &str,
-    np_label: &Label,
-    stop_btn: &Button,
+    title: &str,
+    artist: &str,
+    thumb_url: Option<&str>,
+    ps: &Rc<PlayerState>,
 ) {
-    np_label.set_text(&format!("Loading: {display_title}"));
+    ps.np_title.set_text(title);
+    ps.np_artist.set_text(artist);
+    ps.time_label.set_text("0:00 / 0:00");
+    ps.progress_slider.set_value(0.0);
+
+    if let Some(url) = thumb_url {
+        load_thumbnail_into(&ps.np_thumb, url, 80);
+    }
 
     let state = state.clone();
-    let state_play = state.clone();
     let video_id = video_id.to_string();
-    let display_title = display_title.to_string();
-    let np_label = np_label.clone();
-    let stop_btn = stop_btn.clone();
+    let title = title.to_string();
+    let ps = ps.clone();
 
     glib::spawn_future_local(async move {
-        // Fetch URL in blocking thread (network I/O)
+        let state_bg = state.clone();
+        let vid = video_id.clone();
         let url_result = gio::spawn_blocking(move || {
-            let guard = state.lock().unwrap();
-            guard.client.as_ref().unwrap().get_audio_url(&video_id)
+            let guard = state_bg.lock().unwrap();
+            guard.client.as_ref().unwrap().get_audio_url(&vid)
         }).await;
 
-        // Play on main thread so PR_SET_PDEATHSIG tracks the long-lived main thread
         match url_result {
             Ok(Ok(url)) => {
-                match state_play.lock().unwrap().player.play(&url) {
-                    Ok(()) => {
-                        np_label.set_text(&format!("Now playing: {display_title}"));
-                        stop_btn.set_sensitive(true);
-                    }
-                    Err(e) => {
-                        np_label.set_text(&format!("Playback failed: {e}"));
-                    }
-                }
+                ps.player.play_uri(&url);
+                ps.np_title.set_text(&title);
+                set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
+                ps.play_pause_btn.set_sensitive(true);
+                ps.like_btn.set_sensitive(true);
+                ps.dislike_btn.set_sensitive(true);
+                ps.menu_btn.set_sensitive(true);
             }
             Ok(Err(e)) => {
-                np_label.set_text(&format!("Playback failed: {e}"));
+                ps.np_title.set_text(&format!("Playback failed: {e}"));
+                ps.np_artist.set_text("");
             }
             Err(e) => {
-                np_label.set_text(&format!("Error: {e:?}"));
+                ps.np_title.set_text(&format!("Error: {e:?}"));
+                ps.np_artist.set_text("");
             }
         }
     });
@@ -1031,10 +1295,9 @@ fn add_to_recent(
     recent_list: &GtkBox,
     track: &Track,
     state: &Arc<Mutex<AppState>>,
-    np_label: &Label,
-    stop_btn: &Button,
+    ps: &Rc<PlayerState>,
 ) {
-    let item = build_sidebar_recent_item(track, state, np_label, stop_btn);
+    let item = build_sidebar_recent_item(track, state, ps);
     recent_list.prepend(&item);
 
     // Limit to 15 items

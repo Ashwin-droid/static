@@ -6,7 +6,8 @@ use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
     gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Image, Label,
-    Orientation, Picture, Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType,
+    Orientation, Paned, Picture, Popover, Scale, ScrolledWindow, Separator, Stack,
+    StackTransitionType,
 };
 
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
@@ -19,6 +20,9 @@ const ICON_MENU: &[u8] = include_bytes!("../../assets/icons/menu.svg");
 const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
 const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
+
+const SIDEBAR_WIDTH: i32 = 240;
+const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 
 use crate::cache::MusicCache;
 use crate::models::{Artist, HomeSection, RadioChip, Track};
@@ -315,14 +319,22 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
 fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidgets {
     let page = GtkBox::new(Orientation::Vertical, 0);
 
+    // Use a Paned so the sidebar has a truly fixed width (not just a minimum)
+    let paned = Paned::new(Orientation::Horizontal);
+    paned.set_vexpand(true);
+    paned.set_position(SIDEBAR_WIDTH);
+    paned.set_shrink_start_child(false);
+    paned.set_resize_start_child(false);
+    paned.set_wide_handle(false);
+
+    // Right side of paned: content + queue in a regular hbox
     let hbox = GtkBox::new(Orientation::Horizontal, 0);
-    hbox.set_vexpand(true);
+    hbox.set_hexpand(true);
 
     // ======= SIDEBAR (glass) =======
     let sidebar = GtkBox::new(Orientation::Vertical, 0);
     sidebar.add_css_class("sidebar");
-    sidebar.set_width_request(240);
-    sidebar.set_hexpand(false);
+    sidebar.set_overflow(gtk::Overflow::Hidden);
 
     // Search
     let search_entry = Entry::builder()
@@ -369,6 +381,9 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    recent_scroll.set_min_content_width(0);
+    recent_scroll.set_max_content_width(SIDEBAR_WIDTH);
+    recent_scroll.set_propagate_natural_width(false);
     recent_scroll.set_child(Some(&recent_list));
     sidebar.append(&recent_scroll);
 
@@ -406,7 +421,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     bottom_box.append(&settings_btn);
     sidebar.append(&bottom_box);
-    hbox.append(&sidebar);
+    paned.set_start_child(Some(&sidebar));
 
     // ======= CONTENT AREA (not glass) =======
     let content_outer = GtkBox::new(Orientation::Vertical, 0);
@@ -512,16 +527,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     let np_title = Label::new(Some("Nothing playing"));
     np_title.add_css_class("np-track-title");
     np_title.set_halign(Align::Start);
-    np_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    np_title.set_max_width_chars(45);
-    text_box.append(&np_title);
+    let np_title_sw = label_scroller(&np_title, 18);
+    text_box.append(&np_title_sw);
 
     let np_artist = Label::new(None);
     np_artist.add_css_class("np-track-artist");
     np_artist.set_halign(Align::Start);
-    np_artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    np_artist.set_max_width_chars(45);
-    text_box.append(&np_artist);
+    let np_artist_sw = label_scroller(&np_artist, 15);
+    text_box.append(&np_artist_sw);
 
     track_info_box.append(&text_box);
     controls_box.append(&track_info_box);
@@ -585,7 +598,6 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     // ======= QUEUE PANEL (right side, like YTM's "Up Next") =======
     let queue_panel = GtkBox::new(Orientation::Vertical, 0);
     queue_panel.add_css_class("queue-panel");
-    queue_panel.set_width_request(300);
     queue_panel.set_visible(false);
 
     let queue_header = Label::new(Some("Up Next"));
@@ -620,7 +632,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     queue_panel.append(&queue_scroll);
 
     hbox.append(&queue_panel);
-    page.append(&hbox);
+    paned.set_end_child(Some(&hbox));
+    page.append(&paned);
 
     // ======= PLAYER STATE =======
     let ps = Rc::new(PlayerState {
@@ -1283,13 +1296,94 @@ fn build_track_row(
     row_btn
 }
 
+/// Wrap an existing label in a ScrolledWindow with marquee scrolling.
+/// Restarts the scroll animation whenever the label text changes.
+fn label_scroller(label: &Label, height: i32) -> ScrolledWindow {
+    let sw = ScrolledWindow::new();
+    sw.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
+    sw.set_hexpand(true);
+    sw.set_size_request(1, height);
+    sw.set_vexpand(false);
+    sw.set_propagate_natural_width(false);
+    sw.set_min_content_width(0);
+    sw.set_child(Some(label));
+
+    // Start marquee when text changes
+    let sw_c = sw.clone();
+    label.connect_label_notify(move |_| {
+        // Reset scroll position
+        sw_c.hadjustment().set_value(0.0);
+        // After 1s, start scrolling if needed
+        start_marquee(&sw_c);
+    });
+
+    sw
+}
+
+fn start_marquee(sw: &ScrolledWindow) {
+    let sw_c = sw.clone();
+    glib::timeout_add_local_once(std::time::Duration::from_secs(1), move || {
+        let adj = sw_c.hadjustment();
+        if adj.upper() - adj.page_size() <= 0.0 {
+            return;
+        }
+        let state = Rc::new(Cell::new(0u8));
+        let pause = Rc::new(Cell::new(0i32));
+        let sw_ref = sw_c;
+        glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            if !sw_ref.is_mapped() {
+                return glib::ControlFlow::Break;
+            }
+            let adj = sw_ref.hadjustment();
+            let max = adj.upper() - adj.page_size();
+            if max <= 0.0 {
+                return glib::ControlFlow::Break;
+            }
+            match state.get() {
+                0 => {
+                    let v = adj.value() + 0.6;
+                    if v >= max {
+                        adj.set_value(max);
+                        state.set(1);
+                        pause.set(50);
+                    } else {
+                        adj.set_value(v);
+                    }
+                }
+                1 => {
+                    let t = pause.get() - 1;
+                    pause.set(t);
+                    if t <= 0 {
+                        adj.set_value(0.0);
+                        state.set(2);
+                        pause.set(33);
+                    }
+                }
+                _ => {
+                    let t = pause.get() - 1;
+                    pause.set(t);
+                    if t <= 0 {
+                        state.set(0);
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    });
+}
+
 /// Wrap a label in a ScrolledWindow that auto-scrolls (marquee) after 1 s if the text overflows.
 fn scrolling_label(text: &str, css_class: &str, height: i32) -> ScrolledWindow {
     let sw = ScrolledWindow::new();
     sw.set_policy(gtk::PolicyType::External, gtk::PolicyType::Never);
     sw.set_hexpand(true);
-    sw.set_size_request(-1, height);
+    sw.set_size_request(1, height);
     sw.set_vexpand(false);
+    sw.set_propagate_natural_width(false);
+    sw.set_min_content_width(0);
+    // Keep marquee labels from inflating the sidebar's preferred width while
+    // still allowing the label to scroll inside the fixed 240 px sidebar.
+    sw.set_max_content_width(SIDEBAR_RECENT_CONTENT_WIDTH);
 
     let label = Label::new(Some(text));
     label.add_css_class(css_class);
@@ -1358,8 +1452,11 @@ fn build_sidebar_recent_item(
 ) -> Button {
     let btn = Button::new();
     btn.add_css_class("sidebar-recent-item");
+    btn.set_hexpand(true);
+    btn.set_halign(Align::Fill);
 
     let row = GtkBox::new(Orientation::Vertical, 1);
+    row.set_hexpand(true);
 
     let title_sw = scrolling_label(&track.title, "sidebar-recent-title", 18);
     row.append(&title_sw);
@@ -1716,7 +1813,6 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
         let title_lbl = Label::new(Some(&track.title));
         title_lbl.set_halign(Align::Start);
         title_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title_lbl.set_max_width_chars(30);
         title_lbl.add_css_class("queue-track-title");
         info.append(&title_lbl);
 
@@ -1724,7 +1820,6 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
         let artist_lbl = Label::new(Some(&artist_str));
         artist_lbl.set_halign(Align::Start);
         artist_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        artist_lbl.set_max_width_chars(30);
         artist_lbl.add_css_class("queue-track-artist");
         info.append(&artist_lbl);
 

@@ -431,10 +431,13 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     let np_bar = GtkBox::new(Orientation::Vertical, 0);
     np_bar.add_css_class("now-playing-bar");
 
-    // Row 1: Progress slider (full width)
+    // Row 1: Progress slider (full width) with buffer fill level
     let progress_slider = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.01);
     progress_slider.set_draw_value(false);
     progress_slider.set_hexpand(true);
+    progress_slider.set_show_fill_level(true);
+    progress_slider.set_restrict_to_fill_level(false);
+    progress_slider.set_fill_level(0.0);
     progress_slider.add_css_class("progress-slider");
     np_bar.append(&progress_slider);
 
@@ -646,6 +649,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                 ));
             }
 
+            // Update buffer health (grey bar)
+            let buffered = ps.player.buffered_fraction();
+            ps.progress_slider.set_fill_level(buffered);
+
             glib::ControlFlow::Continue
         });
     }
@@ -755,6 +762,7 @@ fn reset_player_ui(ps: &PlayerState) {
     ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
     ps.time_label.set_text("0:00 / 0:00");
     ps.progress_slider.set_value(0.0);
+    ps.progress_slider.set_fill_level(0.0);
     set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
     ps.play_pause_btn.set_sensitive(false);
     ps.prev_btn.set_sensitive(false);
@@ -1247,13 +1255,22 @@ fn play_track(
     thumb_url: Option<&str>,
     ps: &Rc<PlayerState>,
 ) {
+    // Immediately flush all UI state for the new track
     ps.np_title.set_text(title);
     ps.np_artist.set_text(artist);
     ps.time_label.set_text("0:00 / 0:00");
     ps.progress_slider.set_value(0.0);
+    ps.progress_slider.set_fill_level(0.0);
+    set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
+    ps.play_pause_btn.set_sensitive(false);
+    ps.like_btn.set_sensitive(false);
+    ps.dislike_btn.set_sensitive(false);
+    ps.menu_btn.set_sensitive(false);
 
     if let Some(url) = thumb_url {
         load_thumbnail_into(&ps.np_thumb, url, 80);
+    } else {
+        ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
     }
 
     let state = state.clone();

@@ -1,23 +1,58 @@
 use std::cell::Cell;
+use std::rc::Rc;
 
+use gstreamer as gst;
+use gstreamer::glib;
+use gstreamer::prelude::*;
 use gstreamer::ClockTime;
 use gstreamer_play as gst_play;
 
 pub struct Player {
     inner: gst_play::Play,
     paused: Cell<bool>,
+    /// 0..100 buffering percent reported by GStreamer's Play message bus.
+    buf_percent: Rc<Cell<u32>>,
+    /// Must be kept alive or the bus watch is removed.
+    _bus_watch: gst::bus::BusWatchGuard,
 }
 
 impl Player {
     pub fn new() -> Self {
         let inner = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
+
+        // Keep up to 200 MB of downloaded audio in memory for instant seeking.
+        let pipeline = inner.pipeline();
+        pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
+
+        // Watch the Play message bus for buffering events.
+        let buf_percent = Rc::new(Cell::new(0u32));
+        let bp = buf_percent.clone();
+        let bus = inner.message_bus();
+        let bus_watch = bus
+            .add_watch_local(move |_, msg| {
+                if let Ok(play_msg) = gst_play::PlayMessage::parse(msg) {
+                    if let gst_play::PlayMessage::Buffering(b) = play_msg {
+                        bp.set(b.percent());
+                    }
+                }
+                glib::ControlFlow::Continue
+            })
+            .expect("Failed to add bus watch");
+
         Self {
             inner,
             paused: Cell::new(false),
+            buf_percent,
+            _bus_watch: bus_watch,
         }
     }
 
     pub fn play_uri(&self, uri: &str) {
+        // Stop first to flush old pipeline state so position/duration
+        // queries don't return stale data from the previous song.
+        self.inner.stop();
+        self.buf_percent.set(0);
+
         self.inner.set_uri(Some(uri));
         self.inner.play();
         self.paused.set(false);
@@ -48,6 +83,7 @@ impl Player {
     pub fn stop(&self) {
         self.inner.stop();
         self.paused.set(false);
+        self.buf_percent.set(0);
     }
 
     pub fn seek(&self, position: ClockTime) {
@@ -69,5 +105,10 @@ impl Player {
 
     pub fn duration(&self) -> Option<ClockTime> {
         self.inner.duration()
+    }
+
+    /// Returns 0.0..1.0 — the buffering percent reported by GStreamer.
+    pub fn buffered_fraction(&self) -> f64 {
+        (self.buf_percent.get() as f64 / 100.0).clamp(0.0, 1.0)
     }
 }

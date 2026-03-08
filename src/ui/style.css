@@ -389,6 +389,11 @@ popover > contents {
     border-radius: 0;
 }
 
+.progress-slider fill {
+    background-color: rgba(255, 255, 255, 0.25);
+    border-radius: 0;
+}
+
 .progress-slider highlight {
     background-color: #ff0000;
     border-radius: 0;

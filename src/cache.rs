@@ -39,6 +39,7 @@ impl MusicCache {
                 artist       TEXT NOT NULL,
                 thumbnail_url TEXT,
                 play_count   INTEGER NOT NULL DEFAULT 1,
+                listen_secs  INTEGER NOT NULL DEFAULT 0,
                 last_played  INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS offline (
@@ -49,38 +50,48 @@ impl MusicCache {
             );",
         )?;
 
+        // Migrate: add listen_secs column if missing (existing installs)
+        let _ = db.execute_batch(
+            "ALTER TABLE plays ADD COLUMN listen_secs INTEGER NOT NULL DEFAULT 0;"
+        );
+
+
         Ok(Self { db, offline_dir, art_dir })
     }
 
     // ── Play history ─────────────────────────────────────────────
 
-    /// Record (or increment) a play for a track.
+    /// Record (or increment) a play for a track, accumulating listen time.
     pub fn record_play(
         &self,
         video_id: &str,
         title: &str,
         artist: &str,
         thumbnail_url: Option<&str>,
+        listen_secs: u64,
     ) -> Result<()> {
         let now = epoch_secs();
         self.db.execute(
-            "INSERT INTO plays (video_id, title, artist, thumbnail_url, play_count, last_played)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5)
+            "INSERT INTO plays (video_id, title, artist, thumbnail_url, play_count, listen_secs, last_played)
+             VALUES (?1, ?2, ?3, ?4, 1, ?6, ?5)
              ON CONFLICT(video_id) DO UPDATE SET
                  play_count = play_count + 1,
+                 listen_secs = listen_secs + ?6,
                  last_played = ?5,
                  title = ?2,
                  artist = ?3,
                  thumbnail_url = COALESCE(?4, thumbnail_url)",
-            rusqlite::params![video_id, title, artist, thumbnail_url, now],
+            rusqlite::params![video_id, title, artist, thumbnail_url, now, listen_secs as i64],
         )?;
         Ok(())
     }
 
     /// Top-N most played video IDs (ordered by play_count desc, last_played desc).
+    /// Only includes songs played more than once so a single listen doesn't trigger a download.
     pub fn top_played(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.db.prepare(
             "SELECT video_id FROM plays
+             WHERE play_count >= 2
              ORDER BY play_count DESC, last_played DESC
              LIMIT ?1",
         )?;

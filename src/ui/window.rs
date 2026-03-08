@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Instant;
 
 use gstreamer::ClockTime;
 use gtk::prelude::*;
@@ -27,6 +28,7 @@ const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 use crate::cache::MusicCache;
 use crate::models::{Artist, HomeSection, RadioChip, Track};
 use crate::player::Player;
+use crate::ytmusic::client::TrackingInfo;
 use crate::ytmusic::YtMusicClient;
 
 const KEYRING_SERVICE: &str = "com.static.music";
@@ -43,6 +45,19 @@ struct AppState {
     client: Option<YtMusicClient>,
     cache: MusicCache,
 }
+
+/// Tracks the currently playing song so we can record listen time when navigating away.
+struct NowPlayingTrack {
+    video_id: String,
+    title: String,
+    artist: String,
+    thumb_url: Option<String>,
+    started_at: Instant,
+    tracking: Option<TrackingInfo>,
+}
+
+/// Minimum seconds listened before a play is recorded.
+const MIN_LISTEN_SECS: u64 = 10;
 
 #[allow(dead_code)]
 struct PlayerState {
@@ -78,6 +93,8 @@ struct PlayerState {
     queue_list_box: GtkBox,
     chip_bar: GtkBox,
     queue_panel: GtkBox,
+    // Play tracking — records listen time when navigating away
+    now_playing_track: RefCell<Option<NowPlayingTrack>>,
 }
 
 struct MainPageWidgets {
@@ -660,6 +677,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue_list_box: queue_list_box.clone(),
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
+        now_playing_track: RefCell::new(None),
     });
 
     // ======= WIRE SIGNALS =======
@@ -784,7 +802,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
         logout_btn.connect_clicked(move |_| {
             settings_popover.popdown();
-            reset_player_ui(&ps);
+            reset_player_ui(&ps, &state);
             state.lock().unwrap().client = None;
             clear_box(&content_box);
 
@@ -872,7 +890,8 @@ fn set_button_icon(btn: &Button, svg_bytes: &[u8], size: i32) {
     btn.set_child(Some(&svg_image(svg_bytes, size)));
 }
 
-fn reset_player_ui(ps: &PlayerState) {
+fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
+    flush_play_record(ps, state);
     ps.player.stop();
     ps.np_title.set_text("Nothing playing");
     ps.np_artist.set_text("");
@@ -1525,6 +1544,33 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
     });
 }
 
+/// Flush the current now-playing track: record its listen time in the DB
+/// and report watchtime to YouTube. Only records if listened >= MIN_LISTEN_SECS.
+fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
+    let info = ps.now_playing_track.borrow_mut().take();
+    if let Some(track) = info {
+        let listened = track.started_at.elapsed().as_secs();
+        if listened >= MIN_LISTEN_SECS {
+            // Report watchtime to YouTube
+            if let Some(tracking) = track.tracking {
+                tracking.report_watchtime(listened);
+            }
+            // Record in local DB
+            let state = state.clone();
+            gio::spawn_blocking(move || {
+                let guard = state.lock().unwrap();
+                let _ = guard.cache.record_play(
+                    &track.video_id,
+                    &track.title,
+                    &track.artist,
+                    track.thumb_url.as_deref(),
+                    listened,
+                );
+            });
+        }
+    }
+}
+
 fn play_track(
     state: &Arc<Mutex<AppState>>,
     video_id: &str,
@@ -1533,6 +1579,9 @@ fn play_track(
     thumb_url: Option<&str>,
     ps: &Rc<PlayerState>,
 ) {
+    // Flush listen time for the previous track before switching
+    flush_play_record(ps, state);
+
     // Stop immediately so stale position data can't trigger auto-advance
     ps.player.stop();
 
@@ -1570,20 +1619,24 @@ fn play_track(
             guard.cache.get_cached_audio(&vid)
         }).await.ok().flatten();
 
-        let play_uri = if let Some(path) = cached_path {
+        let play_result: Result<(String, Option<TrackingInfo>), String> = if let Some(path) = cached_path {
             eprintln!("[CACHE] playing from offline: {}", path.display());
-            Ok(Ok(format!("file://{}", path.display())))
+            Ok((format!("file://{}", path.display()), None))
         } else {
             let state_bg = state.clone();
             let vid = video_id.clone();
-            gio::spawn_blocking(move || {
+            match gio::spawn_blocking(move || {
                 let guard = state_bg.lock().unwrap();
                 guard.client.as_ref().unwrap().get_audio_url(&vid)
-            }).await
+            }).await {
+                Ok(Ok((url, tracking))) => Ok((url, tracking)),
+                Ok(Err(e)) => Err(format!("Playback failed: {e}")),
+                Err(e) => Err(format!("Error: {e:?}")),
+            }
         };
 
-        match play_uri {
-            Ok(Ok(url)) => {
+        match play_result {
+            Ok((url, tracking)) => {
                 ps.player.play_uri(&url);
                 ps.np_title.set_text(&title);
                 set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
@@ -1594,26 +1647,24 @@ fn play_track(
                 ps.dislike_btn.set_sensitive(true);
                 ps.menu_btn.set_sensitive(true);
 
-                // Record play + trigger background sync
+                // Start tracking this song's listen time
+                *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
+                    video_id: video_id.clone(),
+                    title: title.clone(),
+                    artist: artist.clone(),
+                    thumb_url: thumb_url.clone(),
+                    started_at: Instant::now(),
+                    tracking,
+                });
+
+                // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();
-                let vid = video_id.clone();
-                let t = title.clone();
-                let a = artist.clone();
-                let tu = thumb_url.clone();
                 gio::spawn_blocking(move || {
-                    {
-                        let guard = state_bg.lock().unwrap();
-                        let _ = guard.cache.record_play(&vid, &t, &a, tu.as_deref());
-                    } // lock released before sync
                     sync_offline_cache(&state_bg);
                 });
             }
-            Ok(Err(e)) => {
-                ps.np_title.set_text(&format!("Playback failed: {e}"));
-                ps.np_artist.set_text("");
-            }
-            Err(e) => {
-                ps.np_title.set_text(&format!("Error: {e:?}"));
+            Err(msg) => {
+                ps.np_title.set_text(&msg);
                 ps.np_artist.set_text("");
             }
         }
@@ -1667,6 +1718,9 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     let thumb_url = track.thumbnail_url.clone();
     drop(queue);
 
+    // Flush listen time for the previous track before switching
+    flush_play_record(ps, state);
+
     // Stop immediately so stale position data can't trigger auto-advance
     ps.player.stop();
 
@@ -1700,20 +1754,24 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
             guard.cache.get_cached_audio(&vid)
         }).await.ok().flatten();
 
-        let play_uri = if let Some(path) = cached_path {
+        let play_result: Result<(String, Option<TrackingInfo>), String> = if let Some(path) = cached_path {
             eprintln!("[CACHE] playing from offline: {}", path.display());
-            Ok(Ok(format!("file://{}", path.display())))
+            Ok((format!("file://{}", path.display()), None))
         } else {
             let state_bg = state.clone();
             let vid = video_id.clone();
-            gio::spawn_blocking(move || {
+            match gio::spawn_blocking(move || {
                 let guard = state_bg.lock().unwrap();
                 guard.client.as_ref().unwrap().get_audio_url(&vid)
-            }).await
+            }).await {
+                Ok(Ok((url, tracking))) => Ok((url, tracking)),
+                Ok(Err(e)) => Err(format!("Playback failed: {e}")),
+                Err(e) => Err(format!("Error: {e:?}")),
+            }
         };
 
-        match play_uri {
-            Ok(Ok(url)) => {
+        match play_result {
+            Ok((url, tracking)) => {
                 ps.player.play_uri(&url);
                 ps.np_title.set_text(&title);
                 set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
@@ -1724,26 +1782,24 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                 ps.dislike_btn.set_sensitive(true);
                 ps.menu_btn.set_sensitive(true);
 
-                // Record play + trigger background sync
+                // Start tracking this song's listen time
+                *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
+                    video_id: video_id.clone(),
+                    title: title.clone(),
+                    artist: artist.clone(),
+                    thumb_url: thumb_url.clone(),
+                    started_at: Instant::now(),
+                    tracking,
+                });
+
+                // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();
-                let vid = video_id.clone();
-                let t = title.clone();
-                let a = artist.clone();
-                let tu = thumb_url.clone();
                 gio::spawn_blocking(move || {
-                    {
-                        let guard = state_bg.lock().unwrap();
-                        let _ = guard.cache.record_play(&vid, &t, &a, tu.as_deref());
-                    } // lock released before sync
                     sync_offline_cache(&state_bg);
                 });
             }
-            Ok(Err(e)) => {
-                ps.np_title.set_text(&format!("Playback failed: {e}"));
-                ps.np_artist.set_text("");
-            }
-            Err(e) => {
-                ps.np_title.set_text(&format!("Error: {e:?}"));
+            Err(msg) => {
+                ps.np_title.set_text(&msg);
                 ps.np_artist.set_text("");
             }
         }
@@ -1953,7 +2009,7 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         let url = {
             let guard = state.lock().unwrap();
             let Some(client) = guard.client.as_ref() else { return };
-            match client.get_audio_url(&vid) {
+            match client.get_audio_url_no_track(&vid) {
                 Ok(u) => u,
                 Err(e) => {
                     eprintln!("[CACHE] failed to get URL for {vid}: {e}");

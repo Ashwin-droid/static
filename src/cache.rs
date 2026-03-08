@@ -86,17 +86,20 @@ impl MusicCache {
         Ok(())
     }
 
-    /// Top-N most played video IDs (ordered by play_count desc, last_played desc).
-    /// Only includes songs played more than once so a single listen doesn't trigger a download.
+    /// Top-N most played video IDs, ranked by a time-decayed score.
+    /// Score = play_count / (1 + days_since_last_played / 30).
+    /// Songs not played recently decay, so current favorites are prioritized.
+    /// Only includes songs played more than once.
     pub fn top_played(&self, limit: usize) -> Result<Vec<String>> {
+        let now = epoch_secs();
         let mut stmt = self.db.prepare(
             "SELECT video_id FROM plays
              WHERE play_count >= 2
-             ORDER BY play_count DESC, last_played DESC
+             ORDER BY CAST(play_count AS REAL) / (1.0 + (?2 - last_played) / 2592000.0) DESC
              LIMIT ?1",
         )?;
         let ids = stmt
-            .query_map([limit as i64], |row| row.get(0))?
+            .query_map(rusqlite::params![limit as i64, now], |row| row.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(ids)
@@ -133,6 +136,30 @@ impl MusicCache {
     }
 
     /// All video IDs currently stored offline.
+    /// Return all offline-cached songs with metadata from play history.
+    /// Returns (video_id, title, artist, art_path).
+    pub fn offline_tracks(&self) -> Result<Vec<(String, String, String, Option<String>)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT o.video_id, COALESCE(p.title, o.video_id), COALESCE(p.artist, ''),
+                    CASE WHEN o.art_path != '' THEN o.art_path ELSE NULL END
+             FROM offline o
+             LEFT JOIN plays p ON o.video_id = p.video_id
+             ORDER BY p.play_count DESC, p.last_played DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn cached_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.db.prepare("SELECT video_id FROM offline")?;
         let ids = stmt

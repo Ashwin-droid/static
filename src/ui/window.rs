@@ -376,11 +376,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     let home_btn = nav_button("Home", true);
     nav_box.append(&home_btn);
 
-    for label in ["History", "Likes", "Playlists", "Offline"] {
+    for label in ["Likes", "Playlists"] {
         let btn = nav_button(label, false);
         btn.set_sensitive(false);
         nav_box.append(&btn);
     }
+
+    let offline_btn = nav_button("Offline", false);
+    nav_box.append(&offline_btn);
 
     sidebar.append(&nav_box);
     sidebar.append(&Separator::new(Orientation::Horizontal));
@@ -839,6 +842,18 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    // Offline button
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+
+        offline_btn.connect_clicked(move |_| {
+            load_offline(&state, &content_box, &ps, &recent_list);
+        });
+    }
+
     // Search
     {
         let state = state.clone();
@@ -1023,6 +1038,75 @@ fn load_search(
             }
         }
     });
+}
+
+fn load_offline(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+
+    let tracks: Vec<Track> = {
+        let guard = state.lock().unwrap();
+        guard.cache.offline_tracks().unwrap_or_default().into_iter().map(|(vid, title, artist, _art)| {
+            let artists = if artist.is_empty() {
+                vec![]
+            } else {
+                vec![Artist { name: artist, id: None }]
+            };
+            // Use cached art file as thumbnail if available
+            let thumbnail_url = guard.cache.get_cached_art(&vid)
+                .map(|p| format!("file://{}", p.display()));
+            Track {
+                video_id: vid,
+                title,
+                artists,
+                album: None,
+                duration: None,
+                thumbnail_url,
+            }
+        }).collect()
+    };
+
+    if tracks.is_empty() {
+        let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
+        empty.add_css_class("dim-label");
+        empty.set_margin_top(60);
+        content_box.append(&empty);
+        return;
+    }
+
+    let header = Label::new(Some("Offline"));
+    header.add_css_class("section-header");
+    header.set_halign(Align::Start);
+    header.set_margin_start(28);
+    header.set_margin_top(20);
+    header.set_margin_bottom(8);
+    content_box.append(&header);
+
+    let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
+    count_label.add_css_class("dim-label");
+    count_label.set_halign(Align::Start);
+    count_label.set_margin_start(28);
+    count_label.set_margin_bottom(12);
+    content_box.append(&count_label);
+
+    let grid = GtkBox::new(Orientation::Vertical, 6);
+    grid.set_margin_start(20);
+    grid.set_margin_end(20);
+
+    for track in &tracks {
+        grid.append(&build_track_row(track, &state, &ps, &recent_list));
+    }
+
+    content_box.append(&grid);
 }
 
 fn load_sidebar_history(
@@ -1530,8 +1614,14 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
 
     glib::spawn_future_local(async move {
         let result = gio::spawn_blocking(move || {
-            let bytes = THUMB_CLIENT.get(&url).send()?.bytes()?;
-            Ok::<_, reqwest::Error>(bytes.to_vec())
+            if let Some(path) = url.strip_prefix("file://") {
+                std::fs::read(path).map_err(|e| e.to_string())
+            } else {
+                THUMB_CLIENT.get(&url).send()
+                    .and_then(|r| r.bytes())
+                    .map(|b| b.to_vec())
+                    .map_err(|e| e.to_string())
+            }
         }).await;
 
         if let Ok(Ok(bytes)) = result {

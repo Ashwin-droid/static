@@ -6,9 +6,9 @@ use std::time::Instant;
 use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
-    gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Image, Label,
-    Orientation, Paned, Picture, Popover, Scale, ScrolledWindow, Separator, Stack,
-    StackTransitionType,
+    gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
+    DropTarget, Entry, GestureClick, Image, Label, Orientation, Paned, Picture, Popover, Scale,
+    ScrolledWindow, Separator, Stack, StackTransitionType,
 };
 
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
@@ -20,6 +20,7 @@ const ICON_DISLIKE: &[u8] = include_bytes!("../../assets/icons/dislike.svg");
 const ICON_MENU: &[u8] = include_bytes!("../../assets/icons/menu.svg");
 const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
 const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
+const ICON_REPEAT_ONE: &[u8] = include_bytes!("../../assets/icons/repeat_one.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
 const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
 
@@ -52,6 +53,32 @@ static DOWNLOAD_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
         .unwrap()
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatMode {
+    Off,
+    All,
+    One,
+}
+
+impl RepeatMode {
+    fn next(self, is_radio: bool) -> Self {
+        if is_radio {
+            // Radio: Off → One → Off (no loop-all for infinite radio)
+            match self {
+                RepeatMode::Off => RepeatMode::One,
+                _ => RepeatMode::Off,
+            }
+        } else {
+            // Playlist/likes/offline: Off → All → One → Off
+            match self {
+                RepeatMode::Off => RepeatMode::All,
+                RepeatMode::All => RepeatMode::One,
+                RepeatMode::One => RepeatMode::Off,
+            }
+        }
+    }
+}
+
 struct AppState {
     client: Option<Arc<YtMusicClient>>,
     cache: MusicCache,
@@ -65,6 +92,7 @@ struct NowPlayingTrack {
     artist: String,
     thumb_url: Option<String>,
     started_at: Instant,
+    awaiting_fresh_position: bool,
     tracking: Option<TrackingInfo>,
 }
 
@@ -103,10 +131,11 @@ struct PlayerState {
     volume_slider: Scale,
     // Modes
     repeat_btn: Button,
-    shuffle_btn: Button,
+    repeat_mode: Cell<RepeatMode>,
     // Queue / Radio
     queue: RefCell<Vec<Track>>,
     queue_index: Cell<usize>,
+    queue_is_radio: Cell<bool>,
     chips: RefCell<Vec<RadioChip>>,
     seed_video_id: RefCell<String>,
     // Queue panel widgets
@@ -832,12 +861,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     modes_box.set_margin_start(8);
 
     let repeat_btn = icon_button(ICON_REPEAT, 18, "np-icon-btn");
-    repeat_btn.set_sensitive(false);
     modes_box.append(&repeat_btn);
-
-    let shuffle_btn = icon_button(ICON_SHUFFLE, 18, "np-icon-btn");
-    shuffle_btn.set_sensitive(false);
-    modes_box.append(&shuffle_btn);
 
     controls_box.append(&modes_box);
 
@@ -903,9 +927,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         menu_btn: menu_btn.clone(),
         volume_slider: volume_slider.clone(),
         repeat_btn: repeat_btn.clone(),
-        shuffle_btn: shuffle_btn.clone(),
+        repeat_mode: Cell::new(RepeatMode::Off),
         queue: RefCell::new(Vec::new()),
         queue_index: Cell::new(0),
+        queue_is_radio: Cell::new(false),
         chips: RefCell::new(Vec::new()),
         seed_video_id: RefCell::new(String::new()),
         queue_list_box: queue_list_box.clone(),
@@ -930,6 +955,16 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    // Repeat mode toggle
+    {
+        let ps = ps.clone();
+        repeat_btn.connect_clicked(move |btn| {
+            let new_mode = ps.repeat_mode.get().next(ps.queue_is_radio.get());
+            ps.repeat_mode.set(new_mode);
+            update_repeat_button_ui(btn, new_mode);
+        });
+    }
+
     // Next track
     {
         let ps = ps.clone();
@@ -937,8 +972,13 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         next_btn.connect_clicked(move |_| {
             let idx = ps.queue_index.get();
             let len = ps.queue.borrow().len();
-            if len > 0 && idx + 1 < len {
+            if len == 0 {
+                return;
+            }
+            if idx + 1 < len {
                 play_from_queue(&state, &ps, idx + 1);
+            } else if ps.repeat_mode.get() == RepeatMode::All {
+                play_from_queue(&state, &ps, 0);
             }
         });
     }
@@ -948,9 +988,21 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let ps = ps.clone();
         let state = state.clone();
         prev_btn.connect_clicked(move |_| {
+            // Restart current track if >3 seconds in
+            if let Some(pos) = ps.player.position() {
+                if pos.seconds() > 3 {
+                    ps.player.seek(ClockTime::ZERO);
+                    return;
+                }
+            }
             let idx = ps.queue_index.get();
             if idx > 0 {
                 play_from_queue(&state, &ps, idx - 1);
+            } else if ps.repeat_mode.get() == RepeatMode::All {
+                let len = ps.queue.borrow().len();
+                if len > 0 {
+                    play_from_queue(&state, &ps, len - 1);
+                }
             }
         });
     }
@@ -1000,13 +1052,23 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                     if !auto_advancing.get() && pos.nseconds() + 500_000_000 >= dur_ns && dur_ns > 1_000_000_000 {
                         let idx = ps.queue_index.get();
                         let len = ps.queue.borrow().len();
-                        if len > 0 && idx + 1 < len {
+                        let repeat = ps.repeat_mode.get();
+                        let next_idx = match repeat {
+                            RepeatMode::One => Some(idx),
+                            RepeatMode::All => {
+                                if idx + 1 < len { Some(idx + 1) } else if len > 0 { Some(0) } else { None }
+                            }
+                            RepeatMode::Off => {
+                                if idx + 1 < len { Some(idx + 1) } else { None }
+                            }
+                        };
+                        if let Some(target) = next_idx {
                             auto_advancing.set(true);
                             let ps2 = ps.clone();
                             let state2 = state.clone();
                             let aa = auto_advancing.clone();
                             glib::idle_add_local_once(move || {
-                                play_from_queue(&state2, &ps2, idx + 1);
+                                play_from_queue(&state2, &ps2, target);
                                 aa.set(false);
                             });
                         }
@@ -1022,6 +1084,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             // Update buffer health (grey bar)
             let buffered = ps.player.buffered_fraction();
             ps.progress_slider.set_fill_level(buffered);
+            maybe_flush_watchtime_progress(&ps);
 
             glib::ControlFlow::Continue
         });
@@ -1183,6 +1246,51 @@ fn set_button_icon(btn: &Button, svg_bytes: &[u8], size: i32) {
     btn.set_child(Some(&svg_image(svg_bytes, size)));
 }
 
+fn update_repeat_button_ui(btn: &Button, mode: RepeatMode) {
+    match mode {
+        RepeatMode::Off => {
+            set_button_icon(btn, ICON_REPEAT, 18);
+            btn.remove_css_class("repeat-active");
+            btn.remove_css_class("repeat-one-active");
+        }
+        RepeatMode::All => {
+            set_button_icon(btn, ICON_REPEAT, 18);
+            btn.remove_css_class("repeat-one-active");
+            btn.add_css_class("repeat-active");
+        }
+        RepeatMode::One => {
+            set_button_icon(btn, ICON_REPEAT_ONE, 18);
+            btn.remove_css_class("repeat-active");
+            btn.add_css_class("repeat-one-active");
+        }
+    }
+}
+
+/// Set queue context (radio vs playlist) and reset repeat mode if needed.
+fn set_queue_context(ps: &PlayerState, is_radio: bool) {
+    ps.queue_is_radio.set(is_radio);
+    // Radio doesn't support loop-all — reset to Off if currently All
+    if is_radio && ps.repeat_mode.get() == RepeatMode::All {
+        ps.repeat_mode.set(RepeatMode::Off);
+        update_repeat_button_ui(&ps.repeat_btn, RepeatMode::Off);
+    }
+}
+
+/// Set the queue from a track list context and play from the given index.
+fn play_from_context(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    tracks: &[Track],
+    index: usize,
+) {
+    *ps.queue.borrow_mut() = tracks.to_vec();
+    ps.queue_index.set(index);
+    ps.chips.borrow_mut().clear();
+    ps.seed_video_id.borrow_mut().clear();
+    set_queue_context(ps, false);
+    play_from_queue(state, ps, index);
+}
+
 fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     flush_play_record(ps, state);
     ps.player.stop();
@@ -1206,6 +1314,46 @@ fn format_clock_time(t: ClockTime) -> String {
     let mins = total_secs / 60;
     let secs = total_secs % 60;
     format!("{mins}:{secs:02}")
+}
+
+fn current_listened_millis(ps: &PlayerState, track: &NowPlayingTrack) -> u64 {
+    ps.player
+        .position()
+        .map(|pos| pos.nseconds() / 1_000_000)
+        .filter(|millis| *millis > 0)
+        .unwrap_or_else(|| track.started_at.elapsed().as_millis() as u64)
+}
+
+fn maybe_flush_watchtime_progress(ps: &PlayerState) {
+    if ps.player.is_paused() {
+        return;
+    }
+
+    let mut now_playing = ps.now_playing_track.borrow_mut();
+    let Some(track) = now_playing.as_mut() else {
+        return;
+    };
+
+    let player_position_millis = ps.player.position().map(|pos| pos.nseconds() / 1_000_000);
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
+
+    if track.awaiting_fresh_position {
+        match player_position_millis {
+            Some(position_millis) if position_millis <= session_elapsed_millis + 1_500 => {
+                track.awaiting_fresh_position = false;
+            }
+            Some(_) | None => {
+                return;
+            }
+        }
+    }
+
+    let listened = player_position_millis
+        .filter(|millis| *millis > 0)
+        .unwrap_or(session_elapsed_millis);
+    if let Some(tracking) = track.tracking.as_ref() {
+        tracking.maybe_report_watchtime(listened);
+    }
 }
 
 // ============================================================
@@ -1485,8 +1633,9 @@ fn load_offline(
                     grid.set_margin_start(20);
                     grid.set_margin_end(20);
 
-                    for track in &tracks {
-                        grid.append(&build_track_row(track, &state, &ps, &recent_list));
+                    let tracks_rc = Rc::new(tracks);
+                    for (i, track) in tracks_rc.iter().enumerate() {
+                        grid.append(&build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list));
                     }
 
                     content_box.append(&grid);
@@ -1564,8 +1713,9 @@ fn load_likes(
                 grid.set_margin_start(20);
                 grid.set_margin_end(20);
 
-                for (i, track) in tracks.iter().enumerate() {
-                    let row = build_track_row(track, &state, &ps, &recent_list);
+                let tracks_rc = Rc::new(tracks);
+                for (i, track) in tracks_rc.iter().enumerate() {
+                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -1828,8 +1978,9 @@ fn load_playlist_detail(
                 grid.set_margin_start(20);
                 grid.set_margin_end(20);
 
-                for (i, track) in tracks.iter().enumerate() {
-                    let row = build_track_row(track, &state, &ps, &recent_list);
+                let tracks_rc = Rc::new(tracks);
+                for (i, track) in tracks_rc.iter().enumerate() {
+                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -2000,8 +2151,9 @@ fn load_offline_playlist_detail(
                 grid.set_margin_start(20);
                 grid.set_margin_end(20);
 
-                for (i, track) in tracks.iter().enumerate() {
-                    let row = build_track_row(track, &state, &ps, &recent_list);
+                let tracks_rc = Rc::new(tracks);
+                for (i, track) in tracks_rc.iter().enumerate() {
+                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -2109,8 +2261,9 @@ fn render_home_view(
         grid.set_column_homogeneous(true);
         grid.set_margin_top(4);
 
-        for (i, track) in section.contents.iter().enumerate() {
-            let row = build_track_row(track, state, ps, recent_list);
+        let section_tracks = Rc::new(section.contents.clone());
+        for (i, track) in section_tracks.iter().enumerate() {
+            let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
             grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
         }
 
@@ -2149,8 +2302,9 @@ fn render_search_view(
     grid.set_column_homogeneous(true);
     grid.set_margin_top(8);
 
-    for (i, track) in tracks.iter().enumerate() {
-        let row = build_track_row(track, state, ps, recent_list);
+    let tracks_rc = Rc::new(tracks.to_vec());
+    for (i, track) in tracks_rc.iter().enumerate() {
+        let row = build_track_row(track, i, &tracks_rc, state, ps, recent_list);
         grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
     }
 
@@ -2234,12 +2388,18 @@ fn build_cover_card(
 
 fn build_track_row(
     track: &Track,
+    index: usize,
+    all_tracks: &Rc<Vec<Track>>,
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
-) -> Button {
+) -> GtkBox {
+    let wrapper = GtkBox::new(Orientation::Horizontal, 0);
+    wrapper.add_css_class("track-row-wrapper");
+
     let row_btn = Button::new();
     row_btn.add_css_class("track-row");
+    row_btn.set_hexpand(true);
 
     let row = GtkBox::new(Orientation::Horizontal, 10);
 
@@ -2295,23 +2455,72 @@ fn build_track_row(
 
     row_btn.set_child(Some(&row));
 
+    // Left-click: play from this track's context (sets queue to all tracks)
     {
         let state = state.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let track = track.clone();
-        let video_id = track.video_id.clone();
-        let title = track.title.clone();
-        let artist_str = artist_str.clone();
-        let thumb_url = track.thumbnail_url.clone();
+        let all_tracks = all_tracks.clone();
 
         row_btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
+            play_from_context(&state, &ps, &all_tracks, index);
             add_to_recent(&recent_list, &track, &state, &ps);
         });
     }
 
-    row_btn
+    wrapper.append(&row_btn);
+
+    // Right-click context menu
+    let popover = Popover::new();
+    popover.add_css_class("context-menu");
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Bottom);
+
+    let pop_box = GtkBox::new(Orientation::Vertical, 0);
+
+    let play_next_btn = Button::with_label("Play next");
+    play_next_btn.add_css_class("popover-action-btn");
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        play_next_btn.connect_clicked(move |_| {
+            popover.popdown();
+            queue_play_next(track.clone(), &ps, &state);
+        });
+    }
+    pop_box.append(&play_next_btn);
+
+    let add_queue_btn = Button::with_label("Add to queue");
+    add_queue_btn.add_css_class("popover-action-btn");
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        add_queue_btn.connect_clicked(move |_| {
+            popover.popdown();
+            queue_add_to_end(track.clone(), &ps, &state);
+        });
+    }
+    pop_box.append(&add_queue_btn);
+
+    popover.set_child(Some(&pop_box));
+    popover.set_parent(&wrapper);
+
+    let gesture = GestureClick::new();
+    gesture.set_button(3);
+    {
+        let popover = popover.clone();
+        gesture.connect_pressed(move |_, _, _, _| {
+            popover.popup();
+        });
+    }
+    wrapper.add_controller(gesture);
+
+    wrapper
 }
 
 /// Wrap an existing label in a ScrolledWindow with marquee scrolling.
@@ -2562,10 +2771,11 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
 fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     let info = ps.now_playing_track.borrow_mut().take();
     if let Some(track) = info {
-        let listened = track.started_at.elapsed().as_secs();
+        let listened_millis = current_listened_millis(ps, &track);
         if let Some(tracking) = track.tracking {
-            tracking.report_watchtime(listened);
+            tracking.report_watchtime(listened_millis);
         }
+        let listened = listened_millis / 1_000;
         if listened >= MIN_LISTEN_SECS {
             // Record in local DB
             let state = state.clone();
@@ -2685,6 +2895,9 @@ fn play_track(
     thumb_url: Option<&str>,
     ps: &Rc<PlayerState>,
 ) {
+    // This is a radio play — mark context
+    set_queue_context(ps, true);
+
     // Flush listen time for the previous track before switching
     flush_play_record(ps, state);
 
@@ -2739,6 +2952,7 @@ fn play_track(
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
+                    awaiting_fresh_position: true,
                     tracking: None,
                 });
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
@@ -2791,6 +3005,40 @@ fn play_track(
             *ps.seed_video_id.borrow_mut() = video_id.clone();
             render_queue_panel(&ps, &state);
         }
+    });
+}
+
+/// Insert a track right after the currently-playing position.
+fn queue_play_next(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    let insert_at = ps.queue_index.get() + 1;
+    ps.queue.borrow_mut().insert(insert_at, track);
+    render_queue_panel(ps, state);
+}
+
+/// Append a track to the end of the queue.
+fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    ps.queue.borrow_mut().push(track);
+    render_queue_panel(ps, state);
+}
+
+/// Remove a track from the queue by index, adjusting queue_index if needed.
+fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    {
+        let mut q = ps.queue.borrow_mut();
+        if index >= q.len() {
+            return;
+        }
+        q.remove(index);
+        let current = ps.queue_index.get();
+        if index < current {
+            ps.queue_index.set(current - 1);
+        }
+    }
+    // Defer re-render to avoid destroying widget while its click handler is running
+    let ps = ps.clone();
+    let state = state.clone();
+    glib::idle_add_local_once(move || {
+        render_queue_panel(&ps, &state);
     });
 }
 
@@ -2856,6 +3104,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
+                    awaiting_fresh_position: true,
                     tracking: None,
                 });
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
@@ -2963,6 +3212,7 @@ fn play_all(
     ps.queue_index.set(0);
     ps.chips.borrow_mut().clear();
     ps.seed_video_id.borrow_mut().clear();
+    set_queue_context(ps, false);
 
     play_from_queue(state, ps, 0);
 }
@@ -3248,19 +3498,125 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
             row.append(&dur_lbl);
         }
 
-        let row_btn = Button::new();
-        row_btn.add_css_class("queue-row-btn");
-        row_btn.set_child(Some(&row));
+        // Wrap row content in a GtkBox (not Button) to avoid drag conflicts
+        let row_wrapper = GtkBox::new(Orientation::Vertical, 0);
+        row_wrapper.add_css_class("queue-row-btn");
+        row_wrapper.append(&row);
 
+        // Click to play
+        let click = GestureClick::new();
+        click.set_button(1);
         {
             let state = state.clone();
             let ps = ps.clone();
-            row_btn.connect_clicked(move |_| {
+            click.connect_released(move |gesture, _, _, _| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
                 play_from_queue(&state, &ps, i);
             });
         }
+        row_wrapper.add_controller(click);
 
-        ps.queue_list_box.append(&row_btn);
+        // Right-click context menu
+        if i != current_idx {
+            let popover = Popover::new();
+            popover.add_css_class("context-menu");
+            popover.set_has_arrow(false);
+            popover.set_position(gtk::PositionType::Bottom);
+
+            let remove_btn = Button::with_label("Remove from queue");
+            remove_btn.add_css_class("popover-action-btn");
+            {
+                let ps = ps.clone();
+                let state = state.clone();
+                let popover = popover.clone();
+                remove_btn.connect_clicked(move |_| {
+                    popover.popdown();
+                    queue_remove(i, &ps, &state);
+                });
+            }
+            popover.set_child(Some(&remove_btn));
+            popover.set_parent(&row_wrapper);
+
+            // On open: dim all siblings, highlight this row
+            {
+                let queue_list = ps.queue_list_box.clone();
+                let row_wrapper_ref = row_wrapper.clone();
+                popover.connect_notify_local(Some("visible"), move |pop, _| {
+                    if pop.is_visible() {
+                        queue_list.add_css_class("queue-ctx-active");
+                        row_wrapper_ref.add_css_class("queue-row-focused");
+                    } else {
+                        queue_list.remove_css_class("queue-ctx-active");
+                        row_wrapper_ref.remove_css_class("queue-row-focused");
+                    }
+                });
+            }
+
+            let rc_gesture = GestureClick::new();
+            rc_gesture.set_button(3);
+            {
+                let popover = popover.clone();
+                rc_gesture.connect_pressed(move |_, _, _, _| {
+                    popover.popup();
+                });
+            }
+            row_wrapper.add_controller(rc_gesture);
+        }
+
+        // Drag source
+        let drag_source = DragSource::new();
+        drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+        {
+            let idx = i as u32;
+            drag_source.connect_prepare(move |_, _, _| {
+                Some(gtk::gdk::ContentProvider::for_value(&idx.to_value()))
+            });
+        }
+        row_wrapper.add_controller(drag_source);
+
+        // Drop target
+        let drop_target = DropTarget::new(u32::static_type(), gtk::gdk::DragAction::MOVE);
+        {
+            let ps = ps.clone();
+            let state = state.clone();
+            drop_target.connect_drop(move |_, value, _, _| {
+                let Ok(from) = value.get::<u32>() else { return false };
+                let from = from as usize;
+                let to = i;
+                if from == to {
+                    return false;
+                }
+                {
+                    let mut q = ps.queue.borrow_mut();
+                    if from >= q.len() || to >= q.len() {
+                        return false;
+                    }
+                    let track = q.remove(from);
+                    let insert_at = if from < to { to - 1 } else { to };
+                    q.insert(insert_at, track);
+
+                    // Adjust current index
+                    let current = ps.queue_index.get();
+                    if from == current {
+                        ps.queue_index.set(insert_at);
+                    } else if from < current && insert_at >= current {
+                        ps.queue_index.set(current - 1);
+                    } else if from > current && insert_at <= current {
+                        ps.queue_index.set(current + 1);
+                    }
+                }
+                // Defer re-render
+                let ps = ps.clone();
+                let state = state.clone();
+                glib::idle_add_local_once(move || {
+                    render_queue_panel(&ps, &state);
+                });
+                true
+            });
+        }
+        row_wrapper.add_controller(drop_target);
+
+        ps.queue_list_box.append(&row_wrapper);
     }
 }
 
@@ -3299,6 +3655,7 @@ fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlis
             }
             *ps.queue.borrow_mut() = radio.tracks;
             ps.queue_index.set(0);
+            set_queue_context(&ps, true);
             // Only update chips if the response included them (filtered responses often don't)
             if !radio.chips.is_empty() {
                 *ps.chips.borrow_mut() = radio.chips;

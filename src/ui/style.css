@@ -589,6 +589,7 @@ popover > contents {
     border: none;
     border-radius: 4px;
     padding: 0;
+    cursor: pointer;
 }
 .queue-row-btn:hover {
     background-color: rgba(255, 255, 255, 0.06);
@@ -624,3 +625,51 @@ popover > contents {
     color: rgba(255, 255, 255, 0.4);
     margin-right: 4px;
 }
+
+/* =============================================
+   REPEAT MODE
+   ============================================= */
+
+.repeat-active,
+.repeat-one-active {
+    opacity: 1;
+    background-color: rgba(130, 160, 255, 0.12);
+}
+
+/* =============================================
+   CONTEXT MENU (glassy)
+   ============================================= */
+
+popover.context-menu > contents {
+    background-color: rgba(22, 22, 32, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 10px;
+    padding: 4px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+
+.popover-action-btn {
+    background: none;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    min-height: 20px;
+    font-size: 13px;
+    font-weight: 500;
+    color: rgba(255, 255, 255, 0.8);
+}
+
+.popover-action-btn:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #ffffff;
+}
+
+/* Queue dim effect — all rows fade, focused row stays bright */
+.queue-ctx-active .queue-row-btn {
+    opacity: 0.25;
+    transition: opacity 150ms ease;
+}
+.queue-ctx-active .queue-row-focused {
+    opacity: 1;
+}
+

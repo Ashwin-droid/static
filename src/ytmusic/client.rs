@@ -1,10 +1,13 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use url::Url;
 
 use crate::models::{HomeSection, PlaylistSummary, RadioQueue, Track};
 
@@ -27,7 +30,16 @@ pub struct TrackingInfo {
     auth: Option<String>,
     watchtime_url: String,
     cpn: String,
-    length_secs: u64,
+    referer_url: String,
+    visitor_id: Option<String>,
+    audio_fmt: String,
+    video_fmt: String,
+    length_millis: u64,
+    flush_points_millis: Vec<u64>,
+    default_flush_interval_millis: u64,
+    last_reported_millis: AtomicU64,
+    last_activity_millis: AtomicU64,
+    session_started_at: Instant,
     rt: *const tokio::runtime::Runtime,
 }
 
@@ -38,38 +50,239 @@ unsafe impl Send for TrackingInfo {}
 unsafe impl Sync for TrackingInfo {}
 
 impl TrackingInfo {
-    /// Fire the watchtime URL with real listened seconds. Call this on song change/stop.
-    pub fn report_watchtime(&self, listened_secs: u64) {
-        let watched = listened_secs.min(self.length_secs);
-        if watched == 0 {
-            return;
+    fn next_flush_after(&self, last_reported_millis: u64) -> Option<u64> {
+        if let Some(next) = self
+            .flush_points_millis
+            .iter()
+            .copied()
+            .find(|flush_at| *flush_at > last_reported_millis)
+        {
+            return Some(next);
         }
-        let referer = "https://music.youtube.com/";
-        let client_params = "&cbr=Static&cbrver=0.1.0&c=WEB_REMIX&cver=1.20260304.03.00\
-             &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP";
-        let full = format!(
-            "{}&cpn={}&ver=2&st=0&et={watched}&cmt={watched}\
-             &fmt=251&afmt=251&muted=0&volume=100&vis=1\
-             &rt={watched}&state=playing&rtn={}\
-             &referrer=https%3A%2F%2Fmusic.youtube.com%2F{client_params}",
-            self.watchtime_url, self.cpn, watched + 5
-        );
+
+        if self.default_flush_interval_millis == 0 {
+            return None;
+        }
+
+        let anchor = self.flush_points_millis.last().copied().unwrap_or(0);
+        let effective_last = last_reported_millis.max(anchor);
+        let intervals_elapsed = (effective_last - anchor) / self.default_flush_interval_millis;
+        Some(anchor + (intervals_elapsed + 1) * self.default_flush_interval_millis)
+    }
+
+    fn set_query_param(params: &mut HashMap<String, String>, key: &str, value: impl Into<String>) {
+        params.insert(key.to_string(), value.into());
+    }
+
+    fn build_query_map(url: &str) -> Option<(Url, HashMap<String, String>)> {
+        let mut parsed = Url::parse(url).ok()?;
+        let params = parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<HashMap<_, _>>();
+        parsed.set_query(None);
+        Some((parsed, params))
+    }
+
+    fn build_watchtime_request(
+        &self,
+        start_millis: u64,
+        listened_millis: u64,
+        state: &str,
+        final_ping: bool,
+    ) -> Option<(String, String, String, String)> {
+        let watched = listened_millis.min(self.length_millis);
+        if watched == 0 || watched <= start_millis {
+            return None;
+        }
+
+        let (mut url, mut params) = Self::build_query_map(&self.watchtime_url)?;
+        let now_unix_millis = unix_epoch_millis();
+        let wall_elapsed_millis = self.session_started_at.elapsed().as_millis() as u64;
+        let previous_activity = self
+            .last_activity_millis
+            .swap(wall_elapsed_millis, Ordering::Relaxed);
+        let lact_millis = wall_elapsed_millis.saturating_sub(previous_activity);
+
+        Self::set_query_param(&mut params, "cpn", self.cpn.clone());
+        Self::set_query_param(&mut params, "ver", "2");
+        Self::set_query_param(&mut params, "st", format_millis(start_millis));
+        Self::set_query_param(&mut params, "et", format_millis(watched));
+        Self::set_query_param(&mut params, "cmt", format_millis(watched));
+        Self::set_query_param(&mut params, "fmt", self.video_fmt.clone());
+        Self::set_query_param(&mut params, "afmt", self.audio_fmt.clone());
+        Self::set_query_param(&mut params, "muted", "0");
+        Self::set_query_param(&mut params, "volume", "100");
+        let vis = params.get("vis").cloned().unwrap_or_else(|| "10".to_string());
+        Self::set_query_param(&mut params, "vis", vis);
+        Self::set_query_param(&mut params, "state", state);
+        Self::set_query_param(&mut params, "rt", format_millis(wall_elapsed_millis));
+        Self::set_query_param(&mut params, "rti", (wall_elapsed_millis / 1000).to_string());
+        Self::set_query_param(&mut params, "lact", lact_millis.to_string());
+
+        if state == "playing" && !final_ping {
+            Self::set_query_param(&mut params, "rtn", ((wall_elapsed_millis / 1000) + 10).to_string());
+            params.remove("final");
+            params.remove("pe");
+        } else if final_ping {
+            Self::set_query_param(&mut params, "final", "1");
+            Self::set_query_param(&mut params, "pe", "1");
+            params.remove("rtn");
+        } else {
+            params.remove("rtn");
+            params.remove("final");
+            params.remove("pe");
+        }
+
+        if !params.contains_key("referrer") {
+            Self::set_query_param(&mut params, "referrer", self.referer_url.clone());
+        }
+        if !params.contains_key("len") {
+            Self::set_query_param(&mut params, "len", format_millis(self.length_millis));
+        }
+        if !params.contains_key("c") {
+            Self::set_query_param(&mut params, "c", "WEB_REMIX");
+        }
+        if !params.contains_key("cver") {
+            Self::set_query_param(&mut params, "cver", "1.20260304.03.00");
+        }
+        if !params.contains_key("cplayer") {
+            Self::set_query_param(&mut params, "cplayer", "UNIPLAYER");
+        }
+        if !params.contains_key("cos") {
+            Self::set_query_param(&mut params, "cos", "X11");
+        }
+        if !params.contains_key("cplatform") {
+            Self::set_query_param(&mut params, "cplatform", "DESKTOP");
+        }
+        if !params.contains_key("cbr") {
+            Self::set_query_param(&mut params, "cbr", "Static");
+        }
+        if !params.contains_key("cbrver") {
+            Self::set_query_param(&mut params, "cbrver", "0.1.0");
+        }
+
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(&key, &value);
+            }
+        }
+
+        Some((
+            url.into(),
+            self.referer_url.clone(),
+            now_unix_millis.to_string(),
+            now_unix_millis.to_string(),
+        ))
+    }
+
+    fn send_watchtime_range(
+        &self,
+        start_millis: u64,
+        listened_millis: u64,
+        state: &str,
+        final_ping: bool,
+    ) {
+        let watched = listened_millis.min(self.length_millis);
+        let Some((full, referer, event_time, request_time)) =
+            self.build_watchtime_request(start_millis, listened_millis, state, final_ping)
+        else {
+            return;
+        };
+
+        if !final_ping {
+            self.last_reported_millis.store(watched, Ordering::Relaxed);
+        }
 
         // Safety: the runtime outlives all TrackingInfo instances (lives in YtMusicClient in AppState)
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
         let auth = self.auth.clone();
+        let visitor_id = self.visitor_id.clone();
+        let state = state.to_string();
         rt.spawn(async move {
-            let mut req = http.get(&full).header("referer", referer);
+            let mut req = http
+                .get(&full)
+                .header("referer", referer)
+                .header("x-goog-authuser", "0")
+                .header("x-goog-event-time", event_time)
+                .header("x-goog-request-time", request_time);
             if let Some(auth) = &auth {
                 req = req.header("authorization", auth.clone());
             }
+            if let Some(visitor_id) = &visitor_id {
+                req = req.header("x-goog-visitor-id", visitor_id);
+            }
             match req.send().await {
-                Ok(r) => eprintln!("[TRACKING] watchtime reported: {}s ({})", watched, r.status()),
+                Ok(r) => eprintln!(
+                    "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
+                    start_millis,
+                    watched,
+                    state,
+                    final_ping,
+                    r.status()
+                ),
                 Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
             }
         });
     }
+
+    pub fn maybe_report_watchtime(&self, listened_millis: u64) {
+        let watched = listened_millis.min(self.length_millis);
+        if watched == 0 {
+            return;
+        }
+
+        let last_reported_millis = self.last_reported_millis.load(Ordering::Relaxed);
+        let Some(next_flush_millis) = self.next_flush_after(last_reported_millis) else {
+            return;
+        };
+
+        if watched < next_flush_millis && watched < self.length_millis {
+            return;
+        }
+
+        self.send_watchtime_range(last_reported_millis, watched, "playing", false);
+    }
+
+    /// Fire the watchtime URL with real listened time. Call this on song change/stop.
+    pub fn report_watchtime(&self, listened_millis: u64) {
+        let last_reported_millis = self.last_reported_millis.load(Ordering::Relaxed);
+        let watched = listened_millis.min(self.length_millis);
+        self.send_watchtime_range(last_reported_millis, watched, "paused", false);
+
+        let near_end_threshold = self.length_millis.saturating_sub(1_500);
+        if watched >= near_end_threshold {
+            let final_start = watched.saturating_sub(7);
+            let final_end = watched.max(final_start + 1);
+            self.send_watchtime_range(final_start, final_end, "paused", true);
+        }
+    }
+}
+
+fn unix_epoch_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn parse_secs_to_millis(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .map(|secs| (secs * 1000.0).round() as u64)
+}
+
+fn format_millis(millis: u64) -> String {
+    let mut rendered = format!("{:.3}", millis as f64 / 1000.0);
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    rendered
 }
 
 pub struct YtMusicClient {
@@ -404,28 +617,87 @@ impl YtMusicClient {
 
             let playback_url = rewrite_url("videostatsPlaybackUrl");
             let watchtime_url = rewrite_url("videostatsWatchtimeUrl");
+            let flush_points_millis = tracking
+                .get("videostatsScheduledFlushWalltimeSeconds")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|value| value.as_u64())
+                        .map(|secs| secs * 1000)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let default_flush_interval_millis = tracking
+                .get("videostatsDefaultFlushIntervalSeconds")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(40)
+                * 1000;
 
-            let length = json
-                .pointer("/videoDetails/lengthSeconds")
+            let audio_fmt = Self::best_audio_format(&json)
+                .ok()
+                .and_then(|format| format.get("itag").and_then(|v| v.as_u64()))
+                .unwrap_or(141)
+                .to_string();
+            let video_fmt = "0".to_string();
+            let visitor_id = json
+                .pointer("/responseContext/visitorData")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(300);
+                .map(str::to_string);
+            let referer_url = playback_url
+                .as_deref()
+                .and_then(|url| TrackingInfo::build_query_map(url))
+                .and_then(|(_, params)| params.get("referrer").cloned())
+                .unwrap_or_else(|| format!("{YTM_ORIGIN}/watch?v={video_id}"));
+            let length_millis = watchtime_url
+                .as_deref()
+                .and_then(|url| TrackingInfo::build_query_map(url))
+                .and_then(|(_, params)| parse_secs_to_millis(params.get("len").map(|s| s.as_str())))
+                .or_else(|| {
+                    parse_secs_to_millis(
+                        json.pointer("/videoDetails/lengthSeconds")
+                            .and_then(|v| v.as_str()),
+                    )
+                })
+                .unwrap_or(300_000);
 
             let cpn = generate_cpn();
 
-            let client_params = "&cbr=Static&cbrver=0.1.0&c=WEB_REMIX&cver=1.20260304.03.00\
-                 &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP";
-            let referer = "https://music.youtube.com/";
-
             // Fire playback URL immediately (start event)
             if let Some(url) = &playback_url {
-                let full = format!(
-                    "{url}&cpn={cpn}&ver=2&cmt=0&fmt=251&afmt=251\
-                     &muted=0&volume=100&vis=1{client_params}"
-                );
-                let mut req = http.get(&full).header("referer", referer);
+                let full: Option<String> = TrackingInfo::build_query_map(url).map(|(mut parsed, mut params)| {
+                    TrackingInfo::set_query_param(&mut params, "cpn", cpn.clone());
+                    TrackingInfo::set_query_param(&mut params, "ver", "2");
+                    TrackingInfo::set_query_param(&mut params, "cmt", "0");
+                    TrackingInfo::set_query_param(&mut params, "fmt", video_fmt.clone());
+                    TrackingInfo::set_query_param(&mut params, "afmt", audio_fmt.clone());
+                    TrackingInfo::set_query_param(&mut params, "muted", "0");
+                    let vis = params.get("vis").cloned().unwrap_or_else(|| "10".to_string());
+                    TrackingInfo::set_query_param(
+                        &mut params,
+                        "vis",
+                        vis,
+                    );
+                    TrackingInfo::set_query_param(&mut params, "volume", "100");
+                    {
+                        let mut pairs = parsed.query_pairs_mut();
+                        for (key, value) in params {
+                            pairs.append_pair(&key, &value);
+                        }
+                    }
+                    parsed.to_string()
+                });
+                let mut req = http
+                    .get(full.as_deref().unwrap_or(url))
+                    .header("referer", &referer_url)
+                    .header("x-goog-authuser", "0")
+                    .header("x-goog-event-time", unix_epoch_millis().to_string())
+                    .header("x-goog-request-time", unix_epoch_millis().to_string());
                 if let Some(ref auth) = auth {
                     req = req.header("authorization", auth.clone());
+                }
+                if let Some(visitor_id) = &visitor_id {
+                    req = req.header("x-goog-visitor-id", visitor_id);
                 }
                 match req.send().await {
                     Ok(r) => eprintln!("[TRACKING] playback reported ({})", r.status()),
@@ -439,7 +711,16 @@ impl YtMusicClient {
                 auth: auth.clone(),
                 watchtime_url: wt_url,
                 cpn,
-                length_secs: length,
+                referer_url,
+                visitor_id,
+                audio_fmt,
+                video_fmt,
+                length_millis,
+                flush_points_millis,
+                default_flush_interval_millis,
+                last_reported_millis: AtomicU64::new(0),
+                last_activity_millis: AtomicU64::new(0),
+                session_started_at: Instant::now(),
                 rt: rt_ptr,
             })
         }

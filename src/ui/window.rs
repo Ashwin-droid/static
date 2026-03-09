@@ -21,6 +21,7 @@ const ICON_MENU: &[u8] = include_bytes!("../../assets/icons/menu.svg");
 const ICON_VOLUME: &[u8] = include_bytes!("../../assets/icons/volume.svg");
 const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
+const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
 
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
@@ -1099,15 +1100,15 @@ fn load_offline(
     let ps = ps.clone();
     let recent_list = recent_list.clone();
 
-    let tracks: Vec<Track> = {
+    let (offline_playlists, tracks) = {
         let guard = state.lock().unwrap();
-        guard.cache.offline_tracks().unwrap_or_default().into_iter().map(|(vid, title, artist, _art)| {
+        let playlists = guard.cache.offline_playlists().unwrap_or_default();
+        let tracks: Vec<Track> = guard.cache.offline_tracks().unwrap_or_default().into_iter().map(|(vid, title, artist, _art)| {
             let artists = if artist.is_empty() {
                 vec![]
             } else {
                 vec![Artist { name: artist, id: None }]
             };
-            // Use cached art file as thumbnail if available
             let thumbnail_url = guard.cache.get_cached_art(&vid)
                 .map(|p| format!("file://{}", p.display()));
             Track {
@@ -1118,10 +1119,11 @@ fn load_offline(
                 duration: None,
                 thumbnail_url,
             }
-        }).collect()
+        }).collect();
+        (playlists, tracks)
     };
 
-    if tracks.is_empty() {
+    if tracks.is_empty() && offline_playlists.is_empty() {
         let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
         empty.add_css_class("dim-label");
         empty.set_margin_top(60);
@@ -1137,22 +1139,66 @@ fn load_offline(
     header.set_margin_bottom(8);
     content_box.append(&header);
 
-    let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
-    count_label.add_css_class("dim-label");
-    count_label.set_halign(Align::Start);
-    count_label.set_margin_start(28);
-    count_label.set_margin_bottom(12);
-    content_box.append(&count_label);
+    // Downloaded playlists section
+    if !offline_playlists.is_empty() {
+        let pl_header = Label::new(Some("Downloaded Playlists"));
+        pl_header.add_css_class("section-header");
+        pl_header.set_halign(Align::Start);
+        pl_header.set_margin_start(28);
+        pl_header.set_margin_top(8);
+        pl_header.set_margin_bottom(4);
+        content_box.append(&pl_header);
 
-    let grid = GtkBox::new(Orientation::Vertical, 6);
-    grid.set_margin_start(20);
-    grid.set_margin_end(20);
+        let cards_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        cards_scroll.add_css_class("cards-scroll");
 
-    for track in &tracks {
-        grid.append(&build_track_row(track, &state, &ps, &recent_list));
+        let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+        cards_box.set_margin_top(4);
+        cards_box.set_margin_bottom(12);
+        cards_box.set_margin_start(24);
+
+        for (pl_id, pl_title, pl_thumb, pl_subtitle) in &offline_playlists {
+            let summary = PlaylistSummary {
+                playlist_id: pl_id.clone(),
+                title: pl_title.clone(),
+                thumbnail_url: pl_thumb.clone(),
+                subtitle: pl_subtitle.clone(),
+            };
+            let card = build_offline_playlist_card(&summary, &state, &content_box, &ps, &recent_list);
+            cards_box.append(&card);
+        }
+
+        cards_scroll.set_child(Some(&cards_box));
+        content_box.append(&cards_scroll);
+
+        content_box.append(&Separator::new(Orientation::Horizontal));
     }
 
-    content_box.append(&grid);
+    // Loose songs section
+    if !tracks.is_empty() {
+        let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
+        count_label.add_css_class("dim-label");
+        count_label.set_halign(Align::Start);
+        count_label.set_margin_start(28);
+        count_label.set_margin_top(8);
+        count_label.set_margin_bottom(4);
+        content_box.append(&count_label);
+
+        content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+
+        let grid = GtkBox::new(Orientation::Vertical, 6);
+        grid.set_margin_start(20);
+        grid.set_margin_end(20);
+
+        for track in &tracks {
+            grid.append(&build_track_row(track, &state, &ps, &recent_list));
+        }
+
+        content_box.append(&grid);
+    }
 }
 
 fn load_likes(
@@ -1203,8 +1249,15 @@ fn load_likes(
                 count_label.add_css_class("dim-label");
                 count_label.set_halign(Align::Start);
                 count_label.set_margin_start(28);
-                count_label.set_margin_bottom(12);
+                count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
+
+                content_box.append(&build_play_controls(&tracks, &state, &ps, Some(DownloadPlaylistMeta {
+                    playlist_id: "LM".to_string(),
+                    title: "Liked Songs".to_string(),
+                    thumbnail_url: None,
+                    subtitle: None,
+                })));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -1278,21 +1331,26 @@ fn load_playlists(
                     return;
                 }
 
-                let cols = 5;
-                let grid = gtk::Grid::new();
-                grid.set_column_spacing(14);
-                grid.set_row_spacing(14);
-                grid.set_column_homogeneous(true);
-                grid.set_margin_start(24);
-                grid.set_margin_end(24);
-                grid.set_margin_top(8);
+                let flow = gtk::FlowBox::new();
+                flow.set_homogeneous(false);
+                flow.set_min_children_per_line(1);
+                flow.set_max_children_per_line(12);
+                flow.set_column_spacing(14);
+                flow.set_row_spacing(14);
+                flow.set_selection_mode(gtk::SelectionMode::None);
+                flow.set_halign(Align::Start);
+                flow.set_valign(Align::Start);
+                flow.set_hexpand(true);
+                flow.set_margin_start(24);
+                flow.set_margin_end(24);
+                flow.set_margin_top(8);
 
-                for (i, playlist) in playlists.iter().enumerate() {
+                for playlist in &playlists {
                     let card = build_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
-                    grid.attach(&card, (i % cols) as i32, (i / cols) as i32, 1, 1);
+                    flow.insert(&card, -1);
                 }
 
-                content_box.append(&grid);
+                content_box.append(&flow);
             }
             Ok(Some(Err(e))) => {
                 content_box.append(&Label::new(Some(&format!("Error: {e}"))));
@@ -1451,8 +1509,15 @@ fn load_playlist_detail(
                 count_label.add_css_class("dim-label");
                 count_label.set_halign(Align::Start);
                 count_label.set_margin_start(28);
-                count_label.set_margin_bottom(12);
+                count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
+
+                content_box.append(&build_play_controls(&tracks, &state, &ps, Some(DownloadPlaylistMeta {
+                    playlist_id: playlist_id.clone(),
+                    title: playlist_title.clone(),
+                    thumbnail_url: None,
+                    subtitle: Some(format!("{} tracks", tracks.len())),
+                })));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -1480,6 +1545,174 @@ fn load_playlist_detail(
             }
         }
     });
+}
+
+fn build_offline_playlist_card(
+    playlist: &PlaylistSummary,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> Button {
+    let card_btn = Button::new();
+    card_btn.add_css_class("cover-card");
+
+    let card = GtkBox::new(Orientation::Vertical, 6);
+    card.set_size_request(150, -1);
+
+    let art_container = GtkBox::new(Orientation::Vertical, 0);
+    art_container.add_css_class("cover-art");
+    art_container.set_size_request(150, 150);
+    art_container.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = &playlist.thumbnail_url {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(false);
+        picture.set_size_request(150, 150);
+        art_container.append(&picture);
+        load_thumbnail_into(&picture, url, 150);
+    } else {
+        let initial = playlist.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("cover-art-letter");
+        letter.set_vexpand(true);
+        letter.set_valign(Align::Center);
+        art_container.append(&letter);
+    }
+
+    card.append(&art_container);
+
+    let name = Label::new(Some(&playlist.title));
+    name.add_css_class("cover-card-title");
+    name.set_halign(Align::Start);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.set_max_width_chars(18);
+    card.append(&name);
+
+    if let Some(sub) = &playlist.subtitle {
+        let subtitle = Label::new(Some(sub));
+        subtitle.add_css_class("cover-card-artist");
+        subtitle.set_halign(Align::Start);
+        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        subtitle.set_max_width_chars(18);
+        card.append(&subtitle);
+    }
+
+    card_btn.set_child(Some(&card));
+
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let playlist_id = playlist.playlist_id.clone();
+        let playlist_title = playlist.title.clone();
+
+        card_btn.connect_clicked(move |_| {
+            load_offline_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, &ps, &recent_list);
+        });
+    }
+
+    card_btn
+}
+
+fn load_offline_playlist_detail(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    playlist_id: &str,
+    playlist_title: &str,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let playlist_id = playlist_id.to_string();
+    let playlist_title = playlist_title.to_string();
+
+    let tracks: Vec<Track> = {
+        let guard = state.lock().unwrap();
+        let video_ids = guard.cache.offline_playlist_track_ids(&playlist_id).unwrap_or_default();
+        video_ids.into_iter().filter_map(|vid| {
+            let thumbnail_url = guard.cache.get_cached_art(&vid)
+                .map(|p| format!("file://{}", p.display()));
+            let (title, artist) = guard.cache.get_track_meta(&vid)
+                .unwrap_or_else(|| (vid.clone(), String::new()));
+            let artists = if artist.is_empty() {
+                vec![]
+            } else {
+                vec![Artist { name: artist, id: None }]
+            };
+            Some(Track {
+                video_id: vid,
+                title,
+                artists,
+                album: None,
+                duration: None,
+                thumbnail_url,
+            })
+        }).collect()
+    };
+
+    // Back button
+    let back_btn = Button::with_label("\u{2190} Back to Offline");
+    back_btn.add_css_class("nav-item");
+    back_btn.set_halign(Align::Start);
+    back_btn.set_margin_start(24);
+    back_btn.set_margin_top(12);
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        back_btn.connect_clicked(move |_| {
+            load_offline(&state, &content_box, &ps, &recent_list);
+        });
+    }
+    content_box.append(&back_btn);
+
+    let header = Label::new(Some(&playlist_title));
+    header.add_css_class("section-header");
+    header.set_halign(Align::Start);
+    header.set_margin_start(28);
+    header.set_margin_top(12);
+    header.set_margin_bottom(8);
+    content_box.append(&header);
+
+    if tracks.is_empty() {
+        let msg = Label::new(Some("No tracks downloaded for this playlist."));
+        msg.add_css_class("dim-label");
+        msg.set_margin_top(20);
+        content_box.append(&msg);
+        return;
+    }
+
+    let count_label = Label::new(Some(&format!("{} tracks", tracks.len())));
+    count_label.add_css_class("dim-label");
+    count_label.set_halign(Align::Start);
+    count_label.set_margin_start(28);
+    count_label.set_margin_bottom(4);
+    content_box.append(&count_label);
+
+    content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(12);
+    grid.set_row_spacing(8);
+    grid.set_column_homogeneous(true);
+    grid.set_margin_top(4);
+    grid.set_margin_start(20);
+    grid.set_margin_end(20);
+
+    for (i, track) in tracks.iter().enumerate() {
+        let row = build_track_row(track, &state, &ps, &recent_list);
+        grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+    }
+
+    content_box.append(&grid);
 }
 
 fn load_sidebar_history(
@@ -2287,6 +2520,233 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     });
 }
 
+/// Set the queue to the given tracks and start playing from index 0.
+/// If `shuffle` is true, the tracks are shuffled first.
+fn play_all(
+    tracks: &[Track],
+    shuffle: bool,
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+) {
+    if tracks.is_empty() {
+        return;
+    }
+
+    let mut queue: Vec<Track> = tracks.to_vec();
+    if shuffle {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::rng();
+        queue.shuffle(&mut rng);
+    }
+
+    *ps.queue.borrow_mut() = queue;
+    ps.queue_index.set(0);
+    ps.chips.borrow_mut().clear();
+    ps.seed_video_id.borrow_mut().clear();
+
+    play_from_queue(state, ps, 0);
+}
+
+/// Build a row with "Play All", "Shuffle", and optionally "Download All" buttons.
+/// Pass `download_meta` to show the download button — `None` hides it.
+fn build_play_controls(
+    tracks: &[Track],
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    download_meta: Option<DownloadPlaylistMeta>,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.set_margin_start(28);
+    row.set_margin_bottom(12);
+
+    let play_all_btn = Button::new();
+    let play_all_content = GtkBox::new(Orientation::Horizontal, 6);
+    play_all_content.append(&svg_image(ICON_PLAY, 14));
+    play_all_content.append(&Label::new(Some("Play All")));
+    play_all_btn.set_child(Some(&play_all_content));
+    play_all_btn.add_css_class("nav-item");
+    {
+        let tracks = tracks.to_vec();
+        let state = state.clone();
+        let ps = ps.clone();
+        play_all_btn.connect_clicked(move |_| {
+            play_all(&tracks, false, &state, &ps);
+        });
+    }
+    row.append(&play_all_btn);
+
+    let shuffle_btn = Button::new();
+    let shuffle_content = GtkBox::new(Orientation::Horizontal, 6);
+    shuffle_content.append(&svg_image(ICON_SHUFFLE, 14));
+    shuffle_content.append(&Label::new(Some("Shuffle")));
+    shuffle_btn.set_child(Some(&shuffle_content));
+    shuffle_btn.add_css_class("nav-item");
+    {
+        let tracks = tracks.to_vec();
+        let state = state.clone();
+        let ps = ps.clone();
+        shuffle_btn.connect_clicked(move |_| {
+            play_all(&tracks, true, &state, &ps);
+        });
+    }
+    row.append(&shuffle_btn);
+
+    if let Some(meta) = download_meta {
+        let already_downloaded = {
+            let guard = state.lock().unwrap();
+            guard.cache.is_playlist_offline(&meta.playlist_id)
+        };
+
+        let dl_btn = Button::new();
+        let dl_content = GtkBox::new(Orientation::Horizontal, 6);
+        dl_content.append(&svg_image(ICON_DOWNLOAD, 14));
+        if already_downloaded {
+            dl_content.append(&Label::new(Some("Downloaded")));
+            dl_btn.set_sensitive(false);
+        } else {
+            dl_content.append(&Label::new(Some("Download All")));
+        }
+        dl_btn.set_child(Some(&dl_content));
+        dl_btn.add_css_class("nav-item");
+        {
+            let tracks = tracks.to_vec();
+            let state = state.clone();
+            let dl_btn = dl_btn.clone();
+            dl_btn.connect_clicked(move |btn| {
+                btn.set_sensitive(false);
+                download_all_offline(tracks.clone(), state.clone(), Some(meta.clone()));
+            });
+        }
+        row.append(&dl_btn);
+    }
+
+    row
+}
+
+/// Optional playlist metadata for download grouping.
+#[derive(Clone)]
+struct DownloadPlaylistMeta {
+    playlist_id: String,
+    title: String,
+    thumbnail_url: Option<String>,
+    subtitle: Option<String>,
+}
+
+fn download_all_offline(
+    tracks: Vec<Track>,
+    state: Arc<Mutex<AppState>>,
+    playlist_meta: Option<DownloadPlaylistMeta>,
+) {
+    let count = tracks.len();
+    eprintln!("[DOWNLOAD] queuing {count} tracks for offline download");
+
+    glib::spawn_future_local(async move {
+        let tracks = tracks.clone();
+        let state = state.clone();
+        gio::spawn_blocking(move || {
+            for (i, track) in tracks.iter().enumerate() {
+                let vid = &track.video_id;
+
+                // Skip if already cached
+                {
+                    let guard = state.lock().unwrap();
+                    if guard.cache.is_cached(vid) {
+                        let _ = guard.cache.pin_offline(vid);
+                        eprintln!("[DOWNLOAD] {}/{count} already cached, pinned: {vid}", i + 1);
+                        continue;
+                    }
+                }
+
+                // Ensure track metadata is in plays table so offline_tracks() can show it
+                {
+                    let guard = state.lock().unwrap();
+                    let artist = if track.artists.is_empty() {
+                        "Unknown artist".to_string()
+                    } else {
+                        track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                    };
+                    let _ = guard.cache.record_play(
+                        vid,
+                        &track.title,
+                        &artist,
+                        track.thumbnail_url.as_deref(),
+                        0,
+                    );
+                }
+
+                // Get streaming URL
+                let url = {
+                    let guard = state.lock().unwrap();
+                    let Some(client) = guard.client.as_ref() else { return };
+                    match client.get_audio_url_no_track(vid) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            eprintln!("[DOWNLOAD] {}/{count} failed URL for {vid}: {e}", i + 1);
+                            continue;
+                        }
+                    }
+                };
+
+                // Download audio
+                eprintln!("[DOWNLOAD] {}/{count} downloading {vid}...", i + 1);
+                let audio = match DOWNLOAD_CLIENT
+                    .get(&url)
+                    .header("Range", "bytes=0-")
+                    .send()
+                    .and_then(|r| r.bytes())
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[DOWNLOAD] {}/{count} failed: {e}", i + 1);
+                        continue;
+                    }
+                };
+
+                // Download artwork
+                let art = track.thumbnail_url.as_ref().and_then(|url| {
+                    THUMB_CLIENT.get(url).send().ok()?.bytes().ok()
+                });
+
+                // Store + pin
+                let guard = state.lock().unwrap();
+                let _ = guard.cache.store_audio(vid, &audio, art.as_deref());
+                let _ = guard.cache.pin_offline(vid);
+                eprintln!("[DOWNLOAD] {}/{count} done: {vid} ({} KB)", i + 1, audio.len() / 1024);
+            }
+
+            // Store playlist metadata + cover art if this is a playlist download
+            if let Some(meta) = &playlist_meta {
+                // Download playlist cover art to disk
+                let cover_art_path = if let Some(url) = &meta.thumbnail_url {
+                    THUMB_CLIENT.get(url).send().ok()
+                        .and_then(|r| r.bytes().ok())
+                        .map(|bytes| {
+                            let guard = state.lock().unwrap();
+                            let p = guard.cache.art_dir.join(format!("playlist_{}.jpg", meta.playlist_id));
+                            let _ = std::fs::write(&p, &bytes);
+                            format!("file://{}", p.display())
+                        })
+                } else {
+                    None
+                };
+
+                let video_ids: Vec<String> = tracks.iter().map(|t| t.video_id.clone()).collect();
+                let guard = state.lock().unwrap();
+                let _ = guard.cache.store_offline_playlist(
+                    &meta.playlist_id,
+                    &meta.title,
+                    cover_art_path.as_deref().or(meta.thumbnail_url.as_deref()),
+                    meta.subtitle.as_deref(),
+                    &video_ids,
+                );
+                eprintln!("[DOWNLOAD] stored playlist meta: {} ({} tracks)", meta.title, video_ids.len());
+            }
+
+            eprintln!("[DOWNLOAD] finished all {count} tracks");
+        }).await.ok();
+    });
+}
+
 /// Render the queue panel with chip filters and track list.
 fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     ps.queue_panel.set_visible(true);
@@ -2455,7 +2915,7 @@ fn add_to_recent(
 /// Sync the offline cache: download top-100 most played songs, evict the rest.
 /// Acquires the AppState lock briefly per-operation so playback is never blocked.
 fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
-    let (top, cached) = {
+    let (top, cached, pinned) = {
         let guard = state.lock().unwrap();
         let top = match guard.cache.top_played(100) {
             Ok(t) => t,
@@ -2465,12 +2925,13 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
             }
         };
         let cached = guard.cache.cached_ids().unwrap_or_default();
-        (top, cached)
+        let pinned = guard.cache.pinned_ids().unwrap_or_default();
+        (top, cached, pinned)
     }; // lock released
 
-    // Evict songs no longer in top 100
+    // Evict songs no longer in top 100 (skip pinned/manually downloaded)
     for id in &cached {
-        if !top.contains(id) {
+        if !top.contains(id) && !pinned.contains(id) {
             let guard = state.lock().unwrap();
             let _ = guard.cache.remove_cached(id);
         }

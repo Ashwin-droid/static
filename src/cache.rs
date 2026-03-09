@@ -12,7 +12,7 @@ use rusqlite::Connection;
 pub struct MusicCache {
     db: Connection,
     offline_dir: PathBuf,
-    art_dir: PathBuf,
+    pub art_dir: PathBuf,
 }
 
 impl MusicCache {
@@ -55,6 +55,28 @@ impl MusicCache {
             "ALTER TABLE plays ADD COLUMN listen_secs INTEGER NOT NULL DEFAULT 0;"
         );
 
+        // Migrate: add pinned column (manually downloaded, not auto-evicted)
+        let _ = db.execute_batch(
+            "ALTER TABLE offline ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"
+        );
+
+        // Offline playlists: store playlist metadata + track ordering
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS offline_playlists (
+                playlist_id    TEXT PRIMARY KEY,
+                title          TEXT NOT NULL,
+                thumbnail_url  TEXT,
+                subtitle       TEXT,
+                created_at     INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS offline_playlist_tracks (
+                playlist_id  TEXT NOT NULL,
+                video_id     TEXT NOT NULL,
+                position     INTEGER NOT NULL,
+                PRIMARY KEY (playlist_id, video_id),
+                FOREIGN KEY (playlist_id) REFERENCES offline_playlists(playlist_id)
+            );",
+        )?;
 
         Ok(Self { db, offline_dir, art_dir })
     }
@@ -226,6 +248,116 @@ impl MusicCache {
             )
             .ok()
             .flatten()
+    }
+
+    /// Mark a song as pinned (manually downloaded, won't be auto-evicted).
+    pub fn pin_offline(&self, video_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE offline SET pinned = 1 WHERE video_id = ?1",
+            [video_id],
+        )?;
+        Ok(())
+    }
+
+    /// Return all pinned (manually downloaded) video IDs.
+    pub fn pinned_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare("SELECT video_id FROM offline WHERE pinned = 1")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Check if a song is already cached offline.
+    pub fn is_cached(&self, video_id: &str) -> bool {
+        self.get_cached_audio(video_id).is_some()
+    }
+
+    /// Get (title, artist) metadata for a video from play history.
+    pub fn get_track_meta(&self, video_id: &str) -> Option<(String, String)> {
+        self.db
+            .query_row(
+                "SELECT title, artist FROM plays WHERE video_id = ?1",
+                [video_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
+    }
+
+    // ── Offline playlists ──────────────────────────────────────
+
+    /// Store an offline playlist header + track ordering.
+    pub fn store_offline_playlist(
+        &self,
+        playlist_id: &str,
+        title: &str,
+        thumbnail_url: Option<&str>,
+        subtitle: Option<&str>,
+        video_ids: &[String],
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO offline_playlists (playlist_id, title, thumbnail_url, subtitle, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![playlist_id, title, thumbnail_url, subtitle, epoch_secs()],
+        )?;
+        // Replace track list
+        self.db.execute(
+            "DELETE FROM offline_playlist_tracks WHERE playlist_id = ?1",
+            [playlist_id],
+        )?;
+        for (i, vid) in video_ids.iter().enumerate() {
+            self.db.execute(
+                "INSERT INTO offline_playlist_tracks (playlist_id, video_id, position)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![playlist_id, vid, i as i64],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get all offline playlists as (playlist_id, title, thumbnail_url, subtitle).
+    pub fn offline_playlists(&self) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT playlist_id, title, thumbnail_url, subtitle
+             FROM offline_playlists ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Check if a playlist has been downloaded offline.
+    pub fn is_playlist_offline(&self, playlist_id: &str) -> bool {
+        self.db
+            .query_row(
+                "SELECT 1 FROM offline_playlists WHERE playlist_id = ?1",
+                [playlist_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Get ordered video IDs for an offline playlist.
+    pub fn offline_playlist_track_ids(&self, playlist_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.db.prepare(
+            "SELECT video_id FROM offline_playlist_tracks
+             WHERE playlist_id = ?1 ORDER BY position",
+        )?;
+        let ids = stmt
+            .query_map([playlist_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
     }
 
     #[allow(dead_code)]

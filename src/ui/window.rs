@@ -34,6 +34,7 @@ use crate::ytmusic::YtMusicClient;
 
 const KEYRING_SERVICE: &str = "com.static.music";
 const KEYRING_USER: &str = "cookie";
+const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
 
 static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
@@ -52,7 +53,7 @@ static DOWNLOAD_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
 });
 
 struct AppState {
-    client: Option<YtMusicClient>,
+    client: Option<Arc<YtMusicClient>>,
     cache: MusicCache,
 }
 
@@ -66,8 +67,17 @@ struct NowPlayingTrack {
     tracking: Option<TrackingInfo>,
 }
 
+struct PreparedPlayback {
+    uri: String,
+    tracking: Option<TrackingInfo>,
+}
+
 /// Minimum seconds listened before a play is recorded.
 const MIN_LISTEN_SECS: u64 = 10;
+
+fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<YtMusicClient>> {
+    state.lock().unwrap().client.clone()
+}
 
 #[allow(dead_code)]
 struct PlayerState {
@@ -130,6 +140,16 @@ fn delete_cookie() {
     }
 }
 
+fn store_vr_refresh_token(token: &str) -> Result<(), keyring::Error> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_VR_TOKEN)?;
+    entry.set_password(token)
+}
+
+fn get_vr_refresh_token() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_VR_TOKEN).ok()?;
+    entry.get_password().ok()
+}
+
 pub fn build_window(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -150,11 +170,22 @@ pub fn build_window(app: &Application) {
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
+    let vr_auth = build_vr_auth_page(&stack, &state);
     let main_widgets = build_main_page(&stack, &state);
 
     stack.add_named(&onboarding, Some("onboarding"));
+    stack.add_named(&vr_auth, Some("vr_auth"));
     stack.add_named(&main_widgets.page, Some("main"));
     stack.set_visible_child_name("onboarding");
+
+    {
+        let state = state.clone();
+        let ps = main_widgets.player_state.clone();
+        window.connect_close_request(move |_| {
+            reset_player_ui(&ps, &state);
+            glib::Propagation::Proceed
+        });
+    }
 
     window.set_child(Some(&stack));
     window.present();
@@ -185,7 +216,11 @@ pub fn build_window(app: &Application) {
             if let Ok(Some(cookie)) = cookie {
                 match YtMusicClient::new(&cookie) {
                     Ok(ytm) => {
-                        state.lock().unwrap().client = Some(ytm);
+                        // Load VR refresh token if available
+                        if let Ok(Some(vr_token)) = gio::spawn_blocking(get_vr_refresh_token).await {
+                            ytm.set_vr_refresh_token(&vr_token);
+                        }
+                        state.lock().unwrap().client = Some(Arc::new(ytm));
                         stack.set_visible_child_name("main");
                     }
                     Err(_) => {
@@ -288,7 +323,7 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
 
             match YtMusicClient::new(&cookie_text) {
                 Ok(ytm) => {
-                    state.lock().unwrap().client = Some(ytm);
+                    state.lock().unwrap().client = Some(Arc::new(ytm));
                     let state = state.clone();
                     let stack = stack.clone();
                     let status_label = status_label.clone();
@@ -298,8 +333,10 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
                     glib::spawn_future_local(async move {
                         let state_bg = state.clone();
                         let result = gio::spawn_blocking(move || {
-                            let guard = state_bg.lock().unwrap();
-                            guard.client.as_ref().unwrap().check_auth()
+                            let Some(client) = app_client(&state_bg) else {
+                                return Err(anyhow::anyhow!("Not connected"));
+                            };
+                            client.check_auth()
                         }).await;
 
                         match result {
@@ -308,7 +345,8 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
                                 let _ = gio::spawn_blocking(move || {
                                     let _ = store_cookie(&cookie_for_save);
                                 }).await;
-                                stack.set_visible_child_name("main");
+                                // Show VR auth step
+                                stack.set_visible_child_name("vr_auth");
                             }
                             Ok(Err(e)) => {
                                 status_label.set_text(&format!("Auth check failed: {e}"));
@@ -334,6 +372,180 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
         let do_connect_click = do_connect.clone();
         connect_btn.connect_clicked(move |_| do_connect_click());
         cookie_entry_for_activate.connect_activate(move |_| do_connect());
+    }
+
+    page
+}
+
+// ============================================================
+// VR AUTH PAGE (optional step 2)
+// ============================================================
+
+fn build_vr_auth_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox {
+    let page = GtkBox::new(Orientation::Vertical, 0);
+    page.set_valign(Align::Center);
+    page.set_halign(Align::Center);
+    page.set_width_request(480);
+
+    let content = GtkBox::new(Orientation::Vertical, 16);
+    content.add_css_class("onboarding-card");
+
+    let title = Label::new(Some("Premium Playback (Optional)"));
+    title.add_css_class("onboarding-title");
+    content.append(&title);
+
+    let subtitle = Label::new(Some(
+        "If you have YouTube Music Premium, sign in to play\npremium-only tracks. You can skip this step."
+    ));
+    subtitle.add_css_class("onboarding-subtitle");
+    subtitle.set_wrap(true);
+    content.append(&subtitle);
+
+    content.append(&Separator::new(Orientation::Horizontal));
+
+    let code_label = Label::new(None);
+    code_label.add_css_class("section-header");
+    code_label.set_selectable(true);
+    content.append(&code_label);
+
+    let instructions_label = Label::new(None);
+    instructions_label.add_css_class("onboarding-steps");
+    instructions_label.set_wrap(true);
+    instructions_label.set_halign(Align::Start);
+    content.append(&instructions_label);
+
+    let status_label = Label::new(None);
+    status_label.add_css_class("onboarding-status");
+    content.append(&status_label);
+
+    let btn_box = GtkBox::new(Orientation::Horizontal, 12);
+    btn_box.set_halign(Align::Center);
+
+    let sign_in_btn = Button::with_label("Sign In");
+    sign_in_btn.add_css_class("connect-btn");
+
+    let skip_btn = Button::with_label("Skip");
+    skip_btn.add_css_class("nav-item");
+
+    btn_box.append(&sign_in_btn);
+    btn_box.append(&skip_btn);
+    content.append(&btn_box);
+
+    page.append(&content);
+
+    // Skip → go straight to main
+    {
+        let stack = stack.clone();
+        skip_btn.connect_clicked(move |_| {
+            stack.set_visible_child_name("main");
+        });
+    }
+
+    // Sign In → start device flow
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let code_label = code_label.clone();
+        let instructions_label = instructions_label.clone();
+        let status_label = status_label.clone();
+        let sign_in_btn = sign_in_btn.clone();
+
+        sign_in_btn.clone().connect_clicked(move |_| {
+            sign_in_btn.set_sensitive(false);
+            sign_in_btn.set_label("Starting...");
+            status_label.set_text("");
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let code_label = code_label.clone();
+            let instructions_label = instructions_label.clone();
+            let status_label = status_label.clone();
+            let sign_in_btn = sign_in_btn.clone();
+
+            glib::spawn_future_local(async move {
+                let state_bg = state.clone();
+                let result = gio::spawn_blocking(move || {
+                    let Some(client) = app_client(&state_bg) else {
+                        return Err(anyhow::anyhow!("Not connected"));
+                    };
+                    client.start_vr_device_flow()
+                }).await;
+
+                match result {
+                    Ok(Ok((device_code, user_code, verification_url))) => {
+                        code_label.set_text(&user_code);
+                        instructions_label.set_text(&format!(
+                            "1. Go to {verification_url}\n2. Enter the code above\n3. Sign in with your Google account\n4. Click \"Done\" below when finished"
+                        ));
+                        sign_in_btn.set_label("Done");
+                        sign_in_btn.set_sensitive(true);
+
+                        // Rewire button to poll
+                        let state = state.clone();
+                        let stack = stack.clone();
+                        let status_label = status_label.clone();
+                        let sign_in_btn_inner = sign_in_btn.clone();
+                        // Disconnect old handler by replacing with new
+                        sign_in_btn.connect_clicked(move |btn| {
+                            btn.set_sensitive(false);
+                            btn.set_label("Checking...");
+
+                            let state = state.clone();
+                            let stack = stack.clone();
+                            let status_label = status_label.clone();
+                            let sign_in_btn = sign_in_btn_inner.clone();
+                            let device_code = device_code.clone();
+
+                            glib::spawn_future_local(async move {
+                                let state_bg = state.clone();
+                                let dc = device_code.clone();
+                                let result = gio::spawn_blocking(move || {
+                                    let Some(client) = app_client(&state_bg) else {
+                                        return Err(anyhow::anyhow!("Not connected"));
+                                    };
+                                    client.poll_vr_device_flow(&dc)
+                                }).await;
+
+                                match result {
+                                    Ok(Ok(refresh_token)) => {
+                                        let token = refresh_token.clone();
+                                        let _ = gio::spawn_blocking(move || {
+                                            let _ = store_vr_refresh_token(&token);
+                                        }).await;
+                                        stack.set_visible_child_name("main");
+                                    }
+                                    Ok(Err(e)) => {
+                                        let msg = e.to_string();
+                                        if msg.contains("authorization_pending") {
+                                            status_label.set_text("Still waiting... complete sign-in in your browser, then click Done again.");
+                                        } else {
+                                            status_label.set_text(&format!("Error: {msg}"));
+                                        }
+                                        sign_in_btn.set_sensitive(true);
+                                        sign_in_btn.set_label("Done");
+                                    }
+                                    Err(e) => {
+                                        status_label.set_text(&format!("Error: {e:?}"));
+                                        sign_in_btn.set_sensitive(true);
+                                        sign_in_btn.set_label("Done");
+                                    }
+                                }
+                            });
+                        });
+                    }
+                    Ok(Err(e)) => {
+                        status_label.set_text(&format!("Failed: {e}"));
+                        sign_in_btn.set_sensitive(true);
+                        sign_in_btn.set_label("Sign In");
+                    }
+                    Err(e) => {
+                        status_label.set_text(&format!("Error: {e:?}"));
+                        sign_in_btn.set_sensitive(true);
+                        sign_in_btn.set_label("Sign In");
+                    }
+                }
+            });
+        });
     }
 
     page
@@ -1018,11 +1230,7 @@ fn load_home(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            match guard.client.as_ref() {
-                Some(ytm) => Some(ytm.get_home()),
-                None => None,
-            }
+            app_client(&state_bg).map(|ytm| ytm.get_home())
         }).await;
 
         clear_box(&content_box);
@@ -1067,11 +1275,7 @@ fn load_search(
         let state_bg = state.clone();
         let q = query.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            match guard.client.as_ref() {
-                Some(ytm) => Some(ytm.search(&q)),
-                None => None,
-            }
+            app_client(&state_bg).map(|ytm| ytm.search(&q))
         }).await;
 
         clear_box(&content_box);
@@ -1093,6 +1297,106 @@ fn load_search(
     });
 }
 
+fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>, Vec<Track>) {
+    let guard = state.lock().unwrap();
+
+    let offline_playlists = guard
+        .cache
+        .offline_playlists()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(playlist_id, title, thumbnail_url, subtitle)| {
+            let thumbnail_url = thumbnail_url.or_else(|| {
+                guard
+                    .cache
+                    .offline_playlist_track_ids(&playlist_id)
+                    .ok()
+                    .and_then(|ids| ids.first().cloned())
+                    .and_then(|vid| guard.cache.get_cached_art(&vid))
+                    .map(|path| format!("file://{}", path.display()))
+            });
+
+            PlaylistSummary {
+                playlist_id,
+                title,
+                thumbnail_url,
+                subtitle,
+            }
+        })
+        .collect();
+
+    let tracks = guard
+        .cache
+        .offline_tracks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(video_id, title, artist, _art)| {
+            let artists = if artist.is_empty() {
+                vec![]
+            } else {
+                vec![Artist {
+                    name: artist,
+                    id: None,
+                }]
+            };
+            let thumbnail_url = guard
+                .cache
+                .get_cached_art(&video_id)
+                .map(|path| format!("file://{}", path.display()));
+
+            Track {
+                video_id,
+                title,
+                artists,
+                album: None,
+                duration: None,
+                thumbnail_url,
+            }
+        })
+        .collect();
+
+    (offline_playlists, tracks)
+}
+
+fn load_offline_playlist_tracks(state: &Arc<Mutex<AppState>>, playlist_id: &str) -> Vec<Track> {
+    let guard = state.lock().unwrap();
+    let video_ids = guard
+        .cache
+        .offline_playlist_track_ids(playlist_id)
+        .unwrap_or_default();
+
+    video_ids
+        .into_iter()
+        .map(|video_id| {
+            let thumbnail_url = guard
+                .cache
+                .get_cached_art(&video_id)
+                .map(|path| format!("file://{}", path.display()));
+            let (title, artist) = guard
+                .cache
+                .get_track_meta(&video_id)
+                .unwrap_or_else(|| (video_id.clone(), String::new()));
+            let artists = if artist.is_empty() {
+                vec![]
+            } else {
+                vec![Artist {
+                    name: artist,
+                    id: None,
+                }]
+            };
+
+            Track {
+                video_id,
+                title,
+                artists,
+                album: None,
+                duration: None,
+                thumbnail_url,
+            }
+        })
+        .collect()
+}
+
 fn load_offline(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -1100,111 +1404,97 @@ fn load_offline(
     recent_list: &GtkBox,
 ) {
     clear_box(content_box);
+    let loading = Label::new(Some("Loading offline library..."));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
 
     let state = state.clone();
     let content_box = content_box.clone();
     let ps = ps.clone();
     let recent_list = recent_list.clone();
 
-    let (offline_playlists, tracks) = {
-        let guard = state.lock().unwrap();
-        let playlists = guard.cache.offline_playlists().unwrap_or_default();
-        let tracks: Vec<Track> = guard.cache.offline_tracks().unwrap_or_default().into_iter().map(|(vid, title, artist, _art)| {
-            let artists = if artist.is_empty() {
-                vec![]
-            } else {
-                vec![Artist { name: artist, id: None }]
-            };
-            let thumbnail_url = guard.cache.get_cached_art(&vid)
-                .map(|p| format!("file://{}", p.display()));
-            Track {
-                video_id: vid,
-                title,
-                artists,
-                album: None,
-                duration: None,
-                thumbnail_url,
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let result = gio::spawn_blocking(move || load_offline_page_data(&state_bg)).await;
+
+        clear_box(&content_box);
+
+        match result {
+            Ok((offline_playlists, tracks)) => {
+                if tracks.is_empty() && offline_playlists.is_empty() {
+                    let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
+                    empty.add_css_class("dim-label");
+                    empty.set_margin_top(60);
+                    content_box.append(&empty);
+                    return;
+                }
+
+                let header = Label::new(Some("Offline"));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(20);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if !offline_playlists.is_empty() {
+                    let pl_header = Label::new(Some("Downloaded Playlists"));
+                    pl_header.add_css_class("section-header");
+                    pl_header.set_halign(Align::Start);
+                    pl_header.set_margin_start(28);
+                    pl_header.set_margin_top(8);
+                    pl_header.set_margin_bottom(4);
+                    content_box.append(&pl_header);
+
+                    let cards_scroll = ScrolledWindow::builder()
+                        .hscrollbar_policy(gtk::PolicyType::Automatic)
+                        .vscrollbar_policy(gtk::PolicyType::Never)
+                        .build();
+                    cards_scroll.add_css_class("cards-scroll");
+
+                    let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+                    cards_box.set_margin_top(4);
+                    cards_box.set_margin_bottom(12);
+                    cards_box.set_margin_start(24);
+
+                    for playlist in &offline_playlists {
+                        let card = build_offline_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
+                        cards_box.append(&card);
+                    }
+
+                    cards_scroll.set_child(Some(&cards_box));
+                    content_box.append(&cards_scroll);
+                    content_box.append(&Separator::new(Orientation::Horizontal));
+                }
+
+                if !tracks.is_empty() {
+                    let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
+                    count_label.add_css_class("dim-label");
+                    count_label.set_halign(Align::Start);
+                    count_label.set_margin_start(28);
+                    count_label.set_margin_top(8);
+                    count_label.set_margin_bottom(4);
+                    content_box.append(&count_label);
+
+                    content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+
+                    let grid = GtkBox::new(Orientation::Vertical, 6);
+                    grid.set_margin_start(20);
+                    grid.set_margin_end(20);
+
+                    for track in &tracks {
+                        grid.append(&build_track_row(track, &state, &ps, &recent_list));
+                    }
+
+                    content_box.append(&grid);
+                }
             }
-        }).collect();
-        (playlists, tracks)
-    };
-
-    if tracks.is_empty() && offline_playlists.is_empty() {
-        let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
-        empty.add_css_class("dim-label");
-        empty.set_margin_top(60);
-        content_box.append(&empty);
-        return;
-    }
-
-    let header = Label::new(Some("Offline"));
-    header.add_css_class("section-header");
-    header.set_halign(Align::Start);
-    header.set_margin_start(28);
-    header.set_margin_top(20);
-    header.set_margin_bottom(8);
-    content_box.append(&header);
-
-    // Downloaded playlists section
-    if !offline_playlists.is_empty() {
-        let pl_header = Label::new(Some("Downloaded Playlists"));
-        pl_header.add_css_class("section-header");
-        pl_header.set_halign(Align::Start);
-        pl_header.set_margin_start(28);
-        pl_header.set_margin_top(8);
-        pl_header.set_margin_bottom(4);
-        content_box.append(&pl_header);
-
-        let cards_scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        cards_scroll.add_css_class("cards-scroll");
-
-        let cards_box = GtkBox::new(Orientation::Horizontal, 14);
-        cards_box.set_margin_top(4);
-        cards_box.set_margin_bottom(12);
-        cards_box.set_margin_start(24);
-
-        for (pl_id, pl_title, pl_thumb, pl_subtitle) in &offline_playlists {
-            let summary = PlaylistSummary {
-                playlist_id: pl_id.clone(),
-                title: pl_title.clone(),
-                thumbnail_url: pl_thumb.clone(),
-                subtitle: pl_subtitle.clone(),
-            };
-            let card = build_offline_playlist_card(&summary, &state, &content_box, &ps, &recent_list);
-            cards_box.append(&card);
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Offline load failed: {e:?}"))));
+            }
         }
-
-        cards_scroll.set_child(Some(&cards_box));
-        content_box.append(&cards_scroll);
-
-        content_box.append(&Separator::new(Orientation::Horizontal));
-    }
-
-    // Loose songs section
-    if !tracks.is_empty() {
-        let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
-        count_label.add_css_class("dim-label");
-        count_label.set_halign(Align::Start);
-        count_label.set_margin_start(28);
-        count_label.set_margin_top(8);
-        count_label.set_margin_bottom(4);
-        content_box.append(&count_label);
-
-        content_box.append(&build_play_controls(&tracks, &state, &ps, None));
-
-        let grid = GtkBox::new(Orientation::Vertical, 6);
-        grid.set_margin_start(20);
-        grid.set_margin_end(20);
-
-        for track in &tracks {
-            grid.append(&build_track_row(track, &state, &ps, &recent_list));
-        }
-
-        content_box.append(&grid);
-    }
+    });
 }
 
 fn load_likes(
@@ -1227,8 +1517,7 @@ fn load_likes(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_playlist("LM"))
+            app_client(&state_bg).map(|ytm| ytm.get_playlist("LM"))
         }).await;
 
         clear_box(&content_box);
@@ -1313,8 +1602,7 @@ fn load_playlists(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_library_playlists())
+            app_client(&state_bg).map(|ytm| ytm.get_library_playlists())
         }).await;
 
         clear_box(&content_box);
@@ -1439,9 +1727,10 @@ fn build_playlist_card(
         let recent_list = recent_list.clone();
         let playlist_id = playlist.playlist_id.clone();
         let playlist_title = playlist.title.clone();
+        let playlist_thumb = playlist.thumbnail_url.clone();
 
         card_btn.connect_clicked(move |_| {
-            load_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, &ps, &recent_list);
+            load_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, playlist_thumb.as_deref(), &ps, &recent_list);
         });
     }
 
@@ -1453,6 +1742,7 @@ fn load_playlist_detail(
     content_box: &GtkBox,
     playlist_id: &str,
     playlist_title: &str,
+    playlist_thumb: Option<&str>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
@@ -1468,13 +1758,13 @@ fn load_playlist_detail(
     let recent_list = recent_list.clone();
     let playlist_id = playlist_id.to_string();
     let playlist_title = playlist_title.to_string();
+    let playlist_thumb = playlist_thumb.map(|s| s.to_string());
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let pid = playlist_id.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_playlist(&pid))
+            app_client(&state_bg).map(|ytm| ytm.get_playlist(&pid))
         }).await;
 
         clear_box(&content_box);
@@ -1524,7 +1814,7 @@ fn load_playlist_detail(
                 content_box.append(&build_play_controls(&tracks, &state, &ps, Some(DownloadPlaylistMeta {
                     playlist_id: playlist_id.clone(),
                     title: playlist_title.clone(),
-                    thumbnail_url: None,
+                    thumbnail_url: playlist_thumb.clone(),
                     subtitle: Some(format!("{} tracks", tracks.len())),
                 })));
 
@@ -1638,6 +1928,10 @@ fn load_offline_playlist_detail(
     recent_list: &GtkBox,
 ) {
     clear_box(content_box);
+    let loading = Label::new(Some(&format!("Loading \"{}\"...", playlist_title)));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
 
     let state = state.clone();
     let content_box = content_box.clone();
@@ -1646,86 +1940,76 @@ fn load_offline_playlist_detail(
     let playlist_id = playlist_id.to_string();
     let playlist_title = playlist_title.to_string();
 
-    let tracks: Vec<Track> = {
-        let guard = state.lock().unwrap();
-        let video_ids = guard.cache.offline_playlist_track_ids(&playlist_id).unwrap_or_default();
-        video_ids.into_iter().filter_map(|vid| {
-            let thumbnail_url = guard.cache.get_cached_art(&vid)
-                .map(|p| format!("file://{}", p.display()));
-            let (title, artist) = guard.cache.get_track_meta(&vid)
-                .unwrap_or_else(|| (vid.clone(), String::new()));
-            let artists = if artist.is_empty() {
-                vec![]
-            } else {
-                vec![Artist { name: artist, id: None }]
-            };
-            Some(Track {
-                video_id: vid,
-                title,
-                artists,
-                album: None,
-                duration: None,
-                thumbnail_url,
-            })
-        }).collect()
-    };
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let playlist_id_bg = playlist_id.clone();
+        let result = gio::spawn_blocking(move || load_offline_playlist_tracks(&state_bg, &playlist_id_bg)).await;
 
-    // Back button
-    let back_btn = Button::with_label("\u{2190} Back to Offline");
-    back_btn.add_css_class("nav-item");
-    back_btn.set_halign(Align::Start);
-    back_btn.set_margin_start(24);
-    back_btn.set_margin_top(12);
-    {
-        let state = state.clone();
-        let content_box = content_box.clone();
-        let ps = ps.clone();
-        let recent_list = recent_list.clone();
-        back_btn.connect_clicked(move |_| {
-            load_offline(&state, &content_box, &ps, &recent_list);
-        });
-    }
-    content_box.append(&back_btn);
+        clear_box(&content_box);
 
-    let header = Label::new(Some(&playlist_title));
-    header.add_css_class("section-header");
-    header.set_halign(Align::Start);
-    header.set_margin_start(28);
-    header.set_margin_top(12);
-    header.set_margin_bottom(8);
-    content_box.append(&header);
+        match result {
+            Ok(tracks) => {
+                let back_btn = Button::with_label("\u{2190} Back to Offline");
+                back_btn.add_css_class("nav-item");
+                back_btn.set_halign(Align::Start);
+                back_btn.set_margin_start(24);
+                back_btn.set_margin_top(12);
+                {
+                    let state = state.clone();
+                    let content_box = content_box.clone();
+                    let ps = ps.clone();
+                    let recent_list = recent_list.clone();
+                    back_btn.connect_clicked(move |_| {
+                        load_offline(&state, &content_box, &ps, &recent_list);
+                    });
+                }
+                content_box.append(&back_btn);
 
-    if tracks.is_empty() {
-        let msg = Label::new(Some("No tracks downloaded for this playlist."));
-        msg.add_css_class("dim-label");
-        msg.set_margin_top(20);
-        content_box.append(&msg);
-        return;
-    }
+                let header = Label::new(Some(&playlist_title));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(12);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
 
-    let count_label = Label::new(Some(&format!("{} tracks", tracks.len())));
-    count_label.add_css_class("dim-label");
-    count_label.set_halign(Align::Start);
-    count_label.set_margin_start(28);
-    count_label.set_margin_bottom(4);
-    content_box.append(&count_label);
+                if tracks.is_empty() {
+                    let msg = Label::new(Some("No tracks downloaded for this playlist."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
 
-    content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+                let count_label = Label::new(Some(&format!("{} tracks", tracks.len())));
+                count_label.add_css_class("dim-label");
+                count_label.set_halign(Align::Start);
+                count_label.set_margin_start(28);
+                count_label.set_margin_bottom(4);
+                content_box.append(&count_label);
 
-    let grid = gtk::Grid::new();
-    grid.set_column_spacing(12);
-    grid.set_row_spacing(8);
-    grid.set_column_homogeneous(true);
-    grid.set_margin_top(4);
-    grid.set_margin_start(20);
-    grid.set_margin_end(20);
+                content_box.append(&build_play_controls(&tracks, &state, &ps, None));
 
-    for (i, track) in tracks.iter().enumerate() {
-        let row = build_track_row(track, &state, &ps, &recent_list);
-        grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
-    }
+                let grid = gtk::Grid::new();
+                grid.set_column_spacing(12);
+                grid.set_row_spacing(8);
+                grid.set_column_homogeneous(true);
+                grid.set_margin_top(4);
+                grid.set_margin_start(20);
+                grid.set_margin_end(20);
 
-    content_box.append(&grid);
+                for (i, track) in tracks.iter().enumerate() {
+                    let row = build_track_row(track, &state, &ps, &recent_list);
+                    grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                }
+
+                content_box.append(&grid);
+            }
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Offline playlist load failed: {e:?}"))));
+            }
+        }
+    });
 }
 
 fn load_sidebar_history(
@@ -1740,8 +2024,7 @@ fn load_sidebar_history(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_history())
+            app_client(&state_bg).map(|ytm| ytm.get_history())
         }).await;
 
         if let Ok(Some(Ok(tracks))) = result {
@@ -2271,17 +2554,17 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
     });
 }
 
-/// Flush the current now-playing track: record its listen time in the DB
-/// and report watchtime to YouTube. Only records if listened >= MIN_LISTEN_SECS.
+/// Flush the current now-playing track.
+/// We always report any non-zero watchtime we have to YouTube, while the local
+/// play-history DB keeps its higher threshold for counting a play.
 fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     let info = ps.now_playing_track.borrow_mut().take();
     if let Some(track) = info {
         let listened = track.started_at.elapsed().as_secs();
+        if let Some(tracking) = track.tracking {
+            tracking.report_watchtime(listened);
+        }
         if listened >= MIN_LISTEN_SECS {
-            // Report watchtime to YouTube
-            if let Some(tracking) = track.tracking {
-                tracking.report_watchtime(listened);
-            }
             // Record in local DB
             let state = state.clone();
             gio::spawn_blocking(move || {
@@ -2295,6 +2578,57 @@ fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
                 );
             });
         }
+    }
+}
+
+async fn prepare_playback(
+    state: &Arc<Mutex<AppState>>,
+    video_id: &str,
+) -> Result<PreparedPlayback, String> {
+    let state_cache = state.clone();
+    let vid = video_id.to_string();
+    let cached_path = gio::spawn_blocking(move || {
+        let guard = state_cache.lock().unwrap();
+        guard.cache.get_cached_audio(&vid)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    if let Some(path) = cached_path {
+        eprintln!("[CACHE] playing from offline: {}", path.display());
+
+        let state_tracking = state.clone();
+        let vid = video_id.to_string();
+        let tracking = gio::spawn_blocking(move || {
+            app_client(&state_tracking).and_then(|ytm| ytm.start_playback_tracking(&vid))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        return Ok(PreparedPlayback {
+            uri: format!("file://{}", path.display()),
+            tracking,
+        });
+    }
+
+    let state_remote = state.clone();
+    let vid = video_id.to_string();
+    match gio::spawn_blocking(move || {
+        let Some(client) = app_client(&state_remote) else {
+            return Err("Playback failed: not connected and no offline copy available".to_string());
+        };
+        client
+            .get_audio_url(&vid)
+            .map(|(uri, tracking)| PreparedPlayback { uri, tracking })
+            .map_err(|e| format!("Playback failed: {e}"))
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Err(msg)) => Err(msg),
+        Err(e) => Err(format!("Error: {e:?}")),
     }
 }
 
@@ -2338,33 +2672,9 @@ fn play_track(
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
-        // Check offline cache first
-        let state_c = state.clone();
-        let vid = video_id.clone();
-        let cached_path = gio::spawn_blocking(move || {
-            let guard = state_c.lock().unwrap();
-            guard.cache.get_cached_audio(&vid)
-        }).await.ok().flatten();
-
-        let play_result: Result<(String, Option<TrackingInfo>), String> = if let Some(path) = cached_path {
-            eprintln!("[CACHE] playing from offline: {}", path.display());
-            Ok((format!("file://{}", path.display()), None))
-        } else {
-            let state_bg = state.clone();
-            let vid = video_id.clone();
-            match gio::spawn_blocking(move || {
-                let guard = state_bg.lock().unwrap();
-                guard.client.as_ref().unwrap().get_audio_url(&vid)
-            }).await {
-                Ok(Ok((url, tracking))) => Ok((url, tracking)),
-                Ok(Err(e)) => Err(format!("Playback failed: {e}")),
-                Err(e) => Err(format!("Error: {e:?}")),
-            }
-        };
-
-        match play_result {
-            Ok((url, tracking)) => {
-                ps.player.play_uri(&url);
+        match prepare_playback(&state, &video_id).await {
+            Ok(prepared) => {
+                ps.player.play_uri(&prepared.uri);
                 ps.np_title.set_text(&title);
                 set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
                 ps.play_pause_btn.set_sensitive(true);
@@ -2381,7 +2691,7 @@ fn play_track(
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
-                    tracking,
+                    tracking: prepared.tracking,
                 });
 
                 // Trigger background sync (no play record — that happens on navigate-away)
@@ -2400,8 +2710,7 @@ fn play_track(
         let state_bg = state.clone();
         let vid = video_id.clone();
         let radio_result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_radio(&vid, None, None))
+            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
         }).await;
 
         if let Ok(Some(Ok(mut radio))) = radio_result {
@@ -2473,33 +2782,9 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
-        // Check offline cache first
-        let state_c = state.clone();
-        let vid = video_id.clone();
-        let cached_path = gio::spawn_blocking(move || {
-            let guard = state_c.lock().unwrap();
-            guard.cache.get_cached_audio(&vid)
-        }).await.ok().flatten();
-
-        let play_result: Result<(String, Option<TrackingInfo>), String> = if let Some(path) = cached_path {
-            eprintln!("[CACHE] playing from offline: {}", path.display());
-            Ok((format!("file://{}", path.display()), None))
-        } else {
-            let state_bg = state.clone();
-            let vid = video_id.clone();
-            match gio::spawn_blocking(move || {
-                let guard = state_bg.lock().unwrap();
-                guard.client.as_ref().unwrap().get_audio_url(&vid)
-            }).await {
-                Ok(Ok((url, tracking))) => Ok((url, tracking)),
-                Ok(Err(e)) => Err(format!("Playback failed: {e}")),
-                Err(e) => Err(format!("Error: {e:?}")),
-            }
-        };
-
-        match play_result {
-            Ok((url, tracking)) => {
-                ps.player.play_uri(&url);
+        match prepare_playback(&state, &video_id).await {
+            Ok(prepared) => {
+                ps.player.play_uri(&prepared.uri);
                 ps.np_title.set_text(&title);
                 set_button_icon(&ps.play_pause_btn, ICON_PAUSE, 28);
                 ps.play_pause_btn.set_sensitive(true);
@@ -2516,7 +2801,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
-                    tracking,
+                    tracking: prepared.tracking,
                 });
 
                 // Trigger background sync (no play record — that happens on navigate-away)
@@ -2689,8 +2974,7 @@ fn download_all_offline(
 
                 // Get streaming URL
                 let url = {
-                    let guard = state.lock().unwrap();
-                    let Some(client) = guard.client.as_ref() else { return };
+                    let Some(client) = app_client(&state) else { return };
                     match client.get_audio_url_no_track(vid) {
                         Ok(u) => u,
                         Err(e) => {
@@ -2877,8 +3161,7 @@ fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlis
         let plid = playlist_id.clone();
         let p = params.clone();
         let result = gio::spawn_blocking(move || {
-            let guard = state_bg.lock().unwrap();
-            guard.client.as_ref().map(|ytm| ytm.get_radio(&vid, Some(&plid), p.as_deref()))
+            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, Some(&plid), p.as_deref()))
         }).await;
 
         if let Ok(Some(Ok(mut radio))) = result {
@@ -2962,8 +3245,7 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
     for vid in to_download {
         // Get streaming URL (brief lock)
         let url = {
-            let guard = state.lock().unwrap();
-            let Some(client) = guard.client.as_ref() else { return };
+            let Some(client) = app_client(state) else { return };
             match client.get_audio_url_no_track(&vid) {
                 Ok(u) => u,
                 Err(e) => {

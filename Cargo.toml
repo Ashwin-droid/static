@@ -56,3 +56,4 @@ tracing-subscriber = "0.3"
 # Offline cache DB
 rusqlite = { version = "0.34", features = ["bundled"] }
 rand = "0.10.0"
+uuid = { version = "1.22.0", features = ["v4"] }

@@ -15,6 +15,12 @@ const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 
+// OAuth device flow for Android VR auth (premium content)
+const VR_OAUTH_CLIENT_ID: &str = "652469312169-4lvs9bnhr9lpns9v451j5oivd81vjvu1.apps.googleusercontent.com";
+const VR_OAUTH_CLIENT_SECRET: &str = "3fTWrBJI5Uojm1TK7_iJCW5Z";
+const VR_OAUTH_TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token?prettyPrint=false";
+const VR_OAUTH_DEVICE_CODE_URL: &str = "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
+
 /// Holds the watchtime tracking URL so we can report real listen time on navigate-away.
 pub struct TrackingInfo {
     http: reqwest::Client,
@@ -75,6 +81,10 @@ pub struct YtMusicClient {
     visitor_data: std::sync::Mutex<Option<String>>,
     #[allow(dead_code)]
     cipher: std::sync::Mutex<Option<Cipher>>,
+    /// OAuth refresh token for Android VR (premium content)
+    vr_refresh_token: std::sync::Mutex<Option<String>>,
+    /// Cached VR access token + expiry (epoch secs)
+    vr_access_token: std::sync::Mutex<Option<(String, u64)>>,
 }
 
 unsafe impl Send for YtMusicClient {}
@@ -141,6 +151,8 @@ impl YtMusicClient {
             sapisid,
             visitor_data: std::sync::Mutex::new(None),
             cipher: std::sync::Mutex::new(None),
+            vr_refresh_token: std::sync::Mutex::new(None),
+            vr_access_token: std::sync::Mutex::new(None),
         })
     }
 
@@ -319,6 +331,12 @@ impl YtMusicClient {
         Ok((url, tracking))
     }
 
+    /// Report playback start to YouTube and return tracking info, even when
+    /// playback is backed by the local cache rather than a network stream.
+    pub fn start_playback_tracking(&self, video_id: &str) -> Option<TrackingInfo> {
+        self.rt.block_on(self.start_playback_tracking_async(video_id))
+    }
+
     /// Get just the streaming URL without reporting anything to YouTube.
     /// Use this for cache downloads and other non-playback fetches.
     pub fn get_audio_url_no_track(&self, video_id: &str) -> Result<String> {
@@ -472,9 +490,32 @@ impl YtMusicClient {
     }
 
     async fn try_android_vr_audio(&self, video_id: &str) -> Result<String> {
-        let visitor_data = self.ensure_visitor_data().await?;
+        // Always try unauthenticated first
+        match self.vr_player_request(video_id, None).await {
+            Ok(url) => return Ok(url),
+            Err(e) => {
+                let msg = e.to_string();
+                // Only escalate to OAuth for premium-gated content
+                let is_premium_gate = msg.contains("Music Premium")
+                    || msg.contains("Premium members");
+                let has_vr_auth = self.vr_refresh_token.lock().unwrap().is_some();
 
-        let body = json!({
+                if is_premium_gate && has_vr_auth {
+                    eprintln!("[PLAYER] premium-gated, retrying with VR OAuth...");
+                    let token = self.ensure_vr_access_token().await?;
+                    return self.vr_player_request(video_id, Some(&token)).await;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    /// Send a single Android VR player request, optionally with OAuth Bearer auth.
+    async fn vr_player_request(&self, video_id: &str, access_token: Option<&str>) -> Result<String> {
+        let vr_ua = "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+        let vr_client = reqwest::Client::new();
+
+        let mut body = json!({
             "context": {
                 "client": {
                     "clientName": "ANDROID_VR",
@@ -486,25 +527,30 @@ impl YtMusicClient {
                     "osVersion": "12L",
                     "hl": "en",
                     "gl": "US",
-                    "visitorData": visitor_data,
                 }
             },
             "videoId": video_id,
         });
 
-        let vr_ua = "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-        let vr_client = reqwest::Client::new();
-        let resp = vr_client
+        // Only include visitorData for unauthenticated requests
+        if access_token.is_none() {
+            let vd = self.ensure_visitor_data().await?;
+            body["context"]["client"]["visitorData"] = json!(vd);
+        }
+
+        let mut req = vr_client
             .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .header("content-type", "application/json")
             .header("user-agent", vr_ua)
             .header("origin", "https://www.youtube.com")
             .header("x-youtube-client-name", "28")
-            .header("x-youtube-client-version", "1.71.26")
-            .header("x-goog-visitor-id", &visitor_data)
-            .json(&body)
-            .send()
-            .await
+            .header("x-youtube-client-version", "1.71.26");
+
+        if let Some(token) = access_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req.json(&body).send().await
             .context("Failed to fetch Android VR player data")?;
 
         let json: Value = resp.json().await.context("Failed to parse Android VR response")?;
@@ -545,6 +591,142 @@ impl YtMusicClient {
             })
             .max_by_key(|f| f.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0))
             .context("No audio streams found")
+    }
+
+    // ── VR OAuth (premium content) ───────────────────────────
+
+    /// Set the VR refresh token (loaded from keyring at startup).
+    pub fn set_vr_refresh_token(&self, token: &str) {
+        *self.vr_refresh_token.lock().unwrap() = Some(token.to_string());
+        eprintln!("[VR-AUTH] refresh token loaded");
+    }
+
+    #[allow(dead_code)]
+    pub fn has_vr_auth(&self) -> bool {
+        self.vr_refresh_token.lock().unwrap().is_some()
+    }
+
+    /// Get a valid VR access token, refreshing if expired.
+    async fn ensure_vr_access_token(&self) -> Result<String> {
+        // Check cached token
+        {
+            let guard = self.vr_access_token.lock().unwrap();
+            if let Some((ref token, expiry)) = *guard {
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                if now < expiry {
+                    return Ok(token.clone());
+                }
+            }
+        }
+
+        let refresh_token = {
+            let guard = self.vr_refresh_token.lock().unwrap();
+            guard.clone().context("No VR refresh token available")?
+        };
+
+        eprintln!("[VR-AUTH] refreshing access token...");
+        let body = json!({
+            "client_id": VR_OAUTH_CLIENT_ID,
+            "client_secret": VR_OAUTH_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        });
+
+        let resp = reqwest::Client::new()
+            .post(VR_OAUTH_TOKEN_URL)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to refresh VR access token")?;
+
+        let json: Value = resp.json().await.context("Failed to parse VR token response")?;
+
+        let access_token = json.get("access_token")
+            .and_then(|v| v.as_str())
+            .context("No access_token in VR token response")?
+            .to_string();
+        let expires_in = json.get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600);
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let expiry = now + expires_in - 60; // refresh 60s early
+
+        eprintln!("[VR-AUTH] got access token (expires in {expires_in}s)");
+        *self.vr_access_token.lock().unwrap() = Some((access_token.clone(), expiry));
+        Ok(access_token)
+    }
+
+    /// Start the OAuth device flow. Returns (device_code, user_code, verification_url).
+    pub fn start_vr_device_flow(&self) -> Result<(String, String, String)> {
+        self.rt.block_on(async {
+            let body = json!({
+                "client_id": VR_OAUTH_CLIENT_ID,
+                "scope": "https://www.googleapis.com/auth/youtube",
+                "device_id": uuid::Uuid::new_v4().to_string(),
+                "device_model": "ANDROID_VR",
+            });
+
+            let resp = reqwest::Client::new()
+                .post(VR_OAUTH_DEVICE_CODE_URL)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to start VR device flow")?;
+
+            let json: Value = resp.json().await?;
+            let device_code = json.get("device_code").and_then(|v| v.as_str())
+                .context("No device_code")?.to_string();
+            let user_code = json.get("user_code").and_then(|v| v.as_str())
+                .context("No user_code")?.to_string();
+            let verification_url = json.get("verification_url").and_then(|v| v.as_str())
+                .unwrap_or("https://www.google.com/device").to_string();
+
+            Ok((device_code, user_code, verification_url))
+        })
+    }
+
+    /// Poll for the refresh token after the user has authorized the device code.
+    /// Returns the refresh token on success, or an error if still pending/expired.
+    pub fn poll_vr_device_flow(&self, device_code: &str) -> Result<String> {
+        self.rt.block_on(async {
+            let body = json!({
+                "client_id": VR_OAUTH_CLIENT_ID,
+                "client_secret": VR_OAUTH_CLIENT_SECRET,
+                "code": device_code,
+                "grant_type": "http://oauth.net/grant_type/device/1.0",
+            });
+
+            let resp = reqwest::Client::new()
+                .post(VR_OAUTH_TOKEN_URL)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to poll VR device flow")?;
+
+            let json: Value = resp.json().await?;
+
+            if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
+                bail!("{error}");
+            }
+
+            let refresh_token = json.get("refresh_token").and_then(|v| v.as_str())
+                .context("No refresh_token in response")?.to_string();
+
+            // Also load the access token we got
+            if let Some(access_token) = json.get("access_token").and_then(|v| v.as_str()) {
+                let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                *self.vr_access_token.lock().unwrap() = Some((access_token.to_string(), now + expires_in - 60));
+            }
+
+            *self.vr_refresh_token.lock().unwrap() = Some(refresh_token.clone());
+            eprintln!("[VR-AUTH] device flow complete, got refresh token");
+            Ok(refresh_token)
+        })
     }
 
     pub fn check_auth(&self) -> Result<bool> {

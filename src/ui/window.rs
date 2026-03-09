@@ -10,6 +10,10 @@ use gtk::{
     DropTarget, Entry, GestureClick, Image, Label, Orientation, Paned, Picture, Popover, Scale,
     ScrolledWindow, Separator, Stack, StackTransitionType,
 };
+use mpris_server::{
+    LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
+    Player as MprisPlayer, Time as MprisTime, TrackId,
+};
 
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
 const ICON_PLAY: &[u8] = include_bytes!("../../assets/icons/play.svg");
@@ -145,6 +149,11 @@ struct PlayerState {
     // Play tracking — records listen time when navigating away
     now_playing_track: RefCell<Option<NowPlayingTrack>>,
     playback_session_id: Cell<u64>,
+    mpris: RefCell<Option<Rc<MprisBridge>>>,
+}
+
+struct MprisBridge {
+    player: MprisPlayer,
 }
 
 struct MainPageWidgets {
@@ -152,6 +161,326 @@ struct MainPageWidgets {
     content_box: GtkBox,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
+}
+
+impl MprisBridge {
+    async fn new(
+        app: &Application,
+        window: &ApplicationWindow,
+        state: &Arc<Mutex<AppState>>,
+        ps: &Rc<PlayerState>,
+    ) -> Result<Rc<Self>, mpris_server::zbus::Error> {
+        let player = MprisPlayer::builder("static")
+            .identity("Static")
+            .desktop_entry("com.static.music")
+            .can_raise(true)
+            .can_quit(true)
+            .can_play(true)
+            .can_pause(true)
+            .can_seek(true)
+            .can_control(true)
+            .build()
+            .await?;
+
+        {
+            let ps = ps.clone();
+            player.connect_play_pause(move |_| {
+                ps.play_pause_btn.emit_clicked();
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_play(move |_| {
+                if ps.now_playing_track.borrow().is_some() && ps.player.is_paused() {
+                    ps.play_pause_btn.emit_clicked();
+                }
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_pause(move |_| {
+                if ps.now_playing_track.borrow().is_some() && !ps.player.is_paused() {
+                    ps.play_pause_btn.emit_clicked();
+                }
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            let state = state.clone();
+            player.connect_stop(move |_| {
+                reset_player_ui(&ps, &state);
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_next(move |_| {
+                ps.next_btn.emit_clicked();
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_previous(move |_| {
+                ps.prev_btn.emit_clicked();
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_seek(move |player, offset| {
+                let Some(current) = ps.player.position() else {
+                    return;
+                };
+                let current_us = (current.nseconds() / 1_000) as i64;
+                let target_us = (current_us + offset.as_micros()).max(0) as u64;
+                ps.player.seek(ClockTime::from_useconds(target_us));
+                player.set_position(MprisTime::from_micros(target_us as i64));
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_set_position(move |player, track_id, position| {
+                let now_playing = ps.now_playing_track.borrow();
+                let Some(current) = now_playing.as_ref() else {
+                    return;
+                };
+                if track_id.to_string() != mpris_track_id(&current.video_id).to_string() {
+                    return;
+                }
+                let target_us = position.as_micros().max(0) as u64;
+                ps.player.seek(ClockTime::from_useconds(target_us));
+                player.set_position(MprisTime::from_micros(target_us as i64));
+            });
+        }
+
+        {
+            let window = window.clone();
+            player.connect_raise(move |_| {
+                window.present();
+            });
+        }
+
+        {
+            let app = app.clone();
+            player.connect_quit(move |_| {
+                app.quit();
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            let state = state.clone();
+            player.connect_set_loop_status(move |_, status| {
+                let next_mode = repeat_mode_from_mpris(status, ps.queue_is_radio.get());
+                ps.repeat_mode.set(next_mode);
+                update_repeat_button_ui(&ps.repeat_btn, next_mode);
+                sync_mpris_transport(&ps, &state);
+            });
+        }
+
+        {
+            let ps = ps.clone();
+            player.connect_set_volume(move |_, volume| {
+                ps.volume_slider.set_value(volume);
+            });
+        }
+
+        let run_task = player.run();
+        glib::spawn_future_local(async move {
+            run_task.await;
+        });
+
+        Ok(Rc::new(Self { player }))
+    }
+
+    fn sync_all(self: &Rc<Self>, ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
+        self.sync_transport(ps, state);
+        self.sync_metadata(ps, state);
+        self.sync_position(ps);
+        self.sync_volume(ps);
+    }
+
+    fn sync_transport(self: &Rc<Self>, ps: &PlayerState, _state: &Arc<Mutex<AppState>>) {
+        let bridge = self.clone();
+        let playback_status = mpris_playback_status(ps);
+        let loop_status = mpris_loop_status(ps.repeat_mode.get());
+        let can_go_next = mpris_can_go_next(ps);
+        let can_go_previous = mpris_can_go_previous(ps);
+        let can_seek = ps.now_playing_track.borrow().is_some();
+        let can_pause = ps.now_playing_track.borrow().is_some();
+        let can_play = ps.now_playing_track.borrow().is_some();
+
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_playback_status(playback_status).await;
+            let _ = bridge.player.set_loop_status(loop_status).await;
+            let _ = bridge.player.set_can_go_next(can_go_next).await;
+            let _ = bridge.player.set_can_go_previous(can_go_previous).await;
+            let _ = bridge.player.set_can_seek(can_seek).await;
+            let _ = bridge.player.set_can_pause(can_pause).await;
+            let _ = bridge.player.set_can_play(can_play).await;
+        });
+    }
+
+    fn sync_metadata(self: &Rc<Self>, ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
+        let bridge = self.clone();
+        let metadata = build_mpris_metadata(ps, state);
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_metadata(metadata).await;
+        });
+    }
+
+    fn sync_position(&self, ps: &PlayerState) {
+        let position_us = ps
+            .player
+            .position()
+            .map(|pos| (pos.nseconds() / 1_000) as i64)
+            .unwrap_or(0);
+        self.player.set_position(MprisTime::from_micros(position_us));
+    }
+
+    fn sync_volume(self: &Rc<Self>, ps: &PlayerState) {
+        let bridge = self.clone();
+        let volume = ps.volume_slider.value();
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_volume(volume).await;
+        });
+    }
+}
+
+fn init_mpris(
+    app: &Application,
+    window: &ApplicationWindow,
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+) {
+    let app = app.clone();
+    let window = window.clone();
+    let state = state.clone();
+    let ps = ps.clone();
+    glib::spawn_future_local(async move {
+        match MprisBridge::new(&app, &window, &state, &ps).await {
+            Ok(bridge) => {
+                *ps.mpris.borrow_mut() = Some(bridge.clone());
+                bridge.sync_all(ps.as_ref(), &state);
+            }
+            Err(err) => eprintln!("[MPRIS] failed to initialize: {err}"),
+        }
+    });
+}
+
+fn with_mpris<F>(ps: &Rc<PlayerState>, f: F)
+where
+    F: FnOnce(&Rc<MprisBridge>),
+{
+    if let Some(bridge) = ps.mpris.borrow().as_ref() {
+        f(bridge);
+    }
+}
+
+fn sync_mpris_transport(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    with_mpris(ps, |bridge| bridge.sync_transport(ps.as_ref(), state));
+}
+
+fn sync_mpris_position(ps: &Rc<PlayerState>) {
+    with_mpris(ps, |bridge| bridge.sync_position(ps));
+}
+
+fn sync_mpris_volume(ps: &Rc<PlayerState>) {
+    with_mpris(ps, |bridge| bridge.sync_volume(ps));
+}
+
+fn sync_mpris_all(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    with_mpris(ps, |bridge| bridge.sync_all(ps.as_ref(), state));
+}
+
+fn mpris_playback_status(ps: &PlayerState) -> MprisPlaybackStatus {
+    if ps.now_playing_track.borrow().is_none() {
+        MprisPlaybackStatus::Stopped
+    } else if ps.player.is_paused() {
+        MprisPlaybackStatus::Paused
+    } else {
+        MprisPlaybackStatus::Playing
+    }
+}
+
+fn mpris_loop_status(mode: RepeatMode) -> MprisLoopStatus {
+    match mode {
+        RepeatMode::Off => MprisLoopStatus::None,
+        RepeatMode::All => MprisLoopStatus::Playlist,
+        RepeatMode::One => MprisLoopStatus::Track,
+    }
+}
+
+fn repeat_mode_from_mpris(status: MprisLoopStatus, is_radio: bool) -> RepeatMode {
+    match status {
+        MprisLoopStatus::Track => RepeatMode::One,
+        MprisLoopStatus::Playlist if !is_radio => RepeatMode::All,
+        _ => RepeatMode::Off,
+    }
+}
+
+fn mpris_track_id(video_id: &str) -> TrackId {
+    let suffix: String = video_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    TrackId::try_from(format!("/com/static/music/track_{suffix}")).unwrap()
+}
+
+fn mpris_can_go_next(ps: &PlayerState) -> bool {
+    let len = ps.queue.borrow().len();
+    if len == 0 {
+        return false;
+    }
+    let idx = ps.queue_index.get();
+    idx + 1 < len || ps.repeat_mode.get() == RepeatMode::All
+}
+
+fn mpris_can_go_previous(ps: &PlayerState) -> bool {
+    if ps.now_playing_track.borrow().is_none() {
+        return false;
+    }
+    if ps.queue_index.get() > 0 || ps.repeat_mode.get() == RepeatMode::All {
+        return true;
+    }
+    ps.player.position().is_some_and(|pos| pos.seconds() > 3)
+}
+
+fn build_mpris_metadata(ps: &PlayerState, state: &Arc<Mutex<AppState>>) -> Metadata {
+    let now_playing = ps.now_playing_track.borrow();
+    let Some(track) = now_playing.as_ref() else {
+        return Metadata::builder().build();
+    };
+
+    let mut builder = Metadata::builder()
+        .trackid(mpris_track_id(&track.video_id))
+        .title(track.title.clone());
+
+    if !track.artist.is_empty() {
+        builder = builder.artist(vec![track.artist.clone()]);
+    }
+
+    if let Some(duration) = ps.player.duration() {
+        builder = builder.length(MprisTime::from_micros((duration.nseconds() / 1_000) as i64));
+    }
+
+    let art_url = state
+        .lock()
+        .ok()
+        .and_then(|guard| guard.cache.get_cached_art(&track.video_id))
+        .and_then(|path| url::Url::from_file_path(path).ok().map(|url| url.to_string()))
+        .or_else(|| track.thumb_url.clone());
+
+    if let Some(art_url) = art_url {
+        builder = builder.art_url(art_url);
+    }
+
+    builder.build()
 }
 
 fn store_cookie(cookie: &str) -> Result<(), keyring::Error> {
@@ -218,6 +547,7 @@ pub fn build_window(app: &Application) {
     }
 
     window.set_child(Some(&stack));
+    init_mpris(app, &window, &state, &main_widgets.player_state);
     window.present();
 
     // Auto-load home + history when main page becomes visible
@@ -938,6 +1268,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue_panel: queue_panel.clone(),
         now_playing_track: RefCell::new(None),
         playback_session_id: Cell::new(0),
+        mpris: RefCell::new(None),
     });
 
     // ======= WIRE SIGNALS =======
@@ -945,6 +1276,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     // Play/Pause toggle
     {
         let ps = ps.clone();
+        let state = state.clone();
         play_pause_btn.connect_clicked(move |btn| {
             ps.player.toggle_pause();
             if ps.player.is_paused() {
@@ -952,16 +1284,19 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             } else {
                 set_button_icon(btn, ICON_PAUSE, 28);
             }
+            sync_mpris_transport(&ps, &state);
         });
     }
 
     // Repeat mode toggle
     {
         let ps = ps.clone();
+        let state = state.clone();
         repeat_btn.connect_clicked(move |btn| {
             let new_mode = ps.repeat_mode.get().next(ps.queue_is_radio.get());
             ps.repeat_mode.set(new_mode);
             update_repeat_button_ui(btn, new_mode);
+            sync_mpris_transport(&ps, &state);
         });
     }
 
@@ -1026,6 +1361,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let ps = ps.clone();
         volume_slider.connect_value_changed(move |slider| {
             ps.player.set_volume(slider.value());
+            sync_mpris_volume(&ps);
         });
     }
 
@@ -1085,6 +1421,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             let buffered = ps.player.buffered_fraction();
             ps.progress_slider.set_fill_level(buffered);
             maybe_flush_watchtime_progress(&ps);
+            sync_mpris_position(&ps);
 
             glib::ControlFlow::Continue
         });
@@ -1307,6 +1644,9 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     ps.like_btn.set_sensitive(false);
     ps.dislike_btn.set_sensitive(false);
     ps.menu_btn.set_sensitive(false);
+    if let Some(bridge) = ps.mpris.borrow().as_ref() {
+        bridge.sync_all(ps, state);
+    }
 }
 
 fn format_clock_time(t: ClockTime) -> String {
@@ -2956,6 +3296,7 @@ fn play_track(
                     tracking: None,
                 });
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
+                sync_mpris_all(&ps, &state);
 
                 // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();
@@ -3004,6 +3345,7 @@ fn play_track(
             *ps.chips.borrow_mut() = radio.chips;
             *ps.seed_video_id.borrow_mut() = video_id.clone();
             render_queue_panel(&ps, &state);
+            sync_mpris_transport(&ps, &state);
         }
     });
 }
@@ -3013,12 +3355,14 @@ fn queue_play_next(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
     let insert_at = ps.queue_index.get() + 1;
     ps.queue.borrow_mut().insert(insert_at, track);
     render_queue_panel(ps, state);
+    sync_mpris_transport(ps, state);
 }
 
 /// Append a track to the end of the queue.
 fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     ps.queue.borrow_mut().push(track);
     render_queue_panel(ps, state);
+    sync_mpris_transport(ps, state);
 }
 
 /// Remove a track from the queue by index, adjusting queue_index if needed.
@@ -3039,6 +3383,7 @@ fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>
     let state = state.clone();
     glib::idle_add_local_once(move || {
         render_queue_panel(&ps, &state);
+        sync_mpris_transport(&ps, &state);
     });
 }
 
@@ -3108,6 +3453,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     tracking: None,
                 });
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
+                sync_mpris_all(&ps, &state);
 
                 // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();
@@ -3610,6 +3956,7 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                 let state = state.clone();
                 glib::idle_add_local_once(move || {
                     render_queue_panel(&ps, &state);
+                    sync_mpris_transport(&ps, &state);
                 });
                 true
             });
@@ -3661,6 +4008,7 @@ fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlis
                 *ps.chips.borrow_mut() = radio.chips;
             }
             render_queue_panel(&ps, &state);
+            sync_mpris_transport(&ps, &state);
         }
     });
 }

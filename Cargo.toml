@@ -45,6 +45,7 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 # GStreamer audio playback
 gstreamer = "0.25"
 gstreamer-play = "0.25"
+mpris-server = "0.9"
 
 # Error handling
 anyhow = "1"

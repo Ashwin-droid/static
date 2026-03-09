@@ -59,6 +59,7 @@ struct AppState {
 
 /// Tracks the currently playing song so we can record listen time when navigating away.
 struct NowPlayingTrack {
+    session_id: u64,
     video_id: String,
     title: String,
     artist: String,
@@ -69,7 +70,6 @@ struct NowPlayingTrack {
 
 struct PreparedPlayback {
     uri: String,
-    tracking: Option<TrackingInfo>,
 }
 
 /// Minimum seconds listened before a play is recorded.
@@ -115,6 +115,7 @@ struct PlayerState {
     queue_panel: GtkBox,
     // Play tracking — records listen time when navigating away
     now_playing_track: RefCell<Option<NowPlayingTrack>>,
+    playback_session_id: Cell<u64>,
 }
 
 struct MainPageWidgets {
@@ -911,6 +912,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
         now_playing_track: RefCell::new(None),
+        playback_session_id: Cell::new(0),
     });
 
     // ======= WIRE SIGNALS =======
@@ -2581,6 +2583,36 @@ fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     }
 }
 
+fn spawn_playback_tracking(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    video_id: &str,
+    session_id: u64,
+) {
+    let state = state.clone();
+    let ps = ps.clone();
+    let video_id = video_id.to_string();
+
+    glib::spawn_future_local(async move {
+        let vid = video_id.clone();
+        let tracking = gio::spawn_blocking(move || {
+            app_client(&state).and_then(|ytm| ytm.start_playback_tracking(&vid))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(tracking) = tracking {
+            let mut now_playing = ps.now_playing_track.borrow_mut();
+            if let Some(current) = now_playing.as_mut() {
+                if current.session_id == session_id && current.video_id == video_id {
+                    current.tracking = Some(tracking);
+                }
+            }
+        }
+    });
+}
+
 async fn prepare_playback(
     state: &Arc<Mutex<AppState>>,
     video_id: &str,
@@ -2597,19 +2629,8 @@ async fn prepare_playback(
 
     if let Some(path) = cached_path {
         eprintln!("[CACHE] playing from offline: {}", path.display());
-
-        let state_tracking = state.clone();
-        let vid = video_id.to_string();
-        let tracking = gio::spawn_blocking(move || {
-            app_client(&state_tracking).and_then(|ytm| ytm.start_playback_tracking(&vid))
-        })
-        .await
-        .ok()
-        .flatten();
-
         return Ok(PreparedPlayback {
             uri: format!("file://{}", path.display()),
-            tracking,
         });
     }
 
@@ -2620,8 +2641,8 @@ async fn prepare_playback(
             return Err("Playback failed: not connected and no offline copy available".to_string());
         };
         client
-            .get_audio_url(&vid)
-            .map(|(uri, tracking)| PreparedPlayback { uri, tracking })
+            .get_audio_url_no_track(&vid)
+            .map(|uri| PreparedPlayback { uri })
             .map_err(|e| format!("Playback failed: {e}"))
     })
     .await
@@ -2685,14 +2706,18 @@ fn play_track(
                 ps.menu_btn.set_sensitive(true);
 
                 // Start tracking this song's listen time
+                let session_id = ps.playback_session_id.get().wrapping_add(1);
+                ps.playback_session_id.set(session_id);
                 *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
+                    session_id,
                     video_id: video_id.clone(),
                     title: title.clone(),
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
-                    tracking: prepared.tracking,
+                    tracking: None,
                 });
+                spawn_playback_tracking(&state, &ps, &video_id, session_id);
 
                 // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();
@@ -2795,14 +2820,18 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                 ps.menu_btn.set_sensitive(true);
 
                 // Start tracking this song's listen time
+                let session_id = ps.playback_session_id.get().wrapping_add(1);
+                ps.playback_session_id.set(session_id);
                 *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
+                    session_id,
                     video_id: video_id.clone(),
                     title: title.clone(),
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
                     started_at: Instant::now(),
-                    tracking: prepared.tracking,
+                    tracking: None,
                 });
+                spawn_playback_tracking(&state, &ps, &video_id, session_id);
 
                 // Trigger background sync (no play record — that happens on navigate-away)
                 let state_bg = state.clone();

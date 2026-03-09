@@ -323,16 +323,8 @@ impl YtMusicClient {
         })
     }
 
-    /// Returns (audio_url, tracking_info). The tracking_info should be used to report
-    /// watchtime when the user navigates away from the song.
-    pub fn get_audio_url(&self, video_id: &str) -> Result<(String, Option<TrackingInfo>)> {
-        let url = self.get_audio_url_no_track(video_id)?;
-        let tracking = self.rt.block_on(self.start_playback_tracking_async(video_id));
-        Ok((url, tracking))
-    }
-
-    /// Report playback start to YouTube and return tracking info, even when
-    /// playback is backed by the local cache rather than a network stream.
+    /// Report playback start to YouTube and return tracking info.
+    /// Call this off the playback-critical path so local files can start instantly.
     pub fn start_playback_tracking(&self, video_id: &str) -> Option<TrackingInfo> {
         self.rt.block_on(self.start_playback_tracking_async(video_id))
     }

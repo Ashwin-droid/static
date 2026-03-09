@@ -666,9 +666,13 @@ popover.context-menu > contents {
     color: #ffffff;
 }
 
+.content-dim-overlay {
+    background-color: rgba(5, 7, 14, 0.42);
+}
+
 /* Queue dim effect — all rows fade, focused row stays bright */
 .queue-ctx-active .queue-row-btn {
-    opacity: 0.25;
+    opacity: 0.42;
     transition: opacity 150ms ease;
 }
 .queue-ctx-active .queue-row-focused {

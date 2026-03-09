@@ -8,8 +8,8 @@ use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
     gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
-    DropTarget, Entry, GestureClick, Image, Label, Orientation, Paned, Picture, Popover, Scale,
-    ScrolledWindow, Separator, Stack, StackTransitionType,
+    DropTarget, Entry, GestureClick, Image, Label, Orientation, Overlay, Paned, Picture,
+    Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType,
 };
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
@@ -120,6 +120,7 @@ struct PlayerState {
     progress_slider: Scale,
     is_seeking: Cell<bool>,
     last_mpris_length_micros: Cell<Option<i64>>,
+    content_dimmer: GtkBox,
     // Transport
     prev_btn: Button,
     play_pause_btn: Button,
@@ -1091,7 +1092,23 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     content_box.set_margin_end(28);
 
     scrolled.set_child(Some(&content_box));
-    content_outer.append(&scrolled);
+
+    let content_overlay = Overlay::new();
+    content_overlay.set_hexpand(true);
+    content_overlay.set_vexpand(true);
+    content_overlay.set_child(Some(&scrolled));
+
+    let content_dimmer = GtkBox::new(Orientation::Vertical, 0);
+    content_dimmer.add_css_class("content-dim-overlay");
+    content_dimmer.set_hexpand(true);
+    content_dimmer.set_vexpand(true);
+    content_dimmer.set_halign(Align::Fill);
+    content_dimmer.set_valign(Align::Fill);
+    content_dimmer.set_visible(false);
+    content_dimmer.set_can_target(false);
+    content_overlay.add_overlay(&content_dimmer);
+
+    content_outer.append(&content_overlay);
 
     // ======= NOW PLAYING BAR (YTM-style) =======
     let np_bar = GtkBox::new(Orientation::Vertical, 0);
@@ -1275,6 +1292,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         progress_slider: progress_slider.clone(),
         is_seeking: Cell::new(false),
         last_mpris_length_micros: Cell::new(None),
+        content_dimmer: content_dimmer.clone(),
         prev_btn: prev_btn.clone(),
         play_pause_btn: play_pause_btn.clone(),
         next_btn: next_btn.clone(),
@@ -1659,6 +1677,10 @@ fn update_repeat_button_ui(btn: &Button, mode: RepeatMode) {
             btn.add_css_class("repeat-one-active");
         }
     }
+}
+
+fn set_content_dimming(ps: &PlayerState, dimmed: bool) {
+    ps.content_dimmer.set_visible(dimmed);
 }
 
 fn update_rating_buttons_ui(like_btn: &Button, dislike_btn: &Button, rating: SongRating) {
@@ -2935,6 +2957,61 @@ fn build_cover_card(
         });
     }
 
+    let popover = Popover::new();
+    popover.add_css_class("context-menu");
+    popover.set_has_arrow(false);
+    popover.set_position(gtk::PositionType::Bottom);
+
+    let pop_box = GtkBox::new(Orientation::Vertical, 0);
+
+    let play_next_btn = Button::with_label("Play next");
+    play_next_btn.add_css_class("popover-action-btn");
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        play_next_btn.connect_clicked(move |_| {
+            popover.popdown();
+            queue_play_next(track.clone(), &ps, &state);
+        });
+    }
+    pop_box.append(&play_next_btn);
+
+    let add_queue_btn = Button::with_label("Add to queue");
+    add_queue_btn.add_css_class("popover-action-btn");
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        add_queue_btn.connect_clicked(move |_| {
+            popover.popdown();
+            queue_add_to_end(track.clone(), &ps, &state);
+        });
+    }
+    pop_box.append(&add_queue_btn);
+
+    popover.set_child(Some(&pop_box));
+    popover.set_parent(&card_btn);
+
+    let gesture = GestureClick::new();
+    gesture.set_button(3);
+    {
+        let popover = popover.clone();
+        gesture.connect_pressed(move |_, _, _, _| {
+            popover.popup();
+        });
+    }
+    card_btn.add_controller(gesture);
+
+    {
+        let ps = ps.clone();
+        popover.connect_notify_local(Some("visible"), move |pop, _| {
+            set_content_dimming(&ps, pop.is_visible());
+        });
+    }
+
     card_btn
 }
 
@@ -3071,6 +3148,13 @@ fn build_track_row(
         });
     }
     wrapper.add_controller(gesture);
+
+    {
+        let ps = ps.clone();
+        popover.connect_notify_local(Some("visible"), move |pop, _| {
+            set_content_dimming(&ps, pop.is_visible());
+        });
+    }
 
     wrapper
 }

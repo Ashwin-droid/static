@@ -2621,19 +2621,22 @@ async fn prepare_playback(
     let vid = video_id.to_string();
     let cached_path = gio::spawn_blocking(move || {
         let guard = state_cache.lock().unwrap();
+        // Check offline cache first, then temp prefetch cache
         guard.cache.get_cached_audio(&vid)
+            .or_else(|| guard.cache.get_temp_audio(&vid))
     })
     .await
     .ok()
     .flatten();
 
     if let Some(path) = cached_path {
-        eprintln!("[CACHE] playing from offline: {}", path.display());
+        eprintln!("[CACHE] playing from local: {}", path.display());
         return Ok(PreparedPlayback {
             uri: format!("file://{}", path.display()),
         });
     }
 
+    // Not cached — get streaming URL, play it, and save to temp in the background
     let state_remote = state.clone();
     let vid = video_id.to_string();
     match gio::spawn_blocking(move || {
@@ -2642,12 +2645,33 @@ async fn prepare_playback(
         };
         client
             .get_audio_url_no_track(&vid)
-            .map(|uri| PreparedPlayback { uri })
             .map_err(|e| format!("Playback failed: {e}"))
     })
     .await
     {
-        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Ok(url)) => {
+            // Fire-and-forget: download to temp cache for rewind support
+            let state_bg = state.clone();
+            let vid_bg = video_id.to_string();
+            let url_bg = url.clone();
+            gio::spawn_blocking(move || {
+                let guard = state_bg.lock().unwrap();
+                if guard.cache.get_temp_audio(&vid_bg).is_some() {
+                    return; // already cached
+                }
+                drop(guard);
+                if let Ok(bytes) = DOWNLOAD_CLIENT
+                    .get(&url_bg)
+                    .header("Range", "bytes=0-")
+                    .send()
+                    .and_then(|r| r.bytes())
+                {
+                    let guard = state_bg.lock().unwrap();
+                    guard.cache.store_temp_audio(&vid_bg, &bytes);
+                }
+            });
+            Ok(PreparedPlayback { uri: url })
+        }
         Ok(Err(msg)) => Err(msg),
         Err(e) => Err(format!("Error: {e:?}")),
     }
@@ -2724,6 +2748,9 @@ fn play_track(
                 gio::spawn_blocking(move || {
                     sync_offline_cache(&state_bg);
                 });
+
+                // Prefetch next songs to temp cache
+                prefetch_upcoming(&state, &ps, ps.queue_index.get());
             }
             Err(msg) => {
                 ps.np_title.set_text(&msg);
@@ -2838,11 +2865,77 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                 gio::spawn_blocking(move || {
                     sync_offline_cache(&state_bg);
                 });
+
+                // Prefetch next songs to temp cache
+                prefetch_upcoming(&state, &ps, ps.queue_index.get());
             }
             Err(msg) => {
                 ps.np_title.set_text(&msg);
                 ps.np_artist.set_text("");
             }
+        }
+    });
+}
+
+/// Prefetch the next N songs in the queue to ~/Music/Static/temp/.
+/// No playback reporting — just download audio bytes to disk.
+fn prefetch_upcoming(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, from_index: usize) {
+    const PREFETCH_AHEAD: usize = 3;
+    let queue = ps.queue.borrow();
+    let mut to_fetch: Vec<(String, Option<String>)> = Vec::new();
+
+    for i in 1..=PREFETCH_AHEAD {
+        let idx = from_index + i;
+        if let Some(track) = queue.get(idx) {
+            to_fetch.push((track.video_id.clone(), track.thumbnail_url.clone()));
+        }
+    }
+    drop(queue);
+
+    if to_fetch.is_empty() {
+        return;
+    }
+
+    let state = state.clone();
+    gio::spawn_blocking(move || {
+        for (vid, _thumb_url) in &to_fetch {
+            // Skip if already in offline cache or temp cache
+            {
+                let guard = state.lock().unwrap();
+                if guard.cache.is_cached(vid) || guard.cache.get_temp_audio(vid).is_some() {
+                    continue;
+                }
+            }
+
+            // Get streaming URL (no playback reporting)
+            let url = {
+                let Some(client) = app_client(&state) else { return };
+                match client.get_audio_url_no_track(vid) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        eprintln!("[PREFETCH] failed URL for {vid}: {e}");
+                        continue;
+                    }
+                }
+            };
+
+            // Download audio bytes
+            let audio = match DOWNLOAD_CLIENT
+                .get(&url)
+                .header("Range", "bytes=0-")
+                .send()
+                .and_then(|r| r.bytes())
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("[PREFETCH] download failed for {vid}: {e}");
+                    continue;
+                }
+            };
+
+            // Write to temp dir (not pinned, not in offline DB)
+            let guard = state.lock().unwrap();
+            guard.cache.store_temp_audio(vid, &audio);
         }
     });
 }

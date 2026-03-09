@@ -13,6 +13,7 @@ pub struct MusicCache {
     db: Connection,
     offline_dir: PathBuf,
     pub art_dir: PathBuf,
+    temp_dir: PathBuf,
 }
 
 impl MusicCache {
@@ -28,6 +29,15 @@ impl MusicCache {
 
         let art_dir = base.join("offline/art");
         std::fs::create_dir_all(&art_dir)?;
+
+        let temp_dir = base.join("temp");
+        std::fs::create_dir_all(&temp_dir)?;
+        // Clean stale prefetch files on startup
+        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
 
         let db = Connection::open(base.join("data.db"))
             .context("Failed to open cache database")?;
@@ -78,7 +88,7 @@ impl MusicCache {
             );",
         )?;
 
-        Ok(Self { db, offline_dir, art_dir })
+        Ok(Self { db, offline_dir, art_dir, temp_dir })
     }
 
     // ── Play history ─────────────────────────────────────────────
@@ -363,6 +373,34 @@ impl MusicCache {
     #[allow(dead_code)]
     pub fn offline_dir(&self) -> &Path {
         &self.offline_dir
+    }
+
+    // ── Temp prefetch cache ──────────────────────────────────
+
+    /// Return the temp-cached path if this song has been prefetched.
+    pub fn get_temp_audio(&self, video_id: &str) -> Option<PathBuf> {
+        let path = self.temp_dir.join(format!("{video_id}.audio"));
+        path.exists().then_some(path)
+    }
+
+    /// Write prefetched audio to the temp directory.
+    pub fn store_temp_audio(&self, video_id: &str, data: &[u8]) {
+        let path = self.temp_dir.join(format!("{video_id}.audio"));
+        if let Err(e) = std::fs::write(&path, data) {
+            eprintln!("[PREFETCH] failed to write temp {video_id}: {e}");
+        } else {
+            eprintln!("[PREFETCH] cached {video_id} ({} KB)", data.len() / 1024);
+        }
+    }
+
+    /// Clear all temp prefetch files.
+    #[allow(dead_code)]
+    pub fn clear_temp(&self) {
+        if let Ok(entries) = std::fs::read_dir(&self.temp_dir) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
 }
 

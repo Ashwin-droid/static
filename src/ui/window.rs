@@ -476,8 +476,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         .vexpand(true)
         .hexpand(true)
         .build();
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    scrolled.set_min_content_width(0);
+    scrolled.set_propagate_natural_width(false);
 
     let content_box = GtkBox::new(Orientation::Vertical, 20);
+    content_box.set_hexpand(true);
+    content_box.set_halign(Align::Fill);
+    content_box.set_valign(Align::Start);
     content_box.set_margin_top(24);
     content_box.set_margin_bottom(24);
     content_box.set_margin_start(28);
@@ -1332,13 +1338,14 @@ fn load_playlists(
                 }
 
                 let flow = gtk::FlowBox::new();
+                flow.set_orientation(Orientation::Horizontal);
                 flow.set_homogeneous(false);
                 flow.set_min_children_per_line(1);
                 flow.set_max_children_per_line(12);
                 flow.set_column_spacing(14);
                 flow.set_row_spacing(14);
                 flow.set_selection_mode(gtk::SelectionMode::None);
-                flow.set_halign(Align::Start);
+                flow.set_halign(Align::Fill);
                 flow.set_valign(Align::Start);
                 flow.set_hexpand(true);
                 flow.set_margin_start(24);
@@ -1374,8 +1381,10 @@ fn build_playlist_card(
 ) -> Button {
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
+    card_btn.set_size_request(166, -1);
     card_btn.set_hexpand(false);
     card_btn.set_halign(Align::Start);
+    card_btn.set_valign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);
@@ -1556,6 +1565,10 @@ fn build_offline_playlist_card(
 ) -> Button {
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
+    card_btn.set_size_request(166, -1);
+    card_btn.set_hexpand(false);
+    card_btn.set_halign(Align::Start);
+    card_btn.set_valign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);

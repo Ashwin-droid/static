@@ -830,14 +830,23 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    let nav_buttons: Rc<[Button; 4]> = Rc::new([
+        home_btn.clone(),
+        likes_btn.clone(),
+        playlists_btn.clone(),
+        offline_btn.clone(),
+    ]);
+
     // Home button
     {
         let state = state.clone();
         let content_box = content_box.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
+        let nav = nav_buttons.clone();
 
-        home_btn.connect_clicked(move |_| {
+        home_btn.connect_clicked(move |btn| {
+            set_active_nav(btn, &nav);
             load_home(&state, &content_box, &ps, &recent_list);
         });
     }
@@ -848,8 +857,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let content_box = content_box.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
+        let nav = nav_buttons.clone();
 
-        likes_btn.connect_clicked(move |_| {
+        likes_btn.connect_clicked(move |btn| {
+            set_active_nav(btn, &nav);
             load_likes(&state, &content_box, &ps, &recent_list);
         });
     }
@@ -860,8 +871,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let content_box = content_box.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
+        let nav = nav_buttons.clone();
 
-        playlists_btn.connect_clicked(move |_| {
+        playlists_btn.connect_clicked(move |btn| {
+            set_active_nav(btn, &nav);
             load_playlists(&state, &content_box, &ps, &recent_list);
         });
     }
@@ -872,8 +885,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let content_box = content_box.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
+        let nav = nav_buttons.clone();
 
-        offline_btn.connect_clicked(move |_| {
+        offline_btn.connect_clicked(move |btn| {
+            set_active_nav(btn, &nav);
             load_offline(&state, &content_box, &ps, &recent_list);
         });
     }
@@ -912,6 +927,13 @@ fn nav_button(text: &str, active: bool) -> Button {
         btn.add_css_class("nav-item-active");
     }
     btn
+}
+
+fn set_active_nav(active: &Button, all: &[Button; 4]) {
+    for btn in all {
+        btn.remove_css_class("nav-item-active");
+    }
+    active.add_css_class("nav-item-active");
 }
 
 fn svg_image(svg_bytes: &[u8], size: i32) -> Image {

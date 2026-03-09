@@ -43,6 +43,17 @@ pub struct TrackingInfo {
     rt: *const tokio::runtime::Runtime,
 }
 
+struct PendingWatchtimeRequest {
+    url: String,
+    referer: String,
+    event_time: String,
+    request_time: String,
+    start_millis: u64,
+    watched_millis: u64,
+    state: String,
+    final_ping: bool,
+}
+
 // TrackingInfo contains a raw pointer to the runtime which lives in YtMusicClient
 // (always alive while AppState exists). We only use it from background threads via
 // report_watchtime which is called from gio::spawn_blocking.
@@ -90,7 +101,7 @@ impl TrackingInfo {
         listened_millis: u64,
         state: &str,
         final_ping: bool,
-    ) -> Option<(String, String, String, String)> {
+    ) -> Option<PendingWatchtimeRequest> {
         let watched = listened_millis.min(self.length_millis);
         if watched == 0 || watched <= start_millis {
             return None;
@@ -169,12 +180,48 @@ impl TrackingInfo {
             }
         }
 
-        Some((
-            url.into(),
-            self.referer_url.clone(),
-            now_unix_millis.to_string(),
-            now_unix_millis.to_string(),
-        ))
+        Some(PendingWatchtimeRequest {
+            url: url.into(),
+            referer: self.referer_url.clone(),
+            event_time: now_unix_millis.to_string(),
+            request_time: now_unix_millis.to_string(),
+            start_millis,
+            watched_millis: watched,
+            state: state.to_string(),
+            final_ping,
+        })
+    }
+
+    fn dispatch_watchtime_request(&self, request: PendingWatchtimeRequest) {
+        let rt = unsafe { &*self.rt };
+        let http = self.http.clone();
+        let auth = self.auth.clone();
+        let visitor_id = self.visitor_id.clone();
+        rt.spawn(async move {
+            let mut req = http
+                .get(&request.url)
+                .header("referer", request.referer)
+                .header("x-goog-authuser", "0")
+                .header("x-goog-event-time", request.event_time)
+                .header("x-goog-request-time", request.request_time);
+            if let Some(auth) = &auth {
+                req = req.header("authorization", auth.clone());
+            }
+            if let Some(visitor_id) = &visitor_id {
+                req = req.header("x-goog-visitor-id", visitor_id);
+            }
+            match req.send().await {
+                Ok(r) => eprintln!(
+                    "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
+                    request.start_millis,
+                    request.watched_millis,
+                    request.state,
+                    request.final_ping,
+                    r.status()
+                ),
+                Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
+            }
+        });
     }
 
     fn send_watchtime_range(
@@ -185,7 +232,7 @@ impl TrackingInfo {
         final_ping: bool,
     ) {
         let watched = listened_millis.min(self.length_millis);
-        let Some((full, referer, event_time, request_time)) =
+        let Some(request) =
             self.build_watchtime_request(start_millis, listened_millis, state, final_ping)
         else {
             return;
@@ -194,38 +241,7 @@ impl TrackingInfo {
         if !final_ping {
             self.last_reported_millis.store(watched, Ordering::Relaxed);
         }
-
-        // Safety: the runtime outlives all TrackingInfo instances (lives in YtMusicClient in AppState)
-        let rt = unsafe { &*self.rt };
-        let http = self.http.clone();
-        let auth = self.auth.clone();
-        let visitor_id = self.visitor_id.clone();
-        let state = state.to_string();
-        rt.spawn(async move {
-            let mut req = http
-                .get(&full)
-                .header("referer", referer)
-                .header("x-goog-authuser", "0")
-                .header("x-goog-event-time", event_time)
-                .header("x-goog-request-time", request_time);
-            if let Some(auth) = &auth {
-                req = req.header("authorization", auth.clone());
-            }
-            if let Some(visitor_id) = &visitor_id {
-                req = req.header("x-goog-visitor-id", visitor_id);
-            }
-            match req.send().await {
-                Ok(r) => eprintln!(
-                    "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
-                    start_millis,
-                    watched,
-                    state,
-                    final_ping,
-                    r.status()
-                ),
-                Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
-            }
-        });
+        self.dispatch_watchtime_request(request);
     }
 
     pub fn maybe_report_watchtime(&self, listened_millis: u64) {
@@ -250,14 +266,47 @@ impl TrackingInfo {
     pub fn report_watchtime(&self, listened_millis: u64) {
         let last_reported_millis = self.last_reported_millis.load(Ordering::Relaxed);
         let watched = listened_millis.min(self.length_millis);
-        self.send_watchtime_range(last_reported_millis, watched, "paused", false);
-
-        let near_end_threshold = self.length_millis.saturating_sub(1_500);
-        if watched >= near_end_threshold {
-            let final_start = watched.saturating_sub(7);
-            let final_end = watched.max(final_start + 1);
-            self.send_watchtime_range(final_start, final_end, "paused", true);
+        let paused_request =
+            self.build_watchtime_request(last_reported_millis, watched, "paused", false);
+        if paused_request.is_some() {
+            self.last_reported_millis.store(watched, Ordering::Relaxed);
         }
+
+        let final_start = watched.saturating_sub(7);
+        let final_end = watched.max(final_start + 1);
+        let final_request = self.build_watchtime_request(final_start, final_end, "paused", true);
+
+        let rt = unsafe { &*self.rt };
+        let http = self.http.clone();
+        let auth = self.auth.clone();
+        let visitor_id = self.visitor_id.clone();
+        rt.spawn(async move {
+            for request in [paused_request, final_request].into_iter().flatten() {
+                let mut req = http
+                    .get(&request.url)
+                    .header("referer", request.referer)
+                    .header("x-goog-authuser", "0")
+                    .header("x-goog-event-time", request.event_time)
+                    .header("x-goog-request-time", request.request_time);
+                if let Some(auth) = &auth {
+                    req = req.header("authorization", auth.clone());
+                }
+                if let Some(visitor_id) = &visitor_id {
+                    req = req.header("x-goog-visitor-id", visitor_id);
+                }
+                match req.send().await {
+                    Ok(r) => eprintln!(
+                        "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
+                        request.start_millis,
+                        request.watched_millis,
+                        request.state,
+                        request.final_ping,
+                        r.status()
+                    ),
+                    Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
+                }
+            }
+        });
     }
 }
 

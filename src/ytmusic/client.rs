@@ -24,6 +24,31 @@ const VR_OAUTH_CLIENT_SECRET: &str = "3fTWrBJI5Uojm1TK7_iJCW5Z";
 const VR_OAUTH_TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token?prettyPrint=false";
 const VR_OAUTH_DEVICE_CODE_URL: &str = "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SongRating {
+    Like,
+    Dislike,
+    Indifferent,
+}
+
+impl SongRating {
+    fn endpoint(self) -> &'static str {
+        match self {
+            SongRating::Like => "like/like",
+            SongRating::Dislike => "like/dislike",
+            SongRating::Indifferent => "like/removelike",
+        }
+    }
+
+    fn from_ytmusic(value: &str) -> Self {
+        match value {
+            "LIKE" => SongRating::Like,
+            "DISLIKE" => SongRating::Dislike,
+            _ => SongRating::Indifferent,
+        }
+    }
+}
+
 /// Holds the watchtime tracking URL so we can report real listen time on navigate-away.
 pub struct TrackingInfo {
     http: reqwest::Client,
@@ -553,6 +578,49 @@ impl YtMusicClient {
         })
     }
 
+    pub fn get_song_rating(&self, video_id: &str) -> Result<SongRating> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["videoId"] = json!(video_id);
+            body["playlistId"] = json!(format!("RDAMVM{video_id}"));
+            body["isAudioOnly"] = json!(true);
+            body["tunerSettingValue"] = json!("AUTOMIX_SETTING_NORMAL");
+
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/next?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to fetch song rating")?;
+
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse song rating response")?;
+
+            Ok(Self::find_like_status(&json)
+                .map(SongRating::from_ytmusic)
+                .unwrap_or(SongRating::Indifferent))
+        })
+    }
+
+    pub fn rate_song(&self, video_id: &str, rating: SongRating) -> Result<()> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["target"] = json!({ "videoId": video_id });
+
+            self.post(&format!("{YTM_BASE_URL}/{}?{YTM_PARAMS}", rating.endpoint()))
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("Failed to submit rating for {video_id}"))?
+                .error_for_status()
+                .with_context(|| format!("YouTube Music rejected rating for {video_id}"))?;
+
+            Ok(())
+        })
+    }
+
     /// Start a radio from a video, or switch to a different radio filter.
     ///
     /// - To start the default radio: `get_radio("VIDEO_ID", None, None)`
@@ -896,6 +964,18 @@ impl YtMusicClient {
             .await
             .context("Failed to fetch player data")?;
         resp.json().await.context("Failed to parse player response")
+    }
+
+    fn find_like_status(value: &Value) -> Option<&str> {
+        if let Some(status) = value.get("likeStatus").and_then(|status| status.as_str()) {
+            return Some(status);
+        }
+
+        match value {
+            Value::Array(items) => items.iter().find_map(Self::find_like_status),
+            Value::Object(map) => map.values().find_map(Self::find_like_status),
+            _ => None,
+        }
     }
 
     fn best_audio_format(json: &Value) -> Result<&Value> {

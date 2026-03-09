@@ -631,7 +631,9 @@ popover > contents {
    ============================================= */
 
 .repeat-active,
-.repeat-one-active {
+.repeat-one-active,
+.like-active,
+.dislike-active {
     opacity: 1;
     background-color: rgba(130, 160, 255, 0.12);
 }
@@ -672,4 +674,3 @@ popover.context-menu > contents {
 .queue-ctx-active .queue-row-focused {
     opacity: 1;
 }
-

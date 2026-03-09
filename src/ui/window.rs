@@ -35,7 +35,7 @@ const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 use crate::cache::MusicCache;
 use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, Track};
 use crate::player::Player;
-use crate::ytmusic::client::TrackingInfo;
+use crate::ytmusic::client::{SongRating, TrackingInfo};
 use crate::ytmusic::YtMusicClient;
 
 const KEYRING_SERVICE: &str = "com.static.music";
@@ -96,6 +96,7 @@ struct NowPlayingTrack {
     title: String,
     artist: String,
     thumb_url: Option<String>,
+    rating: SongRating,
     started_at: Instant,
     awaiting_fresh_position: bool,
     tracking: Option<TrackingInfo>,
@@ -1392,6 +1393,31 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    // Like / dislike
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        like_btn.connect_clicked(move |_| {
+            let next_rating = match current_rating(&ps) {
+                SongRating::Like => SongRating::Indifferent,
+                _ => SongRating::Like,
+            };
+            submit_song_rating(&state, &ps, next_rating);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        dislike_btn.connect_clicked(move |_| {
+            let next_rating = match current_rating(&ps) {
+                SongRating::Dislike => SongRating::Indifferent,
+                _ => SongRating::Dislike,
+            };
+            submit_song_rating(&state, &ps, next_rating);
+        });
+    }
+
     // Position update timer (250ms) + auto-advance
     {
         let ps = ps.clone();
@@ -1635,6 +1661,25 @@ fn update_repeat_button_ui(btn: &Button, mode: RepeatMode) {
     }
 }
 
+fn update_rating_buttons_ui(like_btn: &Button, dislike_btn: &Button, rating: SongRating) {
+    like_btn.remove_css_class("like-active");
+    dislike_btn.remove_css_class("dislike-active");
+
+    match rating {
+        SongRating::Like => like_btn.add_css_class("like-active"),
+        SongRating::Dislike => dislike_btn.add_css_class("dislike-active"),
+        SongRating::Indifferent => {}
+    }
+}
+
+fn current_rating(ps: &PlayerState) -> SongRating {
+    ps.now_playing_track
+        .borrow()
+        .as_ref()
+        .map(|track| track.rating)
+        .unwrap_or(SongRating::Indifferent)
+}
+
 /// Set queue context (radio vs playlist) and reset repeat mode if needed.
 fn set_queue_context(ps: &PlayerState, is_radio: bool) {
     ps.queue_is_radio.set(is_radio);
@@ -1676,6 +1721,7 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     ps.next_btn.set_sensitive(false);
     ps.like_btn.set_sensitive(false);
     ps.dislike_btn.set_sensitive(false);
+    update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
     ps.menu_btn.set_sensitive(false);
     if let Some(bridge) = ps.mpris.borrow().as_ref() {
         bridge.sync_all(ps, state);
@@ -1729,6 +1775,81 @@ fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime) {
     });
 
     ps.is_seeking.set(false);
+}
+
+fn apply_song_rating(ps: &Rc<PlayerState>, session_id: u64, rating: SongRating) {
+    let mut now_playing = ps.now_playing_track.borrow_mut();
+    let Some(track) = now_playing.as_mut() else {
+        return;
+    };
+    if track.session_id != session_id {
+        return;
+    }
+    track.rating = rating;
+    update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, rating);
+}
+
+fn spawn_song_rating_sync(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    video_id: &str,
+    session_id: u64,
+) {
+    let state = state.clone();
+    let ps = ps.clone();
+    let video_id = video_id.to_string();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let video_id_bg = video_id.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_song_rating(&video_id_bg))
+        })
+        .await;
+
+        match result {
+            Ok(Some(Ok(rating))) => apply_song_rating(&ps, session_id, rating),
+            Ok(Some(Err(err))) => eprintln!("[RATING] failed to fetch rating for {video_id}: {err}"),
+            _ => {}
+        }
+    });
+}
+
+fn submit_song_rating(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    desired_rating: SongRating,
+) {
+    let Some((session_id, video_id, previous_rating)) = ps
+        .now_playing_track
+        .borrow()
+        .as_ref()
+        .map(|track| (track.session_id, track.video_id.clone(), track.rating))
+    else {
+        return;
+    };
+
+    apply_song_rating(ps, session_id, desired_rating);
+
+    let state = state.clone();
+    let ps = ps.clone();
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let video_id_bg = video_id.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.rate_song(&video_id_bg, desired_rating))
+        })
+        .await;
+
+        match result {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(err))) => {
+                eprintln!("[RATING] failed to set rating for {video_id}: {err}");
+                apply_song_rating(&ps, session_id, previous_rating);
+            }
+            _ => apply_song_rating(&ps, session_id, previous_rating),
+        }
+    });
 }
 
 fn current_listened_millis(ps: &PlayerState, track: &NowPlayingTrack) -> u64 {
@@ -3383,11 +3504,14 @@ fn play_track(
                     title: title.clone(),
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
+                    rating: SongRating::Indifferent,
                     started_at: Instant::now(),
                     awaiting_fresh_position: true,
                     tracking: None,
                 });
+                update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
+                spawn_song_rating_sync(&state, &ps, &video_id, session_id);
                 sync_mpris_all(&ps, &state);
 
                 // Trigger background sync (no play record — that happens on navigate-away)
@@ -3541,11 +3665,14 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     title: title.clone(),
                     artist: artist.clone(),
                     thumb_url: thumb_url.clone(),
+                    rating: SongRating::Indifferent,
                     started_at: Instant::now(),
                     awaiting_fresh_position: true,
                     tracking: None,
                 });
+                update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
+                spawn_song_rating_sync(&state, &ps, &video_id, session_id);
                 sync_mpris_all(&ps, &state);
 
                 // Trigger background sync (no play record — that happens on navigate-away)

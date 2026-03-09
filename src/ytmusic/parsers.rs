@@ -47,14 +47,13 @@ fn parse_carousel_shelf(shelf: &Value) -> Option<HomeSection> {
         .and_then(|t| t.as_str())?
         .to_string();
 
-    let items = shelf
-        .pointer("/contents")
-        .and_then(|c| c.as_array())?;
+    let items = shelf.pointer("/contents").and_then(|c| c.as_array())?;
 
     let tracks: Vec<Track> = items
         .iter()
         .filter_map(|item| {
-            let renderer = item.get("musicTwoRowItemRenderer")
+            let renderer = item
+                .get("musicTwoRowItemRenderer")
                 .or_else(|| item.get("musicResponsiveListItemRenderer"))?;
             parse_track_from_renderer(renderer)
         })
@@ -72,9 +71,7 @@ fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
         .and_then(|t| t.as_str())?
         .to_string();
 
-    let items = shelf
-        .pointer("/contents")
-        .and_then(|c| c.as_array())?;
+    let items = shelf.pointer("/contents").and_then(|c| c.as_array())?;
 
     let tracks: Vec<Track> = items
         .iter()
@@ -135,21 +132,7 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
         .and_then(|c| c.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
         .and_then(|r| r.as_array())
     {
-        runs.iter()
-            .filter(|run| {
-                run.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
-                    .and_then(|p| p.as_str())
-                    .is_some_and(|p| p == "MUSIC_PAGE_TYPE_ARTIST")
-            })
-            .filter_map(|run| {
-                Some(Artist {
-                    name: run.get("text")?.as_str()?.to_string(),
-                    id: run.pointer("/navigationEndpoint/browseEndpoint/browseId")
-                        .and_then(|b| b.as_str())
-                        .map(String::from),
-                })
-            })
-            .collect()
+        extract_artists_from_runs(runs)
     } else {
         vec![]
     };
@@ -179,27 +162,36 @@ fn extract_artists_from_subtitle(renderer: &Value) -> Vec<Artist> {
         return vec![];
     };
 
-    // First try: artists with navigation endpoints (clickable)
-    let navigable: Vec<Artist> = runs
+    extract_artists_from_runs(runs)
+}
+
+fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
+    let artists: Vec<Artist> = runs
         .iter()
-        .filter(|run| run.get("navigationEndpoint").is_some())
+        .filter(|run| {
+            run.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| p == "MUSIC_PAGE_TYPE_ARTIST")
+        })
         .filter_map(|run| {
             Some(Artist {
-                name: run.get("text")?.as_str()?.to_string(),
+                name: run.get("text")?.as_str()?.trim().to_string(),
                 id: run
                     .pointer("/navigationEndpoint/browseEndpoint/browseId")
                     .and_then(|b| b.as_str())
                     .map(String::from),
             })
         })
+        .filter(|artist| !artist.name.is_empty())
         .collect();
 
-    if !navigable.is_empty() {
-        return navigable;
+    if !artists.is_empty() {
+        return artists;
     }
 
-    // Fallback: concatenate all non-separator subtitle runs as artist name.
-    // Subtitle format is typically "Artist • Album • Duration" — take the first segment.
+    // Fallback for history/video rows that only expose uploader text such as
+    // "Channel Name • 40M views". We still take the first subtitle segment so
+    // the UI shows the best available label instead of "Unknown artist".
     let full_text: String = runs
         .iter()
         .filter_map(|run| run.get("text")?.as_str())
@@ -217,14 +209,19 @@ fn extract_artists_from_subtitle(renderer: &Value) -> Vec<Artist> {
     if artist_name.is_empty() {
         vec![]
     } else {
-        vec![Artist { name: artist_name, id: None }]
+        vec![Artist {
+            name: artist_name,
+            id: None,
+        }]
     }
 }
 
 fn extract_thumbnail(renderer: &Value) -> Option<String> {
     renderer
         .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails")
-        .or_else(|| renderer.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails"))
+        .or_else(|| {
+            renderer.pointer("/thumbnailRenderer/musicThumbnailRenderer/thumbnail/thumbnails")
+        })
         .and_then(|t| t.as_array())
         .and_then(|thumbs| thumbs.last())
         .and_then(|t| t.get("url"))
@@ -263,6 +260,139 @@ pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
     Ok(tracks)
 }
 
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_track_from_renderer;
+
+    #[test]
+    fn responsive_history_items_fall_back_to_user_channel_name() {
+        let renderer = json!({
+            "flexColumns": [
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Nightcore - Cheap Thrills",
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {
+                                            "videoId": "ffUxkjW5GMY"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Evercore ",
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {
+                                            "browseId": "UCdOr-hoBc8cJsBvgUjNQlMw",
+                                            "browseEndpointContextSupportedConfigs": {
+                                                "browseEndpointContextMusicConfig": {
+                                                    "pageType": "MUSIC_PAGE_TYPE_USER_CHANNEL"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "text": " • " },
+                                { "text": "62M views" }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("history track should parse");
+        assert_eq!(track.artists.len(), 1);
+        assert_eq!(track.artists[0].name, "Evercore");
+        assert_eq!(track.artists[0].id, None);
+    }
+
+    #[test]
+    fn responsive_items_prefer_explicit_artist_runs() {
+        let renderer = json!({
+            "flexColumns": [
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Small Palm of the Hand",
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {
+                                            "videoId": "example123"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "riya",
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {
+                                            "browseId": "UCZlQlnbAOW3HVSCtDzhFLog",
+                                            "browseEndpointContextSupportedConfigs": {
+                                                "browseEndpointContextMusicConfig": {
+                                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "text": " & " },
+                                {
+                                    "text": "VISUAL ARTS / Key",
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {
+                                            "browseId": "UCgTaSNshxaxU52vJa6Pe47A",
+                                            "browseEndpointContextSupportedConfigs": {
+                                                "browseEndpointContextMusicConfig": {
+                                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                                { "text": " • " },
+                                { "text": "Single" }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("track should parse");
+        assert_eq!(track.artists.len(), 2);
+        assert_eq!(track.artists[0].name, "riya");
+        assert_eq!(
+            track.artists[0].id.as_deref(),
+            Some("UCZlQlnbAOW3HVSCtDzhFLog")
+        );
+        assert_eq!(track.artists[1].name, "VISUAL ARTS / Key");
+        assert_eq!(
+            track.artists[1].id.as_deref(),
+            Some("UCgTaSNshxaxU52vJa6Pe47A")
+        );
+    }
+}
+
 /// Parse the `/next` response into a RadioQueue with tracks, chips, and continuation token.
 pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
     let mqr = json.pointer(
@@ -270,8 +400,7 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
          /watchNextTabbedResultsRenderer/tabs/0/tabRenderer/content/musicQueueRenderer",
     );
 
-    let playlist = mqr
-        .and_then(|m| m.pointer("/content/playlistPanelRenderer"));
+    let playlist = mqr.and_then(|m| m.pointer("/content/playlistPanelRenderer"));
 
     let playlist_id = playlist
         .and_then(|p| p["playlistId"].as_str())
@@ -287,7 +416,8 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                 .filter_map(|item| {
                     let r = item.get("playlistPanelVideoRenderer")?;
                     let video_id = r["videoId"].as_str()?.to_string();
-                    let title = r.pointer("/title/runs/0/text")
+                    let title = r
+                        .pointer("/title/runs/0/text")
                         .and_then(|t| t.as_str())
                         .unwrap_or("Unknown")
                         .to_string();
@@ -298,23 +428,33 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                                 .filter(|run| run.get("text").is_some())
                                 .map(|run| Artist {
                                     name: run["text"].as_str().unwrap_or("").to_string(),
-                                    id: run.pointer("/navigationEndpoint/browseEndpoint/browseId")
+                                    id: run
+                                        .pointer("/navigationEndpoint/browseEndpoint/browseId")
                                         .and_then(|b| b.as_str())
                                         .map(String::from),
                                 })
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let duration = r.pointer("/lengthText/runs/0/text")
+                    let duration = r
+                        .pointer("/lengthText/runs/0/text")
                         .and_then(|d| d.as_str())
                         .map(String::from);
-                    let thumbnail_url = r.pointer("/thumbnail/thumbnails")
+                    let thumbnail_url = r
+                        .pointer("/thumbnail/thumbnails")
                         .and_then(|t| t.as_array())
                         .and_then(|a| a.last())
                         .and_then(|t| t["url"].as_str())
                         .map(String::from);
 
-                    Some(Track { video_id, title, artists, album: None, duration, thumbnail_url })
+                    Some(Track {
+                        video_id,
+                        title,
+                        artists,
+                        album: None,
+                        duration,
+                        thumbnail_url,
+                    })
                 })
                 .collect()
         })
@@ -328,7 +468,8 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
             arr.iter()
                 .filter_map(|chip| {
                     let r = chip.get("chipCloudChipRenderer")?;
-                    let label = r.pointer("/text/runs/0/text")
+                    let label = r
+                        .pointer("/text/runs/0/text")
                         .and_then(|t| t.as_str())?
                         .to_string();
                     let watch_ep = r.pointer(
@@ -336,7 +477,11 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                     )?;
                     let playlist_id = watch_ep["playlistId"].as_str()?.to_string();
                     let params = watch_ep["params"].as_str().map(String::from);
-                    Some(RadioChip { label, playlist_id, params })
+                    Some(RadioChip {
+                        label,
+                        playlist_id,
+                        params,
+                    })
                 })
                 .collect()
         })
@@ -348,7 +493,12 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
         .and_then(|c| c.as_str())
         .map(String::from);
 
-    Ok(RadioQueue { playlist_id, tracks, chips, continuation })
+    Ok(RadioQueue {
+        playlist_id,
+        tracks,
+        chips,
+        continuation,
+    })
 }
 
 pub fn parse_playlist_tracks(json: &Value) -> Result<Vec<Track>> {
@@ -404,7 +554,9 @@ pub fn parse_library_playlists(json: &Value) -> Result<Vec<PlaylistSummary>> {
             .and_then(|b| b.as_str())
             .map(|id| id.strip_prefix("VL").unwrap_or(id).to_string());
 
-        let Some(playlist_id) = playlist_id else { continue };
+        let Some(playlist_id) = playlist_id else {
+            continue;
+        };
 
         let title = renderer
             .pointer("/title/runs/0/text")

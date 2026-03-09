@@ -1256,28 +1256,21 @@ fn load_playlists(
                     return;
                 }
 
-                let cards_box = GtkBox::new(Orientation::Horizontal, 14);
-                cards_box.set_margin_top(4);
-                cards_box.set_margin_bottom(8);
-                cards_box.set_halign(Align::Start);
+                let cols = 5;
+                let grid = gtk::Grid::new();
+                grid.set_column_spacing(14);
+                grid.set_row_spacing(14);
+                grid.set_column_homogeneous(true);
+                grid.set_margin_start(24);
+                grid.set_margin_end(24);
+                grid.set_margin_top(8);
 
-                let flow = gtk::FlowBox::new();
-                flow.set_homogeneous(false);
-                flow.set_column_spacing(14);
-                flow.set_row_spacing(14);
-                flow.set_max_children_per_line(6);
-                flow.set_min_children_per_line(2);
-                flow.set_margin_start(24);
-                flow.set_margin_end(24);
-                flow.set_margin_top(8);
-                flow.set_selection_mode(gtk::SelectionMode::None);
-
-                for playlist in &playlists {
+                for (i, playlist) in playlists.iter().enumerate() {
                     let card = build_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
-                    flow.insert(&card, -1);
+                    grid.attach(&card, (i % cols) as i32, (i / cols) as i32, 1, 1);
                 }
 
-                content_box.append(&flow);
+                content_box.append(&grid);
             }
             Ok(Some(Err(e))) => {
                 content_box.append(&Label::new(Some(&format!("Error: {e}"))));
@@ -1301,21 +1294,26 @@ fn build_playlist_card(
 ) -> Button {
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
+    card_btn.set_hexpand(false);
+    card_btn.set_halign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);
+    card.set_hexpand(false);
 
     let art_container = GtkBox::new(Orientation::Vertical, 0);
     art_container.add_css_class("cover-art");
     art_container.set_size_request(150, 150);
+    art_container.set_hexpand(false);
     art_container.set_overflow(gtk::Overflow::Hidden);
 
     if let Some(url) = &playlist.thumbnail_url {
         let picture = Picture::new();
         picture.set_keep_aspect_ratio(false);
         picture.set_size_request(150, 150);
+        picture.set_hexpand(false);
         art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 300);
+        load_thumbnail_into(&picture, url, 150);
     } else {
         let initial = playlist.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
         let letter = Label::new(Some(&initial));

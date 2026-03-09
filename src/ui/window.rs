@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
@@ -117,6 +118,7 @@ struct PlayerState {
     // Progress
     progress_slider: Scale,
     is_seeking: Cell<bool>,
+    last_mpris_length_micros: Cell<Option<i64>>,
     // Transport
     prev_btn: Button,
     play_pause_btn: Button,
@@ -231,20 +233,19 @@ impl MprisBridge {
 
         {
             let ps = ps.clone();
-            player.connect_seek(move |player, offset| {
+            player.connect_seek(move |_, offset| {
                 let Some(current) = ps.player.position() else {
                     return;
                 };
                 let current_us = (current.nseconds() / 1_000) as i64;
                 let target_us = (current_us + offset.as_micros()).max(0) as u64;
-                ps.player.seek(ClockTime::from_useconds(target_us));
-                player.set_position(MprisTime::from_micros(target_us as i64));
+                apply_seek_position(&ps, ClockTime::from_useconds(target_us));
             });
         }
 
         {
             let ps = ps.clone();
-            player.connect_set_position(move |player, track_id, position| {
+            player.connect_set_position(move |_, track_id, position| {
                 let now_playing = ps.now_playing_track.borrow();
                 let Some(current) = now_playing.as_ref() else {
                     return;
@@ -253,8 +254,7 @@ impl MprisBridge {
                     return;
                 }
                 let target_us = position.as_micros().max(0) as u64;
-                ps.player.seek(ClockTime::from_useconds(target_us));
-                player.set_position(MprisTime::from_micros(target_us as i64));
+                apply_seek_position(&ps, ClockTime::from_useconds(target_us));
             });
         }
 
@@ -390,6 +390,10 @@ fn sync_mpris_position(ps: &Rc<PlayerState>) {
     with_mpris(ps, |bridge| bridge.sync_position(ps));
 }
 
+fn sync_mpris_metadata(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    with_mpris(ps, |bridge| bridge.sync_metadata(ps.as_ref(), state));
+}
+
 fn sync_mpris_volume(ps: &Rc<PlayerState>) {
     with_mpris(ps, |bridge| bridge.sync_volume(ps));
 }
@@ -465,8 +469,21 @@ fn build_mpris_metadata(ps: &PlayerState, state: &Arc<Mutex<AppState>>) -> Metad
         builder = builder.artist(vec![track.artist.clone()]);
     }
 
-    if let Some(duration) = ps.player.duration() {
-        builder = builder.length(MprisTime::from_micros((duration.nseconds() / 1_000) as i64));
+    let duration_micros = ps
+        .player
+        .duration()
+        .map(|duration| (duration.nseconds() / 1_000) as i64)
+        .or_else(|| {
+            ps.queue
+                .borrow()
+                .iter()
+                .find(|candidate| candidate.video_id == track.video_id)
+                .and_then(|candidate| candidate.duration.as_deref())
+                .and_then(parse_duration_text_to_micros)
+        });
+
+    if let Some(duration_micros) = duration_micros {
+        builder = builder.length(MprisTime::from_micros(duration_micros));
     }
 
     let art_url = state
@@ -481,6 +498,17 @@ fn build_mpris_metadata(ps: &PlayerState, state: &Arc<Mutex<AppState>>) -> Metad
     }
 
     builder.build()
+}
+
+fn parse_duration_text_to_micros(duration: &str) -> Option<i64> {
+    let mut total_secs: u64 = 0;
+    let mut saw_component = false;
+    for component in duration.split(':') {
+        let value = component.trim().parse::<u64>().ok()?;
+        total_secs = total_secs.checked_mul(60)?.checked_add(value)?;
+        saw_component = true;
+    }
+    saw_component.then_some((total_secs.checked_mul(1_000_000)?) as i64)
 }
 
 fn store_cookie(cookie: &str) -> Result<(), keyring::Error> {
@@ -1245,6 +1273,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         player: Player::new(),
         progress_slider: progress_slider.clone(),
         is_seeking: Cell::new(false),
+        last_mpris_length_micros: Cell::new(None),
         prev_btn: prev_btn.clone(),
         play_pause_btn: play_pause_btn.clone(),
         next_btn: next_btn.clone(),
@@ -1346,12 +1375,10 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     {
         let ps = ps.clone();
         progress_slider.connect_change_value(move |_, _, value| {
-            ps.is_seeking.set(true);
             if let Some(duration) = ps.player.duration() {
                 let target = ClockTime::from_nseconds((value * duration.nseconds() as f64) as u64);
-                ps.player.seek(target);
+                apply_seek_position(&ps, target);
             }
-            ps.is_seeking.set(false);
             glib::Propagation::Proceed
         });
     }
@@ -1377,6 +1404,11 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
             let pos = ps.player.position();
             let dur = ps.player.duration();
+            let duration_micros = dur.map(|duration| (duration.nseconds() / 1_000) as i64);
+            if ps.last_mpris_length_micros.get() != duration_micros {
+                ps.last_mpris_length_micros.set(duration_micros);
+                sync_mpris_metadata(&ps, &state);
+            }
 
             if let (Some(pos), Some(dur)) = (pos, dur) {
                 let dur_ns = dur.nseconds();
@@ -1631,6 +1663,7 @@ fn play_from_context(
 fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     flush_play_record(ps, state);
     ps.player.stop();
+    ps.last_mpris_length_micros.set(None);
     ps.np_title.set_text("Nothing playing");
     ps.np_artist.set_text("");
     ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
@@ -1654,6 +1687,48 @@ fn format_clock_time(t: ClockTime) -> String {
     let mins = total_secs / 60;
     let secs = total_secs % 60;
     format!("{mins}:{secs:02}")
+}
+
+fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime) {
+    let clamped_target = ps
+        .player
+        .duration()
+        .map(|duration| {
+            ClockTime::from_nseconds(target.nseconds().min(duration.nseconds()))
+        })
+        .unwrap_or(target);
+
+    ps.is_seeking.set(true);
+    ps.player.seek(clamped_target);
+
+    if let Some(duration) = ps.player.duration() {
+        let duration_ns = duration.nseconds();
+        if duration_ns > 0 {
+            let frac = clamped_target.nseconds() as f64 / duration_ns as f64;
+            ps.progress_slider.set_value(frac.clamp(0.0, 1.0));
+        }
+        ps.time_label.set_text(&format!(
+            "{} / {}",
+            format_clock_time(clamped_target),
+            format_clock_time(duration),
+        ));
+    }
+
+    let position_micros = (clamped_target.nseconds() / 1_000) as i64;
+    with_mpris(ps, |bridge| {
+        bridge
+            .player
+            .set_position(MprisTime::from_micros(position_micros));
+        let bridge = bridge.clone();
+        glib::spawn_future_local(async move {
+            let _ = bridge
+                .player
+                .seeked(MprisTime::from_micros(position_micros))
+                .await;
+        });
+    });
+
+    ps.is_seeking.set(false);
 }
 
 fn current_listened_millis(ps: &PlayerState, track: &NowPlayingTrack) -> u64 {
@@ -1787,10 +1862,10 @@ fn load_search(
     });
 }
 
-fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>, Vec<Track>) {
+fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>, Vec<Track>, Vec<Track>) {
     let guard = state.lock().unwrap();
 
-    let offline_playlists = guard
+    let offline_playlists: Vec<PlaylistSummary> = guard
         .cache
         .offline_playlists()
         .unwrap_or_default()
@@ -1815,7 +1890,7 @@ fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>
         })
         .collect();
 
-    let tracks = guard
+    let all_tracks: Vec<Track> = guard
         .cache
         .offline_tracks()
         .unwrap_or_default()
@@ -1845,7 +1920,23 @@ fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>
         })
         .collect();
 
-    (offline_playlists, tracks)
+    let playlist_track_ids: HashSet<String> = offline_playlists
+        .iter()
+        .flat_map(|playlist| {
+            guard
+                .cache
+                .offline_playlist_track_ids(&playlist.playlist_id)
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let display_tracks = all_tracks
+        .iter()
+        .filter(|track| !playlist_track_ids.contains(&track.video_id))
+        .cloned()
+        .collect();
+
+    (offline_playlists, display_tracks, all_tracks)
 }
 
 fn load_offline_playlist_tracks(state: &Arc<Mutex<AppState>>, playlist_id: &str) -> Vec<Track> {
@@ -1911,7 +2002,7 @@ fn load_offline(
         clear_box(&content_box);
 
         match result {
-            Ok((offline_playlists, tracks)) => {
+            Ok((offline_playlists, tracks, _playable_tracks)) => {
                 if tracks.is_empty() && offline_playlists.is_empty() {
                     let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
                     empty.add_css_class("dim-label");
@@ -3285,6 +3376,7 @@ fn play_track(
                 // Start tracking this song's listen time
                 let session_id = ps.playback_session_id.get().wrapping_add(1);
                 ps.playback_session_id.set(session_id);
+                ps.last_mpris_length_micros.set(None);
                 *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
                     session_id,
                     video_id: video_id.clone(),
@@ -3442,6 +3534,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                 // Start tracking this song's listen time
                 let session_id = ps.playback_session_id.get().wrapping_add(1);
                 ps.playback_session_id.set(session_id);
+                ps.last_mpris_length_micros.set(None);
                 *ps.now_playing_track.borrow_mut() = Some(NowPlayingTrack {
                     session_id,
                     video_id: video_id.clone(),

@@ -9,6 +9,9 @@ pub struct AppSettings {
     pub chromium_cookie_path: String,
     pub auto_manage_offline_cache: bool,
     pub offline_cache_target: u32,
+    pub offline_rewatch_threshold: u32,
+    pub score_decay_window_days: u32,
+    pub minimum_offline_score: f64,
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
@@ -21,6 +24,9 @@ impl Default for AppSettings {
             chromium_cookie_path: String::new(),
             auto_manage_offline_cache: true,
             offline_cache_target: 100,
+            offline_rewatch_threshold: 1,
+            score_decay_window_days: 30,
+            minimum_offline_score: 0.0,
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
@@ -241,6 +247,15 @@ impl MusicCache {
                 "offline_cache_target" => {
                     settings.offline_cache_target = row.1.parse::<u32>().ok().unwrap_or(settings.offline_cache_target).clamp(0, 500);
                 }
+                "offline_rewatch_threshold" => {
+                    settings.offline_rewatch_threshold = row.1.parse::<u32>().ok().unwrap_or(settings.offline_rewatch_threshold).clamp(0, 50);
+                }
+                "score_decay_window_days" => {
+                    settings.score_decay_window_days = row.1.parse::<u32>().ok().unwrap_or(settings.score_decay_window_days).clamp(1, 365);
+                }
+                "minimum_offline_score" => {
+                    settings.minimum_offline_score = row.1.parse::<f64>().ok().unwrap_or(settings.minimum_offline_score).clamp(0.0, 999.0);
+                }
                 "prefetch_enabled" => {
                     settings.prefetch_enabled = parse_bool_setting(&row.1, settings.prefetch_enabled);
                 }
@@ -265,6 +280,9 @@ impl MusicCache {
             ("chromium_cookie_path", settings.chromium_cookie_path.clone()),
             ("auto_manage_offline_cache", bool_setting(settings.auto_manage_offline_cache)),
             ("offline_cache_target", settings.offline_cache_target.to_string()),
+            ("offline_rewatch_threshold", settings.offline_rewatch_threshold.to_string()),
+            ("score_decay_window_days", settings.score_decay_window_days.to_string()),
+            ("minimum_offline_score", settings.minimum_offline_score.to_string()),
             ("prefetch_enabled", bool_setting(settings.prefetch_enabled)),
             ("prefetch_ahead", settings.prefetch_ahead.to_string()),
             (
@@ -309,23 +327,58 @@ impl MusicCache {
         Ok(())
     }
 
-    /// Top-N most played video IDs, ranked by a time-decayed score.
-    /// Score = play_count / (1 + days_since_last_played / 30).
-    /// Songs not played recently decay, so current favorites are prioritized.
-    /// Only includes songs played more than once.
-    pub fn top_played(&self, limit: usize) -> Result<Vec<String>> {
+    pub fn auto_offline_candidates(&self, settings: &AppSettings, limit: usize) -> Result<Vec<String>> {
         let now = epoch_secs();
+        let min_total_plays = settings.offline_rewatch_threshold.saturating_add(1).max(1);
+        let decay_window_days = settings.score_decay_window_days.max(1) as f64;
+        let min_score = settings.minimum_offline_score.max(0.0);
+
         let mut stmt = self.db.prepare(
-            "SELECT video_id FROM plays
-             WHERE play_count >= 2
-             ORDER BY CAST(play_count AS REAL) / (1.0 + (?2 - last_played) / 2592000.0) DESC
-             LIMIT ?1",
+            "SELECT video_id, play_count, last_played
+             FROM plays
+             WHERE play_count >= ?1",
         )?;
-        let ids = stmt
-            .query_map(rusqlite::params![limit as i64, now], |row| row.get(0))?
-            .filter_map(|r| r.ok())
+        let mut ranked = stmt
+            .query_map([min_total_plays as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .filter_map(|row| row.ok())
+            .filter_map(|(video_id, play_count, last_played)| {
+                let days_since = ((now - last_played).max(0) as f64) / 86_400.0;
+                let score = play_count as f64 / (1.0 + (days_since / decay_window_days));
+                (score >= min_score).then_some((video_id, score))
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|(_, left), (_, right)| {
+            right
+                .partial_cmp(left)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let ids = ranked
+            .into_iter()
+            .take(limit)
+            .map(|(video_id, _)| video_id)
             .collect();
         Ok(ids)
+    }
+
+    pub fn auto_download_eviction_count(&self, settings: &AppSettings) -> Result<usize> {
+        let candidates = self
+            .auto_offline_candidates(settings, settings.offline_cache_target as usize)?
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let cached = self.cached_ids()?;
+        let pinned = self.pinned_ids()?;
+        Ok(cached
+            .into_iter()
+            .filter(|video_id| !pinned.contains(video_id) && !candidates.contains(video_id))
+            .count())
     }
 
     // ── Offline cache ────────────────────────────────────────────

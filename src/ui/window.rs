@@ -622,6 +622,53 @@ where
     guard.settings = settings;
 }
 
+fn persist_and_sync_settings<F>(state: &Arc<Mutex<AppState>>, updater: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut AppSettings),
+{
+    {
+        let mut guard = state.lock().unwrap();
+        let mut settings = guard.settings.clone();
+        updater(&mut settings);
+        guard.cache.save_settings(&settings)?;
+        guard.settings = settings;
+    }
+    sync_offline_cache(state);
+    Ok(())
+}
+
+fn preview_auto_cache_evictions<F>(state: &Arc<Mutex<AppState>>, updater: F) -> anyhow::Result<usize>
+where
+    F: FnOnce(&mut AppSettings),
+{
+    let guard = state.lock().unwrap();
+    let mut settings = guard.settings.clone();
+    updater(&mut settings);
+    Ok(guard.cache.auto_download_eviction_count(&settings)?)
+}
+
+fn build_settings_warning_dialog(
+    stack: &Stack,
+    title: &str,
+    secondary_text: &str,
+    accept_label: &str,
+) -> MessageDialog {
+    let dialog = MessageDialog::builder()
+        .modal(true)
+        .message_type(MessageType::Warning)
+        .text(title)
+        .secondary_text(secondary_text)
+        .build();
+    dialog.add_css_class("settings-warning-dialog");
+    if let Some(window) = stack.root().and_then(|root| root.downcast::<ApplicationWindow>().ok()) {
+        dialog.set_transient_for(Some(&window));
+    }
+    dialog.add_button("Cancel", ResponseType::Cancel);
+    dialog.add_button(accept_label, ResponseType::Accept);
+    dialog.set_default_response(ResponseType::Cancel);
+    dialog
+}
+
 fn persist_storage_root_override(state: &Arc<Mutex<AppState>>, raw_root: &str) -> anyhow::Result<()> {
     let trimmed = raw_root.trim().to_string();
     let mut guard = state.lock().unwrap();
@@ -2303,7 +2350,10 @@ fn load_settings_page(
 
             let active = sw.is_active();
             if active {
-                update_app_settings(&state, |s| s.auto_manage_offline_cache = true);
+                let state = state.clone();
+                gio::spawn_blocking(move || {
+                    let _ = persist_and_sync_settings(&state, |s| s.auto_manage_offline_cache = true);
+                });
                 return;
             }
 
@@ -2311,24 +2361,36 @@ fn load_settings_page(
             sw.set_active(true);
             guard_flag_closure.set(false);
 
-            let dialog = MessageDialog::builder()
-                .modal(true)
-                .message_type(MessageType::Warning)
-                .text("Turn off local cache?")
-                .secondary_text("Auto-downloaded songs will be deleted from Static’s local cache. Manually pinned downloads stay right where they are.")
-                .build();
-            dialog.add_css_class("settings-warning-dialog");
-            if let Some(window) = stack.root().and_then(|root| root.downcast::<ApplicationWindow>().ok()) {
-                dialog.set_transient_for(Some(&window));
-            }
-            dialog.add_button("Cancel", ResponseType::Cancel);
-            dialog.add_button("Delete auto-downloaded songs", ResponseType::Accept);
-            dialog.set_default_response(ResponseType::Cancel);
-
             let state = state.clone();
             let sw = sw.clone();
             let guard_flag = guard_flag.clone();
+            let stack_for_dialog = stack.clone();
             glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || {
+                        let guard = state.lock().unwrap();
+                        let cached = guard.cache.cached_ids().unwrap_or_default();
+                        let pinned = guard.cache.pinned_ids().unwrap_or_default();
+                        cached
+                            .into_iter()
+                            .filter(|video_id| !pinned.contains(video_id))
+                            .count()
+                    }
+                })
+                .await
+                .unwrap_or(0);
+
+                let song_label = if impact == 1 { "song" } else { "songs" };
+                let dialog = build_settings_warning_dialog(
+                    &stack_for_dialog,
+                    "Turn off local cache?",
+                    &format!(
+                        "{impact} auto-downloaded {song_label} will be deleted from Static’s local cache. Manually pinned downloads stay right where they are."
+                    ),
+                    &format!("Delete {impact} auto-downloaded {song_label}"),
+                );
+
                 let response = dialog.run_future().await;
                 dialog.close();
 
@@ -2393,13 +2455,335 @@ fn load_settings_page(
     target_spin.set_value(settings.offline_cache_target as f64);
     {
         let state = state.clone();
+        let stack = stack.clone();
+        let target_spin_ref = target_spin.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
         target_spin.connect_value_changed(move |spin| {
-            let value = spin.value() as u32;
-            update_app_settings(&state, |s| s.offline_cache_target = value.min(500));
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = (spin.value() as u32).min(500);
+            let current_value = app_settings(&state).offline_cache_target;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let target_spin = target_spin_ref.clone();
+            let guard_flag = guard_flag.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || preview_auto_cache_evictions(&state, |s| s.offline_cache_target = next_value)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change = |guard_flag: &Rc<Cell<bool>>, target_spin: &SpinButton, value: u32| {
+                    guard_flag.set(true);
+                    target_spin.set_value(value as f64);
+                    guard_flag.set(false);
+                };
+
+                if next_value < current_value && impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack,
+                        "Lower the auto-cache target?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately to honor the smaller offline library size."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &target_spin, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.offline_cache_target = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &target_spin, next_value),
+                    _ => apply_change(&guard_flag, &target_spin, current_value),
+                }
+            });
         });
     }
     target_row.append(&target_spin);
     offline_section.append(&target_row);
+
+    let replay_row = GtkBox::new(Orientation::Horizontal, 12);
+    replay_row.add_css_class("settings-row");
+    let replay_copy = GtkBox::new(Orientation::Vertical, 2);
+    replay_copy.set_hexpand(true);
+    let replay_label = Label::new(Some("Offline after rewatches"));
+    replay_label.add_css_class("settings-row-title");
+    replay_label.set_halign(Align::Start);
+    replay_copy.append(&replay_label);
+    let replay_hint = Label::new(Some("How many rewatches a song needs before it becomes eligible for auto-offline caching."));
+    replay_hint.add_css_class("settings-row-copy");
+    replay_hint.set_wrap(true);
+    replay_hint.set_halign(Align::Start);
+    replay_copy.append(&replay_hint);
+    replay_row.append(&replay_copy);
+    let replay_spin = SpinButton::with_range(0.0, 50.0, 1.0);
+    replay_spin.set_value(settings.offline_rewatch_threshold as f64);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let replay_spin_ref = replay_spin.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        replay_spin.connect_value_changed(move |spin| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = (spin.value() as u32).min(50);
+            let current_value = app_settings(&state).offline_rewatch_threshold;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let replay_spin = replay_spin_ref.clone();
+            let guard_flag = guard_flag.clone();
+            let stack_for_dialog = stack.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || preview_auto_cache_evictions(&state, |s| s.offline_rewatch_threshold = next_value)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change = |guard_flag: &Rc<Cell<bool>>, replay_spin: &SpinButton, value: u32| {
+                    guard_flag.set(true);
+                    replay_spin.set_value(value as f64);
+                    guard_flag.set(false);
+                };
+
+                if impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack_for_dialog,
+                        "Raise the offline replay threshold?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they no longer qualify for offline caching."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &replay_spin, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.offline_rewatch_threshold = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &replay_spin, next_value),
+                    _ => apply_change(&guard_flag, &replay_spin, current_value),
+                }
+            });
+        });
+    }
+    replay_row.append(&replay_spin);
+    offline_section.append(&replay_row);
+
+    let decay_row = GtkBox::new(Orientation::Horizontal, 12);
+    decay_row.add_css_class("settings-row");
+    let decay_copy = GtkBox::new(Orientation::Vertical, 2);
+    decay_copy.set_hexpand(true);
+    let decay_label = Label::new(Some("Score decay window"));
+    decay_label.add_css_class("settings-row-title");
+    decay_label.set_halign(Align::Start);
+    decay_copy.append(&decay_label);
+    let decay_hint = Label::new(Some("How slowly songs cool off after their last play. Lower means faster decay, higher means old favorites stick around longer."));
+    decay_hint.add_css_class("settings-row-copy");
+    decay_hint.set_wrap(true);
+    decay_hint.set_halign(Align::Start);
+    decay_copy.append(&decay_hint);
+    decay_row.append(&decay_copy);
+    let decay_spin = SpinButton::with_range(1.0, 365.0, 1.0);
+    decay_spin.set_value(settings.score_decay_window_days as f64);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let decay_spin_ref = decay_spin.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        decay_spin.connect_value_changed(move |spin| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = (spin.value() as u32).clamp(1, 365);
+            let current_value = app_settings(&state).score_decay_window_days;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let decay_spin = decay_spin_ref.clone();
+            let guard_flag = guard_flag.clone();
+            let stack_for_dialog = stack.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || preview_auto_cache_evictions(&state, |s| s.score_decay_window_days = next_value)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change = |guard_flag: &Rc<Cell<bool>>, decay_spin: &SpinButton, value: u32| {
+                    guard_flag.set(true);
+                    decay_spin.set_value(value as f64);
+                    guard_flag.set(false);
+                };
+
+                if impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack_for_dialog,
+                        "Tighten score decay?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because the new decay window would knock them below the offline cutoff."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &decay_spin, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.score_decay_window_days = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &decay_spin, next_value),
+                    _ => apply_change(&guard_flag, &decay_spin, current_value),
+                }
+            });
+        });
+    }
+    decay_row.append(&decay_spin);
+    offline_section.append(&decay_row);
+
+    let score_row = GtkBox::new(Orientation::Horizontal, 12);
+    score_row.add_css_class("settings-row");
+    let score_copy = GtkBox::new(Orientation::Vertical, 2);
+    score_copy.set_hexpand(true);
+    let score_label = Label::new(Some("Minimum offline score"));
+    score_label.add_css_class("settings-row-title");
+    score_label.set_halign(Align::Start);
+    score_copy.append(&score_label);
+    let score_hint = Label::new(Some("Anything below this score is ignored for downloads and evicted if it is already auto-downloaded. `0` keeps the current behavior."));
+    score_hint.add_css_class("settings-row-copy");
+    score_hint.set_wrap(true);
+    score_hint.set_halign(Align::Start);
+    score_copy.append(&score_hint);
+    score_row.append(&score_copy);
+    let score_spin = SpinButton::with_range(0.0, 999.0, 0.1);
+    score_spin.set_digits(1);
+    score_spin.set_value(settings.minimum_offline_score);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let score_spin_ref = score_spin.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        score_spin.connect_value_changed(move |spin| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = (spin.value() * 10.0).round() / 10.0;
+            let current_value = app_settings(&state).minimum_offline_score;
+            if (next_value - current_value).abs() < f64::EPSILON {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let score_spin = score_spin_ref.clone();
+            let guard_flag = guard_flag.clone();
+            let stack_for_dialog = stack.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || preview_auto_cache_evictions(&state, |s| s.minimum_offline_score = next_value)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change = |guard_flag: &Rc<Cell<bool>>, score_spin: &SpinButton, value: f64| {
+                    guard_flag.set(true);
+                    score_spin.set_value(value);
+                    guard_flag.set(false);
+                };
+
+                if impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack_for_dialog,
+                        "Raise the minimum offline score?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they would fall below the new score floor."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &score_spin, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.minimum_offline_score = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &score_spin, next_value),
+                    _ => apply_change(&guard_flag, &score_spin, current_value),
+                }
+            });
+        });
+    }
+    score_row.append(&score_spin);
+    offline_section.append(&score_row);
 
     let storage_root_row = GtkBox::new(Orientation::Vertical, 8);
     storage_root_row.add_css_class("settings-row");
@@ -5556,10 +5940,10 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         if !enabled {
             return;
         }
-        let top = match guard.cache.top_played(cache_target) {
+        let top = match guard.cache.auto_offline_candidates(&guard.settings, cache_target) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("[CACHE] failed to get top played: {e}");
+                eprintln!("[CACHE] failed to compute offline candidates: {e}");
                 return;
             }
         };

@@ -112,6 +112,7 @@ struct NowPlayingTrack {
     rating: SongRating,
     started_at: Instant,
     awaiting_fresh_position: bool,
+    last_observed_position_millis: u64,
     tracking: Option<TrackingInfo>,
 }
 
@@ -1948,6 +1949,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             }
 
             if let (Some(pos), Some(dur)) = (pos, dur) {
+                note_playback_position(&ps, pos.nseconds() / 1_000_000);
                 let dur_ns = dur.nseconds();
                 if dur_ns > 0 {
                     let frac = pos.nseconds() as f64 / dur_ns as f64;
@@ -2785,6 +2787,7 @@ fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime) {
 
     ps.is_seeking.set(true);
     ps.player.seek(clamped_target);
+    note_playback_position(ps, clamped_target.nseconds() / 1_000_000);
 
     if let Some(duration) = ps.player.duration() {
         let duration_ns = duration.nseconds();
@@ -2892,11 +2895,24 @@ fn submit_song_rating(
 }
 
 fn current_listened_millis(ps: &PlayerState, track: &NowPlayingTrack) -> u64 {
-    ps.player
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
+    let current_position_millis = ps.player
         .position()
         .map(|pos| pos.nseconds() / 1_000_000)
-        .filter(|millis| *millis > 0)
-        .unwrap_or_else(|| track.started_at.elapsed().as_millis() as u64)
+        .filter(|millis| *millis > 0);
+
+    match current_position_millis {
+        Some(current_position_millis)
+            if track.last_observed_position_millis > current_position_millis + 1_500
+                && current_position_millis < 5_000
+                && session_elapsed_millis > current_position_millis + 1_500 =>
+        {
+            track.last_observed_position_millis
+        }
+        Some(current_position_millis) => current_position_millis,
+        None if track.last_observed_position_millis > 0 => track.last_observed_position_millis,
+        None => session_elapsed_millis,
+    }
 }
 
 fn maybe_flush_watchtime_progress(ps: &PlayerState) {
@@ -2926,6 +2942,7 @@ fn maybe_flush_watchtime_progress(ps: &PlayerState) {
     let listened = player_position_millis
         .filter(|millis| *millis > 0)
         .unwrap_or(session_elapsed_millis);
+    track.last_observed_position_millis = listened;
     if let Some(tracking) = track.tracking.as_ref() {
         tracking.maybe_report_watchtime(listened);
     }
@@ -4498,6 +4515,18 @@ fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
     url.filter(|value| !value.starts_with("file://"))
 }
 
+fn note_playback_position(ps: &PlayerState, position_millis: u64) {
+    if position_millis == 0 {
+        return;
+    }
+
+    let mut now_playing = ps.now_playing_track.borrow_mut();
+    let Some(track) = now_playing.as_mut() else {
+        return;
+    };
+    track.last_observed_position_millis = position_millis;
+}
+
 /// Flush the current now-playing track.
 /// We always report any non-zero watchtime we have to YouTube, while the local
 /// play-history DB keeps its higher threshold for counting a play.
@@ -4733,6 +4762,7 @@ fn play_track(
                     rating: SongRating::Indifferent,
                     started_at: Instant::now(),
                     awaiting_fresh_position: true,
+                    last_observed_position_millis: 0,
                     tracking: None,
                 });
                 update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
@@ -4894,6 +4924,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     rating: SongRating::Indifferent,
                     started_at: Instant::now(),
                     awaiting_fresh_position: true,
+                    last_observed_position_millis: 0,
                     tracking: None,
                 });
                 update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);

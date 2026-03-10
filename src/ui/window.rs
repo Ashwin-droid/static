@@ -1,9 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use anyhow::Context;
 use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
@@ -15,6 +18,10 @@ use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
     Player as MprisPlayer, Time as MprisTime, TrackId,
 };
+use pbkdf2::pbkdf2_hmac;
+use rusqlite::Connection as SqliteConnection;
+use sha1::Sha1;
+use zbus::{blocking::Connection as ZbusConnection, zvariant::{OwnedObjectPath, OwnedValue, Value}};
 
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
 const ICON_PLAY: &[u8] = include_bytes!("../../assets/icons/play.svg");
@@ -41,6 +48,9 @@ use crate::ytmusic::YtMusicClient;
 const KEYRING_SERVICE: &str = "com.static.music";
 const KEYRING_USER: &str = "cookie";
 const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
+
+type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
+type SecretResponse = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
 
 static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
     reqwest::blocking::Client::builder()
@@ -574,6 +584,264 @@ fn get_vr_refresh_token() -> Option<String> {
     entry.get_password().ok()
 }
 
+fn candidate_edge_cookie_paths() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".config/microsoft-edge"));
+        roots.push(home.join(".config/microsoft-edge-beta"));
+        roots.push(home.join(".config/microsoft-edge-dev"));
+        roots.push(home.join(".config/microsoft-edge-nightly"));
+        roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge"));
+        roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-beta"));
+        roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-dev"));
+        roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-nightly"));
+    }
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        candidates.push(root.join("Default/Cookies"));
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("Profile "))
+                {
+                    candidates.push(path.join("Cookies"));
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn newest_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|path| path.is_file())
+        .max_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+        })
+}
+
+fn chromium_safe_storage_password() -> anyhow::Result<String> {
+    let connection = ZbusConnection::session().context("Failed to open session bus")?;
+
+    for schema in [
+        "chrome_libsecret_os_crypt_password_v2",
+        "chrome_libsecret_os_crypt_password_v1",
+    ] {
+        for application in ["chromium", "chrome"] {
+            let mut attrs = HashMap::<&str, &str>::new();
+            attrs.insert("xdg:schema", schema);
+            attrs.insert("application", application);
+
+            let search = connection.call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "SearchItems",
+                &attrs,
+            )?;
+            let (unlocked, locked): (Vec<OwnedObjectPath>, Vec<OwnedObjectPath>) =
+                search.body().deserialize()?;
+
+            let object_path = if let Some(path) = unlocked.first() {
+                path.clone()
+            } else if let Some(path) = locked.first() {
+                let unlock = connection.call_method(
+                    Some("org.freedesktop.secrets"),
+                    "/org/freedesktop/secrets",
+                    Some("org.freedesktop.Secret.Service"),
+                    "Unlock",
+                    &(vec![path.clone()]),
+                )?;
+                let (unlocked_paths, _prompt): (Vec<OwnedObjectPath>, OwnedObjectPath) =
+                    unlock.body().deserialize()?;
+                if let Some(unlocked_path) = unlocked_paths.first() {
+                    unlocked_path.clone()
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            let open_session = connection.call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "OpenSession",
+                &("plain", Value::new("")),
+            )?;
+            let (_output, session): (OwnedValue, OwnedObjectPath) = open_session.body().deserialize()?;
+
+            let secrets = connection.call_method(
+                Some("org.freedesktop.secrets"),
+                "/org/freedesktop/secrets",
+                Some("org.freedesktop.Secret.Service"),
+                "GetSecrets",
+                &(vec![object_path.clone()], session),
+            )?;
+            let reply: HashMap<OwnedObjectPath, SecretResponse> = secrets.body().deserialize()?;
+            if let Some(secret) = reply.get(&object_path).map(|entry| &entry.2) {
+                return String::from_utf8(secret.clone()).context("Invalid Chromium secret encoding");
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!("No Chromium safe-storage secret found"))
+}
+
+fn chromium_cookie_key(password: &str) -> [u8; 16] {
+    let mut output = [0u8; 16];
+    pbkdf2_hmac::<Sha1>(password.as_bytes(), b"saltysalt", 1, &mut output);
+    output
+}
+
+fn decrypt_chromium_cookie(value: String, encrypted_value: Vec<u8>, keys: &[[u8; 16]]) -> Option<String> {
+    if !value.is_empty() {
+        return Some(value);
+    }
+    if encrypted_value.len() < 4 {
+        return None;
+    }
+
+    let prefix = &encrypted_value[..3];
+    if prefix != b"v10" && prefix != b"v11" && prefix != b"v20" {
+        return None;
+    }
+
+    let payload = &encrypted_value[3..];
+    let iv = [b' '; 16];
+
+    for key in keys {
+        let cipher = Aes128CbcDec::new(&(*key).into(), &iv.into());
+        let mut buffer = payload.to_vec();
+        if let Ok(plaintext) = cipher.decrypt_padded_mut::<Pkcs7>(&mut buffer) {
+            if let Ok(text) = String::from_utf8(plaintext.to_vec()) {
+                return Some(text);
+            }
+            if plaintext.len() > 32 {
+                if let Ok(text) = String::from_utf8(plaintext[32..].to_vec()) {
+                    return Some(text);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn load_cookie_from_edge_profile() -> anyhow::Result<Option<String>> {
+    let db_path = match newest_existing_path(candidate_edge_cookie_paths()) {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+
+    let temp_db = std::env::temp_dir().join(format!("static-edge-cookies-{}.db", uuid::Uuid::new_v4()));
+    std::fs::copy(&db_path, &temp_db)
+        .with_context(|| format!("Failed to copy Edge cookie DB from {}", db_path.display()))?;
+
+    let result = (|| -> anyhow::Result<Option<String>> {
+        let password = chromium_safe_storage_password()?;
+        let keys = [
+            chromium_cookie_key(&password),
+            chromium_cookie_key("peanuts"),
+            chromium_cookie_key(""),
+        ];
+
+        let conn = SqliteConnection::open(&temp_db)?;
+        let mut stmt = conn.prepare(
+            "SELECT host_key, name, value, CAST(encrypted_value AS BLOB)
+             FROM cookies
+             WHERE host_key LIKE '%youtube.com%'
+             ORDER BY CASE WHEN host_key LIKE '%music.youtube.com%' THEN 0 ELSE 1 END, host_key DESC, name ASC",
+        )?;
+
+        let mut rows = stmt.query([])?;
+        let mut seen = HashSet::new();
+        let mut cookie_pairs = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            let value: String = row.get(2)?;
+            let encrypted_value: Vec<u8> = row.get(3)?;
+            let Some(decrypted) = decrypt_chromium_cookie(value, encrypted_value, &keys) else {
+                continue;
+            };
+            if decrypted.is_empty() || !seen.insert(name.clone()) {
+                continue;
+            }
+            cookie_pairs.push((name, decrypted));
+        }
+
+        if cookie_pairs.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            cookie_pairs
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        ))
+    })();
+
+    let _ = std::fs::remove_file(&temp_db);
+    result
+}
+
+async fn validate_cookie_and_build_client(
+    cookie: String,
+    source_label: &str,
+) -> Option<Arc<YtMusicClient>> {
+    let client = match YtMusicClient::new(&cookie) {
+        Ok(client) => Arc::new(client),
+        Err(err) => {
+            eprintln!("[AUTH] {source_label}: invalid cookie: {err}");
+            return None;
+        }
+    };
+
+    let check_client = client.clone();
+    let auth_result = gio::spawn_blocking(move || check_client.check_auth()).await;
+    match auth_result {
+        Ok(Ok(true)) => Some(client),
+        Ok(Ok(false)) => {
+            eprintln!("[AUTH] {source_label}: cookie is not authenticated");
+            None
+        }
+        Ok(Err(err)) => {
+            eprintln!("[AUTH] {source_label}: auth check failed: {err}");
+            None
+        }
+        Err(err) => {
+            eprintln!("[AUTH] {source_label}: auth worker failed: {err:?}");
+            None
+        }
+    }
+}
+
+async fn activate_authenticated_client(
+    client: Arc<YtMusicClient>,
+    state: &Arc<Mutex<AppState>>,
+    stack: &Stack,
+) {
+    if let Ok(Some(vr_token)) = gio::spawn_blocking(get_vr_refresh_token).await {
+        client.set_vr_refresh_token(&vr_token);
+    }
+    state.lock().unwrap().client = Some(client);
+    stack.set_visible_child_name("main");
+}
+
 pub fn build_window(app: &Application) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -621,11 +889,10 @@ pub fn build_window(app: &Application) {
         let content_box = main_widgets.content_box.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
-        let loaded = Rc::new(RefCell::new(false));
 
         stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-            if stack.visible_child_name().as_deref() == Some("main") && !*loaded.borrow() {
-                *loaded.borrow_mut() = true;
+            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some() {
+                clear_box(&content_box);
                 load_home(&state, &content_box, &ps, &recent_list);
                 load_sidebar_history(&state, &recent_list, &ps);
             }
@@ -637,20 +904,28 @@ pub fn build_window(app: &Application) {
         let stack = stack.clone();
         let state = state.clone();
         glib::spawn_future_local(async move {
-            let cookie = gio::spawn_blocking(get_cookie).await;
-            if let Ok(Some(cookie)) = cookie {
-                match YtMusicClient::new(&cookie) {
-                    Ok(ytm) => {
-                        // Load VR refresh token if available
-                        if let Ok(Some(vr_token)) = gio::spawn_blocking(get_vr_refresh_token).await {
-                            ytm.set_vr_refresh_token(&vr_token);
-                        }
-                        state.lock().unwrap().client = Some(Arc::new(ytm));
-                        stack.set_visible_child_name("main");
+            if let Ok(Some(cookie)) = gio::spawn_blocking(get_cookie).await {
+                if let Some(client) = validate_cookie_and_build_client(cookie, "keyring cookie").await {
+                    activate_authenticated_client(client, &state, &stack).await;
+                    return;
+                }
+                let _ = gio::spawn_blocking(delete_cookie).await;
+            }
+
+            match gio::spawn_blocking(load_cookie_from_edge_profile).await {
+                Ok(Ok(Some(edge_cookie))) => {
+                    if let Some(client) = validate_cookie_and_build_client(edge_cookie.clone(), "Edge cookie auto-sync").await {
+                        let cookie_to_store = edge_cookie.clone();
+                        let _ = gio::spawn_blocking(move || store_cookie(&cookie_to_store)).await;
+                        activate_authenticated_client(client, &state, &stack).await;
                     }
-                    Err(_) => {
-                        let _ = gio::spawn_blocking(delete_cookie).await;
-                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
+                    eprintln!("[AUTH] Edge cookie auto-sync failed: {err}");
+                }
+                Err(err) => {
+                    eprintln!("[AUTH] Edge cookie auto-sync worker failed: {err:?}");
                 }
             }
         });

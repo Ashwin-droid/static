@@ -9,7 +9,7 @@ use gtk::prelude::*;
 use gtk::{
     gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
     DropTarget, Entry, GestureClick, Image, Label, Orientation, Overlay, Paned, Picture,
-    Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType,
+    Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType, WidgetPaintable,
 };
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
@@ -144,6 +144,8 @@ struct PlayerState {
     queue: RefCell<Vec<Track>>,
     queue_index: Cell<usize>,
     queue_is_radio: Cell<bool>,
+    queue_drag_source_index: Cell<Option<usize>>,
+    queue_drop_preview_slot: Cell<Option<usize>>,
     chips: RefCell<Vec<RadioChip>>,
     seed_video_id: RefCell<String>,
     // Queue panel widgets
@@ -165,6 +167,25 @@ struct MainPageWidgets {
     content_box: GtkBox,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum QueueDragPayload {
+    QueueRow { index: usize },
+    Track { track: Track },
+    Playlist {
+        playlist_id: String,
+        title: String,
+        thumbnail_url: Option<String>,
+        subtitle: Option<String>,
+        source: QueuePlaylistSource,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum QueuePlaylistSource {
+    Remote,
+    Offline,
 }
 
 impl MprisBridge {
@@ -1309,6 +1330,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue: RefCell::new(Vec::new()),
         queue_index: Cell::new(0),
         queue_is_radio: Cell::new(false),
+        queue_drag_source_index: Cell::new(None),
+        queue_drop_preview_slot: Cell::new(None),
         chips: RefCell::new(Vec::new()),
         seed_video_id: RefCell::new(String::new()),
         queue_list_box: queue_list_box.clone(),
@@ -1318,6 +1341,42 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         playback_session_id: Cell::new(0),
         mpris: RefCell::new(None),
     });
+
+    {
+        let ps_enter = ps.clone();
+        let state = state.clone();
+        let drop_target = DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        drop_target.connect_enter(move |_, _, _| {
+            set_queue_drop_active(&ps_enter, true);
+            let preview_slot = normalized_preview_slot(&ps_enter, ps_enter.queue.borrow().len());
+            set_queue_drop_preview(&ps_enter, preview_slot);
+            gtk::gdk::DragAction::MOVE
+        });
+
+        let ps_motion = ps.clone();
+        drop_target.connect_motion(move |_, _, _| {
+            set_queue_drop_active(&ps_motion, true);
+            let preview_slot = normalized_preview_slot(&ps_motion, ps_motion.queue.borrow().len());
+            set_queue_drop_preview(&ps_motion, preview_slot);
+            gtk::gdk::DragAction::MOVE
+        });
+
+        let ps_leave = ps.clone();
+        drop_target.connect_leave(move |_| {
+            clear_queue_drop_preview(&ps_leave);
+            set_queue_drop_active(&ps_leave, false);
+        });
+
+        let ps_drop = ps.clone();
+        drop_target.connect_drop(move |_, value, _, _| {
+            let Some(payload) = parse_queue_drag_payload(value) else { return false };
+            clear_queue_drop_preview(&ps_drop);
+            set_queue_drop_active(&ps_drop, false);
+            handle_queue_drop_payload(payload, ps_drop.queue.borrow().len(), &ps_drop, &state)
+        });
+
+        ps.queue_list_box.add_controller(drop_target);
+    }
 
     // ======= WIRE SIGNALS =======
 
@@ -2460,6 +2519,17 @@ fn build_playlist_card(
         });
     }
 
+    attach_queue_drag_source(
+        &card_btn,
+        QueueDragPayload::Playlist {
+            playlist_id: playlist.playlist_id.clone(),
+            title: playlist.title.clone(),
+            thumbnail_url: playlist.thumbnail_url.clone(),
+            subtitle: playlist.subtitle.clone(),
+            source: QueuePlaylistSource::Remote,
+        },
+    );
+
     card_btn
 }
 
@@ -2642,6 +2712,17 @@ fn build_offline_playlist_card(
             load_offline_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, &ps, &recent_list);
         });
     }
+
+    attach_queue_drag_source(
+        &card_btn,
+        QueueDragPayload::Playlist {
+            playlist_id: playlist.playlist_id.clone(),
+            title: playlist.title.clone(),
+            thumbnail_url: playlist.thumbnail_url.clone(),
+            subtitle: playlist.subtitle.clone(),
+            source: QueuePlaylistSource::Offline,
+        },
+    );
 
     card_btn
 }
@@ -3012,6 +3093,13 @@ fn build_cover_card(
         });
     }
 
+    attach_queue_drag_source(
+        &card_btn,
+        QueueDragPayload::Track {
+            track: track.clone(),
+        },
+    );
+
     card_btn
 }
 
@@ -3155,6 +3243,13 @@ fn build_track_row(
             set_content_dimming(&ps, pop.is_visible());
         });
     }
+
+    attach_queue_drag_source(
+        &wrapper,
+        QueueDragPayload::Track {
+            track: track.clone(),
+        },
+    );
 
     wrapper
 }
@@ -3350,6 +3445,13 @@ fn build_sidebar_recent_item(
         });
     }
 
+    attach_queue_drag_source(
+        &btn,
+        QueueDragPayload::Track {
+            track: track.clone(),
+        },
+    );
+
     btn
 }
 
@@ -3456,6 +3558,19 @@ fn spawn_playback_tracking(
                 }
             }
         }
+
+        let ps_bootstrap = ps.clone();
+        let video_id_bootstrap = video_id.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
+            let now_playing = ps_bootstrap.now_playing_track.borrow();
+            let Some(current) = now_playing.as_ref() else { return };
+            if current.session_id != session_id || current.video_id != video_id_bootstrap {
+                return;
+            }
+            if let Some(tracking) = current.tracking.as_ref() {
+                tracking.maybe_bootstrap_watchtime();
+            }
+        });
     });
 }
 
@@ -4069,6 +4184,8 @@ fn download_all_offline(
 /// Render the queue panel with chip filters and track list.
 fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     ps.queue_panel.set_visible(true);
+    clear_queue_drop_preview(ps);
+    ps.queue_drag_source_index.set(None);
 
     // -- Chips --
     clear_box(&ps.chip_bar);
@@ -4217,52 +4334,78 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
         let drag_source = DragSource::new();
         drag_source.set_actions(gtk::gdk::DragAction::MOVE);
         {
-            let idx = i as u32;
-            drag_source.connect_prepare(move |_, _, _| {
-                Some(gtk::gdk::ContentProvider::for_value(&idx.to_value()))
+            let payload = QueueDragPayload::QueueRow { index: i };
+            drag_source.connect_prepare(move |_, _, _| queue_drag_provider(&payload));
+        }
+        {
+            let ps = ps.clone();
+            let row_wrapper_ref = row_wrapper.clone();
+            let drag_source_ref = drag_source.clone();
+            drag_source.connect_drag_begin(move |_, _| {
+                ps.queue_drag_source_index.set(Some(i));
+                ps.queue_list_box.add_css_class("queue-drag-active");
+                row_wrapper_ref.add_css_class("queue-row-dragging");
+                let paintable = WidgetPaintable::new(Some(&row_wrapper_ref));
+                drag_source_ref.set_icon(
+                    Some(&paintable),
+                    28,
+                    (row_wrapper_ref.allocated_height() / 2).max(1),
+                );
+            });
+        }
+        {
+            let ps = ps.clone();
+            let row_wrapper_ref = row_wrapper.clone();
+            drag_source.connect_drag_end(move |_, _, _| {
+                row_wrapper_ref.remove_css_class("queue-row-dragging");
+                ps.queue_drag_source_index.set(None);
+                ps.queue_list_box.remove_css_class("queue-drag-active");
+                clear_queue_drop_preview(&ps);
             });
         }
         row_wrapper.add_controller(drag_source);
 
         // Drop target
-        let drop_target = DropTarget::new(u32::static_type(), gtk::gdk::DragAction::MOVE);
+        let drop_target = DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        {
+            let ps = ps.clone();
+            let row_wrapper_ref = row_wrapper.clone();
+            drop_target.connect_enter(move |_, _, y| {
+                let raw_slot = preview_slot_for_pointer(i, y, row_wrapper_ref.allocated_height());
+                set_queue_drop_active(&ps, true);
+                let preview_slot = normalized_preview_slot(&ps, raw_slot);
+                set_queue_drop_preview(&ps, preview_slot);
+                gtk::gdk::DragAction::MOVE
+            });
+        }
+        {
+            let ps = ps.clone();
+            let row_wrapper_ref = row_wrapper.clone();
+            drop_target.connect_motion(move |_, _, y| {
+                let raw_slot = preview_slot_for_pointer(i, y, row_wrapper_ref.allocated_height());
+                set_queue_drop_active(&ps, true);
+                let preview_slot = normalized_preview_slot(&ps, raw_slot);
+                set_queue_drop_preview(&ps, preview_slot);
+                gtk::gdk::DragAction::MOVE
+            });
+        }
+        {
+            let ps = ps.clone();
+            drop_target.connect_leave(move |_| {
+                clear_queue_drop_preview(&ps);
+                set_queue_drop_active(&ps, false);
+            });
+        }
         {
             let ps = ps.clone();
             let state = state.clone();
-            drop_target.connect_drop(move |_, value, _, _| {
-                let Ok(from) = value.get::<u32>() else { return false };
-                let from = from as usize;
-                let to = i;
-                if from == to {
-                    return false;
-                }
-                {
-                    let mut q = ps.queue.borrow_mut();
-                    if from >= q.len() || to >= q.len() {
-                        return false;
-                    }
-                    let track = q.remove(from);
-                    let insert_at = if from < to { to - 1 } else { to };
-                    q.insert(insert_at, track);
-
-                    // Adjust current index
-                    let current = ps.queue_index.get();
-                    if from == current {
-                        ps.queue_index.set(insert_at);
-                    } else if from < current && insert_at >= current {
-                        ps.queue_index.set(current - 1);
-                    } else if from > current && insert_at <= current {
-                        ps.queue_index.set(current + 1);
-                    }
-                }
-                // Defer re-render
-                let ps = ps.clone();
-                let state = state.clone();
-                glib::idle_add_local_once(move || {
-                    render_queue_panel(&ps, &state);
-                    sync_mpris_transport(&ps, &state);
-                });
-                true
+            let row_wrapper_ref = row_wrapper.clone();
+            drop_target.connect_drop(move |_, value, _, y| {
+                let Some(payload) = parse_queue_drag_payload(value) else { return false };
+                let raw_slot = preview_slot_for_pointer(i, y, row_wrapper_ref.allocated_height());
+                clear_queue_drop_preview(&ps);
+                set_queue_drop_active(&ps, false);
+                handle_queue_drop_payload(payload, raw_slot, &ps, &state)
             });
         }
         row_wrapper.add_controller(drop_target);
@@ -4434,5 +4577,225 @@ fn artist_string(track: &Track) -> String {
 fn clear_box(container: &GtkBox) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
+    }
+}
+
+fn clear_queue_drop_preview(ps: &PlayerState) {
+    if ps.queue_drop_preview_slot.take().is_none() {
+        return;
+    }
+
+    let mut child = ps.queue_list_box.first_child();
+    while let Some(widget) = child {
+        widget.remove_css_class("queue-drop-before");
+        widget.remove_css_class("queue-drop-after");
+        child = widget.next_sibling();
+    }
+}
+
+fn set_queue_drop_active(ps: &PlayerState, active: bool) {
+    if active {
+        ps.queue_panel.add_css_class("queue-drop-active");
+    } else {
+        ps.queue_panel.remove_css_class("queue-drop-active");
+        ps.queue_list_box.remove_css_class("queue-drop-empty");
+    }
+}
+
+fn set_queue_drop_preview(ps: &PlayerState, slot: Option<usize>) {
+    if ps.queue_drop_preview_slot.get() == slot {
+        return;
+    }
+
+    clear_queue_drop_preview(ps);
+
+    let Some(slot) = slot else { return };
+    let queue_len = ps.queue.borrow().len();
+    if queue_len == 0 {
+        ps.queue_list_box.add_css_class("queue-drop-empty");
+        ps.queue_drop_preview_slot.set(Some(0));
+        return;
+    }
+    ps.queue_list_box.remove_css_class("queue-drop-empty");
+
+    let target_index = slot.min(queue_len - 1);
+    let preview_class = if slot >= queue_len {
+        "queue-drop-after"
+    } else {
+        "queue-drop-before"
+    };
+
+    let mut child = ps.queue_list_box.first_child();
+    let mut index = 0usize;
+    while let Some(widget) = child {
+        if index == target_index {
+            widget.add_css_class(preview_class);
+            ps.queue_drop_preview_slot.set(Some(slot));
+            return;
+        }
+        index += 1;
+        child = widget.next_sibling();
+    }
+}
+
+fn preview_slot_for_pointer(row_index: usize, y: f64, row_height: i32) -> usize {
+    if y < (row_height.max(1) as f64 / 2.0) {
+        row_index
+    } else {
+        row_index + 1
+    }
+}
+
+fn normalized_preview_slot(ps: &PlayerState, raw_slot: usize) -> Option<usize> {
+    ps.queue_drag_source_index
+        .get()
+        .and_then(|from| {
+            let normalized = if from < raw_slot { raw_slot.saturating_sub(1) } else { raw_slot };
+            (normalized != from).then_some(raw_slot)
+        })
+        .or(Some(raw_slot))
+}
+
+fn queue_drag_provider(payload: &QueueDragPayload) -> Option<gtk::gdk::ContentProvider> {
+    let json = serde_json::to_string(payload).ok()?;
+    Some(gtk::gdk::ContentProvider::for_value(&json.to_value()))
+}
+
+fn parse_queue_drag_payload(value: &glib::Value) -> Option<QueueDragPayload> {
+    let json = value.get::<String>().ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+fn attach_queue_drag_source(widget: &impl IsA<gtk::Widget>, payload: QueueDragPayload) {
+    let drag_source = DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+
+    {
+        let payload = payload.clone();
+        drag_source.connect_prepare(move |_, _, _| queue_drag_provider(&payload));
+    }
+
+    {
+        let drag_source_ref = drag_source.clone();
+        let widget_ref: gtk::Widget = widget.as_ref().clone();
+        drag_source.connect_drag_begin(move |_, _| {
+            let paintable = WidgetPaintable::new(Some(&widget_ref));
+            drag_source_ref.set_icon(
+                Some(&paintable),
+                28,
+                (widget_ref.allocated_height() / 2).max(1),
+            );
+        });
+    }
+
+    widget.as_ref().add_controller(drag_source);
+}
+
+fn insert_tracks_into_queue(
+    tracks: Vec<Track>,
+    insert_at: usize,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    if tracks.is_empty() {
+        return;
+    }
+
+    let added = tracks.len();
+    {
+        let mut queue = ps.queue.borrow_mut();
+        let had_queue = !queue.is_empty();
+        let insert_at = insert_at.min(queue.len());
+        for (offset, track) in tracks.into_iter().enumerate() {
+            queue.insert(insert_at + offset, track);
+        }
+        if had_queue && insert_at <= ps.queue_index.get() {
+            ps.queue_index.set(ps.queue_index.get() + added);
+        }
+    }
+
+    render_queue_panel(ps, state);
+    sync_mpris_transport(ps, state);
+}
+
+fn resolve_dragged_playlist_tracks(
+    payload: &QueueDragPayload,
+    state: &Arc<Mutex<AppState>>,
+) -> Result<Vec<Track>, String> {
+    match payload {
+        QueueDragPayload::Playlist {
+            playlist_id,
+            source,
+            ..
+        } => match source {
+            QueuePlaylistSource::Offline => Ok(load_offline_playlist_tracks(state, playlist_id)),
+            QueuePlaylistSource::Remote => {
+                let Some(client) = app_client(state) else {
+                    return Err("Not connected.".to_string());
+                };
+                client.get_playlist(playlist_id).map_err(|e| e.to_string())
+            }
+        },
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn handle_queue_drop_payload(
+    payload: QueueDragPayload,
+    raw_slot: usize,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) -> bool {
+    match payload {
+        QueueDragPayload::QueueRow { index: from } => {
+            let insert_at = if from < raw_slot { raw_slot.saturating_sub(1) } else { raw_slot };
+            if insert_at == from {
+                return false;
+            }
+            {
+                let mut q = ps.queue.borrow_mut();
+                if from >= q.len() || raw_slot > q.len() {
+                    return false;
+                }
+                let track = q.remove(from);
+                q.insert(insert_at, track);
+
+                let current = ps.queue_index.get();
+                if from == current {
+                    ps.queue_index.set(insert_at);
+                } else if from < current && insert_at >= current {
+                    ps.queue_index.set(current - 1);
+                } else if from > current && insert_at <= current {
+                    ps.queue_index.set(current + 1);
+                }
+            }
+
+            render_queue_panel(ps, state);
+            sync_mpris_transport(ps, state);
+            true
+        }
+        QueueDragPayload::Track { track } => {
+            insert_tracks_into_queue(vec![track], raw_slot, ps, state);
+            true
+        }
+        payload @ QueueDragPayload::Playlist { .. } => {
+            let ps = ps.clone();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let payload_bg = payload.clone();
+                let state_bg = state.clone();
+                let result = gio::spawn_blocking(move || {
+                    resolve_dragged_playlist_tracks(&payload_bg, &state_bg)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(tracks)) => insert_tracks_into_queue(tracks, raw_slot, &ps, &state),
+                    Ok(Err(err)) => eprintln!("[QUEUE] failed to expand playlist drop: {err}"),
+                    Err(err) => eprintln!("[QUEUE] failed to load playlist drop: {err:?}"),
+                }
+            });
+            true
+        }
     }
 }

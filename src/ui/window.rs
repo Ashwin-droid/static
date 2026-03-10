@@ -11,8 +11,9 @@ use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
     gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
-    DropTarget, Entry, GestureClick, Image, Label, Orientation, Overlay, Paned, Picture,
-    Popover, Scale, ScrolledWindow, Separator, Stack, StackTransitionType, WidgetPaintable,
+    DropTarget, Entry, GestureClick, Image, Label, MessageDialog, MessageType, Orientation,
+    Overlay, Paned, Picture, Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton,
+    Stack, StackTransitionType, Switch, WidgetPaintable,
 };
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
@@ -39,7 +40,7 @@ const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 
-use crate::cache::MusicCache;
+use crate::cache::{AppSettings, MusicCache};
 use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, Track};
 use crate::player::Player;
 use crate::ytmusic::client::{SongRating, TrackingInfo};
@@ -48,6 +49,7 @@ use crate::ytmusic::YtMusicClient;
 const KEYRING_SERVICE: &str = "com.static.music";
 const KEYRING_USER: &str = "cookie";
 const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
+const KEYRING_STORAGE_ROOT: &str = "storage_root";
 
 type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
 type SecretResponse = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
@@ -97,6 +99,7 @@ impl RepeatMode {
 struct AppState {
     client: Option<Arc<YtMusicClient>>,
     cache: MusicCache,
+    settings: AppSettings,
 }
 
 /// Tracks the currently playing song so we can record listen time when navigating away.
@@ -584,7 +587,53 @@ fn get_vr_refresh_token() -> Option<String> {
     entry.get_password().ok()
 }
 
-fn candidate_edge_cookie_paths() -> Vec<PathBuf> {
+fn store_storage_root(root: &str) -> Result<(), keyring::Error> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT)?;
+    entry.set_password(root)
+}
+
+fn get_storage_root() -> Option<String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT).ok()?;
+    entry.get_password().ok()
+}
+
+fn delete_storage_root() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT) {
+        let _ = entry.delete_credential();
+    }
+}
+
+fn app_settings(state: &Arc<Mutex<AppState>>) -> AppSettings {
+    state.lock().unwrap().settings.clone()
+}
+
+fn update_app_settings<F>(state: &Arc<Mutex<AppState>>, updater: F)
+where
+    F: FnOnce(&mut AppSettings),
+{
+    let mut guard = state.lock().unwrap();
+    let mut settings = guard.settings.clone();
+    updater(&mut settings);
+    if let Err(err) = guard.cache.save_settings(&settings) {
+        eprintln!("[SETTINGS] failed to persist settings: {err}");
+        return;
+    }
+    guard.settings = settings;
+}
+
+fn persist_storage_root_override(state: &Arc<Mutex<AppState>>, raw_root: &str) -> anyhow::Result<()> {
+    let trimmed = raw_root.trim().to_string();
+    let mut guard = state.lock().unwrap();
+    guard.cache.migrate_storage_root(&trimmed)?;
+    if trimmed.is_empty() {
+        delete_storage_root();
+    } else {
+        store_storage_root(&trimmed)?;
+    }
+    Ok(())
+}
+
+fn candidate_chromium_cookie_paths() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
@@ -592,10 +641,19 @@ fn candidate_edge_cookie_paths() -> Vec<PathBuf> {
         roots.push(home.join(".config/microsoft-edge-beta"));
         roots.push(home.join(".config/microsoft-edge-dev"));
         roots.push(home.join(".config/microsoft-edge-nightly"));
+        roots.push(home.join(".config/google-chrome"));
+        roots.push(home.join(".config/google-chrome-beta"));
+        roots.push(home.join(".config/google-chrome-unstable"));
+        roots.push(home.join(".config/chromium"));
+        roots.push(home.join(".config/BraveSoftware/Brave-Browser"));
+        roots.push(home.join(".config/vivaldi"));
+        roots.push(home.join(".config/opera"));
         roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge"));
         roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-beta"));
         roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-dev"));
         roots.push(home.join(".var/app/com.microsoft.Edge/config/microsoft-edge-nightly"));
+        roots.push(home.join(".var/app/com.google.Chrome/config/google-chrome"));
+        roots.push(home.join(".var/app/org.chromium.Chromium/config/chromium"));
     }
 
     let mut candidates = Vec::new();
@@ -637,7 +695,17 @@ fn chromium_safe_storage_password() -> anyhow::Result<String> {
         "chrome_libsecret_os_crypt_password_v2",
         "chrome_libsecret_os_crypt_password_v1",
     ] {
-        for application in ["chromium", "chrome"] {
+        for application in [
+            "chromium",
+            "chrome",
+            "google-chrome",
+            "microsoft-edge",
+            "Brave",
+            "brave",
+            "vivaldi",
+            "opera",
+            "Code",
+        ] {
             let mut attrs = HashMap::<&str, &str>::new();
             attrs.insert("xdg:schema", schema);
             attrs.insert("application", application);
@@ -739,10 +807,18 @@ fn decrypt_chromium_cookie(value: String, encrypted_value: Vec<u8>, keys: &[[u8;
     None
 }
 
-fn load_cookie_from_edge_profile() -> anyhow::Result<Option<String>> {
-    let db_path = match newest_existing_path(candidate_edge_cookie_paths()) {
-        Some(path) => path,
-        None => return Ok(None),
+fn load_cookie_from_chromium_profile(settings: &AppSettings) -> anyhow::Result<Option<String>> {
+    let db_path = if settings.chromium_cookie_path.trim().is_empty() {
+        match newest_existing_path(candidate_chromium_cookie_paths()) {
+            Some(path) => path,
+            None => return Ok(None),
+        }
+    } else {
+        let path = PathBuf::from(settings.chromium_cookie_path.trim());
+        if !path.is_file() {
+            return Ok(None);
+        }
+        path
     };
 
     let temp_db = std::env::temp_dir().join(format!("static-edge-cookies-{}.db", uuid::Uuid::new_v4()));
@@ -856,9 +932,21 @@ pub fn build_window(app: &Application) {
     stack.set_transition_duration(300);
 
     let cache = MusicCache::new().expect("Failed to initialise music cache");
+    let mut cache = cache;
+    let settings = cache.load_settings().unwrap_or_else(|err| {
+        eprintln!("[SETTINGS] failed to load persisted settings: {err}");
+        AppSettings::default()
+    });
+    if let Some(root) = get_storage_root() {
+        if let Err(err) = cache.migrate_storage_root(&root) {
+            eprintln!("[SETTINGS] failed to apply storage root override: {err}");
+            let _ = cache.apply_storage_root("");
+        }
+    }
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
         cache,
+        settings,
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -899,6 +987,22 @@ pub fn build_window(app: &Application) {
         });
     }
 
+    // Keep sidebar history fresh while the live app is open so
+    // plays from other devices/clients eventually show up too.
+    {
+        let stack = stack.clone();
+        let state = state.clone();
+        let recent_list = main_widgets.recent_list.clone();
+        let ps = main_widgets.player_state.clone();
+
+        glib::timeout_add_seconds_local(60, move || {
+            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some() {
+                load_sidebar_history(&state, &recent_list, &ps);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     // Check keyring on startup
     {
         let stack = stack.clone();
@@ -912,9 +1016,16 @@ pub fn build_window(app: &Application) {
                 let _ = gio::spawn_blocking(delete_cookie).await;
             }
 
-            match gio::spawn_blocking(load_cookie_from_edge_profile).await {
+            let settings = app_settings(&state);
+            if !settings.auto_sync_chromium_cookies {
+                return;
+            }
+
+            match gio::spawn_blocking(move || load_cookie_from_chromium_profile(&settings)).await {
                 Ok(Ok(Some(edge_cookie))) => {
-                    if let Some(client) = validate_cookie_and_build_client(edge_cookie.clone(), "Edge cookie auto-sync").await {
+                    if let Some(client) =
+                        validate_cookie_and_build_client(edge_cookie.clone(), "Chromium cookie auto-sync").await
+                    {
                         let cookie_to_store = edge_cookie.clone();
                         let _ = gio::spawn_blocking(move || store_cookie(&cookie_to_store)).await;
                         activate_authenticated_client(client, &state, &stack).await;
@@ -922,10 +1033,10 @@ pub fn build_window(app: &Application) {
                 }
                 Ok(Ok(None)) => {}
                 Ok(Err(err)) => {
-                    eprintln!("[AUTH] Edge cookie auto-sync failed: {err}");
+                    eprintln!("[AUTH] Chromium cookie auto-sync failed: {err}");
                 }
                 Err(err) => {
-                    eprintln!("[AUTH] Edge cookie auto-sync worker failed: {err:?}");
+                    eprintln!("[AUTH] Chromium cookie auto-sync worker failed: {err:?}");
                 }
             }
         });
@@ -1329,7 +1440,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     recent_scroll.set_child(Some(&recent_list));
     sidebar.append(&recent_scroll);
 
-    // Bottom: Settings with popover containing Logout
+    // Bottom: Settings
     sidebar.append(&Separator::new(Orientation::Horizontal));
     let bottom_box = GtkBox::new(Orientation::Horizontal, 8);
     bottom_box.add_css_class("sidebar-bottom");
@@ -1337,29 +1448,6 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     let settings_btn = Button::with_label("Settings");
     settings_btn.add_css_class("nav-item");
     settings_btn.set_hexpand(true);
-
-    let settings_popover = Popover::new();
-    settings_popover.set_parent(&settings_btn);
-    settings_popover.set_position(gtk::PositionType::Top);
-
-    let pop_content = GtkBox::new(Orientation::Vertical, 4);
-    pop_content.set_margin_top(4);
-    pop_content.set_margin_bottom(4);
-    pop_content.set_margin_start(4);
-    pop_content.set_margin_end(4);
-
-    let logout_btn = Button::with_label("Log out");
-    logout_btn.add_css_class("popover-logout-btn");
-    pop_content.append(&logout_btn);
-
-    settings_popover.set_child(Some(&pop_content));
-
-    {
-        let popover = settings_popover.clone();
-        settings_btn.connect_clicked(move |_| {
-            popover.popup();
-        });
-    }
 
     bottom_box.append(&settings_btn);
     sidebar.append(&bottom_box);
@@ -1908,35 +1996,12 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
-    // Logout (inside settings popover)
-    {
-        let state = state.clone();
-        let stack = stack.clone();
-        let ps = ps.clone();
-        let content_box = content_box.clone();
-        let settings_popover = settings_popover.clone();
-
-        logout_btn.connect_clicked(move |_| {
-            settings_popover.popdown();
-            reset_player_ui(&ps, &state);
-            state.lock().unwrap().client = None;
-            clear_box(&content_box);
-
-            glib::spawn_future_local({
-                let stack = stack.clone();
-                async move {
-                    let _ = gio::spawn_blocking(delete_cookie).await;
-                    stack.set_visible_child_name("onboarding");
-                }
-            });
-        });
-    }
-
-    let nav_buttons: Rc<[Button; 4]> = Rc::new([
+    let nav_buttons: Rc<Vec<Button>> = Rc::new(vec![
         home_btn.clone(),
         likes_btn.clone(),
         playlists_btn.clone(),
         offline_btn.clone(),
+        settings_btn.clone(),
     ]);
 
     // Home button
@@ -1995,6 +2060,20 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
     }
 
+    // Settings button
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let content_box = content_box.clone();
+        let ps = ps.clone();
+        let nav = nav_buttons.clone();
+
+        settings_btn.connect_clicked(move |btn| {
+            set_active_nav(btn, &nav);
+            load_settings_page(&state, &stack, &content_box, &ps);
+        });
+    }
+
     // Search
     {
         let state = state.clone();
@@ -2031,11 +2110,544 @@ fn nav_button(text: &str, active: bool) -> Button {
     btn
 }
 
-fn set_active_nav(active: &Button, all: &[Button; 4]) {
+fn set_active_nav(active: &Button, all: &[Button]) {
     for btn in all {
         btn.remove_css_class("nav-item-active");
     }
     active.add_css_class("nav-item-active");
+}
+
+fn load_settings_page(
+    state: &Arc<Mutex<AppState>>,
+    stack: &Stack,
+    content_box: &GtkBox,
+    ps: &Rc<PlayerState>,
+) {
+    clear_box(content_box);
+
+    let settings = app_settings(state);
+    let storage_root_override = get_storage_root().unwrap_or_default();
+    let default_storage_root = std::env::var("HOME")
+        .map(|home| format!("{home}/Music/Static"))
+        .unwrap_or_else(|_| "/tmp/Music/Static".to_string());
+    let (cache_root, offline_root, temp_root) = {
+        let guard = state.lock().unwrap();
+        (
+            guard.cache.base_dir().display().to_string(),
+            guard.cache.offline_dir().display().to_string(),
+            guard.cache.temp_dir().display().to_string(),
+        )
+    };
+
+    let page = GtkBox::new(Orientation::Vertical, 18);
+    page.add_css_class("settings-page");
+    page.set_margin_top(28);
+    page.set_margin_bottom(28);
+    page.set_margin_start(24);
+    page.set_margin_end(24);
+
+    let hero = GtkBox::new(Orientation::Vertical, 8);
+    hero.add_css_class("settings-hero");
+
+    let title = Label::new(Some("Settings"));
+    title.add_css_class("settings-title");
+    title.set_halign(Align::Start);
+    hero.append(&title);
+
+    let subtitle = Label::new(Some(
+        "Tune how Static imports cookies, warms up playback, and manages your offline library.",
+    ));
+    subtitle.add_css_class("settings-subtitle");
+    subtitle.set_wrap(true);
+    subtitle.set_halign(Align::Start);
+    hero.append(&subtitle);
+
+    page.append(&hero);
+
+    let sections = GtkBox::new(Orientation::Vertical, 16);
+    sections.add_css_class("settings-sections");
+
+    let playback_section = GtkBox::new(Orientation::Vertical, 12);
+    playback_section.add_css_class("settings-card");
+    let playback_title = Label::new(Some("Playback & Cache"));
+    playback_title.add_css_class("settings-card-title");
+    playback_title.set_halign(Align::Start);
+    playback_section.append(&playback_title);
+
+    let playback_copy = Label::new(Some("Decide when local cache wins and how aggressively Static stages upcoming songs."));
+    playback_copy.add_css_class("settings-card-copy");
+    playback_copy.set_wrap(true);
+    playback_copy.set_halign(Align::Start);
+    playback_section.append(&playback_copy);
+
+    let local_row = GtkBox::new(Orientation::Horizontal, 12);
+    local_row.add_css_class("settings-row");
+    let local_copy = GtkBox::new(Orientation::Vertical, 2);
+    local_copy.set_hexpand(true);
+    let local_label = Label::new(Some("Prefer local cache on playback"));
+    local_label.add_css_class("settings-row-title");
+    local_label.set_halign(Align::Start);
+    local_copy.append(&local_label);
+    let local_hint = Label::new(Some("Play offline or prefetched audio first when it exists, then fall back to streaming."));
+    local_hint.add_css_class("settings-row-copy");
+    local_hint.set_wrap(true);
+    local_hint.set_halign(Align::Start);
+    local_copy.append(&local_hint);
+    local_row.append(&local_copy);
+    let local_switch = Switch::new();
+    local_switch.set_active(settings.prefer_local_cache_on_playback);
+    {
+        let state = state.clone();
+        local_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            update_app_settings(&state, |s| s.prefer_local_cache_on_playback = active);
+        });
+    }
+    local_row.append(&local_switch);
+    playback_section.append(&local_row);
+
+    let prefetch_row = GtkBox::new(Orientation::Horizontal, 12);
+    prefetch_row.add_css_class("settings-row");
+    let prefetch_copy = GtkBox::new(Orientation::Vertical, 2);
+    prefetch_copy.set_hexpand(true);
+    let prefetch_label = Label::new(Some("Prefetch upcoming tracks"));
+    prefetch_label.add_css_class("settings-row-title");
+    prefetch_label.set_halign(Align::Start);
+    prefetch_copy.append(&prefetch_label);
+    let prefetch_hint = Label::new(Some("Downloads the next few queue items into temp cache for faster skips and rewinds."));
+    prefetch_hint.add_css_class("settings-row-copy");
+    prefetch_hint.set_wrap(true);
+    prefetch_hint.set_halign(Align::Start);
+    prefetch_copy.append(&prefetch_hint);
+    prefetch_row.append(&prefetch_copy);
+    let prefetch_switch = Switch::new();
+    prefetch_switch.set_active(settings.prefetch_enabled);
+    {
+        let state = state.clone();
+        prefetch_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            update_app_settings(&state, |s| s.prefetch_enabled = active);
+        });
+    }
+    prefetch_row.append(&prefetch_switch);
+    playback_section.append(&prefetch_row);
+
+    let prefetch_count_row = GtkBox::new(Orientation::Horizontal, 12);
+    prefetch_count_row.add_css_class("settings-row");
+    let prefetch_count_copy = GtkBox::new(Orientation::Vertical, 2);
+    prefetch_count_copy.set_hexpand(true);
+    let prefetch_count_label = Label::new(Some("Prefetch lookahead"));
+    prefetch_count_label.add_css_class("settings-row-title");
+    prefetch_count_label.set_halign(Align::Start);
+    prefetch_count_copy.append(&prefetch_count_label);
+    let prefetch_count_hint = Label::new(Some("How many upcoming songs should be staged in temp cache."));
+    prefetch_count_hint.add_css_class("settings-row-copy");
+    prefetch_count_hint.set_wrap(true);
+    prefetch_count_hint.set_halign(Align::Start);
+    prefetch_count_copy.append(&prefetch_count_hint);
+    prefetch_count_row.append(&prefetch_count_copy);
+    let prefetch_spin = SpinButton::with_range(0.0, 12.0, 1.0);
+    prefetch_spin.set_value(settings.prefetch_ahead as f64);
+    {
+        let state = state.clone();
+        prefetch_spin.connect_value_changed(move |spin| {
+            let value = spin.value() as u32;
+            update_app_settings(&state, |s| s.prefetch_ahead = value.min(12));
+        });
+    }
+    prefetch_count_row.append(&prefetch_spin);
+    playback_section.append(&prefetch_count_row);
+
+    sections.append(&playback_section);
+
+    let offline_section = GtkBox::new(Orientation::Vertical, 12);
+    offline_section.add_css_class("settings-card");
+    let offline_title = Label::new(Some("Offline Library"));
+    offline_title.add_css_class("settings-card-title");
+    offline_title.set_halign(Align::Start);
+    offline_section.append(&offline_title);
+
+    let offline_copy = Label::new(Some("Control how opinionated the automatic offline cache should be."));
+    offline_copy.add_css_class("settings-card-copy");
+    offline_copy.set_wrap(true);
+    offline_copy.set_halign(Align::Start);
+    offline_section.append(&offline_copy);
+
+    let manage_row = GtkBox::new(Orientation::Horizontal, 12);
+    manage_row.add_css_class("settings-row");
+    let manage_copy = GtkBox::new(Orientation::Vertical, 2);
+    manage_copy.set_hexpand(true);
+    let manage_label = Label::new(Some("Auto-manage offline cache"));
+    manage_label.add_css_class("settings-row-title");
+    manage_label.set_halign(Align::Start);
+    manage_copy.append(&manage_label);
+    let manage_hint = Label::new(Some("Keeps a rolling offline library based on your play history, without touching pinned downloads."));
+    manage_hint.add_css_class("settings-row-copy");
+    manage_hint.set_wrap(true);
+    manage_hint.set_halign(Align::Start);
+    manage_copy.append(&manage_hint);
+    manage_row.append(&manage_copy);
+    let manage_switch = Switch::new();
+    manage_switch.set_active(settings.auto_manage_offline_cache);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        manage_switch.connect_active_notify(move |sw| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let active = sw.is_active();
+            if active {
+                update_app_settings(&state, |s| s.auto_manage_offline_cache = true);
+                return;
+            }
+
+            guard_flag_closure.set(true);
+            sw.set_active(true);
+            guard_flag_closure.set(false);
+
+            let dialog = MessageDialog::builder()
+                .modal(true)
+                .message_type(MessageType::Warning)
+                .text("Turn off local cache?")
+                .secondary_text("Auto-downloaded songs will be deleted from Static’s local cache. Manually pinned downloads stay right where they are.")
+                .build();
+            dialog.add_css_class("settings-warning-dialog");
+            if let Some(window) = stack.root().and_then(|root| root.downcast::<ApplicationWindow>().ok()) {
+                dialog.set_transient_for(Some(&window));
+            }
+            dialog.add_button("Cancel", ResponseType::Cancel);
+            dialog.add_button("Delete auto-downloaded songs", ResponseType::Accept);
+            dialog.set_default_response(ResponseType::Cancel);
+
+            let state = state.clone();
+            let sw = sw.clone();
+            let guard_flag = guard_flag.clone();
+            glib::spawn_future_local(async move {
+                let response = dialog.run_future().await;
+                dialog.close();
+
+                if response != ResponseType::Accept {
+                    guard_flag.set(true);
+                    sw.set_active(true);
+                    guard_flag.set(false);
+                    return;
+                }
+
+                match gio::spawn_blocking(move || -> anyhow::Result<usize> {
+                    let mut guard = state.lock().unwrap();
+                    let removed = guard.cache.clear_auto_downloads()?;
+                    let mut next_settings = guard.settings.clone();
+                    next_settings.auto_manage_offline_cache = false;
+                    guard.cache.save_settings(&next_settings)?;
+                    guard.settings = next_settings;
+                    Ok(removed)
+                })
+                .await
+                {
+                    Ok(Ok(removed)) => {
+                        eprintln!("[CACHE] removed {removed} auto-downloaded songs after disabling local cache");
+                        guard_flag.set(true);
+                        sw.set_active(false);
+                        guard_flag.set(false);
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("[SETTINGS] failed to disable local cache: {err}");
+                        guard_flag.set(true);
+                        sw.set_active(true);
+                        guard_flag.set(false);
+                    }
+                    Err(err) => {
+                        eprintln!("[SETTINGS] local cache disable worker failed: {err:?}");
+                        guard_flag.set(true);
+                        sw.set_active(true);
+                        guard_flag.set(false);
+                    }
+                }
+            });
+        });
+    }
+    manage_row.append(&manage_switch);
+    offline_section.append(&manage_row);
+
+    let target_row = GtkBox::new(Orientation::Horizontal, 12);
+    target_row.add_css_class("settings-row");
+    let target_copy = GtkBox::new(Orientation::Vertical, 2);
+    target_copy.set_hexpand(true);
+    let target_label = Label::new(Some("Auto-cache target"));
+    target_label.add_css_class("settings-row-title");
+    target_label.set_halign(Align::Start);
+    target_copy.append(&target_label);
+    let target_hint = Label::new(Some("How many frequently played songs Static should keep ready offline."));
+    target_hint.add_css_class("settings-row-copy");
+    target_hint.set_wrap(true);
+    target_hint.set_halign(Align::Start);
+    target_copy.append(&target_hint);
+    target_row.append(&target_copy);
+    let target_spin = SpinButton::with_range(0.0, 500.0, 5.0);
+    target_spin.set_value(settings.offline_cache_target as f64);
+    {
+        let state = state.clone();
+        target_spin.connect_value_changed(move |spin| {
+            let value = spin.value() as u32;
+            update_app_settings(&state, |s| s.offline_cache_target = value.min(500));
+        });
+    }
+    target_row.append(&target_spin);
+    offline_section.append(&target_row);
+
+    let storage_root_row = GtkBox::new(Orientation::Vertical, 8);
+    storage_root_row.add_css_class("settings-row");
+    let storage_root_label = Label::new(Some("Static storage root"));
+    storage_root_label.add_css_class("settings-row-title");
+    storage_root_label.set_halign(Align::Start);
+    storage_root_row.append(&storage_root_label);
+
+    let storage_root_hint = Label::new(Some(
+        "Moves Static’s offline audio, artwork, and temp cache together. Leave blank to fall back to the default root.",
+    ));
+    storage_root_hint.add_css_class("settings-row-copy");
+    storage_root_hint.set_wrap(true);
+    storage_root_hint.set_halign(Align::Start);
+    storage_root_row.append(&storage_root_hint);
+
+    let storage_root_controls = GtkBox::new(Orientation::Horizontal, 8);
+    let storage_root_entry = Entry::new();
+    storage_root_entry.set_hexpand(true);
+    storage_root_entry.set_placeholder_text(Some(&default_storage_root));
+    storage_root_entry.set_text(&storage_root_override);
+    storage_root_entry.add_css_class("settings-path-entry");
+    storage_root_controls.append(&storage_root_entry);
+
+    let storage_root_save_btn = Button::with_label("Move");
+    storage_root_save_btn.add_css_class("settings-secondary-btn");
+    storage_root_controls.append(&storage_root_save_btn);
+
+    let storage_root_default_btn = Button::with_label("Default");
+    storage_root_default_btn.add_css_class("settings-secondary-btn");
+    storage_root_controls.append(&storage_root_default_btn);
+    storage_root_row.append(&storage_root_controls);
+
+    let storage_root_status = Label::new(None);
+    storage_root_status.add_css_class("settings-row-copy");
+    storage_root_status.set_wrap(true);
+    storage_root_status.set_halign(Align::Start);
+    storage_root_row.append(&storage_root_status);
+    offline_section.append(&storage_root_row);
+
+    let cache_root_value = Label::new(Some(&cache_root));
+    cache_root_value.add_css_class("settings-value-path");
+    cache_root_value.set_wrap(true);
+    cache_root_value.set_hexpand(true);
+    cache_root_value.set_halign(Align::End);
+
+    let offline_root_value = Label::new(Some(&offline_root));
+    offline_root_value.add_css_class("settings-value-path");
+    offline_root_value.set_wrap(true);
+    offline_root_value.set_hexpand(true);
+    offline_root_value.set_halign(Align::End);
+
+    let temp_root_value = Label::new(Some(&temp_root));
+    temp_root_value.add_css_class("settings-value-path");
+    temp_root_value.set_wrap(true);
+    temp_root_value.set_hexpand(true);
+    temp_root_value.set_halign(Align::End);
+
+    for (label_text, value_widget) in [
+        ("Cache root", cache_root_value.clone()),
+        ("Offline store", offline_root_value.clone()),
+        ("Temp prefetch cache", temp_root_value.clone()),
+    ] {
+        let row = GtkBox::new(Orientation::Horizontal, 12);
+        row.add_css_class("settings-row");
+        let label = Label::new(Some(label_text));
+        label.add_css_class("settings-row-title");
+        label.set_halign(Align::Start);
+        row.append(&label);
+        row.append(&value_widget);
+        offline_section.append(&row);
+    }
+
+    {
+        let state = state.clone();
+        let storage_root_entry = storage_root_entry.clone();
+        let storage_root_status = storage_root_status.clone();
+        let cache_root_value = cache_root_value.clone();
+        let offline_root_value = offline_root_value.clone();
+        let temp_root_value = temp_root_value.clone();
+        storage_root_save_btn.connect_clicked(move |_| {
+            let raw = storage_root_entry.text().trim().to_string();
+            match persist_storage_root_override(&state, &raw) {
+                Ok(()) => {
+                    let guard = state.lock().unwrap();
+                    cache_root_value.set_text(&guard.cache.base_dir().display().to_string());
+                    offline_root_value.set_text(&guard.cache.offline_dir().display().to_string());
+                    temp_root_value.set_text(&guard.cache.temp_dir().display().to_string());
+                    storage_root_status.set_text("Moved Static’s local cache into the new root.");
+                }
+                Err(err) => {
+                    storage_root_status.set_text(&format!("Couldn’t move the local cache yet: {err}"));
+                }
+            }
+        });
+    }
+
+    {
+        let state = state.clone();
+        let storage_root_entry = storage_root_entry.clone();
+        let storage_root_status = storage_root_status.clone();
+        let cache_root_value = cache_root_value.clone();
+        let offline_root_value = offline_root_value.clone();
+        let temp_root_value = temp_root_value.clone();
+        storage_root_default_btn.connect_clicked(move |_| {
+            storage_root_entry.set_text("");
+            match persist_storage_root_override(&state, "") {
+                Ok(()) => {
+                    let guard = state.lock().unwrap();
+                    cache_root_value.set_text(&guard.cache.base_dir().display().to_string());
+                    offline_root_value.set_text(&guard.cache.offline_dir().display().to_string());
+                    temp_root_value.set_text(&guard.cache.temp_dir().display().to_string());
+                    storage_root_status.set_text("Static is back on the default storage root.");
+                }
+                Err(err) => {
+                    storage_root_status.set_text(&format!("Couldn’t return to the default root yet: {err}"));
+                }
+            }
+        });
+    }
+
+    sections.append(&offline_section);
+
+    let import_section = GtkBox::new(Orientation::Vertical, 12);
+    import_section.add_css_class("settings-card");
+    let import_title = Label::new(Some("Chromium Cookie Import"));
+    import_title.add_css_class("settings-card-title");
+    import_title.set_halign(Align::Start);
+    import_section.append(&import_title);
+
+    let import_copy = Label::new(Some("Auto-sync cookies from Edge or another Chromium-family browser. Leave the path blank to auto-detect."));
+    import_copy.add_css_class("settings-card-copy");
+    import_copy.set_wrap(true);
+    import_copy.set_halign(Align::Start);
+    import_section.append(&import_copy);
+
+    let import_toggle_row = GtkBox::new(Orientation::Horizontal, 12);
+    import_toggle_row.add_css_class("settings-row");
+    let import_toggle_copy = GtkBox::new(Orientation::Vertical, 2);
+    import_toggle_copy.set_hexpand(true);
+    let import_toggle_label = Label::new(Some("Auto-sync Chromium cookies on startup"));
+    import_toggle_label.add_css_class("settings-row-title");
+    import_toggle_label.set_halign(Align::Start);
+    import_toggle_copy.append(&import_toggle_label);
+    let import_toggle_hint = Label::new(Some("If a saved cookie is missing or stale, Static will try your Chromium-family browser before asking for manual cookies."));
+    import_toggle_hint.add_css_class("settings-row-copy");
+    import_toggle_hint.set_wrap(true);
+    import_toggle_hint.set_halign(Align::Start);
+    import_toggle_copy.append(&import_toggle_hint);
+    import_toggle_row.append(&import_toggle_copy);
+    let import_switch = Switch::new();
+    import_switch.set_active(settings.auto_sync_chromium_cookies);
+    {
+        let state = state.clone();
+        import_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            update_app_settings(&state, |s| s.auto_sync_chromium_cookies = active);
+        });
+    }
+    import_toggle_row.append(&import_switch);
+    import_section.append(&import_toggle_row);
+
+    let path_row = GtkBox::new(Orientation::Vertical, 8);
+    path_row.add_css_class("settings-row");
+    let path_label = Label::new(Some("Chromium cookie DB path"));
+    path_label.add_css_class("settings-row-title");
+    path_label.set_halign(Align::Start);
+    path_row.append(&path_label);
+
+    let path_hint = Label::new(Some("Examples: `~/.config/microsoft-edge/Default/Cookies`, `~/.config/google-chrome/Default/Cookies`, `~/.config/chromium/Default/Cookies`."));
+    path_hint.add_css_class("settings-row-copy");
+    path_hint.set_wrap(true);
+    path_hint.set_halign(Align::Start);
+    path_row.append(&path_hint);
+
+    let path_controls = GtkBox::new(Orientation::Horizontal, 8);
+    let path_entry = Entry::new();
+    path_entry.set_hexpand(true);
+    path_entry.set_placeholder_text(Some("Auto-detect Chromium browser profile"));
+    path_entry.set_text(&settings.chromium_cookie_path);
+    path_entry.add_css_class("settings-path-entry");
+    path_controls.append(&path_entry);
+
+    let save_path_btn = Button::with_label("Save");
+    save_path_btn.add_css_class("settings-secondary-btn");
+    {
+        let state = state.clone();
+        let path_entry = path_entry.clone();
+        save_path_btn.connect_clicked(move |_| {
+            let path = path_entry.text().trim().to_string();
+            update_app_settings(&state, move |s| s.chromium_cookie_path = path);
+        });
+    }
+    path_controls.append(&save_path_btn);
+
+    let auto_path_btn = Button::with_label("Auto");
+    auto_path_btn.add_css_class("settings-secondary-btn");
+    {
+        let state = state.clone();
+        let path_entry = path_entry.clone();
+        auto_path_btn.connect_clicked(move |_| {
+            path_entry.set_text("");
+            update_app_settings(&state, |s| s.chromium_cookie_path.clear());
+        });
+    }
+    path_controls.append(&auto_path_btn);
+    path_row.append(&path_controls);
+    import_section.append(&path_row);
+
+    sections.append(&import_section);
+
+    let session_section = GtkBox::new(Orientation::Vertical, 12);
+    session_section.add_css_class("settings-card");
+    let session_title = Label::new(Some("Session"));
+    session_title.add_css_class("settings-card-title");
+    session_title.set_halign(Align::Start);
+    session_section.append(&session_title);
+
+    let session_copy = Label::new(Some("Sign out cleanly without touching your browser’s own cookie jar."));
+    session_copy.add_css_class("settings-card-copy");
+    session_copy.set_wrap(true);
+    session_copy.set_halign(Align::Start);
+    session_section.append(&session_copy);
+
+    let logout_btn = Button::with_label("Log out");
+    logout_btn.add_css_class("settings-danger-btn");
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let ps = ps.clone();
+        let content_box = content_box.clone();
+        logout_btn.connect_clicked(move |_| {
+            reset_player_ui(&ps, &state);
+            state.lock().unwrap().client = None;
+            clear_box(&content_box);
+
+            glib::spawn_future_local({
+                let stack = stack.clone();
+                async move {
+                    let _ = gio::spawn_blocking(delete_cookie).await;
+                    stack.set_visible_child_name("onboarding");
+                }
+            });
+        });
+    }
+    session_section.append(&logout_btn);
+    sections.append(&session_section);
+
+    page.append(&sections);
+    content_box.append(&page);
 }
 
 fn svg_image(svg_bytes: &[u8], size: i32) -> Image {
@@ -2452,10 +3064,7 @@ fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>
                     id: None,
                 }]
             };
-            let thumbnail_url = guard
-                .cache
-                .get_cached_art(&video_id)
-                .map(|path| format!("file://{}", path.display()));
+            let thumbnail_url = offline_thumbnail_url(&guard.cache, &video_id);
 
             Track {
                 video_id,
@@ -2497,10 +3106,7 @@ fn load_offline_playlist_tracks(state: &Arc<Mutex<AppState>>, playlist_id: &str)
     video_ids
         .into_iter()
         .map(|video_id| {
-            let thumbnail_url = guard
-                .cache
-                .get_cached_art(&video_id)
-                .map(|path| format!("file://{}", path.display()));
+            let thumbnail_url = offline_thumbnail_url(&guard.cache, &video_id);
             let (title, artist) = guard
                 .cache
                 .get_track_meta(&video_id)
@@ -2524,6 +3130,13 @@ fn load_offline_playlist_tracks(state: &Arc<Mutex<AppState>>, playlist_id: &str)
             }
         })
         .collect()
+}
+
+fn offline_thumbnail_url(cache: &MusicCache, video_id: &str) -> Option<String> {
+    cache
+        .get_cached_art(video_id)
+        .map(|path| format!("file://{}", path.display()))
+        .or_else(|| cache.get_thumbnail_url(video_id))
 }
 
 fn load_offline(
@@ -3819,10 +4432,8 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
             if let Some(path) = url.strip_prefix("file://") {
                 std::fs::read(path).map_err(|e| e.to_string())
             } else {
-                THUMB_CLIENT.get(&url).send()
-                    .and_then(|r| r.bytes())
-                    .map(|b| b.to_vec())
-                    .map_err(|e| e.to_string())
+                fetch_thumbnail_bytes(&url)
+                    .ok_or_else(|| format!("failed to load thumbnail after retries: {url}"))
             }
         }).await;
 
@@ -3854,6 +4465,39 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
     });
 }
 
+fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
+    const MAX_ATTEMPTS: usize = 3;
+    const BACKOFF_MS: [u64; MAX_ATTEMPTS] = [250, 700, 1500];
+
+    if let Some(path) = url.strip_prefix("file://") {
+        return std::fs::read(path).ok();
+    }
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let response = THUMB_CLIENT.get(url).send();
+        match response.and_then(|resp| resp.error_for_status()).and_then(|resp| resp.bytes()) {
+            Ok(bytes) => return Some(bytes.to_vec()),
+            Err(err) => {
+                eprintln!(
+                    "[ART] thumbnail fetch failed (attempt {}/{}): {} ({err})",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    url
+                );
+                if attempt + 1 < MAX_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
+    url.filter(|value| !value.starts_with("file://"))
+}
+
 /// Flush the current now-playing track.
 /// We always report any non-zero watchtime we have to YouTube, while the local
 /// play-history DB keeps its higher threshold for counting a play.
@@ -3874,7 +4518,7 @@ fn flush_play_record(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
                     &track.video_id,
                     &track.title,
                     &track.artist,
-                    track.thumb_url.as_deref(),
+                    history_thumbnail_candidate(track.thumb_url.as_deref()),
                     listened,
                 );
             });
@@ -3931,21 +4575,32 @@ async fn prepare_playback(
 ) -> Result<PreparedPlayback, String> {
     let state_cache = state.clone();
     let vid = video_id.to_string();
-    let cached_path = gio::spawn_blocking(move || {
+    let (prefer_local_cache_on_playback, prefetch_enabled, cached_path) = gio::spawn_blocking(move || {
         let guard = state_cache.lock().unwrap();
-        // Check offline cache first, then temp prefetch cache
-        guard.cache.get_cached_audio(&vid)
-            .or_else(|| guard.cache.get_temp_audio(&vid))
+        let local_path = guard.cache.get_cached_audio(&vid).or_else(|| {
+            guard
+                .settings
+                .prefetch_enabled
+                .then(|| guard.cache.get_temp_audio(&vid))
+                .flatten()
+        });
+        (
+            guard.settings.prefer_local_cache_on_playback,
+            guard.settings.prefetch_enabled,
+            local_path,
+        )
     })
     .await
     .ok()
-    .flatten();
+    .unwrap_or((true, true, None));
 
-    if let Some(path) = cached_path {
-        eprintln!("[CACHE] playing from local: {}", path.display());
-        return Ok(PreparedPlayback {
-            uri: format!("file://{}", path.display()),
-        });
+    if prefer_local_cache_on_playback {
+        if let Some(path) = cached_path.clone() {
+            eprintln!("[CACHE] playing from local: {}", path.display());
+            return Ok(PreparedPlayback {
+                uri: format!("file://{}", path.display()),
+            });
+        }
     }
 
     // Not cached — get streaming URL, play it, and save to temp in the background
@@ -3962,14 +4617,17 @@ async fn prepare_playback(
     .await
     {
         Ok(Ok(url)) => {
+            if !prefetch_enabled {
+                return Ok(PreparedPlayback { uri: url });
+            }
             // Fire-and-forget: download to temp cache for rewind support
             let state_bg = state.clone();
             let vid_bg = video_id.to_string();
             let url_bg = url.clone();
             gio::spawn_blocking(move || {
                 let guard = state_bg.lock().unwrap();
-                if guard.cache.get_temp_audio(&vid_bg).is_some() {
-                    return; // already cached
+                if !guard.settings.prefetch_enabled || guard.cache.get_temp_audio(&vid_bg).is_some() {
+                    return;
                 }
                 drop(guard);
                 if let Ok(bytes) = DOWNLOAD_CLIENT
@@ -3984,8 +4642,26 @@ async fn prepare_playback(
             });
             Ok(PreparedPlayback { uri: url })
         }
-        Ok(Err(msg)) => Err(msg),
-        Err(e) => Err(format!("Error: {e:?}")),
+        Ok(Err(msg)) => {
+            if let Some(path) = cached_path {
+                eprintln!("[CACHE] remote failed, falling back to local: {}", path.display());
+                Ok(PreparedPlayback {
+                    uri: format!("file://{}", path.display()),
+                })
+            } else {
+                Err(msg)
+            }
+        }
+        Err(e) => {
+            if let Some(path) = cached_path {
+                eprintln!("[CACHE] worker failed, falling back to local: {}", path.display());
+                Ok(PreparedPlayback {
+                    uri: format!("file://{}", path.display()),
+                })
+            } else {
+                Err(format!("Error: {e:?}"))
+            }
+        }
     }
 }
 
@@ -4245,11 +4921,15 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
 /// Prefetch the next N songs in the queue to ~/Music/Static/temp/.
 /// No playback reporting — just download audio bytes to disk.
 fn prefetch_upcoming(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, from_index: usize) {
-    const PREFETCH_AHEAD: usize = 3;
+    let settings = app_settings(state);
+    if !settings.prefetch_enabled {
+        return;
+    }
+    let prefetch_ahead = settings.prefetch_ahead.clamp(1, 12) as usize;
     let queue = ps.queue.borrow();
     let mut to_fetch: Vec<(String, Option<String>)> = Vec::new();
 
-    for i in 1..=PREFETCH_AHEAD {
+    for i in 1..=prefetch_ahead {
         let idx = from_index + i;
         if let Some(track) = queue.get(idx) {
             to_fetch.push((track.video_id.clone(), track.thumbnail_url.clone()));
@@ -4455,7 +5135,7 @@ fn download_all_offline(
                         vid,
                         &track.title,
                         &artist,
-                        track.thumbnail_url.as_deref(),
+                        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
                         0,
                     );
                 }
@@ -4488,9 +5168,10 @@ fn download_all_offline(
                 };
 
                 // Download artwork
-                let art = track.thumbnail_url.as_ref().and_then(|url| {
-                    THUMB_CLIENT.get(url).send().ok()?.bytes().ok()
-                });
+                let art = track
+                    .thumbnail_url
+                    .as_ref()
+                    .and_then(|url| fetch_thumbnail_bytes(url));
 
                 // Store + pin
                 let guard = state.lock().unwrap();
@@ -4503,9 +5184,7 @@ fn download_all_offline(
             if let Some(meta) = &playlist_meta {
                 // Download playlist cover art to disk
                 let cover_art_path = if let Some(url) = &meta.thumbnail_url {
-                    THUMB_CLIENT.get(url).send().ok()
-                        .and_then(|r| r.bytes().ok())
-                        .map(|bytes| {
+                    fetch_thumbnail_bytes(url).map(|bytes| {
                             let guard = state.lock().unwrap();
                             let p = guard.cache.art_dir.join(format!("playlist_{}.jpg", meta.playlist_id));
                             let _ = std::fs::write(&p, &bytes);
@@ -4839,9 +5518,14 @@ fn add_to_recent(
 /// Sync the offline cache: download top-100 most played songs, evict the rest.
 /// Acquires the AppState lock briefly per-operation so playback is never blocked.
 fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
-    let (top, cached, pinned) = {
+    let (enabled, cache_target, top, cached, pinned) = {
         let guard = state.lock().unwrap();
-        let top = match guard.cache.top_played(100) {
+        let enabled = guard.settings.auto_manage_offline_cache;
+        let cache_target = guard.settings.offline_cache_target as usize;
+        if !enabled {
+            return;
+        }
+        let top = match guard.cache.top_played(cache_target) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[CACHE] failed to get top played: {e}");
@@ -4850,10 +5534,14 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         };
         let cached = guard.cache.cached_ids().unwrap_or_default();
         let pinned = guard.cache.pinned_ids().unwrap_or_default();
-        (top, cached, pinned)
+        (enabled, cache_target, top, cached, pinned)
     }; // lock released
 
-    // Evict songs no longer in top 100 (skip pinned/manually downloaded)
+    if !enabled {
+        return;
+    }
+
+    // Evict songs no longer in top configured set (skip pinned/manually downloaded)
     for id in &cached {
         if !top.contains(id) && !pinned.contains(id) {
             let guard = state.lock().unwrap();
@@ -4863,6 +5551,7 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
 
     // Download songs that are in top 100 but not cached
     let to_download: Vec<String> = top.into_iter()
+        .take(cache_target)
         .filter(|id| !cached.contains(id))
         .collect();
 
@@ -4910,9 +5599,7 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
             let guard = state.lock().unwrap();
             guard.cache.get_thumbnail_url(&vid)
         };
-        let art = thumb_url.and_then(|url| {
-            THUMB_CLIENT.get(&url).send().ok()?.bytes().ok()
-        });
+        let art = thumb_url.and_then(|url| fetch_thumbnail_bytes(&url));
 
         // Store to disk + DB (brief lock)
         let guard = state.lock().unwrap();

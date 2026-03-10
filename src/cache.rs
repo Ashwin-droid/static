@@ -3,6 +3,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+#[derive(Debug, Clone)]
+pub struct AppSettings {
+    pub auto_sync_chromium_cookies: bool,
+    pub chromium_cookie_path: String,
+    pub auto_manage_offline_cache: bool,
+    pub offline_cache_target: u32,
+    pub prefetch_enabled: bool,
+    pub prefetch_ahead: u32,
+    pub prefer_local_cache_on_playback: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_sync_chromium_cookies: true,
+            chromium_cookie_path: String::new(),
+            auto_manage_offline_cache: true,
+            offline_cache_target: 100,
+            prefetch_enabled: true,
+            prefetch_ahead: 3,
+            prefer_local_cache_on_playback: true,
+        }
+    }
+}
+
 /// Manages play history (SQLite) and offline audio/artwork cache on disk.
 ///
 /// Directory layout under `$HOME/Music/Static/`:
@@ -11,18 +36,44 @@ use rusqlite::Connection;
 ///   offline/art/     – downloaded artwork      (`{video_id}.jpg`)
 pub struct MusicCache {
     db: Connection,
+    base_dir: PathBuf,
     offline_dir: PathBuf,
     pub art_dir: PathBuf,
     temp_dir: PathBuf,
 }
 
 impl MusicCache {
-    pub fn new() -> Result<Self> {
-        let base = std::env::var("HOME")
+    fn default_base_dir() -> PathBuf {
+        std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join("Music/Static");
-        std::fs::create_dir_all(&base)?;
+            .join("Music/Static")
+    }
+
+    fn resolve_storage_root(raw: &str) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Self::default_base_dir();
+        }
+
+        if trimmed == "~" {
+            return std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return std::env::var("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/tmp"))
+                .join(rest);
+        }
+
+        PathBuf::from(trimmed)
+    }
+
+    fn ensure_storage_layout(base: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+        std::fs::create_dir_all(base)?;
 
         let offline_dir = base.join("offline");
         std::fs::create_dir_all(&offline_dir)?;
@@ -32,6 +83,13 @@ impl MusicCache {
 
         let temp_dir = base.join("temp");
         std::fs::create_dir_all(&temp_dir)?;
+
+        Ok((offline_dir, art_dir, temp_dir))
+    }
+
+    pub fn new() -> Result<Self> {
+        let base = Self::default_base_dir();
+        let (offline_dir, art_dir, temp_dir) = Self::ensure_storage_layout(&base)?;
         // Clean stale prefetch files on startup
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
             for entry in entries.flatten() {
@@ -57,6 +115,10 @@ impl MusicCache {
                 audio_path TEXT NOT NULL,
                 art_path   TEXT NOT NULL DEFAULT '',
                 cached_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );",
         )?;
 
@@ -88,7 +150,136 @@ impl MusicCache {
             );",
         )?;
 
-        Ok(Self { db, offline_dir, art_dir, temp_dir })
+        Ok(Self { db, base_dir: base, offline_dir, art_dir, temp_dir })
+    }
+
+    pub fn apply_storage_root(&mut self, raw_root: &str) -> Result<()> {
+        let base = Self::resolve_storage_root(raw_root);
+        let (offline_dir, art_dir, temp_dir) = Self::ensure_storage_layout(&base)?;
+        self.base_dir = base;
+        self.offline_dir = offline_dir;
+        self.art_dir = art_dir;
+        self.temp_dir = temp_dir;
+        Ok(())
+    }
+
+    pub fn migrate_storage_root(&mut self, raw_root: &str) -> Result<()> {
+        let new_base = Self::resolve_storage_root(raw_root);
+        if self.base_dir == new_base {
+            self.apply_storage_root(raw_root)?;
+            return Ok(());
+        }
+
+        let old_base = self.base_dir.clone();
+        let old_offline_dir = self.offline_dir.clone();
+        let old_art_dir = self.art_dir.clone();
+        let old_temp_dir = self.temp_dir.clone();
+
+        let (new_offline_dir, new_art_dir, new_temp_dir) = Self::ensure_storage_layout(&new_base)?;
+
+        move_dir_contents(&old_art_dir, &new_art_dir)?;
+        move_dir_contents(&old_offline_dir, &new_offline_dir)?;
+        move_dir_contents(&old_temp_dir, &new_temp_dir)?;
+
+        self.db.execute(
+            "UPDATE offline
+             SET audio_path = REPLACE(audio_path, ?1, ?2),
+                 art_path = CASE
+                     WHEN art_path = '' THEN art_path
+                     ELSE REPLACE(art_path, ?3, ?4)
+                 END",
+            rusqlite::params![
+                old_offline_dir.to_string_lossy().as_ref(),
+                new_offline_dir.to_string_lossy().as_ref(),
+                old_art_dir.to_string_lossy().as_ref(),
+                new_art_dir.to_string_lossy().as_ref(),
+            ],
+        )?;
+
+        self.db.execute(
+            "UPDATE offline_playlists
+             SET thumbnail_url = CASE
+                 WHEN thumbnail_url IS NULL THEN NULL
+                 ELSE REPLACE(thumbnail_url, ?1, ?2)
+             END",
+            rusqlite::params![
+                old_art_dir.to_string_lossy().as_ref(),
+                new_art_dir.to_string_lossy().as_ref(),
+            ],
+        )?;
+
+        self.base_dir = new_base;
+        self.offline_dir = new_offline_dir;
+        self.art_dir = new_art_dir;
+        self.temp_dir = new_temp_dir;
+
+        let _ = std::fs::remove_dir(old_art_dir);
+        let _ = std::fs::remove_dir(old_offline_dir);
+        let _ = std::fs::remove_dir(old_temp_dir);
+        let _ = std::fs::remove_dir(old_base);
+        Ok(())
+    }
+
+    pub fn load_settings(&self) -> Result<AppSettings> {
+        let mut settings = AppSettings::default();
+        let mut stmt = self.db.prepare("SELECT key, value FROM app_settings")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        for row in rows.flatten() {
+            match row.0.as_str() {
+                "auto_sync_chromium_cookies" => {
+                    settings.auto_sync_chromium_cookies = parse_bool_setting(&row.1, settings.auto_sync_chromium_cookies);
+                }
+                "chromium_cookie_path" => {
+                    settings.chromium_cookie_path = row.1;
+                }
+                "auto_manage_offline_cache" => {
+                    settings.auto_manage_offline_cache = parse_bool_setting(&row.1, settings.auto_manage_offline_cache);
+                }
+                "offline_cache_target" => {
+                    settings.offline_cache_target = row.1.parse::<u32>().ok().unwrap_or(settings.offline_cache_target).clamp(0, 500);
+                }
+                "prefetch_enabled" => {
+                    settings.prefetch_enabled = parse_bool_setting(&row.1, settings.prefetch_enabled);
+                }
+                "prefetch_ahead" => {
+                    settings.prefetch_ahead = row.1.parse::<u32>().ok().unwrap_or(settings.prefetch_ahead).clamp(0, 12);
+                }
+                "prefer_local_cache_on_playback" => {
+                    settings.prefer_local_cache_on_playback =
+                        parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(settings)
+    }
+
+    pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for (key, value) in [
+            ("auto_sync_chromium_cookies", bool_setting(settings.auto_sync_chromium_cookies)),
+            ("chromium_cookie_path", settings.chromium_cookie_path.clone()),
+            ("auto_manage_offline_cache", bool_setting(settings.auto_manage_offline_cache)),
+            ("offline_cache_target", settings.offline_cache_target.to_string()),
+            ("prefetch_enabled", bool_setting(settings.prefetch_enabled)),
+            ("prefetch_ahead", settings.prefetch_ahead.to_string()),
+            (
+                "prefer_local_cache_on_playback",
+                bool_setting(settings.prefer_local_cache_on_playback),
+            ),
+        ] {
+            tx.execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // ── Play history ─────────────────────────────────────────────
@@ -250,14 +441,27 @@ impl MusicCache {
 
     /// Get the thumbnail URL stored in play history for a given video.
     pub fn get_thumbnail_url(&self, video_id: &str) -> Option<String> {
-        self.db
+        let thumbnail: Option<String> = self
+            .db
             .query_row(
                 "SELECT thumbnail_url FROM plays WHERE video_id = ?1",
                 [video_id],
                 |row| row.get(0),
             )
             .ok()
-            .flatten()
+            .flatten();
+
+        thumbnail.and_then(|url| {
+            if let Some(path) = url.strip_prefix("file://") {
+                if PathBuf::from(path).exists() {
+                    Some(url)
+                } else {
+                    None
+                }
+            } else {
+                Some(url)
+            }
+        })
     }
 
     /// Mark a song as pinned (manually downloaded, won't be auto-evicted).
@@ -371,8 +575,17 @@ impl MusicCache {
     }
 
     #[allow(dead_code)]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    #[allow(dead_code)]
     pub fn offline_dir(&self) -> &Path {
         &self.offline_dir
+    }
+
+    pub fn temp_dir(&self) -> &Path {
+        &self.temp_dir
     }
 
     // ── Temp prefetch cache ──────────────────────────────────
@@ -402,6 +615,21 @@ impl MusicCache {
             }
         }
     }
+
+    pub fn clear_auto_downloads(&self) -> Result<usize> {
+        let mut stmt = self.db.prepare("SELECT video_id FROM offline WHERE pinned = 0")?;
+        let ids: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+
+        let removed = ids.len();
+        for video_id in ids {
+            let _ = self.remove_cached(&video_id);
+        }
+
+        Ok(removed)
+    }
 }
 
 fn epoch_secs() -> i64 {
@@ -409,4 +637,47 @@ fn epoch_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+fn parse_bool_setting(value: &str, default: bool) -> bool {
+    match value {
+        "1" | "true" | "TRUE" | "yes" | "on" => true,
+        "0" | "false" | "FALSE" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+fn bool_setting(value: bool) -> String {
+    if value { "1" } else { "0" }.to_string()
+}
+
+fn move_dir_contents(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() || from == to {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let source = entry.path();
+        let destination = to.join(entry.file_name());
+        if source.is_dir() {
+            move_dir_contents(&source, &destination)?;
+            let _ = std::fs::remove_dir(&source);
+            continue;
+        }
+
+        if destination.exists() {
+            let _ = std::fs::remove_file(&destination);
+        }
+
+        match std::fs::rename(&source, &destination) {
+            Ok(_) => {}
+            Err(_) => {
+                std::fs::copy(&source, &destination)?;
+                std::fs::remove_file(&source)?;
+            }
+        }
+    }
+    Ok(())
 }

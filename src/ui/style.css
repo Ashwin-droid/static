@@ -322,7 +322,7 @@ popover > contents {
    ============================================= */
 
 .cards-scroll {
-    min-content-height: 230;
+    min-height: 230px;
 }
 
 .cover-card {
@@ -651,21 +651,32 @@ popover > contents {
     transform: translateX(10px) scale(1.015);
 }
 
-.queue-row-btn.queue-drop-before,
-.queue-row-btn.queue-drop-after {
+.queue-drop-indicator {
+    margin: 0 0 0 0;
+}
+
+.queue-drop-indicator-row {
+    min-height: 52px;
+    margin: 2px 8px;
+    padding: 4px 8px;
+    border-radius: 10px;
     background-color: rgba(130, 160, 255, 0.08);
+    box-shadow:
+        inset 0 0 0 1px rgba(160, 186, 255, 0.28),
+        0 8px 20px rgba(0, 0, 0, 0.12);
 }
 
-.queue-row-btn.queue-drop-before {
-    box-shadow:
-        inset 0 2px 0 rgba(160, 186, 255, 0.95),
-        inset 0 10px 18px rgba(130, 160, 255, 0.08);
+.queue-drop-indicator-thumb {
+    border-radius: 4px;
+    opacity: 0.78;
 }
 
-.queue-row-btn.queue-drop-after {
-    box-shadow:
-        inset 0 -2px 0 rgba(160, 186, 255, 0.95),
-        inset 0 -10px 18px rgba(130, 160, 255, 0.08);
+.queue-row-btn.queue-drop-gap-before {
+    margin-top: 56px;
+}
+
+.queue-row-btn.queue-drop-gap-after {
+    margin-bottom: 56px;
 }
 
 .queue-panel.queue-drop-active {

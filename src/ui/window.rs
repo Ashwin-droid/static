@@ -146,6 +146,12 @@ struct PlayerState {
     queue_is_radio: Cell<bool>,
     queue_drag_source_index: Cell<Option<usize>>,
     queue_drop_preview_slot: Cell<Option<usize>>,
+    queue_drag_preview_payload: RefCell<Option<QueueDragPayload>>,
+    queue_drop_indicator: GtkBox,
+    queue_drop_indicator_thumb: Picture,
+    queue_drop_indicator_title: Label,
+    queue_drop_indicator_subtitle: Label,
+    queue_drop_indicator_duration: Label,
     chips: RefCell<Vec<RadioChip>>,
     seed_video_id: RefCell<String>,
     // Queue panel widgets
@@ -167,6 +173,14 @@ struct MainPageWidgets {
     content_box: GtkBox,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
+}
+
+#[derive(Debug, Clone)]
+struct QueuePreviewData {
+    title: String,
+    subtitle: String,
+    thumbnail_url: Option<String>,
+    duration: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1298,10 +1312,58 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    let queue_overlay = Overlay::new();
     let queue_list_box = GtkBox::new(Orientation::Vertical, 0);
     queue_list_box.set_margin_top(4);
     queue_scroll.set_child(Some(&queue_list_box));
-    queue_panel.append(&queue_scroll);
+    let queue_drop_indicator = GtkBox::new(Orientation::Vertical, 0);
+    queue_drop_indicator.add_css_class("queue-drop-indicator");
+    queue_drop_indicator.set_halign(Align::Fill);
+    queue_drop_indicator.set_valign(Align::Start);
+    queue_drop_indicator.set_can_target(false);
+    queue_drop_indicator.set_visible(false);
+
+    let queue_drop_indicator_row = GtkBox::new(Orientation::Horizontal, 8);
+    queue_drop_indicator_row.add_css_class("queue-drop-indicator-row");
+    queue_drop_indicator_row.set_margin_start(8);
+    queue_drop_indicator_row.set_margin_end(8);
+    queue_drop_indicator_row.set_margin_top(2);
+    queue_drop_indicator_row.set_margin_bottom(2);
+
+    let queue_drop_indicator_thumb = Picture::new();
+    queue_drop_indicator_thumb.add_css_class("queue-drop-indicator-thumb");
+    queue_drop_indicator_thumb.set_keep_aspect_ratio(true);
+    queue_drop_indicator_thumb.set_size_request(40, 40);
+    queue_drop_indicator_row.append(&queue_drop_indicator_thumb);
+
+    let queue_drop_indicator_info = GtkBox::new(Orientation::Vertical, 0);
+    queue_drop_indicator_info.set_hexpand(true);
+    queue_drop_indicator_info.set_valign(Align::Center);
+
+    let queue_drop_indicator_title = Label::new(None);
+    queue_drop_indicator_title.set_halign(Align::Start);
+    queue_drop_indicator_title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    queue_drop_indicator_title.add_css_class("queue-track-title");
+    queue_drop_indicator_info.append(&queue_drop_indicator_title);
+
+    let queue_drop_indicator_subtitle = Label::new(None);
+    queue_drop_indicator_subtitle.set_halign(Align::Start);
+    queue_drop_indicator_subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    queue_drop_indicator_subtitle.add_css_class("queue-track-artist");
+    queue_drop_indicator_info.append(&queue_drop_indicator_subtitle);
+
+    queue_drop_indicator_row.append(&queue_drop_indicator_info);
+
+    let queue_drop_indicator_duration = Label::new(None);
+    queue_drop_indicator_duration.add_css_class("queue-track-duration");
+    queue_drop_indicator_duration.set_valign(Align::Center);
+    queue_drop_indicator_row.append(&queue_drop_indicator_duration);
+
+    queue_drop_indicator.append(&queue_drop_indicator_row);
+
+    queue_overlay.set_child(Some(&queue_scroll));
+    queue_overlay.add_overlay(&queue_drop_indicator);
+    queue_panel.append(&queue_overlay);
 
     hbox.append(&queue_panel);
     paned.set_end_child(Some(&hbox));
@@ -1332,6 +1394,12 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue_is_radio: Cell::new(false),
         queue_drag_source_index: Cell::new(None),
         queue_drop_preview_slot: Cell::new(None),
+        queue_drag_preview_payload: RefCell::new(None),
+        queue_drop_indicator: queue_drop_indicator.clone(),
+        queue_drop_indicator_thumb: queue_drop_indicator_thumb.clone(),
+        queue_drop_indicator_title: queue_drop_indicator_title.clone(),
+        queue_drop_indicator_subtitle: queue_drop_indicator_subtitle.clone(),
+        queue_drop_indicator_duration: queue_drop_indicator_duration.clone(),
         chips: RefCell::new(Vec::new()),
         seed_video_id: RefCell::new(String::new()),
         queue_list_box: queue_list_box.clone(),
@@ -1346,17 +1414,19 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let ps_enter = ps.clone();
         let state = state.clone();
         let drop_target = DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
-        drop_target.connect_enter(move |_, _, _| {
+        drop_target.connect_enter(move |_, _, y| {
             set_queue_drop_active(&ps_enter, true);
-            let preview_slot = normalized_preview_slot(&ps_enter, ps_enter.queue.borrow().len());
+            let raw_slot = preview_slot_for_queue_y(&ps_enter, y);
+            let preview_slot = normalized_preview_slot(&ps_enter, raw_slot);
             set_queue_drop_preview(&ps_enter, preview_slot);
             gtk::gdk::DragAction::MOVE
         });
 
         let ps_motion = ps.clone();
-        drop_target.connect_motion(move |_, _, _| {
+        drop_target.connect_motion(move |_, _, y| {
             set_queue_drop_active(&ps_motion, true);
-            let preview_slot = normalized_preview_slot(&ps_motion, ps_motion.queue.borrow().len());
+            let raw_slot = preview_slot_for_queue_y(&ps_motion, y);
+            let preview_slot = normalized_preview_slot(&ps_motion, raw_slot);
             set_queue_drop_preview(&ps_motion, preview_slot);
             gtk::gdk::DragAction::MOVE
         });
@@ -1368,11 +1438,12 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         });
 
         let ps_drop = ps.clone();
-        drop_target.connect_drop(move |_, value, _, _| {
+        drop_target.connect_drop(move |_, value, _, y| {
             let Some(payload) = parse_queue_drag_payload(value) else { return false };
             clear_queue_drop_preview(&ps_drop);
             set_queue_drop_active(&ps_drop, false);
-            handle_queue_drop_payload(payload, ps_drop.queue.borrow().len(), &ps_drop, &state)
+            let raw_slot = preview_slot_for_queue_y(&ps_drop, y);
+            handle_queue_drop_payload(payload, raw_slot, &ps_drop, &state)
         });
 
         ps.queue_list_box.add_controller(drop_target);
@@ -2528,6 +2599,7 @@ fn build_playlist_card(
             subtitle: playlist.subtitle.clone(),
             source: QueuePlaylistSource::Remote,
         },
+        ps,
     );
 
     card_btn
@@ -2722,6 +2794,7 @@ fn build_offline_playlist_card(
             subtitle: playlist.subtitle.clone(),
             source: QueuePlaylistSource::Offline,
         },
+        ps,
     );
 
     card_btn
@@ -3098,6 +3171,7 @@ fn build_cover_card(
         QueueDragPayload::Track {
             track: track.clone(),
         },
+        ps,
     );
 
     card_btn
@@ -3249,6 +3323,7 @@ fn build_track_row(
         QueueDragPayload::Track {
             track: track.clone(),
         },
+        ps,
     );
 
     wrapper
@@ -3450,6 +3525,7 @@ fn build_sidebar_recent_item(
         QueueDragPayload::Track {
             track: track.clone(),
         },
+        ps,
     );
 
     btn
@@ -4341,8 +4417,10 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
             let ps = ps.clone();
             let row_wrapper_ref = row_wrapper.clone();
             let drag_source_ref = drag_source.clone();
+            let preview_payload = QueueDragPayload::QueueRow { index: i };
             drag_source.connect_drag_begin(move |_, _| {
                 ps.queue_drag_source_index.set(Some(i));
+                ps.queue_drag_preview_payload.replace(Some(preview_payload.clone()));
                 ps.queue_list_box.add_css_class("queue-drag-active");
                 row_wrapper_ref.add_css_class("queue-row-dragging");
                 let paintable = WidgetPaintable::new(Some(&row_wrapper_ref));
@@ -4359,6 +4437,7 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
             drag_source.connect_drag_end(move |_, _, _| {
                 row_wrapper_ref.remove_css_class("queue-row-dragging");
                 ps.queue_drag_source_index.set(None);
+                ps.queue_drag_preview_payload.replace(None);
                 ps.queue_list_box.remove_css_class("queue-drag-active");
                 clear_queue_drop_preview(&ps);
             });
@@ -4580,15 +4659,77 @@ fn clear_box(container: &GtkBox) {
     }
 }
 
+fn queue_preview_data_for_payload(ps: &PlayerState, payload: &QueueDragPayload) -> Option<QueuePreviewData> {
+    match payload {
+        QueueDragPayload::QueueRow { index } => {
+            let queue = ps.queue.borrow();
+            let track = queue.get(*index)?;
+            Some(QueuePreviewData {
+                title: track.title.clone(),
+                subtitle: artist_string(track),
+                thumbnail_url: track.thumbnail_url.clone(),
+                duration: track.duration.clone(),
+            })
+        }
+        QueueDragPayload::Track { track } => Some(QueuePreviewData {
+            title: track.title.clone(),
+            subtitle: artist_string(track),
+            thumbnail_url: track.thumbnail_url.clone(),
+            duration: track.duration.clone(),
+        }),
+        QueueDragPayload::Playlist {
+            title,
+            subtitle,
+            thumbnail_url,
+            ..
+        } => Some(QueuePreviewData {
+            title: title.clone(),
+            subtitle: subtitle.clone().unwrap_or_else(|| "Playlist".to_string()),
+            thumbnail_url: thumbnail_url.clone(),
+            duration: None,
+        }),
+    }
+}
+
+fn refresh_queue_drop_indicator(ps: &PlayerState) {
+    let preview = ps
+        .queue_drag_preview_payload
+        .borrow()
+        .as_ref()
+        .and_then(|payload| queue_preview_data_for_payload(ps, payload));
+
+    if let Some(preview) = preview {
+        ps.queue_drop_indicator_title.set_text(&preview.title);
+        ps.queue_drop_indicator_subtitle.set_text(&preview.subtitle);
+        ps.queue_drop_indicator_duration
+            .set_text(preview.duration.as_deref().unwrap_or(""));
+        if let Some(url) = preview.thumbnail_url.as_deref() {
+            ps.queue_drop_indicator_thumb.set_visible(true);
+            load_thumbnail_into(&ps.queue_drop_indicator_thumb, url, 80);
+        } else {
+            ps.queue_drop_indicator_thumb.set_paintable(Option::<&gtk::gdk::Paintable>::None);
+            ps.queue_drop_indicator_thumb.set_visible(false);
+        }
+    } else {
+        ps.queue_drop_indicator_title.set_text("Drop into queue");
+        ps.queue_drop_indicator_subtitle.set_text("");
+        ps.queue_drop_indicator_duration.set_text("");
+        ps.queue_drop_indicator_thumb.set_paintable(Option::<&gtk::gdk::Paintable>::None);
+        ps.queue_drop_indicator_thumb.set_visible(false);
+    }
+}
+
 fn clear_queue_drop_preview(ps: &PlayerState) {
     if ps.queue_drop_preview_slot.take().is_none() {
         return;
     }
 
+    ps.queue_drop_indicator.set_visible(false);
+
     let mut child = ps.queue_list_box.first_child();
     while let Some(widget) = child {
-        widget.remove_css_class("queue-drop-before");
-        widget.remove_css_class("queue-drop-after");
+        widget.remove_css_class("queue-drop-gap-before");
+        widget.remove_css_class("queue-drop-gap-after");
         child = widget.next_sibling();
     }
 }
@@ -4613,29 +4754,46 @@ fn set_queue_drop_preview(ps: &PlayerState, slot: Option<usize>) {
     let queue_len = ps.queue.borrow().len();
     if queue_len == 0 {
         ps.queue_list_box.add_css_class("queue-drop-empty");
+        refresh_queue_drop_indicator(ps);
+        ps.queue_drop_indicator.set_margin_top(ps.queue_list_box.margin_top());
+        ps.queue_drop_indicator.set_visible(true);
         ps.queue_drop_preview_slot.set(Some(0));
         return;
     }
     ps.queue_list_box.remove_css_class("queue-drop-empty");
 
-    let target_index = slot.min(queue_len - 1);
-    let preview_class = if slot >= queue_len {
-        "queue-drop-after"
-    } else {
-        "queue-drop-before"
-    };
+    let slot = slot.min(queue_len);
+    let mut row_widgets: Vec<gtk::Widget> = Vec::new();
+    let mut collect = ps.queue_list_box.first_child();
+    while let Some(widget) = collect {
+        row_widgets.push(widget.clone());
+        collect = widget.next_sibling();
+    }
 
-    let mut child = ps.queue_list_box.first_child();
-    let mut index = 0usize;
-    while let Some(widget) = child {
-        if index == target_index {
-            widget.add_css_class(preview_class);
-            ps.queue_drop_preview_slot.set(Some(slot));
-            return;
+    if slot >= queue_len {
+        if let Some(last_row) = row_widgets.last() {
+            last_row.add_css_class("queue-drop-gap-after");
         }
+    } else if let Some(target_row) = row_widgets.get(slot) {
+        target_row.add_css_class("queue-drop-gap-before");
+    }
+
+    let mut offset = ps.queue_list_box.margin_top() as i32;
+    let mut index = 0usize;
+    let mut child = ps.queue_list_box.first_child();
+    while let Some(widget) = child {
+        if index >= slot {
+            break;
+        }
+        offset += widget.allocated_height().max(0);
         index += 1;
         child = widget.next_sibling();
     }
+
+    refresh_queue_drop_indicator(ps);
+    ps.queue_drop_indicator.set_margin_top(offset);
+    ps.queue_drop_indicator.set_visible(true);
+    ps.queue_drop_preview_slot.set(Some(slot));
 }
 
 fn preview_slot_for_pointer(row_index: usize, y: f64, row_height: i32) -> usize {
@@ -4644,6 +4802,25 @@ fn preview_slot_for_pointer(row_index: usize, y: f64, row_height: i32) -> usize 
     } else {
         row_index + 1
     }
+}
+
+fn preview_slot_for_queue_y(ps: &PlayerState, y: f64) -> usize {
+    let mut child = ps.queue_list_box.first_child();
+    let mut index = 0usize;
+    let mut cursor_y = 0.0f64;
+
+    while let Some(widget) = child {
+        let height = widget.allocated_height().max(1) as f64;
+        let midpoint = cursor_y + (height / 2.0);
+        if y < midpoint {
+            return index;
+        }
+        cursor_y += height;
+        index += 1;
+        child = widget.next_sibling();
+    }
+
+    index
 }
 
 fn normalized_preview_slot(ps: &PlayerState, raw_slot: usize) -> Option<usize> {
@@ -4666,7 +4843,11 @@ fn parse_queue_drag_payload(value: &glib::Value) -> Option<QueueDragPayload> {
     serde_json::from_str(&json).ok()
 }
 
-fn attach_queue_drag_source(widget: &impl IsA<gtk::Widget>, payload: QueueDragPayload) {
+fn attach_queue_drag_source(
+    widget: &impl IsA<gtk::Widget>,
+    payload: QueueDragPayload,
+    ps: &Rc<PlayerState>,
+) {
     let drag_source = DragSource::new();
     drag_source.set_actions(gtk::gdk::DragAction::MOVE);
 
@@ -4678,13 +4859,25 @@ fn attach_queue_drag_source(widget: &impl IsA<gtk::Widget>, payload: QueueDragPa
     {
         let drag_source_ref = drag_source.clone();
         let widget_ref: gtk::Widget = widget.as_ref().clone();
+        let payload = payload.clone();
+        let ps = ps.clone();
         drag_source.connect_drag_begin(move |_, _| {
+            ps.queue_drag_preview_payload.replace(Some(payload.clone()));
             let paintable = WidgetPaintable::new(Some(&widget_ref));
             drag_source_ref.set_icon(
                 Some(&paintable),
                 28,
                 (widget_ref.allocated_height() / 2).max(1),
             );
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        drag_source.connect_drag_end(move |_, _, _| {
+            ps.queue_drag_preview_payload.replace(None);
+            clear_queue_drop_preview(&ps);
+            set_queue_drop_active(&ps, false);
         });
     }
 

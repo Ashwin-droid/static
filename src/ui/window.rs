@@ -37,6 +37,7 @@ const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
 
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
+const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::cache::{AppSettings, MusicCache};
@@ -162,6 +163,7 @@ struct PlayerState {
     queue_list_box: GtkBox,
     chip_bar: GtkBox,
     queue_panel: GtkBox,
+    queue_dismiss_btn: Button,
     // Play tracking — records listen time when navigating away
     now_playing_track: RefCell<Option<NowPlayingTrack>>,
     playback_session_id: Cell<u64>,
@@ -1561,13 +1563,25 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     queue_panel.add_css_class("queue-panel");
     queue_panel.set_visible(false);
 
+    let queue_header_row = GtkBox::new(Orientation::Horizontal, 8);
+    queue_header_row.set_margin_start(16);
+    queue_header_row.set_margin_end(16);
+    queue_header_row.set_margin_top(12);
+    queue_header_row.set_margin_bottom(8);
+
     let queue_header = Label::new(Some("Up Next"));
     queue_header.add_css_class("queue-header");
     queue_header.set_halign(Align::Start);
-    queue_header.set_margin_start(16);
-    queue_header.set_margin_top(12);
-    queue_header.set_margin_bottom(8);
-    queue_panel.append(&queue_header);
+    queue_header.set_hexpand(true);
+    queue_header_row.append(&queue_header);
+
+    let dismiss_queue_btn = Button::with_label("Dismiss Queue");
+    dismiss_queue_btn.add_css_class("settings-secondary-btn");
+    dismiss_queue_btn.set_halign(Align::End);
+    dismiss_queue_btn.set_sensitive(false);
+    queue_header_row.append(&dismiss_queue_btn);
+
+    queue_panel.append(&queue_header_row);
 
     // Chip filter bar (horizontal scrollable)
     let chip_scroll = ScrolledWindow::builder()
@@ -1683,9 +1697,18 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue_list_box: queue_list_box.clone(),
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
+        queue_dismiss_btn: dismiss_queue_btn.clone(),
         now_playing_track: RefCell::new(None),
         playback_session_id: Cell::new(0),
     });
+
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        dismiss_queue_btn.connect_clicked(move |_| {
+            dismiss_queue_after_current(&ps, &state);
+        });
+    }
 
     {
         let ps_enter = ps.clone();
@@ -4602,7 +4625,7 @@ fn load_sidebar_history(state: &Arc<Mutex<AppState>>, recent_list: &GtkBox, ps: 
 
         if let Ok(Some(Ok(tracks))) = result {
             clear_box(&recent_list);
-            for track in tracks.iter().take(15) {
+            for track in tracks.iter().take(SIDEBAR_HISTORY_LIMIT) {
                 let item = build_sidebar_recent_item(track, &state, &ps);
                 recent_list.append(&item);
             }
@@ -4865,6 +4888,8 @@ fn build_cover_card(
     }
     pop_box.append(&add_queue_btn);
 
+    append_download_action(&pop_box, track, state, &popover);
+
     popover.set_child(Some(&pop_box));
     popover.set_parent(&card_btn);
 
@@ -5022,6 +5047,8 @@ fn build_track_row(
         });
     }
     pop_box.append(&add_queue_btn);
+
+    append_download_action(&pop_box, track, state, &popover);
 
     popover.set_child(Some(&pop_box));
     popover.set_parent(&wrapper);
@@ -5526,6 +5553,27 @@ fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppSta
     sync_mpris_transport(ps, state);
 }
 
+fn dismiss_queue_after_current(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    let keep_len = ps.queue_index.get().saturating_add(1);
+    {
+        let mut queue = ps.queue.borrow_mut();
+        if queue.len() <= keep_len {
+            return;
+        }
+        queue.truncate(keep_len);
+    }
+
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        radio.touched_len = radio.touched_len.min(keep_len);
+    }
+
+    ps.radio_append_in_flight.set(false);
+    *ps.last_radio_append_anchor.borrow_mut() = None;
+    render_queue_panel(ps, state);
+    sync_remote_queue(ps);
+    sync_mpris_transport(ps, state);
+}
+
 /// Remove a track from the queue by index, adjusting queue_index if needed.
 fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     {
@@ -5549,6 +5597,68 @@ fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>
         sync_remote_queue(&ps);
         sync_mpris_transport(&ps, &state);
     });
+}
+
+fn queue_download_track(track: Track, state: &Arc<Mutex<AppState>>) {
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        let _ = gio::spawn_blocking(move || {
+            let vid = track.video_id.clone();
+            if ensure_track_available_offline(&state, &track, true, "DOWNLOAD") {
+                eprintln!("[DOWNLOAD] pinned {vid} for offline playback");
+            }
+        })
+        .await;
+    });
+}
+
+fn delete_track_from_offline(track: Track, state: &Arc<Mutex<AppState>>) {
+    let state = state.clone();
+    glib::spawn_future_local(async move {
+        let _ = gio::spawn_blocking(move || {
+            let vid = track.video_id.clone();
+            let guard = state.lock().unwrap();
+            if let Err(err) = guard.cache.remove_cached(&vid) {
+                eprintln!("[DOWNLOAD] failed to remove {vid} from offline cache: {err}");
+            } else {
+                eprintln!("[DOWNLOAD] removed {vid} from offline cache");
+            }
+        })
+        .await;
+    });
+}
+
+fn is_pinned_download(state: &Arc<Mutex<AppState>>, video_id: &str) -> bool {
+    state.lock().unwrap().cache.is_pinned_offline(video_id)
+}
+
+fn append_download_action(
+    pop_box: &GtkBox,
+    track: &Track,
+    state: &Arc<Mutex<AppState>>,
+    popover: &Popover,
+) {
+    let is_pinned = is_pinned_download(state, &track.video_id);
+    let button = if is_pinned {
+        Button::with_label("Delete from offline")
+    } else {
+        Button::with_label("Download")
+    };
+    button.add_css_class("popover-action-btn");
+
+    let track = track.clone();
+    let state = state.clone();
+    let popover = popover.clone();
+    button.connect_clicked(move |_| {
+        popover.popdown();
+        if is_pinned {
+            delete_track_from_offline(track.clone(), &state);
+        } else {
+            queue_download_track(track.clone(), &state);
+        }
+    });
+
+    pop_box.append(&button);
 }
 
 /// Play a track from the queue by index (no radio re-fetch).
@@ -5929,6 +6039,11 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     clear_queue_drop_preview(ps);
     ps.queue_drag_source_index.set(None);
 
+    let queue = ps.queue.borrow();
+    let current_idx = ps.queue_index.get();
+    let can_dismiss = current_idx.saturating_add(1) < queue.len();
+    ps.queue_dismiss_btn.set_sensitive(can_dismiss);
+
     // -- Chips --
     clear_box(&ps.chip_bar);
     let chips = radio_chips(ps);
@@ -5948,8 +6063,6 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     }
     // -- Track list --
     clear_box(&ps.queue_list_box);
-    let queue = ps.queue.borrow();
-    let current_idx = ps.queue_index.get();
     let radio_tail_start = if is_radio_queue(ps) {
         let touched_len = radio_touched_len(ps).unwrap_or(0).min(queue.len());
         (touched_len < queue.len()).then_some(touched_len)
@@ -6005,6 +6118,10 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
             popover.set_has_arrow(false);
             popover.set_position(gtk::PositionType::Bottom);
 
+            let pop_box = GtkBox::new(Orientation::Vertical, 0);
+
+            append_download_action(&pop_box, track, state, &popover);
+
             let remove_btn = Button::with_label("Remove from queue");
             remove_btn.add_css_class("popover-action-btn");
             {
@@ -6016,7 +6133,9 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                     queue_remove(i, &ps, &state);
                 });
             }
-            popover.set_child(Some(&remove_btn));
+            pop_box.append(&remove_btn);
+
+            popover.set_child(Some(&pop_box));
             popover.set_parent(&row_wrapper);
 
             // On open: dim all siblings, highlight this row
@@ -6203,13 +6322,13 @@ fn add_to_recent(
     let item = build_sidebar_recent_item(track, state, ps);
     recent_list.prepend(&item);
 
-    // Limit to 15 items
+    // Keep the sidebar aligned with the full history payload we preload.
     let mut count = 0;
     let mut child = recent_list.first_child();
     while let Some(c) = child {
         let next = c.next_sibling();
         count += 1;
-        if count > 15 {
+        if count > SIDEBAR_HISTORY_LIMIT {
             recent_list.remove(&c);
         }
         child = next;

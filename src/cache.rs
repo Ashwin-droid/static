@@ -756,6 +756,18 @@ impl MusicCache {
         Ok(ids)
     }
 
+    /// Check whether a song is a manually pinned offline download.
+    pub fn is_pinned_offline(&self, video_id: &str) -> bool {
+        self.db
+            .query_row(
+                "SELECT pinned FROM offline WHERE video_id = ?1",
+                [video_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|pinned| pinned != 0)
+            .unwrap_or(false)
+    }
+
     /// Check if a song is already cached offline.
     pub fn is_cached(&self, video_id: &str) -> bool {
         self.get_cached_audio(video_id).is_some()

@@ -42,6 +42,7 @@ const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
 
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
+const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::cache::{AppSettings, MusicCache};
 use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, Track};
@@ -2315,8 +2316,7 @@ fn load_settings_page(
     local_hint.set_halign(Align::Start);
     local_copy.append(&local_hint);
     local_row.append(&local_copy);
-    let local_switch = Switch::new();
-    local_switch.set_active(settings.prefer_local_cache_on_playback);
+    let local_switch = settings_switch(settings.prefer_local_cache_on_playback);
     {
         let state = state.clone();
         local_switch.connect_active_notify(move |sw| {
@@ -2343,8 +2343,7 @@ fn load_settings_page(
     prefetch_hint.set_halign(Align::Start);
     prefetch_copy.append(&prefetch_hint);
     prefetch_row.append(&prefetch_copy);
-    let prefetch_switch = Switch::new();
-    prefetch_switch.set_active(settings.prefetch_enabled);
+    let prefetch_switch = settings_switch(settings.prefetch_enabled);
     {
         let state = state.clone();
         prefetch_switch.connect_active_notify(move |sw| {
@@ -2416,8 +2415,7 @@ fn load_settings_page(
     sponsorblock_hint.set_halign(Align::Start);
     sponsorblock_row_copy.append(&sponsorblock_hint);
     sponsorblock_row.append(&sponsorblock_row_copy);
-    let sponsorblock_switch = Switch::new();
-    sponsorblock_switch.set_active(settings.sponsorblock_enabled);
+    let sponsorblock_switch = settings_switch(settings.sponsorblock_enabled);
     let sponsorblock_categories_box = GtkBox::new(Orientation::Vertical, 12);
     sponsorblock_categories_box.set_sensitive(settings.sponsorblock_enabled);
     {
@@ -2458,8 +2456,7 @@ fn load_settings_page(
         category_copy.append(&category_hint);
         category_row.append(&category_copy);
 
-        let category_switch = Switch::new();
-        category_switch.set_active(
+        let category_switch = settings_switch(
             settings
                 .sponsorblock_categories
                 .iter()
@@ -2523,8 +2520,7 @@ fn load_settings_page(
     manage_hint.set_halign(Align::Start);
     manage_copy.append(&manage_hint);
     manage_row.append(&manage_copy);
-    let manage_switch = Switch::new();
-    manage_switch.set_active(settings.auto_manage_offline_cache);
+    let manage_switch = settings_switch(settings.auto_manage_offline_cache);
     {
         let state = state.clone();
         let stack = stack.clone();
@@ -2623,6 +2619,98 @@ fn load_settings_page(
     }
     manage_row.append(&manage_switch);
     offline_section.append(&manage_row);
+
+    let listen_again_row = GtkBox::new(Orientation::Horizontal, 12);
+    listen_again_row.add_css_class("settings-row");
+    let listen_again_copy = GtkBox::new(Orientation::Vertical, 2);
+    listen_again_copy.set_hexpand(true);
+    let listen_again_label = Label::new(Some("Cache Listen again picks"));
+    listen_again_label.add_css_class("settings-row-title");
+    listen_again_label.set_halign(Align::Start);
+    listen_again_copy.append(&listen_again_label);
+    let listen_again_hint = Label::new(Some(
+        "Also keep songs from Listen again offline. Static hangs onto them for up to 30 days, and removes older ones once they have not been played in that window.",
+    ));
+    listen_again_hint.add_css_class("settings-row-copy");
+    listen_again_hint.set_wrap(true);
+    listen_again_hint.set_halign(Align::Start);
+    listen_again_copy.append(&listen_again_hint);
+    listen_again_row.append(&listen_again_copy);
+    let listen_again_switch = settings_switch(settings.auto_cache_listen_again);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let listen_again_switch_ref = listen_again_switch.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        listen_again_switch.connect_active_notify(move |sw| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = sw.is_active();
+            let current_value = app_settings(&state).auto_cache_listen_again;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let listen_again_switch = listen_again_switch_ref.clone();
+            let guard_flag = guard_flag.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || {
+                        preview_auto_cache_evictions(&state, |s| {
+                            s.auto_cache_listen_again = next_value
+                        })
+                    }
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change =
+                    |guard_flag: &Rc<Cell<bool>>, listen_again_switch: &Switch, value: bool| {
+                        guard_flag.set(true);
+                        listen_again_switch.set_active(value);
+                        guard_flag.set(false);
+                    };
+
+                if !next_value && impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack,
+                        "Turn off Listen again auto-cache?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they only qualify through Listen again right now."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &listen_again_switch, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.auto_cache_listen_again = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &listen_again_switch, next_value),
+                    _ => apply_change(&guard_flag, &listen_again_switch, current_value),
+                }
+            });
+        });
+    }
+    listen_again_row.append(&listen_again_switch);
+    offline_section.append(&listen_again_row);
 
     let target_row = GtkBox::new(Orientation::Horizontal, 12);
     target_row.add_css_class("settings-row");
@@ -3135,8 +3223,7 @@ fn load_settings_page(
     import_toggle_hint.set_halign(Align::Start);
     import_toggle_copy.append(&import_toggle_hint);
     import_toggle_row.append(&import_toggle_copy);
-    let import_switch = Switch::new();
-    import_switch.set_active(settings.auto_sync_chromium_cookies);
+    let import_switch = settings_switch(settings.auto_sync_chromium_cookies);
     {
         let state = state.clone();
         import_switch.connect_active_notify(move |sw| {
@@ -3265,6 +3352,14 @@ fn icon_button(svg_bytes: &[u8], size: i32, css_class: &str) -> Button {
     btn.set_child(Some(&svg_image(svg_bytes, size)));
     btn.add_css_class(css_class);
     btn
+}
+
+fn settings_switch(active: bool) -> Switch {
+    let sw = Switch::new();
+    sw.set_active(active);
+    sw.set_valign(Align::Center);
+    sw.set_halign(Align::End);
+    sw
 }
 
 fn set_button_icon(btn: &Button, svg_bytes: &[u8], size: i32) {
@@ -3849,6 +3944,25 @@ fn load_home(
 
         match result {
             Ok(Some(Ok(sections))) => {
+                let listen_again_tracks = extract_listen_again_tracks(&sections);
+                let state_bg = state.clone();
+                let _ = gio::spawn_blocking(move || {
+                    let guard = state_bg.lock().unwrap();
+                    let listen_again_ids = listen_again_tracks
+                        .iter()
+                        .map(|track| track.video_id.clone())
+                        .collect::<Vec<_>>();
+                    for track in &listen_again_tracks {
+                        let _ = guard.cache.upsert_track_metadata(
+                            &track.video_id,
+                            &track.title,
+                            &artist_string(track),
+                            history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+                        );
+                    }
+                    guard.cache.store_listen_again_snapshot(&listen_again_ids)
+                })
+                .await;
                 render_home_view(&content_box, &sections, &state, &ps, &recent_list);
             }
             Ok(Some(Err(e))) => {
@@ -3911,9 +4025,11 @@ fn load_search(
 fn load_offline_page_data(
     state: &Arc<Mutex<AppState>>,
 ) -> (Vec<PlaylistSummary>, Vec<Track>, Vec<Track>) {
+    repair_offline_track_metadata(state);
+
     let guard = state.lock().unwrap();
 
-    let offline_playlists: Vec<PlaylistSummary> = guard
+    let mut offline_playlists: Vec<PlaylistSummary> = guard
         .cache
         .offline_playlists()
         .unwrap_or_default()
@@ -3937,6 +4053,22 @@ fn load_offline_page_data(
             }
         })
         .collect();
+
+    let listen_again_track_ids = guard
+        .cache
+        .offline_listen_again_track_ids()
+        .unwrap_or_default();
+    if let Some(first_video_id) = listen_again_track_ids.first() {
+        offline_playlists.insert(
+            0,
+            PlaylistSummary {
+                playlist_id: OFFLINE_LISTEN_AGAIN_PLAYLIST_ID.to_string(),
+                title: "Listen again".to_string(),
+                thumbnail_url: offline_thumbnail_url(&guard.cache, first_video_id),
+                subtitle: Some("Auto-kept from Listen again".to_string()),
+            },
+        );
+    }
 
     let all_tracks: Vec<Track> = guard
         .cache
@@ -3968,10 +4100,14 @@ fn load_offline_page_data(
     let playlist_track_ids: HashSet<String> = offline_playlists
         .iter()
         .flat_map(|playlist| {
-            guard
-                .cache
-                .offline_playlist_track_ids(&playlist.playlist_id)
-                .unwrap_or_default()
+            if playlist.playlist_id == OFFLINE_LISTEN_AGAIN_PLAYLIST_ID {
+                listen_again_track_ids.clone()
+            } else {
+                guard
+                    .cache
+                    .offline_playlist_track_ids(&playlist.playlist_id)
+                    .unwrap_or_default()
+            }
         })
         .collect();
 
@@ -3984,12 +4120,77 @@ fn load_offline_page_data(
     (offline_playlists, display_tracks, all_tracks)
 }
 
+fn repair_offline_track_metadata(state: &Arc<Mutex<AppState>>) {
+    let repair_ids = {
+        let guard = state.lock().unwrap();
+        guard
+            .cache
+            .offline_tracks()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(video_id, title, artist, _art)| {
+                let thumbnail_url = offline_thumbnail_url(&guard.cache, &video_id);
+                let needs_repair = title.trim().is_empty()
+                    || title == video_id
+                    || artist.trim().is_empty()
+                    || thumbnail_url.is_none();
+                needs_repair.then_some(video_id)
+            })
+            .take(8)
+            .collect::<Vec<_>>()
+    };
+
+    if repair_ids.is_empty() {
+        return;
+    }
+
+    let Some(client) = app_client(state) else {
+        return;
+    };
+
+    for video_id in repair_ids {
+        let mut radio = match client.get_radio(&video_id, None, None) {
+            Ok(radio) => radio,
+            Err(err) => {
+                eprintln!("[OFFLINE] failed to repair metadata for {video_id}: {err}");
+                continue;
+            }
+        };
+
+        let repaired = radio
+            .tracks
+            .iter()
+            .find(|track| track.video_id == video_id)
+            .cloned()
+            .or_else(|| radio.tracks.drain(..).next());
+
+        let Some(track) = repaired else {
+            continue;
+        };
+
+        let guard = state.lock().unwrap();
+        let _ = guard.cache.upsert_track_metadata(
+            &track.video_id,
+            &track.title,
+            &artist_string(&track),
+            history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        );
+    }
+}
+
 fn load_offline_playlist_tracks(state: &Arc<Mutex<AppState>>, playlist_id: &str) -> Vec<Track> {
     let guard = state.lock().unwrap();
-    let video_ids = guard
-        .cache
-        .offline_playlist_track_ids(playlist_id)
-        .unwrap_or_default();
+    let video_ids = if playlist_id == OFFLINE_LISTEN_AGAIN_PLAYLIST_ID {
+        guard
+            .cache
+            .offline_listen_again_track_ids()
+            .unwrap_or_default()
+    } else {
+        guard
+            .cache
+            .offline_playlist_track_ids(playlist_id)
+            .unwrap_or_default()
+    };
 
     video_ids
         .into_iter()
@@ -4071,7 +4272,7 @@ fn load_offline(
                 content_box.append(&header);
 
                 if !offline_playlists.is_empty() {
-                    let pl_header = Label::new(Some("Downloaded Playlists"));
+                    let pl_header = Label::new(Some("Offline Collections"));
                     pl_header.add_css_class("section-header");
                     pl_header.set_halign(Align::Start);
                     pl_header.set_margin_start(28);
@@ -4829,6 +5030,19 @@ fn render_home_view(
 
         content_box.append(&grid);
     }
+}
+
+fn extract_listen_again_tracks(sections: &[HomeSection]) -> Vec<Track> {
+    sections
+        .iter()
+        .find(|section| section.title.eq_ignore_ascii_case("Listen again"))
+        .or_else(|| {
+            sections
+                .iter()
+                .find(|section| section.title.to_ascii_lowercase().contains("listen again"))
+        })
+        .map(|section| section.contents.clone())
+        .unwrap_or_default()
 }
 
 fn render_search_view(
@@ -6980,6 +7194,10 @@ fn parse_queue_drag_payload(value: &glib::Value) -> Option<QueueDragPayload> {
     serde_json::from_str(&json).ok()
 }
 
+fn queue_accepts_external_dnd(ps: &PlayerState) -> bool {
+    ps.queue_panel.is_visible()
+}
+
 fn attach_queue_drag_source(
     widget: &impl IsA<gtk::Widget>,
     payload: QueueDragPayload,
@@ -6990,7 +7208,13 @@ fn attach_queue_drag_source(
 
     {
         let payload = payload.clone();
-        drag_source.connect_prepare(move |_, _, _| queue_drag_provider(&payload));
+        let ps = ps.clone();
+        drag_source.connect_prepare(move |_, _, _| {
+            if !queue_accepts_external_dnd(&ps) {
+                return None;
+            }
+            queue_drag_provider(&payload)
+        });
     }
 
     {

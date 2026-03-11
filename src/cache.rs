@@ -12,6 +12,7 @@ pub struct AppSettings {
     pub auto_sync_chromium_cookies: bool,
     pub chromium_cookie_path: String,
     pub auto_manage_offline_cache: bool,
+    pub auto_cache_listen_again: bool,
     pub offline_cache_target: u32,
     pub offline_rewatch_threshold: u32,
     pub score_decay_window_days: u32,
@@ -29,6 +30,7 @@ impl Default for AppSettings {
             auto_sync_chromium_cookies: true,
             chromium_cookie_path: String::new(),
             auto_manage_offline_cache: true,
+            auto_cache_listen_again: true,
             offline_cache_target: 100,
             offline_rewatch_threshold: 1,
             score_decay_window_days: 30,
@@ -55,6 +57,8 @@ pub struct MusicCache {
     pub art_dir: PathBuf,
     temp_dir: PathBuf,
 }
+
+const LISTEN_AGAIN_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
 
 impl MusicCache {
     fn default_base_dir() -> PathBuf {
@@ -133,6 +137,10 @@ impl MusicCache {
                 video_id      TEXT PRIMARY KEY,
                 segments_json TEXT NOT NULL,
                 cached_at     INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS listen_again_candidates (
+                video_id            TEXT PRIMARY KEY,
+                last_recommended_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS app_settings (
                 key   TEXT PRIMARY KEY,
@@ -262,6 +270,10 @@ impl MusicCache {
                     settings.auto_manage_offline_cache =
                         parse_bool_setting(&row.1, settings.auto_manage_offline_cache);
                 }
+                "auto_cache_listen_again" => {
+                    settings.auto_cache_listen_again =
+                        parse_bool_setting(&row.1, settings.auto_cache_listen_again);
+                }
                 "offline_cache_target" => {
                     settings.offline_cache_target = row
                         .1
@@ -344,6 +356,10 @@ impl MusicCache {
                 bool_setting(settings.auto_manage_offline_cache),
             ),
             (
+                "auto_cache_listen_again",
+                bool_setting(settings.auto_cache_listen_again),
+            ),
+            (
                 "offline_cache_target",
                 settings.offline_cache_target.to_string(),
             ),
@@ -408,15 +424,48 @@ impl MusicCache {
         Ok(())
     }
 
+    pub fn upsert_track_metadata(
+        &self,
+        video_id: &str,
+        title: &str,
+        artist: &str,
+        thumbnail_url: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO plays (video_id, title, artist, thumbnail_url, play_count, listen_secs, last_played)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, 0)
+             ON CONFLICT(video_id) DO UPDATE SET
+                 title = ?2,
+                 artist = ?3,
+                 thumbnail_url = COALESCE(?4, thumbnail_url)",
+            rusqlite::params![video_id, title, artist, thumbnail_url],
+        )?;
+        Ok(())
+    }
+
     pub fn auto_offline_candidates(
         &self,
         settings: &AppSettings,
         limit: usize,
     ) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
         let now = epoch_secs();
         let min_total_plays = settings.offline_rewatch_threshold.saturating_add(1).max(1);
         let decay_window_days = settings.score_decay_window_days.max(1) as f64;
         let min_score = settings.minimum_offline_score.max(0.0);
+        let mut candidate_ids = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+
+        if settings.auto_cache_listen_again {
+            for video_id in self.listen_again_candidate_ids()? {
+                if seen_ids.insert(video_id.clone()) {
+                    candidate_ids.push(video_id);
+                }
+            }
+        }
 
         let mut stmt = self.db.prepare(
             "SELECT video_id, play_count, last_played
@@ -443,12 +492,16 @@ impl MusicCache {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let ids = ranked
-            .into_iter()
-            .take(limit)
-            .map(|(video_id, _)| video_id)
-            .collect();
-        Ok(ids)
+        for (video_id, _) in ranked {
+            if candidate_ids.len() >= limit {
+                break;
+            }
+            if seen_ids.insert(video_id.clone()) {
+                candidate_ids.push(video_id);
+            }
+        }
+
+        Ok(candidate_ids)
     }
 
     pub fn auto_download_eviction_count(&self, settings: &AppSettings) -> Result<usize> {
@@ -623,6 +676,22 @@ impl MusicCache {
         Ok(())
     }
 
+    pub fn store_listen_again_snapshot(&self, video_ids: &[String]) -> Result<()> {
+        let now = epoch_secs();
+        let tx = self.db.unchecked_transaction()?;
+        for video_id in video_ids {
+            tx.execute(
+                "INSERT INTO listen_again_candidates (video_id, last_recommended_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(video_id) DO UPDATE SET last_recommended_at = excluded.last_recommended_at",
+                rusqlite::params![video_id, now],
+            )?;
+        }
+        tx.commit()?;
+        self.prune_stale_listen_again_candidates()?;
+        Ok(())
+    }
+
     /// Remove a single song from offline cache (files + DB row).
     pub fn remove_cached(&self, video_id: &str) -> Result<()> {
         if let Some(p) = self.get_cached_audio(video_id) {
@@ -780,6 +849,28 @@ impl MusicCache {
         Ok(ids)
     }
 
+    pub fn offline_listen_again_track_ids(&self) -> Result<Vec<String>> {
+        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+        let mut stmt = self.db.prepare(
+            "SELECT lac.video_id
+             FROM listen_again_candidates lac
+             INNER JOIN offline o ON o.video_id = lac.video_id
+             LEFT JOIN plays p ON p.video_id = lac.video_id
+             WHERE lac.last_recommended_at >= ?1
+                OR COALESCE(p.last_played, 0) >= ?1
+             ORDER BY
+                CASE
+                    WHEN lac.last_recommended_at >= ?1 THEN lac.last_recommended_at
+                    ELSE COALESCE(p.last_played, 0)
+                END DESC",
+        )?;
+        let ids = stmt
+            .query_map([cutoff], |row| row.get(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(ids)
+    }
+
     #[allow(dead_code)]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
@@ -837,6 +928,43 @@ impl MusicCache {
         }
 
         Ok(removed)
+    }
+
+    fn listen_again_candidate_ids(&self) -> Result<Vec<String>> {
+        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+        let mut stmt = self.db.prepare(
+            "SELECT lac.video_id
+             FROM listen_again_candidates lac
+             LEFT JOIN plays p ON p.video_id = lac.video_id
+             WHERE lac.last_recommended_at >= ?1
+                OR COALESCE(p.last_played, 0) >= ?1
+             ORDER BY
+                CASE
+                    WHEN lac.last_recommended_at >= ?1 THEN lac.last_recommended_at
+                    ELSE COALESCE(p.last_played, 0)
+                END DESC",
+        )?;
+        let ids = stmt
+            .query_map([cutoff], |row| row.get(0))?
+            .filter_map(|row| row.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    fn prune_stale_listen_again_candidates(&self) -> Result<()> {
+        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+        self.db.execute(
+            "DELETE FROM listen_again_candidates
+             WHERE video_id IN (
+                 SELECT lac.video_id
+                 FROM listen_again_candidates lac
+                 LEFT JOIN plays p ON p.video_id = lac.video_id
+                 WHERE lac.last_recommended_at < ?1
+                   AND COALESCE(p.last_played, 0) < ?1
+             )",
+            [cutoff],
+        )?;
+        Ok(())
     }
 }
 

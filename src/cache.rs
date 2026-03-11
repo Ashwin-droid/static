@@ -849,6 +849,18 @@ impl MusicCache {
         Ok(ids)
     }
 
+    pub fn is_track_in_any_offline_playlist(&self, video_id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT 1 FROM offline_playlist_tracks WHERE video_id = ?1 LIMIT 1",
+                [video_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
     pub fn offline_listen_again_track_ids(&self) -> Result<Vec<String>> {
         let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
         let mut stmt = self.db.prepare(

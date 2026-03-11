@@ -78,6 +78,14 @@ static DOWNLOAD_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
         .unwrap()
 });
 
+static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+thread_local! {
+    static THUMBNAIL_TEXTURE_CACHE: RefCell<HashMap<(String, i32), gtk::gdk::Texture>> =
+        RefCell::new(HashMap::new());
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepeatMode {
     Off,
@@ -109,6 +117,7 @@ struct AppState {
     sponsorblock: SponsorBlockClient,
     cache: MusicCache,
     settings: AppSettings,
+    home_cache: Option<Vec<HomeSection>>,
 }
 
 /// Tracks the currently playing song so we can record listen time when navigating away.
@@ -134,6 +143,18 @@ const MIN_LISTEN_SECS: u64 = 10;
 
 fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<YtMusicClient>> {
     state.lock().unwrap().client.clone()
+}
+
+fn cached_home_sections(state: &Arc<Mutex<AppState>>) -> Option<Vec<HomeSection>> {
+    state.lock().unwrap().home_cache.clone()
+}
+
+fn store_home_cache(state: &Arc<Mutex<AppState>>, sections: &[HomeSection]) {
+    state.lock().unwrap().home_cache = Some(sections.to_vec());
+}
+
+fn invalidate_home_cache(state: &Arc<Mutex<AppState>>) {
+    state.lock().unwrap().home_cache = None;
 }
 
 #[allow(dead_code)]
@@ -198,6 +219,7 @@ struct MainPageWidgets {
     content_box: GtkBox,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
+    home_btn: Button,
 }
 
 #[derive(Debug, Clone)]
@@ -1003,7 +1025,11 @@ async fn activate_authenticated_client(
     if let Ok(Some(vr_token)) = gio::spawn_blocking(get_vr_refresh_token).await {
         client.set_vr_refresh_token(&vr_token);
     }
-    state.lock().unwrap().client = Some(client);
+    {
+        let mut guard = state.lock().unwrap();
+        guard.client = Some(client);
+        guard.home_cache = None;
+    }
     stack.set_visible_child_name("main");
 }
 
@@ -1036,6 +1062,7 @@ pub fn build_window(app: &Application) {
         sponsorblock: SponsorBlockClient::new().expect("Failed to initialise SponsorBlock client"),
         cache,
         settings,
+        home_cache: None,
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -1058,6 +1085,31 @@ pub fn build_window(app: &Application) {
 
     window.set_child(Some(&stack));
     init_mpris(app, &window, &state, &main_widgets.player_state);
+
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let content_box = main_widgets.content_box.clone();
+        let ps = main_widgets.player_state.clone();
+        let recent_list = main_widgets.recent_list.clone();
+        let home_btn = main_widgets.home_btn.clone();
+        let refresh = gtk::EventControllerKey::new();
+        refresh.connect_key_pressed(move |_, key, _, modifiers| {
+            let wants_refresh = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && (key == gtk::gdk::Key::r || key == gtk::gdk::Key::R);
+            if wants_refresh
+                && stack.visible_child_name().as_deref() == Some("main")
+                && home_btn.has_css_class("nav-item-active")
+            {
+                invalidate_home_cache(&state);
+                load_home(&state, &content_box, &ps, &recent_list, true);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(refresh);
+    }
+
     window.present();
 
     // Auto-load home + history when main page becomes visible
@@ -1071,7 +1123,7 @@ pub fn build_window(app: &Application) {
             if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
             {
                 clear_box(&content_box);
-                load_home(&state, &content_box, &ps, &recent_list);
+                load_home(&state, &content_box, &ps, &recent_list, false);
                 load_sidebar_history(&state, &recent_list, &ps);
             }
         });
@@ -1232,7 +1284,11 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
 
             match YtMusicClient::new(&cookie_text) {
                 Ok(ytm) => {
-                    state.lock().unwrap().client = Some(Arc::new(ytm));
+                    {
+                        let mut guard = state.lock().unwrap();
+                        guard.client = Some(Arc::new(ytm));
+                        guard.home_cache = None;
+                    }
                     let state = state.clone();
                     let stack = stack.clone();
                     let status_label = status_label.clone();
@@ -2133,7 +2189,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
         home_btn.connect_clicked(move |btn| {
             set_active_nav(btn, &nav);
-            load_home(&state, &content_box, &ps, &recent_list);
+            load_home(&state, &content_box, &ps, &recent_list, false);
         });
     }
 
@@ -2214,6 +2270,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         content_box,
         player_state: ps,
         recent_list,
+        home_btn,
     }
 }
 
@@ -3310,7 +3367,9 @@ fn load_settings_page(
         let content_box = content_box.clone();
         logout_btn.connect_clicked(move |_| {
             reset_player_ui(&ps, &state);
-            state.lock().unwrap().client = None;
+            let mut guard = state.lock().unwrap();
+            guard.client = None;
+            guard.home_cache = None;
             clear_box(&content_box);
 
             glib::spawn_future_local({
@@ -3443,6 +3502,34 @@ fn set_queue_context(ps: &PlayerState, radio: Option<RadioVirtualPlaylist>) {
 fn mark_radio_touched_through(ps: &PlayerState, index: usize) {
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
         radio.touched_len = radio.touched_len.max(index.saturating_add(1));
+    }
+}
+
+fn extend_radio_touched_for_insert(ps: &PlayerState, insert_at: usize, added: usize) {
+    if added == 0 {
+        return;
+    }
+
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        let touched_len = radio.touched_len;
+        let inserted_end = insert_at + added;
+        if insert_at < touched_len {
+            radio.touched_len = touched_len + added;
+        } else {
+            radio.touched_len = touched_len.max(inserted_end);
+        }
+    }
+}
+
+fn shrink_radio_touched_for_remove(ps: &PlayerState, remove_at: usize) {
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        if radio.touched_len == 0 {
+            return;
+        }
+
+        if remove_at < radio.touched_len {
+            radio.touched_len = radio.touched_len.saturating_sub(1);
+        }
     }
 }
 
@@ -4049,7 +4136,16 @@ fn load_home(
     content_box: &GtkBox,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
+    force_refresh: bool,
 ) {
+    if !force_refresh {
+        if let Some(sections) = cached_home_sections(state) {
+            clear_box(content_box);
+            render_home_view(content_box, &sections, state, ps, recent_list);
+            return;
+        }
+    }
+
     clear_box(content_box);
     let loading = Label::new(Some("Loading recommendations..."));
     loading.add_css_class("dim-label");
@@ -4070,6 +4166,7 @@ fn load_home(
 
         match result {
             Ok(Some(Ok(sections))) => {
+                store_home_cache(&state, &sections);
                 let listen_again_tracks = extract_listen_again_tracks(&sections);
                 let state_bg = state.clone();
                 let _ = gio::spawn_blocking(move || {
@@ -5734,47 +5831,29 @@ fn build_sidebar_recent_item(
 // ============================================================
 
 fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
+    if let Some(texture) = cached_thumbnail_texture(url, size) {
+        picture.set_paintable(Some(&texture));
+        return;
+    }
+
     let picture = picture.clone();
     let url = url.to_string();
 
     glib::spawn_future_local(async move {
+        let fetch_url = url.clone();
         let result = gio::spawn_blocking(move || {
-            if let Some(path) = url.strip_prefix("file://") {
+            if let Some(path) = fetch_url.strip_prefix("file://") {
                 std::fs::read(path).map_err(|e| e.to_string())
             } else {
-                fetch_thumbnail_bytes(&url)
-                    .ok_or_else(|| format!("failed to load thumbnail after retries: {url}"))
+                fetch_thumbnail_bytes(&fetch_url)
+                    .ok_or_else(|| format!("failed to load thumbnail after retries: {fetch_url}"))
             }
         })
         .await;
 
         if let Ok(Ok(bytes)) = result {
-            let gbytes = glib::Bytes::from(&bytes);
-            let stream = gio::MemoryInputStream::from_bytes(&gbytes);
-            // Load at original size first so we can compute aspect ratio
-            if let Ok(pixbuf) =
-                gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE)
-            {
-                let w = pixbuf.width();
-                let h = pixbuf.height();
-                // Scale so the shorter side == size, then center-crop to square
-                let (sw, sh) = if w < h {
-                    (size, (h as f64 * size as f64 / w as f64) as i32)
-                } else {
-                    ((w as f64 * size as f64 / h as f64) as i32, size)
-                };
-                let scaled = pixbuf
-                    .scale_simple(sw, sh, gtk::gdk_pixbuf::InterpType::Bilinear)
-                    .unwrap_or(pixbuf);
-                let ox = (scaled.width() - size).max(0) / 2;
-                let oy = (scaled.height() - size).max(0) / 2;
-                let cropped = scaled.new_subpixbuf(
-                    ox,
-                    oy,
-                    size.min(scaled.width()),
-                    size.min(scaled.height()),
-                );
-                let texture = gtk::gdk::Texture::for_pixbuf(&cropped);
+            if let Some(texture) = build_thumbnail_texture(&bytes, size) {
+                store_thumbnail_texture(&url, size, &texture);
                 picture.set_paintable(Some(&texture));
             }
         }
@@ -5789,13 +5868,24 @@ fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
         return std::fs::read(path).ok();
     }
 
+    if let Some(bytes) = THUMBNAIL_BYTES_CACHE.lock().unwrap().get(url).cloned() {
+        return Some(bytes);
+    }
+
     for attempt in 0..MAX_ATTEMPTS {
         let response = THUMB_CLIENT.get(url).send();
         match response
             .and_then(|resp| resp.error_for_status())
             .and_then(|resp| resp.bytes())
         {
-            Ok(bytes) => return Some(bytes.to_vec()),
+            Ok(bytes) => {
+                let bytes = bytes.to_vec();
+                THUMBNAIL_BYTES_CACHE
+                    .lock()
+                    .unwrap()
+                    .insert(url.to_string(), bytes.clone());
+                return Some(bytes);
+            }
             Err(err) => {
                 eprintln!(
                     "[ART] thumbnail fetch failed (attempt {}/{}): {} ({err})",
@@ -5811,6 +5901,38 @@ fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+fn build_thumbnail_texture(bytes: &[u8], size: i32) -> Option<gtk::gdk::Texture> {
+    let gbytes = glib::Bytes::from(bytes);
+    let stream = gio::MemoryInputStream::from_bytes(&gbytes);
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE).ok()?;
+    let w = pixbuf.width();
+    let h = pixbuf.height();
+    let (sw, sh) = if w < h {
+        (size, (h as f64 * size as f64 / w as f64) as i32)
+    } else {
+        ((w as f64 * size as f64 / h as f64) as i32, size)
+    };
+    let scaled = pixbuf
+        .scale_simple(sw, sh, gtk::gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or(pixbuf);
+    let ox = (scaled.width() - size).max(0) / 2;
+    let oy = (scaled.height() - size).max(0) / 2;
+    let cropped = scaled.new_subpixbuf(ox, oy, size.min(scaled.width()), size.min(scaled.height()));
+    Some(gtk::gdk::Texture::for_pixbuf(&cropped))
+}
+
+fn cached_thumbnail_texture(url: &str, size: i32) -> Option<gtk::gdk::Texture> {
+    THUMBNAIL_TEXTURE_CACHE.with(|cache| cache.borrow().get(&(url.to_string(), size)).cloned())
+}
+
+fn store_thumbnail_texture(url: &str, size: i32, texture: &gtk::gdk::Texture) {
+    THUMBNAIL_TEXTURE_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert((url.to_string(), size), texture.clone());
+    });
 }
 
 fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
@@ -6194,6 +6316,7 @@ fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>
             ps.queue_index.set(current - 1);
         }
     }
+    shrink_radio_touched_for_remove(ps, index);
     *ps.last_radio_append_anchor.borrow_mut() = None;
     // Defer re-render to avoid destroying widget while its click handler is running
     let ps = ps.clone();
@@ -6475,6 +6598,91 @@ struct DownloadPlaylistMeta {
     subtitle: Option<String>,
 }
 
+fn cache_track_metadata(state: &Arc<Mutex<AppState>>, track: &Track) {
+    let guard = state.lock().unwrap();
+    let artist = if track.artists.is_empty() {
+        "Unknown artist".to_string()
+    } else {
+        track
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let _ = guard.cache.record_play(
+        &track.video_id,
+        &track.title,
+        &artist,
+        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        0,
+    );
+}
+
+fn ensure_track_available_offline(
+    state: &Arc<Mutex<AppState>>,
+    track: &Track,
+    pin: bool,
+    log_prefix: &str,
+) -> bool {
+    let vid = &track.video_id;
+
+    {
+        let guard = state.lock().unwrap();
+        if guard.cache.is_cached(vid) {
+            if pin {
+                let _ = guard.cache.pin_offline(vid);
+            }
+            drop(guard);
+            let _ = ensure_offline_sponsorblock_cache(state, vid);
+            return true;
+        }
+    }
+
+    cache_track_metadata(state, track);
+
+    let url = {
+        let Some(client) = app_client(state) else {
+            return false;
+        };
+        match client.get_audio_url_no_track(vid) {
+            Ok(url) => url,
+            Err(err) => {
+                eprintln!("[{log_prefix}] failed URL for {vid}: {err}");
+                return false;
+            }
+        }
+    };
+
+    let audio = match DOWNLOAD_CLIENT
+        .get(&url)
+        .header("Range", "bytes=0-")
+        .send()
+        .and_then(|r| r.bytes())
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("[{log_prefix}] download failed for {vid}: {err}");
+            return false;
+        }
+    };
+
+    let art = track
+        .thumbnail_url
+        .as_ref()
+        .and_then(|url| fetch_thumbnail_bytes(url));
+
+    {
+        let guard = state.lock().unwrap();
+        let _ = guard.cache.store_audio(vid, &audio, art.as_deref());
+        if pin {
+            let _ = guard.cache.pin_offline(vid);
+        }
+    }
+    let _ = ensure_offline_sponsorblock_cache(state, vid);
+    true
+}
+
 fn download_all_offline(
     tracks: Vec<Track>,
     state: Arc<Mutex<AppState>>,
@@ -6489,88 +6697,10 @@ fn download_all_offline(
         gio::spawn_blocking(move || {
             for (i, track) in tracks.iter().enumerate() {
                 let vid = &track.video_id;
-
-                // Skip if already cached
-                {
-                    let guard = state.lock().unwrap();
-                    if guard.cache.is_cached(vid) {
-                        let _ = guard.cache.pin_offline(vid);
-                        eprintln!("[DOWNLOAD] {}/{count} already cached, pinned: {vid}", i + 1);
-                        drop(guard);
-                        let _ = ensure_offline_sponsorblock_cache(&state, vid);
-                        continue;
-                    }
-                }
-
-                // Ensure track metadata is in plays table so offline_tracks() can show it
-                {
-                    let guard = state.lock().unwrap();
-                    let artist = if track.artists.is_empty() {
-                        "Unknown artist".to_string()
-                    } else {
-                        track
-                            .artists
-                            .iter()
-                            .map(|a| a.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    };
-                    let _ = guard.cache.record_play(
-                        vid,
-                        &track.title,
-                        &artist,
-                        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
-                        0,
-                    );
-                }
-
-                // Get streaming URL
-                let url = {
-                    let Some(client) = app_client(&state) else {
-                        return;
-                    };
-                    match client.get_audio_url_no_track(vid) {
-                        Ok(u) => u,
-                        Err(e) => {
-                            eprintln!("[DOWNLOAD] {}/{count} failed URL for {vid}: {e}", i + 1);
-                            continue;
-                        }
-                    }
-                };
-
-                // Download audio
                 eprintln!("[DOWNLOAD] {}/{count} downloading {vid}...", i + 1);
-                let audio = match DOWNLOAD_CLIENT
-                    .get(&url)
-                    .header("Range", "bytes=0-")
-                    .send()
-                    .and_then(|r| r.bytes())
-                {
-                    Ok(b) => b,
-                    Err(e) => {
-                        eprintln!("[DOWNLOAD] {}/{count} failed: {e}", i + 1);
-                        continue;
-                    }
-                };
-
-                // Download artwork
-                let art = track
-                    .thumbnail_url
-                    .as_ref()
-                    .and_then(|url| fetch_thumbnail_bytes(url));
-
-                // Store + pin
-                {
-                    let guard = state.lock().unwrap();
-                    let _ = guard.cache.store_audio(vid, &audio, art.as_deref());
-                    let _ = guard.cache.pin_offline(vid);
+                if ensure_track_available_offline(&state, track, true, "DOWNLOAD") {
+                    eprintln!("[DOWNLOAD] {}/{count} ready: {vid}", i + 1);
                 }
-                let _ = ensure_offline_sponsorblock_cache(&state, vid);
-                eprintln!(
-                    "[DOWNLOAD] {}/{count} done: {vid} ({} KB)",
-                    i + 1,
-                    audio.len() / 1024
-                );
             }
 
             // Store playlist metadata + cover art if this is a playlist download
@@ -6907,7 +7037,95 @@ fn add_to_recent(
 
 /// Sync the offline cache: download top-100 most played songs, evict the rest.
 /// Acquires the AppState lock briefly per-operation so playback is never blocked.
+fn sync_downloaded_playlists(state: &Arc<Mutex<AppState>>) {
+    let offline_playlists = {
+        let guard = state.lock().unwrap();
+        guard.cache.offline_playlists().unwrap_or_default()
+    };
+    if offline_playlists.is_empty() {
+        return;
+    }
+
+    let Some(client) = app_client(state) else {
+        return;
+    };
+
+    for (playlist_id, title, thumbnail_url, subtitle) in offline_playlists {
+        let local_ids = {
+            let guard = state.lock().unwrap();
+            guard
+                .cache
+                .offline_playlist_track_ids(&playlist_id)
+                .unwrap_or_default()
+        };
+
+        let upstream_tracks = match client.get_playlist(&playlist_id) {
+            Ok(tracks) => tracks,
+            Err(err) => {
+                eprintln!("[PLAYLIST_SYNC] failed to fetch {playlist_id}: {err}");
+                continue;
+            }
+        };
+        let upstream_ids: Vec<String> = upstream_tracks
+            .iter()
+            .map(|track| track.video_id.clone())
+            .collect();
+
+        if upstream_ids == local_ids {
+            continue;
+        }
+
+        let local_set = local_ids.iter().cloned().collect::<HashSet<_>>();
+        let upstream_set = upstream_ids.iter().cloned().collect::<HashSet<_>>();
+        let removed_ids = local_ids
+            .iter()
+            .filter(|video_id| !upstream_set.contains(*video_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for track in upstream_tracks
+            .iter()
+            .filter(|track| !local_set.contains(&track.video_id))
+        {
+            eprintln!(
+                "[PLAYLIST_SYNC] caching new track for {}: {}",
+                playlist_id, track.video_id
+            );
+            let _ = ensure_track_available_offline(state, track, true, "PLAYLIST_SYNC");
+        }
+
+        {
+            let guard = state.lock().unwrap();
+            let _ = guard.cache.store_offline_playlist(
+                &playlist_id,
+                &title,
+                thumbnail_url.as_deref(),
+                subtitle.as_deref(),
+                &upstream_ids,
+            );
+        }
+
+        for video_id in removed_ids {
+            let still_needed = {
+                let guard = state.lock().unwrap();
+                guard
+                    .cache
+                    .is_track_in_any_offline_playlist(&video_id)
+                    .unwrap_or(false)
+            };
+            if !still_needed {
+                let guard = state.lock().unwrap();
+                let _ = guard.cache.remove_cached(&video_id);
+            }
+        }
+
+        eprintln!("[PLAYLIST_SYNC] refreshed downloaded playlist: {playlist_id}");
+    }
+}
+
 fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
+    sync_downloaded_playlists(state);
+
     let (enabled, cache_target, top, cached, pinned) = {
         let guard = state.lock().unwrap();
         let enabled = guard.settings.auto_manage_offline_cache;
@@ -7464,7 +7682,7 @@ fn insert_tracks_into_queue(
         }
     }
     if mark_as_touched {
-        mark_radio_touched_through(ps, insert_at + added - 1);
+        extend_radio_touched_for_insert(ps, insert_at, added);
     }
     *ps.last_radio_append_anchor.borrow_mut() = None;
 
@@ -7527,6 +7745,7 @@ fn handle_queue_drop_payload(
                     ps.queue_index.set(current + 1);
                 }
             }
+            mark_radio_touched_through(ps, insert_at);
             *ps.last_radio_append_anchor.borrow_mut() = None;
 
             render_queue_panel(ps, state);

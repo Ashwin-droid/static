@@ -1,114 +1,129 @@
-use std::cell::Cell;
-use std::rc::Rc;
+use std::cell::RefCell;
 
-use gstreamer as gst;
 use gstreamer::ClockTime;
-use gstreamer::glib;
-use gstreamer::prelude::*;
-use gstreamer_play as gst_play;
+
+use crate::ipc::{DaemonClient, PlaybackSnapshot, RepeatMode, millis_to_clock_time};
+use crate::models::{RadioVirtualPlaylist, Track};
 
 pub struct Player {
-    inner: gst_play::Play,
-    paused: Cell<bool>,
-    /// 0..100 buffering percent reported by GStreamer's Play message bus.
-    buf_percent: Rc<Cell<u32>>,
-    /// Must be kept alive or the bus watch is removed.
-    _bus_watch: gst::bus::BusWatchGuard,
+    client: DaemonClient,
+    snapshot: RefCell<PlaybackSnapshot>,
 }
 
 impl Player {
     pub fn new() -> Self {
-        let inner = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
-
-        // Keep up to 200 MB of downloaded audio in memory for instant seeking.
-        let pipeline = inner.pipeline();
-        pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
-
-        // Watch the Play message bus for buffering events.
-        let buf_percent = Rc::new(Cell::new(0u32));
-        let bp = buf_percent.clone();
-        let bus = inner.message_bus();
-        let bus_watch = bus
-            .add_watch_local(move |_, msg| {
-                if let Ok(play_msg) = gst_play::PlayMessage::parse(msg) {
-                    if let gst_play::PlayMessage::Buffering(b) = play_msg {
-                        bp.set(b.percent());
-                    }
-                }
-                glib::ControlFlow::Continue
-            })
-            .expect("Failed to add bus watch");
-
+        let client = DaemonClient::new().expect("Failed to connect to staticd");
+        let snapshot = client.state().unwrap_or_default();
         Self {
-            inner,
-            paused: Cell::new(false),
-            buf_percent,
-            _bus_watch: bus_watch,
+            client,
+            snapshot: RefCell::new(snapshot),
         }
     }
 
-    pub fn play_uri(&self, uri: &str) {
-        // Stop first to flush old pipeline state so position/duration
-        // queries don't return stale data from the previous song.
-        self.inner.stop();
-        self.buf_percent.set(0);
-
-        self.inner.set_uri(Some(uri));
-        self.inner.play();
-        self.paused.set(false);
+    pub fn snapshot(&self) -> PlaybackSnapshot {
+        self.snapshot.borrow().clone()
     }
 
-    pub fn pause(&self) {
-        self.inner.pause();
-        self.paused.set(true);
+    pub fn play_queue_at(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+        repeat_mode: RepeatMode,
+    ) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| {
+            client.play_queue_at(queue, index, radio_virtual_playlist, repeat_mode)
+        })
     }
 
-    pub fn resume(&self) {
-        self.inner.play();
-        self.paused.set(false);
+    pub fn set_queue(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+        repeat_mode: RepeatMode,
+    ) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| {
+            client.replace_queue(queue, index, radio_virtual_playlist, repeat_mode)
+        })
     }
 
-    pub fn toggle_pause(&self) {
-        if self.paused.get() {
-            self.resume();
-        } else {
-            self.pause();
-        }
+    pub fn replace_queue(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+        repeat_mode: RepeatMode,
+    ) -> Result<PlaybackSnapshot, String> {
+        self.set_queue(queue, index, radio_virtual_playlist, repeat_mode)
     }
 
-    pub fn is_paused(&self) -> bool {
-        self.paused.get()
+    pub fn toggle_pause(&self) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.toggle_pause())
     }
 
-    pub fn stop(&self) {
-        self.inner.stop();
-        self.paused.set(false);
-        self.buf_percent.set(0);
+    pub fn stop(&self) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.stop())
     }
 
-    pub fn seek(&self, position: ClockTime) {
-        self.inner.seek(position);
+    pub fn next(&self) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.next())
     }
 
-    pub fn set_volume(&self, volume: f64) {
-        self.inner.set_volume(volume);
+    pub fn previous(&self) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.previous())
     }
 
-    #[allow(dead_code)]
-    pub fn volume(&self) -> f64 {
-        self.inner.volume()
+    pub fn seek(&self, position: ClockTime) -> Result<PlaybackSnapshot, String> {
+        let position_millis = position.nseconds() / 1_000_000;
+        self.run_command(|client| client.seek_to_millis(position_millis))
+    }
+
+    pub fn set_volume(&self, volume: f64) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.set_volume(volume))
+    }
+
+    pub fn set_repeat_mode(&self, repeat_mode: RepeatMode) -> Result<PlaybackSnapshot, String> {
+        self.run_command(|client| client.set_repeat_mode(repeat_mode))
     }
 
     pub fn position(&self) -> Option<ClockTime> {
-        self.inner.position()
+        millis_to_clock_time(self.snapshot.borrow().position_millis)
     }
 
     pub fn duration(&self) -> Option<ClockTime> {
-        self.inner.duration()
+        millis_to_clock_time(self.snapshot.borrow().duration_millis)
     }
 
-    /// Returns 0.0..1.0 — the buffering percent reported by GStreamer.
     pub fn buffered_fraction(&self) -> f64 {
-        (self.buf_percent.get() as f64 / 100.0).clamp(0.0, 1.0)
+        self.snapshot.borrow().buffered_fraction
+    }
+
+    pub fn daemon_client(&self) -> DaemonClient {
+        self.client.clone()
+    }
+
+    pub fn apply_snapshot(&self, snapshot: PlaybackSnapshot) {
+        *self.snapshot.borrow_mut() = snapshot;
+    }
+
+    fn run_command<F>(&self, f: F) -> Result<PlaybackSnapshot, String>
+    where
+        F: FnOnce(&DaemonClient) -> anyhow::Result<PlaybackSnapshot>,
+    {
+        match f(&self.client) {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot.clone());
+                Ok(snapshot)
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    }
+}
+
+pub fn notify_daemon_settings_changed() {
+    match DaemonClient::new().and_then(|client| client.reload_settings()) {
+        Ok(_) => {}
+        Err(err) => eprintln!("[PLAYER] failed to notify staticd about settings changes: {err}"),
     }
 }

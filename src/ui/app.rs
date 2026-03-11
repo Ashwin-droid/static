@@ -2,6 +2,7 @@ use gtk::prelude::*;
 use gtk::{Application, CssProvider, gdk};
 
 use super::window;
+use crate::ipc;
 
 const APP_ID: &str = "com.static.music";
 
@@ -16,6 +17,10 @@ pub fn build_app() -> Application {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_USER,
         );
+
+        if let Err(err) = ipc::ensure_daemon_running() {
+            eprintln!("[STATIC] failed to ensure playback daemon: {err}");
+        }
     });
 
     app.connect_activate(|app| {

@@ -1,0 +1,1465 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{HashSet, VecDeque};
+use std::rc::Rc;
+use std::sync::{LazyLock, mpsc};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow};
+use gstreamer::ClockTime;
+use gstreamer::glib;
+use keyring::Entry;
+use mpris_server::{
+    LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
+    Player as MprisPlayer, Time as MprisTime, TrackId,
+};
+use reqwest::blocking::Client as BlockingClient;
+use zbus::interface;
+
+use crate::cache::{AppSettings, MusicCache};
+use crate::ipc::{
+    ActiveTrackSnapshot, DAEMON_BUS_NAME, DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse,
+    PlaybackSnapshot, RepeatMode,
+};
+use crate::models::{RadioVirtualPlaylist, Track};
+use crate::playback_engine::PlaybackEngine;
+use crate::sponsorblock::{
+    SponsorBlockClient, SponsorSegment, default_skip_categories, filter_segments_for_categories,
+    sanitize_categories,
+};
+use crate::ytmusic::YtMusicClient;
+use crate::ytmusic::client::{SongRating, TrackingInfo};
+
+const KEYRING_SERVICE: &str = "com.static.music";
+const KEYRING_USER: &str = "cookie";
+const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
+const KEYRING_STORAGE_ROOT: &str = "storage_root";
+const MIN_LISTEN_SECS: u64 = 10;
+const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
+
+static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
+    BlockingClient::builder()
+        .timeout(Duration::from_secs(120))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
+        .build()
+        .unwrap()
+});
+
+struct ActiveTrack {
+    video_id: String,
+    title: String,
+    artist: String,
+    thumb_url: Option<String>,
+    rating: SongRating,
+    tracking: Option<TrackingInfo>,
+    started_at: Instant,
+    last_position_millis: u64,
+    awaiting_fresh_position: bool,
+    bootstrapped_watchtime: bool,
+}
+
+struct DaemonState {
+    player: PlaybackEngine,
+    cache: MusicCache,
+    settings: AppSettings,
+    client: Option<Rc<YtMusicClient>>,
+    sponsorblock: SponsorBlockClient,
+    queue: Vec<Track>,
+    queue_index: usize,
+    radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+    repeat_mode: RepeatMode,
+    active_track: Option<ActiveTrack>,
+    sponsor_segments: Vec<SponsorSegment>,
+    sponsor_segments_reported: HashSet<String>,
+    paused_since: Option<Instant>,
+    radio_append_in_flight: bool,
+    last_radio_append_anchor: Option<String>,
+    background_tx: mpsc::Sender<BackgroundEvent>,
+    deferred_actions: VecDeque<DeferredAction>,
+    last_duration_micros: Cell<Option<i64>>,
+    mpris: RefCell<Option<Rc<DaemonMprisBridge>>>,
+    shutting_down: Cell<bool>,
+}
+
+struct CommandEnvelope {
+    request: DaemonRequest,
+    reply: mpsc::Sender<DaemonResponse>,
+}
+
+enum BackgroundEvent {
+    TrackingReady {
+        video_id: String,
+        tracking: Option<TrackingInfo>,
+    },
+    SponsorSegmentsReady {
+        video_id: String,
+        segments: Vec<SponsorSegment>,
+    },
+    RadioExtensionReady {
+        anchor_video_id: String,
+        tracks: Vec<Track>,
+        chips: Vec<crate::models::RadioChip>,
+    },
+}
+
+enum DeferredAction {
+    StartPlaybackTracking {
+        video_id: String,
+    },
+}
+
+struct StaticdDbus {
+    command_tx: mpsc::Sender<CommandEnvelope>,
+}
+
+#[interface(name = "com.static.music.Staticd1")]
+impl StaticdDbus {
+    fn request_json(&self, request_json: &str) -> zbus::fdo::Result<String> {
+        let request = serde_json::from_str(request_json)
+            .map_err(|err| zbus::fdo::Error::Failed(format!("Invalid request: {err}")))?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.command_tx
+            .send(CommandEnvelope {
+                request,
+                reply: reply_tx,
+            })
+            .map_err(|_| zbus::fdo::Error::Failed("Daemon main loop is unavailable".into()))?;
+        let response = reply_rx
+            .recv()
+            .unwrap_or_else(|_| DaemonResponse::Error("Daemon did not reply".to_string()));
+        serde_json::to_string(&response)
+            .map_err(|err| zbus::fdo::Error::Failed(format!("Failed to encode response: {err}")))
+    }
+}
+
+struct DaemonMprisBridge {
+    player: MprisPlayer,
+}
+
+impl DaemonMprisBridge {
+    async fn new(state: &Rc<RefCell<DaemonState>>) -> Result<Rc<Self>, mpris_server::zbus::Error> {
+        let player = MprisPlayer::builder("static")
+            .identity("Static")
+            .desktop_entry("com.static.music")
+            .can_raise(true)
+            .can_quit(true)
+            .can_play(true)
+            .can_pause(true)
+            .can_seek(true)
+            .can_control(true)
+            .build()
+            .await?;
+
+        {
+            let state = state.clone();
+            player.connect_play_pause(move |_| {
+                let state = state.borrow_mut();
+                state.player.toggle_pause();
+                sync_mpris(&state);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_play(move |_| {
+                let state = state.borrow_mut();
+                if state.active_track.is_some() && state.player.is_paused() {
+                    state.player.resume();
+                    sync_mpris(&state);
+                }
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_pause(move |_| {
+                let state = state.borrow_mut();
+                if state.active_track.is_some() && !state.player.is_paused() {
+                    state.player.pause();
+                    sync_mpris(&state);
+                }
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_stop(move |_| {
+                stop_playback(&mut state.borrow_mut(), false);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_next(move |_| {
+                let _ = advance_queue(&mut state.borrow_mut(), true);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_previous(move |_| {
+                let mut state = state.borrow_mut();
+                if state
+                    .player
+                    .position()
+                    .is_some_and(|position| position.seconds() > 3)
+                {
+                    state.player.seek(ClockTime::ZERO);
+                    signal_mpris_seeked(&state, ClockTime::ZERO);
+                    sync_mpris(&state);
+                } else {
+                    let _ = advance_queue(&mut state, false);
+                }
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_seek(move |_, offset| {
+                let state = state.borrow();
+                let Some(current) = state.player.position() else {
+                    return;
+                };
+                let current_us = (current.nseconds() / 1_000) as i64;
+                let target_us = (current_us + offset.as_micros()).max(0) as u64;
+                let target = ClockTime::from_useconds(target_us);
+                state.player.seek(target);
+                signal_mpris_seeked(&state, target);
+                sync_mpris(&state);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_set_position(move |_, _, position| {
+                let state = state.borrow_mut();
+                let target = ClockTime::from_useconds(position.as_micros().max(0) as u64);
+                state.player.seek(target);
+                signal_mpris_seeked(&state, target);
+                sync_mpris(&state);
+            });
+        }
+
+        player.connect_raise(move |_| {
+            let _ = reopen_ui_window();
+        });
+
+        {
+            let state = state.clone();
+            player.connect_quit(move |_| {
+                let mut state = state.borrow_mut();
+                stop_playback(&mut state, true);
+                state.shutting_down.set(true);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_set_loop_status(move |_, status| {
+                let mut state = state.borrow_mut();
+                state.repeat_mode = match status {
+                    MprisLoopStatus::Track => RepeatMode::One,
+                    MprisLoopStatus::Playlist => RepeatMode::All,
+                    _ => RepeatMode::Off,
+                };
+                sync_mpris(&state);
+            });
+        }
+
+        {
+            let state = state.clone();
+            player.connect_set_volume(move |_, volume| {
+                let state = state.borrow_mut();
+                state.player.set_volume(volume);
+                sync_mpris(&state);
+            });
+        }
+
+        let run_task = player.run();
+        glib::spawn_future_local(async move {
+            run_task.await;
+        });
+
+        Ok(Rc::new(Self { player }))
+    }
+
+    fn sync_all(self: &Rc<Self>, state: &DaemonState) {
+        self.sync_transport(state);
+        self.sync_metadata(state);
+        self.sync_position(state);
+        self.sync_volume(state);
+    }
+
+    fn sync_transport(self: &Rc<Self>, state: &DaemonState) {
+        let bridge = self.clone();
+        let snapshot = state_snapshot(state);
+        let playback_status = if snapshot.current_track.is_none() {
+            MprisPlaybackStatus::Stopped
+        } else if snapshot.paused {
+            MprisPlaybackStatus::Paused
+        } else {
+            MprisPlaybackStatus::Playing
+        };
+        let loop_status = match snapshot.repeat_mode {
+            RepeatMode::Off => MprisLoopStatus::None,
+            RepeatMode::All => MprisLoopStatus::Playlist,
+            RepeatMode::One => MprisLoopStatus::Track,
+        };
+        let can_go_next = snapshot.queue_index + 1 < snapshot.queue.len()
+            || snapshot.repeat_mode == RepeatMode::All;
+        let can_go_previous = snapshot.current_track.is_some()
+            && (snapshot.queue_index > 0
+                || snapshot.repeat_mode == RepeatMode::All
+                || snapshot
+                    .position_millis
+                    .is_some_and(|position| position > 3_000));
+        let can_seek = snapshot.current_track.is_some();
+        let can_pause = snapshot.current_track.is_some();
+        let can_play = snapshot.current_track.is_some();
+
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_playback_status(playback_status).await;
+            let _ = bridge.player.set_loop_status(loop_status).await;
+            let _ = bridge.player.set_can_go_next(can_go_next).await;
+            let _ = bridge.player.set_can_go_previous(can_go_previous).await;
+            let _ = bridge.player.set_can_seek(can_seek).await;
+            let _ = bridge.player.set_can_pause(can_pause).await;
+            let _ = bridge.player.set_can_play(can_play).await;
+        });
+    }
+
+    fn sync_metadata(self: &Rc<Self>, state: &DaemonState) {
+        let bridge = self.clone();
+        let metadata = build_mpris_metadata(state);
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_metadata(metadata).await;
+        });
+    }
+
+    fn sync_position(&self, state: &DaemonState) {
+        let position_us = state
+            .player
+            .position()
+            .map(|position| (position.nseconds() / 1_000) as i64)
+            .unwrap_or(0);
+        self.player
+            .set_position(MprisTime::from_micros(position_us));
+    }
+
+    fn emit_seeked(self: &Rc<Self>, position_us: i64) {
+        let bridge = self.clone();
+        glib::spawn_future_local(async move {
+            let _ = bridge
+                .player
+                .seeked(MprisTime::from_micros(position_us))
+                .await;
+        });
+    }
+
+    fn sync_volume(self: &Rc<Self>, state: &DaemonState) {
+        let bridge = self.clone();
+        let volume = state.player.volume();
+        glib::spawn_future_local(async move {
+            let _ = bridge.player.set_volume(volume).await;
+        });
+    }
+}
+
+pub fn run() -> Result<()> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Err(err) = ensure_desktop_entry_for_current_exe(&exe) {
+            eprintln!("[STATICD] failed to refresh desktop entry: {err}");
+        }
+    }
+
+    let mut cache = MusicCache::new().context("Failed to initialise music cache")?;
+    if let Some(root) = get_storage_root() {
+        if let Err(err) = cache.migrate_storage_root(&root) {
+            eprintln!("[STATICD] failed to apply storage root override: {err}");
+            let _ = cache.apply_storage_root("");
+        }
+    }
+    let settings = cache.load_settings().unwrap_or_default();
+    let (command_tx, command_rx) = mpsc::channel::<CommandEnvelope>();
+    let (background_tx, background_rx) = mpsc::channel::<BackgroundEvent>();
+    let state = Rc::new(RefCell::new(DaemonState {
+        player: PlaybackEngine::new(),
+        cache,
+        settings,
+        client: None,
+        sponsorblock: SponsorBlockClient::new().context("Failed to initialise SponsorBlock client")?,
+        queue: Vec::new(),
+        queue_index: 0,
+        radio_virtual_playlist: None,
+        repeat_mode: RepeatMode::Off,
+        active_track: None,
+        sponsor_segments: Vec::new(),
+        sponsor_segments_reported: HashSet::new(),
+        paused_since: None,
+        radio_append_in_flight: false,
+        last_radio_append_anchor: None,
+        background_tx,
+        deferred_actions: VecDeque::new(),
+        last_duration_micros: Cell::new(None),
+        mpris: RefCell::new(None),
+        shutting_down: Cell::new(false),
+    }));
+
+    {
+        let state = state.clone();
+        glib::spawn_future_local(async move {
+            match DaemonMprisBridge::new(&state).await {
+                Ok(bridge) => {
+                    *state.borrow().mpris.borrow_mut() = Some(bridge.clone());
+                    bridge.sync_all(&state.borrow());
+                }
+                Err(err) => eprintln!("[MPRIS] failed to initialize daemon bridge: {err}"),
+            }
+        });
+    }
+
+    let _dbus_connection = zbus::blocking::connection::Builder::session()
+        .context("Failed to connect staticd to the session D-Bus")?
+        .name(DAEMON_BUS_NAME)
+        .context("Failed to request staticd D-Bus name")?
+        .serve_at(
+            DAEMON_OBJECT_PATH,
+            StaticdDbus {
+                command_tx: command_tx.clone(),
+            },
+        )
+        .context("Failed to export staticd D-Bus interface")?
+        .build()
+        .context("Failed to start staticd D-Bus service")?;
+
+    let main_loop = glib::MainLoop::new(None, false);
+    let main_loop_handle = main_loop.clone();
+    glib::timeout_add_local(Duration::from_millis(40), move || {
+        while let Ok(envelope) = command_rx.try_recv() {
+            let response = {
+                let mut state = state.borrow_mut();
+                handle_request(&mut state, envelope.request)
+            };
+            let _ = envelope.reply.send(response);
+        }
+
+        while let Ok(event) = background_rx.try_recv() {
+            handle_background_event(&mut state.borrow_mut(), event);
+        }
+
+        let should_quit = {
+            let mut state = state.borrow_mut();
+            maintain_playback(&mut state);
+            state.shutting_down.get()
+        };
+
+        if should_quit {
+            main_loop_handle.quit();
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+
+    main_loop.run();
+    Ok(())
+}
+
+fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
+    match request {
+        DaemonRequest::Ping => DaemonResponse::Pong,
+        DaemonRequest::GetState => DaemonResponse::State(state_snapshot(state)),
+        DaemonRequest::PlayQueueAt {
+            queue,
+            index,
+            radio_virtual_playlist,
+            repeat_mode,
+        } => match play_queue_at(state, queue, index, radio_virtual_playlist, repeat_mode) {
+            Ok(()) => DaemonResponse::State(state_snapshot(state)),
+            Err(err) => DaemonResponse::Error(err.to_string()),
+        },
+        DaemonRequest::ReplaceQueue {
+            queue,
+            index,
+            radio_virtual_playlist,
+            repeat_mode,
+        } => {
+            state.queue = queue;
+            state.queue_index = index.min(state.queue.len().saturating_sub(1));
+            state.radio_virtual_playlist = radio_virtual_playlist;
+            state.radio_append_in_flight = false;
+            state.last_radio_append_anchor = None;
+            state.repeat_mode = repeat_mode;
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::TogglePause => {
+            state.player.toggle_pause();
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::Pause => {
+            state.player.pause();
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::Resume => {
+            state.player.resume();
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::Stop => {
+            stop_playback(state, false);
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::Next => match advance_queue(state, true) {
+            Ok(()) => DaemonResponse::State(state_snapshot(state)),
+            Err(err) => DaemonResponse::Error(err.to_string()),
+        },
+        DaemonRequest::Previous => {
+            if state
+                .player
+                .position()
+                .is_some_and(|position| position.seconds() > 3)
+            {
+                state.player.seek(ClockTime::ZERO);
+                signal_mpris_seeked(state, ClockTime::ZERO);
+                sync_mpris(state);
+                DaemonResponse::State(state_snapshot(state))
+            } else {
+                match advance_queue(state, false) {
+                    Ok(()) => DaemonResponse::State(state_snapshot(state)),
+                    Err(err) => DaemonResponse::Error(err.to_string()),
+                }
+            }
+        }
+        DaemonRequest::SeekToMillis { position_millis } => {
+            let target = ClockTime::from_mseconds(position_millis);
+            state.player.seek(target);
+            signal_mpris_seeked(state, target);
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::SetVolume { volume } => {
+            state.player.set_volume(volume.clamp(0.0, 1.0));
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::SetRepeatMode { repeat_mode } => {
+            state.repeat_mode = repeat_mode;
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::ReloadSettings => {
+            reload_settings(state);
+            sync_mpris(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::Shutdown => {
+            stop_playback(state, true);
+            state.shutting_down.set(true);
+            DaemonResponse::Ok
+        }
+    }
+}
+
+fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
+    match event {
+        BackgroundEvent::TrackingReady { video_id, tracking } => {
+            if let Some(active) = state.active_track.as_mut() {
+                if active.video_id == video_id {
+                    active.tracking = tracking;
+                }
+            }
+        }
+        BackgroundEvent::SponsorSegmentsReady { video_id, segments } => {
+            if state
+                .active_track
+                .as_ref()
+                .is_some_and(|active| active.video_id == video_id)
+            {
+                let count = segments.len();
+                state.sponsor_segments = segments;
+                state.sponsor_segments_reported.clear();
+
+                if count > 0 {
+                    eprintln!(
+                        "[SPONSORBLOCK] loaded {} skippable segments for {}",
+                        count,
+                        video_id
+                    );
+                }
+            }
+        }
+        BackgroundEvent::RadioExtensionReady {
+            anchor_video_id,
+            tracks,
+            chips,
+        } => {
+            state.radio_append_in_flight = false;
+            let queue_still_matches = state
+                .queue
+                .last()
+                .is_some_and(|track| track.video_id == anchor_video_id);
+            if !queue_still_matches {
+                return;
+            }
+
+            let mut seen_ids = state
+                .queue
+                .iter()
+                .map(|track| track.video_id.clone())
+                .collect::<HashSet<_>>();
+            let mut added = 0usize;
+            for track in tracks {
+                if seen_ids.insert(track.video_id.clone()) {
+                    state.queue.push(track);
+                    added += 1;
+                }
+            }
+
+            if let Some(radio) = state.radio_virtual_playlist.as_mut() {
+                if !chips.is_empty() {
+                    radio.chips = chips;
+                }
+            }
+
+            if added > 0 {
+                sync_mpris(state);
+            }
+        }
+    }
+}
+
+fn maintain_playback(state: &mut DaemonState) {
+    if state.active_track.is_some() {
+        if state.player.is_paused() {
+            if state.paused_since.is_none() {
+                state.paused_since = Some(Instant::now());
+            }
+        } else {
+            state.paused_since = None;
+        }
+    } else {
+        state.paused_since = None;
+    }
+
+    if state
+        .paused_since
+        .is_some_and(|paused_at| paused_at.elapsed() >= PAUSED_SHUTDOWN_AFTER)
+    {
+        stop_playback(state, true);
+        state.shutting_down.set(true);
+        return;
+    }
+
+    if let Some(active) = state.active_track.as_mut() {
+        if let Some(position) = state.player.position() {
+            active.last_position_millis = position.mseconds();
+        }
+    }
+
+    let duration_micros = state
+        .player
+        .duration()
+        .map(|duration| duration.useconds() as i64);
+    if state.last_duration_micros.get() != duration_micros {
+        state.last_duration_micros.set(duration_micros);
+        sync_mpris(state);
+    }
+
+    maybe_flush_watchtime_progress(state);
+    maybe_apply_sponsorblock_skip(state);
+    maybe_run_deferred_action(state);
+    maybe_extend_radio_queue(state);
+
+    let next_target = match (state.player.position(), state.player.duration()) {
+        (Some(position), Some(duration))
+            if duration > ClockTime::from_seconds(1)
+                && position + ClockTime::from_mseconds(500) >= duration =>
+        {
+            match state.repeat_mode {
+                RepeatMode::One => Some(state.queue_index),
+                RepeatMode::All => {
+                    if state.queue_index + 1 < state.queue.len() {
+                        Some(state.queue_index + 1)
+                    } else if !state.queue.is_empty() {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                }
+                RepeatMode::Off => {
+                    if state.queue_index + 1 < state.queue.len() {
+                        Some(state.queue_index + 1)
+                    } else {
+                        None
+                    }
+                }
+            }
+        }
+        _ => None,
+    };
+
+    if let Some(target) = next_target {
+        if let Err(err) = play_index(state, target) {
+            eprintln!("[DAEMON] failed to auto-advance: {err}");
+        }
+    }
+}
+
+fn play_queue_at(
+    state: &mut DaemonState,
+    queue: Vec<Track>,
+    index: usize,
+    radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+    repeat_mode: RepeatMode,
+) -> Result<()> {
+    if queue.is_empty() {
+        stop_playback(state, false);
+        return Ok(());
+    }
+    state.queue = queue;
+    state.queue_index = index.min(state.queue.len().saturating_sub(1));
+    state.radio_virtual_playlist = radio_virtual_playlist;
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    state.repeat_mode = repeat_mode;
+    play_index(state, state.queue_index)
+}
+
+fn advance_queue(state: &mut DaemonState, forward: bool) -> Result<()> {
+    if state.queue.is_empty() {
+        return Ok(());
+    }
+
+    let target = if forward {
+        if state.queue_index + 1 < state.queue.len() {
+            Some(state.queue_index + 1)
+        } else if state.repeat_mode == RepeatMode::All {
+            Some(0)
+        } else if state.repeat_mode == RepeatMode::One {
+            Some(state.queue_index)
+        } else {
+            None
+        }
+    } else if state.queue_index > 0 {
+        Some(state.queue_index - 1)
+    } else if state.repeat_mode == RepeatMode::All {
+        Some(state.queue.len().saturating_sub(1))
+    } else if state.repeat_mode == RepeatMode::One {
+        Some(state.queue_index)
+    } else {
+        None
+    };
+
+    match target {
+        Some(index) => play_index(state, index),
+        None => {
+            stop_playback(state, false);
+            Ok(())
+        }
+    }
+}
+
+fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
+    stop_playback(state, false);
+
+    let track = state
+        .queue
+        .get(index)
+        .cloned()
+        .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
+    let prepared_uri = prepare_playback(state, &track.video_id)?;
+    state.queue_index = index;
+    mark_radio_touched_through(state, index);
+    state.player.play_uri(&prepared_uri);
+    state.last_duration_micros.set(None);
+    state.active_track = Some(ActiveTrack {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artist: artist_string(&track),
+        thumb_url: track.thumbnail_url.clone(),
+        rating: SongRating::Indifferent,
+        tracking: None,
+        started_at: Instant::now(),
+        last_position_millis: 0,
+        awaiting_fresh_position: true,
+        bootstrapped_watchtime: false,
+    });
+    state.sponsor_segments.clear();
+    state.sponsor_segments_reported.clear();
+    state.paused_since = None;
+    state.deferred_actions.push_back(DeferredAction::StartPlaybackTracking {
+        video_id: track.video_id.clone(),
+    });
+    refresh_sponsorblock_for_current_track(state);
+    prefetch_upcoming(state);
+    signal_mpris_seeked(state, ClockTime::ZERO);
+    sync_mpris(state);
+    Ok(())
+}
+
+fn mark_radio_touched_through(state: &mut DaemonState, index: usize) {
+    if let Some(radio) = state.radio_virtual_playlist.as_mut() {
+        radio.touched_len = radio.touched_len.max(index.saturating_add(1));
+    }
+}
+
+fn stop_playback(state: &mut DaemonState, exiting: bool) {
+    if let Some(track) = state.active_track.take() {
+        let current_position_millis = state
+            .player
+            .position()
+            .map(|position| position.nseconds() / 1_000_000);
+        flush_active_track(track, current_position_millis, exiting);
+    }
+    state.player.stop();
+    state.sponsor_segments.clear();
+    state.sponsor_segments_reported.clear();
+    state.paused_since = None;
+    sync_mpris(state);
+}
+
+fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<String> {
+    if state.settings.prefer_local_cache_on_playback {
+        if let Some(cached_path) = state.cache.get_cached_audio(video_id) {
+            return url::Url::from_file_path(cached_path)
+                .map(|url| url.to_string())
+                .map_err(|_| anyhow!("Failed to build file URL for cached audio"));
+        }
+        if state.settings.prefetch_enabled {
+            if let Some(temp_path) = state.cache.get_temp_audio(video_id) {
+                return url::Url::from_file_path(temp_path)
+                    .map(|url| url.to_string())
+                    .map_err(|_| anyhow!("Failed to build file URL for prefetched audio"));
+            }
+        }
+    }
+
+    let client = ensure_client_loaded(state)?;
+    client
+        .get_audio_url_no_track(video_id)
+        .map_err(|err| anyhow!("Playback failed: {err}"))
+}
+
+fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<YtMusicClient>> {
+    if let Some(client) = state.client.as_ref() {
+        return Ok(client.clone());
+    }
+
+    let cookie = get_cookie().ok_or_else(|| anyhow!("Not authenticated"))?;
+    let client = Rc::new(YtMusicClient::new(&cookie)?);
+    if let Some(token) = get_vr_refresh_token() {
+        client.set_vr_refresh_token(&token);
+    }
+    state.client = Some(client.clone());
+    Ok(client)
+}
+
+fn reload_settings(state: &mut DaemonState) {
+    match state.cache.load_settings() {
+        Ok(settings) => {
+            state.settings = settings;
+            refresh_sponsorblock_for_current_track(state);
+            prefetch_upcoming(state);
+        }
+        Err(err) => eprintln!("[STATICD] failed to reload settings: {err}"),
+    }
+}
+
+fn maybe_run_deferred_action(state: &mut DaemonState) {
+    let Some(action) = state.deferred_actions.pop_front() else {
+        return;
+    };
+
+    match action {
+        DeferredAction::StartPlaybackTracking { video_id } => {
+            let tracking = state
+                .client
+                .as_ref()
+                .and_then(|client| client.start_playback_tracking(&video_id));
+            let _ = state
+                .background_tx
+                .send(BackgroundEvent::TrackingReady { video_id, tracking });
+        }
+    }
+}
+
+fn maybe_extend_radio_queue(state: &mut DaemonState) {
+    if state.radio_append_in_flight
+        || state.radio_virtual_playlist.is_none()
+        || state.repeat_mode == RepeatMode::All
+    {
+        return;
+    }
+
+    let Some(anchor_video_id) = ({
+        let idx = state.queue_index;
+        if state.queue.is_empty() || idx + 1 != state.queue.len() {
+            None
+        } else {
+            state.queue.last().map(|track| track.video_id.clone())
+        }
+    }) else {
+        return;
+    };
+
+    if state.last_radio_append_anchor.as_deref() == Some(anchor_video_id.as_str()) {
+        return;
+    }
+
+    state.last_radio_append_anchor = Some(anchor_video_id.clone());
+    state.radio_append_in_flight = true;
+
+    let background_tx = state.background_tx.clone();
+    let vr_refresh_token = get_vr_refresh_token();
+
+    std::thread::spawn(move || {
+        let Some(cookie) = get_cookie() else {
+            let _ = background_tx.send(BackgroundEvent::RadioExtensionReady {
+                anchor_video_id,
+                tracks: Vec::new(),
+                chips: Vec::new(),
+            });
+            return;
+        };
+
+        let client = match YtMusicClient::new(&cookie) {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("[RADIO] failed to initialize YT Music client: {err}");
+                let _ = background_tx.send(BackgroundEvent::RadioExtensionReady {
+                    anchor_video_id,
+                    tracks: Vec::new(),
+                    chips: Vec::new(),
+                });
+                return;
+            }
+        };
+        if let Some(token) = vr_refresh_token.as_deref() {
+            client.set_vr_refresh_token(token);
+        }
+
+        let (tracks, chips) = match client.get_radio(&anchor_video_id, None, None) {
+            Ok(radio) => (radio.tracks, radio.chips),
+            Err(err) => {
+                eprintln!("[RADIO] failed to extend radio from {anchor_video_id}: {err}");
+                (Vec::new(), Vec::new())
+            }
+        };
+
+        let _ = background_tx.send(BackgroundEvent::RadioExtensionReady {
+            anchor_video_id,
+            tracks,
+            chips,
+        });
+    });
+}
+
+fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, exiting: bool) {
+    let listened_millis = current_listened_millis(current_position_millis, &track);
+    std::thread::spawn(move || {
+        if let Some(tracking) = track.tracking {
+            if exiting {
+                tracking.report_watchtime_on_exit(listened_millis);
+            } else {
+                tracking.report_watchtime(listened_millis);
+            }
+        }
+
+        let listened_secs = listened_millis / 1_000;
+        if listened_secs < MIN_LISTEN_SECS {
+            return;
+        }
+
+        let mut cache = match MusicCache::new() {
+            Ok(cache) => cache,
+            Err(err) => {
+                eprintln!("[STATICD] failed to initialise music cache for history flush: {err}");
+                return;
+            }
+        };
+        if let Some(root) = get_storage_root() {
+            if let Err(err) = cache.migrate_storage_root(&root) {
+                eprintln!("[STATICD] failed to apply storage root override: {err}");
+                let _ = cache.apply_storage_root("");
+            }
+        }
+
+        if let Err(err) = cache.record_play(
+            &track.video_id,
+            &track.title,
+            &track.artist,
+            history_thumbnail_candidate(track.thumb_url.as_deref()),
+            listened_secs,
+        ) {
+            eprintln!("[STATICD] failed to record play for {}: {err}", track.video_id);
+        }
+    });
+}
+
+fn current_listened_millis(current_position_millis: Option<u64>, track: &ActiveTrack) -> u64 {
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
+    let current_position_millis = current_position_millis.filter(|millis| *millis > 0);
+
+    match current_position_millis {
+        Some(current_position_millis)
+            if track.last_position_millis > current_position_millis + 1_500
+                && current_position_millis < 5_000
+                && session_elapsed_millis > current_position_millis + 1_500 =>
+        {
+            track.last_position_millis
+        }
+        Some(current_position_millis) => current_position_millis,
+        None if track.last_position_millis > 0 => track.last_position_millis,
+        None => session_elapsed_millis,
+    }
+}
+
+fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
+    if state.player.is_paused() {
+        return;
+    }
+
+    let Some(track) = state.active_track.as_mut() else {
+        return;
+    };
+
+    let player_position_millis = state.player.position().map(|pos| pos.nseconds() / 1_000_000);
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
+
+    if track.awaiting_fresh_position {
+        match player_position_millis {
+            Some(position_millis) if position_millis <= session_elapsed_millis + 1_500 => {
+                track.awaiting_fresh_position = false;
+            }
+            Some(_) | None => return,
+        }
+    }
+
+    let listened = player_position_millis
+        .filter(|millis| *millis > 0)
+        .unwrap_or(session_elapsed_millis);
+    track.last_position_millis = listened;
+
+    if let Some(tracking) = track.tracking.as_ref() {
+        tracking.maybe_report_watchtime(listened);
+        if !track.bootstrapped_watchtime && track.started_at.elapsed() >= Duration::from_secs(3) {
+            tracking.maybe_bootstrap_watchtime();
+            track.bootstrapped_watchtime = true;
+        }
+    }
+}
+
+fn clear_sponsorblock_state(state: &mut DaemonState) {
+    state.sponsor_segments.clear();
+    state.sponsor_segments_reported.clear();
+}
+
+fn load_sponsorblock_segments(
+    cache: &mut MusicCache,
+    settings: &AppSettings,
+    sponsorblock: &SponsorBlockClient,
+    video_id: &str,
+) -> Result<Vec<SponsorSegment>> {
+    let requested_categories = sanitize_categories(&settings.sponsorblock_categories);
+    if !settings.sponsorblock_enabled || requested_categories.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if cache.is_cached(video_id) {
+        match cache.get_offline_sponsor_segments(video_id) {
+            Ok(Some(segments)) => {
+                return Ok(filter_segments_for_categories(&segments, &requested_categories));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] failed to read offline cache for {video_id}: {err}");
+            }
+        }
+
+        let segments = sponsorblock.fetch_skip_segments(video_id, &default_skip_categories())?;
+        if let Err(err) = cache.store_offline_sponsor_segments(video_id, &segments) {
+            eprintln!("[SPONSORBLOCK] failed to store offline cache for {video_id}: {err}");
+        }
+        return Ok(filter_segments_for_categories(&segments, &requested_categories));
+    }
+
+    sponsorblock.fetch_skip_segments(video_id, &requested_categories)
+}
+
+fn refresh_sponsorblock_for_current_track(state: &mut DaemonState) {
+    clear_sponsorblock_state(state);
+
+    let Some(video_id) = state
+        .active_track
+        .as_ref()
+        .map(|track| track.video_id.clone())
+    else {
+        return;
+    };
+    let settings = state.settings.clone();
+    let background_tx = state.background_tx.clone();
+
+    std::thread::spawn(move || {
+        let mut cache = match MusicCache::new() {
+            Ok(cache) => cache,
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] failed to initialize music cache for {video_id}: {err}");
+                return;
+            }
+        };
+        if let Some(root) = get_storage_root() {
+            if let Err(err) = cache.migrate_storage_root(&root) {
+                eprintln!("[SPONSORBLOCK] failed to apply storage root override: {err}");
+                let _ = cache.apply_storage_root("");
+            }
+        }
+        let sponsorblock = match SponsorBlockClient::new() {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] failed to initialize client for {video_id}: {err}");
+                return;
+            }
+        };
+
+        match load_sponsorblock_segments(&mut cache, &settings, &sponsorblock, &video_id) {
+            Ok(segments) => {
+                let _ = background_tx.send(BackgroundEvent::SponsorSegmentsReady {
+                    video_id,
+                    segments,
+                });
+            }
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] failed to load segments for {video_id}: {err}");
+            }
+        }
+    });
+}
+
+fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
+    if state.player.is_paused() {
+        return;
+    }
+
+    let Some(video_id) = state
+        .active_track
+        .as_ref()
+        .map(|track| track.video_id.clone())
+    else {
+        return;
+    };
+    let Some(position) = state.player.position() else {
+        return;
+    };
+
+    let position_seconds = position.nseconds() as f64 / 1_000_000_000.0;
+    let segment = state
+        .sponsor_segments
+        .iter()
+        .find(|segment| segment.should_skip_at(position_seconds))
+        .cloned();
+    let Some(segment) = segment else {
+        return;
+    };
+    let Some(target_seconds) = segment.seek_target_seconds(position_seconds) else {
+        return;
+    };
+
+    let target_millis = (target_seconds * 1_000.0).round() as u64;
+    eprintln!(
+        "[SPONSORBLOCK] skipping {} segment on {} to {:.2}s",
+        segment.category, video_id, target_seconds
+    );
+    let target = ClockTime::from_mseconds(target_millis);
+    state.player.seek(target);
+    signal_mpris_seeked(state, target);
+    if let Some(track) = state.active_track.as_mut() {
+        track.last_position_millis = target_millis;
+    }
+
+    if state.sponsor_segments_reported.insert(segment.uuid.clone()) {
+        if let Err(err) = state.sponsorblock.mark_segment_viewed(&segment.uuid) {
+            eprintln!(
+                "[SPONSORBLOCK] failed to report viewed segment {} on {}: {}",
+                segment.uuid, video_id, err
+            );
+        }
+    }
+}
+
+fn prefetch_upcoming(state: &mut DaemonState) {
+    if !state.settings.prefetch_enabled {
+        return;
+    }
+
+    let prefetch_ahead = state.settings.prefetch_ahead.clamp(1, 12) as usize;
+    let start = state.queue_index.saturating_add(1);
+    let to_fetch = state
+        .queue
+        .iter()
+        .skip(start)
+        .take(prefetch_ahead)
+        .map(|track| track.video_id.clone())
+        .collect::<Vec<_>>();
+
+    if to_fetch.is_empty() {
+        return;
+    }
+
+    let cookie = get_cookie();
+    let vr_refresh_token = get_vr_refresh_token();
+    let storage_root = get_storage_root();
+
+    std::thread::spawn(move || {
+        let Some(cookie) = cookie else {
+            return;
+        };
+
+        let mut cache = match MusicCache::new() {
+            Ok(cache) => cache,
+            Err(err) => {
+                eprintln!("[PREFETCH] failed to initialize music cache: {err}");
+                return;
+            }
+        };
+        if let Some(root) = storage_root.as_deref() {
+            if let Err(err) = cache.migrate_storage_root(root) {
+                eprintln!("[PREFETCH] failed to apply storage root override: {err}");
+                let _ = cache.apply_storage_root("");
+            }
+        }
+
+        let client = match YtMusicClient::new(&cookie) {
+            Ok(client) => client,
+            Err(err) => {
+                eprintln!("[PREFETCH] failed to initialize YT Music client: {err}");
+                return;
+            }
+        };
+        if let Some(token) = vr_refresh_token.as_deref() {
+            client.set_vr_refresh_token(token);
+        }
+
+        for video_id in to_fetch {
+            if cache.is_cached(&video_id) || cache.get_temp_audio(&video_id).is_some() {
+                continue;
+            }
+
+            let Ok(url) = client.get_audio_url_no_track(&video_id) else {
+                continue;
+            };
+
+            let Ok(audio) = DOWNLOAD_CLIENT
+                .get(&url)
+                .header("Range", "bytes=0-")
+                .send()
+                .and_then(|response| response.bytes())
+            else {
+                continue;
+            };
+
+            cache.store_temp_audio(&video_id, &audio);
+        }
+    });
+}
+
+fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
+    url.filter(|value| !value.starts_with("file://"))
+}
+
+fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
+    PlaybackSnapshot {
+        current_track: state
+            .active_track
+            .as_ref()
+            .map(|track| ActiveTrackSnapshot {
+                video_id: track.video_id.clone(),
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                thumb_url: track.thumb_url.clone(),
+                rating: track.rating,
+            }),
+        queue: state.queue.clone(),
+        queue_index: state.queue_index,
+        radio_virtual_playlist: state.radio_virtual_playlist.clone(),
+        repeat_mode: state.repeat_mode,
+        paused: state.player.is_paused(),
+        volume: state.player.volume(),
+        position_millis: state.player.position().map(|position| position.mseconds()),
+        duration_millis: state.player.duration().map(|duration| duration.mseconds()),
+        buffered_fraction: state.player.buffered_fraction(),
+    }
+}
+
+fn sync_mpris(state: &DaemonState) {
+    if let Some(bridge) = state.mpris.borrow().as_ref() {
+        bridge.sync_all(state);
+    }
+}
+
+fn signal_mpris_seeked(state: &DaemonState, position: ClockTime) {
+    if let Some(bridge) = state.mpris.borrow().as_ref() {
+        let position_us = (position.nseconds() / 1_000) as i64;
+        bridge.player.set_position(MprisTime::from_micros(position_us));
+        bridge.emit_seeked(position_us);
+    }
+}
+
+fn build_mpris_metadata(state: &DaemonState) -> Metadata {
+    let Some(track) = state.active_track.as_ref() else {
+        return Metadata::builder().build();
+    };
+
+    let mut builder = Metadata::builder()
+        .trackid(mpris_track_id(&track.video_id))
+        .title(track.title.clone())
+        .artist(vec![track.artist.clone()]);
+
+    if let Some(duration_millis) = state.player.duration().map(|duration| duration.mseconds()) {
+        builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
+    }
+
+    let art_url = state
+        .cache
+        .get_cached_art(&track.video_id)
+        .and_then(|path| {
+            url::Url::from_file_path(path)
+                .ok()
+                .map(|url| url.to_string())
+        })
+        .or_else(|| track.thumb_url.clone());
+    if let Some(art_url) = art_url {
+        builder = builder.art_url(art_url);
+    }
+
+    builder.build()
+}
+
+fn mpris_track_id(video_id: &str) -> TrackId {
+    let suffix: String = video_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    TrackId::try_from(format!("/com/static/music/track_{suffix}")).unwrap()
+}
+
+fn artist_string(track: &Track) -> String {
+    if track.artists.is_empty() {
+        "Unknown artist".to_string()
+    } else {
+        track
+            .artists
+            .iter()
+            .map(|artist| artist.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn reopen_ui_window() -> Result<()> {
+    let exe = std::env::current_exe().context("Failed to locate current executable")?;
+    ensure_desktop_entry_for_current_exe(&exe)?;
+    if std::process::Command::new("gtk-launch")
+        .arg("com.static.music")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        return Ok(());
+    }
+
+    std::process::Command::new(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to reopen UI")?;
+    Ok(())
+}
+
+fn ensure_desktop_entry_for_current_exe(exe: &std::path::Path) -> Result<()> {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".local/share"))
+        })
+        .ok_or_else(|| anyhow!("Could not determine XDG data directory"))?;
+    ensure_local_icon_for_current_exe(exe, &data_home)?;
+    let applications_dir = data_home.join("applications");
+    std::fs::create_dir_all(&applications_dir)
+        .with_context(|| format!("Failed to create {}", applications_dir.display()))?;
+
+    let desktop_path = applications_dir.join("com.static.music.desktop");
+    let exe_escaped = exe.to_string_lossy().replace(' ', "\\ ");
+    let desktop_entry = format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName=Static\nExec={exe_escaped}\nTryExec={exe_escaped}\nIcon=com.static.music\nTerminal=false\nDBusActivatable=false\nCategories=AudioVideo;Audio;Player;\nStartupNotify=true\nStartupWMClass=com.static.music\n"
+    );
+
+    let needs_write = std::fs::read_to_string(&desktop_path)
+        .map(|current| current != desktop_entry)
+        .unwrap_or(true);
+    if needs_write {
+        std::fs::write(&desktop_path, desktop_entry)
+            .with_context(|| format!("Failed to write {}", desktop_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn ensure_local_icon_for_current_exe(exe: &std::path::Path, data_home: &std::path::Path) -> Result<()> {
+    let Some(project_root) = exe
+        .parent()
+        .and_then(|dir| dir.parent())
+        .and_then(|dir| dir.parent())
+    else {
+        return Ok(());
+    };
+    let source_icon = project_root.join("assets/static.png");
+    if !source_icon.exists() {
+        return Ok(());
+    }
+
+    let icon_dir = data_home.join("icons/hicolor/256x256/apps");
+    std::fs::create_dir_all(&icon_dir)
+        .with_context(|| format!("Failed to create {}", icon_dir.display()))?;
+    let target_icon = icon_dir.join("com.static.music.png");
+
+    let needs_copy = match (std::fs::metadata(&source_icon), std::fs::metadata(&target_icon)) {
+        (Ok(source), Ok(target)) => source.len() != target.len(),
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    };
+
+    if needs_copy {
+        std::fs::copy(&source_icon, &target_icon).with_context(|| {
+            format!(
+                "Failed to copy icon from {} to {}",
+                source_icon.display(),
+                target_icon.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn get_cookie() -> Option<String> {
+    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
+    entry.get_password().ok()
+}
+
+fn get_vr_refresh_token() -> Option<String> {
+    let entry = Entry::new(KEYRING_SERVICE, KEYRING_VR_TOKEN).ok()?;
+    entry.get_password().ok()
+}
+
+fn get_storage_root() -> Option<String> {
+    let entry = Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT).ok()?;
+    entry.get_password().ok()
+}

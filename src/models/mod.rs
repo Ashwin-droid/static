@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Track {
     pub video_id: String,
     pub title: String,
@@ -10,7 +10,7 @@ pub struct Track {
     pub thumbnail_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artist {
     pub name: String,
     pub id: Option<String>,
@@ -49,7 +49,7 @@ pub struct PlaylistSummary {
 }
 
 /// A single filter chip from a radio queue (e.g. "All", "Discover", "J-pop").
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RadioChip {
     pub label: String,
     pub playlist_id: String,
@@ -68,7 +68,7 @@ pub struct RadioQueue {
 }
 
 /// The locally-managed virtual-playlist state for a radio queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RadioVirtualPlaylist {
     pub source_video_id: String,
     pub touched_len: usize,

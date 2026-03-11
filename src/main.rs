@@ -1,5 +1,8 @@
 mod cache;
+mod daemon;
+mod ipc;
 mod models;
+mod playback_engine;
 mod player;
 mod sponsorblock;
 mod ui;
@@ -11,6 +14,10 @@ fn main() {
     tracing_subscriber::fmt::init();
     gstreamer::init().expect("Failed to initialise GStreamer");
 
-    let app = ui::build_app();
-    app.run();
+    if std::env::args().any(|arg| arg == "--daemon") {
+        daemon::run().expect("Failed to start playback daemon");
+    } else {
+        let app = ui::build_app();
+        app.run();
+    }
 }

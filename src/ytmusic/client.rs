@@ -26,7 +26,7 @@ const VR_OAUTH_TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token?prettyP
 const VR_OAUTH_DEVICE_CODE_URL: &str =
     "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SongRating {
     Like,
     Dislike,

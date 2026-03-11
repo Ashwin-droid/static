@@ -1,6 +1,7 @@
 mod cache;
 mod models;
 mod player;
+mod sponsorblock;
 mod ui;
 mod ytmusic;
 

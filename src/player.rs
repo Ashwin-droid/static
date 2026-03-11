@@ -2,9 +2,9 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gstreamer as gst;
+use gstreamer::ClockTime;
 use gstreamer::glib;
 use gstreamer::prelude::*;
-use gstreamer::ClockTime;
 use gstreamer_play as gst_play;
 
 pub struct Player {

@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::sponsorblock::{
+    SponsorSegment, default_skip_categories, normalize_segments, sanitize_categories,
+};
 
 #[derive(Debug, Clone)]
 pub struct AppSettings {
@@ -15,6 +19,8 @@ pub struct AppSettings {
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
+    pub sponsorblock_enabled: bool,
+    pub sponsorblock_categories: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -30,6 +36,8 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
+            sponsorblock_enabled: true,
+            sponsorblock_categories: default_skip_categories(),
         }
     }
 }
@@ -103,8 +111,7 @@ impl MusicCache {
             }
         }
 
-        let db = Connection::open(base.join("data.db"))
-            .context("Failed to open cache database")?;
+        let db = Connection::open(base.join("data.db")).context("Failed to open cache database")?;
 
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS plays (
@@ -122,6 +129,11 @@ impl MusicCache {
                 art_path   TEXT NOT NULL DEFAULT '',
                 cached_at  INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS offline_sponsorblock (
+                video_id      TEXT PRIMARY KEY,
+                segments_json TEXT NOT NULL,
+                cached_at     INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS app_settings (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -129,14 +141,12 @@ impl MusicCache {
         )?;
 
         // Migrate: add listen_secs column if missing (existing installs)
-        let _ = db.execute_batch(
-            "ALTER TABLE plays ADD COLUMN listen_secs INTEGER NOT NULL DEFAULT 0;"
-        );
+        let _ = db
+            .execute_batch("ALTER TABLE plays ADD COLUMN listen_secs INTEGER NOT NULL DEFAULT 0;");
 
         // Migrate: add pinned column (manually downloaded, not auto-evicted)
-        let _ = db.execute_batch(
-            "ALTER TABLE offline ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;"
-        );
+        let _ =
+            db.execute_batch("ALTER TABLE offline ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;");
 
         // Offline playlists: store playlist metadata + track ordering
         db.execute_batch(
@@ -156,7 +166,13 @@ impl MusicCache {
             );",
         )?;
 
-        Ok(Self { db, base_dir: base, offline_dir, art_dir, temp_dir })
+        Ok(Self {
+            db,
+            base_dir: base,
+            offline_dir,
+            art_dir,
+            temp_dir,
+        })
     }
 
     pub fn apply_storage_root(&mut self, raw_root: &str) -> Result<()> {
@@ -236,35 +252,72 @@ impl MusicCache {
         for row in rows.flatten() {
             match row.0.as_str() {
                 "auto_sync_chromium_cookies" => {
-                    settings.auto_sync_chromium_cookies = parse_bool_setting(&row.1, settings.auto_sync_chromium_cookies);
+                    settings.auto_sync_chromium_cookies =
+                        parse_bool_setting(&row.1, settings.auto_sync_chromium_cookies);
                 }
                 "chromium_cookie_path" => {
                     settings.chromium_cookie_path = row.1;
                 }
                 "auto_manage_offline_cache" => {
-                    settings.auto_manage_offline_cache = parse_bool_setting(&row.1, settings.auto_manage_offline_cache);
+                    settings.auto_manage_offline_cache =
+                        parse_bool_setting(&row.1, settings.auto_manage_offline_cache);
                 }
                 "offline_cache_target" => {
-                    settings.offline_cache_target = row.1.parse::<u32>().ok().unwrap_or(settings.offline_cache_target).clamp(0, 500);
+                    settings.offline_cache_target = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.offline_cache_target)
+                        .clamp(0, 500);
                 }
                 "offline_rewatch_threshold" => {
-                    settings.offline_rewatch_threshold = row.1.parse::<u32>().ok().unwrap_or(settings.offline_rewatch_threshold).clamp(0, 50);
+                    settings.offline_rewatch_threshold = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.offline_rewatch_threshold)
+                        .clamp(0, 50);
                 }
                 "score_decay_window_days" => {
-                    settings.score_decay_window_days = row.1.parse::<u32>().ok().unwrap_or(settings.score_decay_window_days).clamp(1, 365);
+                    settings.score_decay_window_days = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.score_decay_window_days)
+                        .clamp(1, 365);
                 }
                 "minimum_offline_score" => {
-                    settings.minimum_offline_score = row.1.parse::<f64>().ok().unwrap_or(settings.minimum_offline_score).clamp(0.0, 999.0);
+                    settings.minimum_offline_score = row
+                        .1
+                        .parse::<f64>()
+                        .ok()
+                        .unwrap_or(settings.minimum_offline_score)
+                        .clamp(0.0, 999.0);
                 }
                 "prefetch_enabled" => {
-                    settings.prefetch_enabled = parse_bool_setting(&row.1, settings.prefetch_enabled);
+                    settings.prefetch_enabled =
+                        parse_bool_setting(&row.1, settings.prefetch_enabled);
                 }
                 "prefetch_ahead" => {
-                    settings.prefetch_ahead = row.1.parse::<u32>().ok().unwrap_or(settings.prefetch_ahead).clamp(0, 12);
+                    settings.prefetch_ahead = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.prefetch_ahead)
+                        .clamp(0, 12);
                 }
                 "prefer_local_cache_on_playback" => {
                     settings.prefer_local_cache_on_playback =
                         parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
+                }
+                "sponsorblock_enabled" => {
+                    settings.sponsorblock_enabled =
+                        parse_bool_setting(&row.1, settings.sponsorblock_enabled);
+                }
+                "sponsorblock_categories" => {
+                    if let Ok(categories) = serde_json::from_str::<Vec<String>>(&row.1) {
+                        settings.sponsorblock_categories = sanitize_categories(&categories);
+                    }
                 }
                 _ => {}
             }
@@ -275,20 +328,48 @@ impl MusicCache {
 
     pub fn save_settings(&self, settings: &AppSettings) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
+        let sponsorblock_categories =
+            serde_json::to_string(&sanitize_categories(&settings.sponsorblock_categories))?;
         for (key, value) in [
-            ("auto_sync_chromium_cookies", bool_setting(settings.auto_sync_chromium_cookies)),
-            ("chromium_cookie_path", settings.chromium_cookie_path.clone()),
-            ("auto_manage_offline_cache", bool_setting(settings.auto_manage_offline_cache)),
-            ("offline_cache_target", settings.offline_cache_target.to_string()),
-            ("offline_rewatch_threshold", settings.offline_rewatch_threshold.to_string()),
-            ("score_decay_window_days", settings.score_decay_window_days.to_string()),
-            ("minimum_offline_score", settings.minimum_offline_score.to_string()),
+            (
+                "auto_sync_chromium_cookies",
+                bool_setting(settings.auto_sync_chromium_cookies),
+            ),
+            (
+                "chromium_cookie_path",
+                settings.chromium_cookie_path.clone(),
+            ),
+            (
+                "auto_manage_offline_cache",
+                bool_setting(settings.auto_manage_offline_cache),
+            ),
+            (
+                "offline_cache_target",
+                settings.offline_cache_target.to_string(),
+            ),
+            (
+                "offline_rewatch_threshold",
+                settings.offline_rewatch_threshold.to_string(),
+            ),
+            (
+                "score_decay_window_days",
+                settings.score_decay_window_days.to_string(),
+            ),
+            (
+                "minimum_offline_score",
+                settings.minimum_offline_score.to_string(),
+            ),
             ("prefetch_enabled", bool_setting(settings.prefetch_enabled)),
             ("prefetch_ahead", settings.prefetch_ahead.to_string()),
             (
                 "prefer_local_cache_on_playback",
                 bool_setting(settings.prefer_local_cache_on_playback),
             ),
+            (
+                "sponsorblock_enabled",
+                bool_setting(settings.sponsorblock_enabled),
+            ),
+            ("sponsorblock_categories", sponsorblock_categories.clone()),
         ] {
             tx.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
@@ -327,7 +408,11 @@ impl MusicCache {
         Ok(())
     }
 
-    pub fn auto_offline_candidates(&self, settings: &AppSettings, limit: usize) -> Result<Vec<String>> {
+    pub fn auto_offline_candidates(
+        &self,
+        settings: &AppSettings,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         let now = epoch_secs();
         let min_total_plays = settings.offline_rewatch_threshold.saturating_add(1).max(1);
         let decay_window_days = settings.score_decay_window_days.max(1) as f64;
@@ -355,9 +440,7 @@ impl MusicCache {
             .collect::<Vec<_>>();
 
         ranked.sort_by(|(_, left), (_, right)| {
-            right
-                .partial_cmp(left)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
 
         let ids = ranked
@@ -474,7 +557,69 @@ impl MusicCache {
             ],
         )?;
 
-        eprintln!("[CACHE] stored offline: {video_id} ({} KB)", audio_data.len() / 1024);
+        eprintln!(
+            "[CACHE] stored offline: {video_id} ({} KB)",
+            audio_data.len() / 1024
+        );
+        Ok(())
+    }
+
+    pub fn get_offline_sponsor_segments(
+        &self,
+        video_id: &str,
+    ) -> Result<Option<Vec<SponsorSegment>>> {
+        let payload: Option<String> = self
+            .db
+            .query_row(
+                "SELECT segments_json FROM offline_sponsorblock WHERE video_id = ?1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+
+        match serde_json::from_str::<Vec<SponsorSegment>>(&payload) {
+            Ok(segments) => Ok(Some(normalize_segments(segments))),
+            Err(err) => {
+                eprintln!(
+                    "[SPONSORBLOCK] invalid offline cache entry for {video_id}, dropping it: {err}"
+                );
+                let _ = self.db.execute(
+                    "DELETE FROM offline_sponsorblock WHERE video_id = ?1",
+                    [video_id],
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn store_offline_sponsor_segments(
+        &self,
+        video_id: &str,
+        segments: &[SponsorSegment],
+    ) -> Result<()> {
+        let is_offline = self
+            .db
+            .query_row(
+                "SELECT 1 FROM offline WHERE video_id = ?1",
+                [video_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !is_offline {
+            return Ok(());
+        }
+
+        let segments_json = serde_json::to_string(&normalize_segments(segments.to_vec()))
+            .context("Failed to serialize SponsorBlock segments")?;
+        self.db.execute(
+            "INSERT OR REPLACE INTO offline_sponsorblock (video_id, segments_json, cached_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![video_id, segments_json, epoch_secs()],
+        )?;
         Ok(())
     }
 
@@ -486,6 +631,10 @@ impl MusicCache {
         if let Some(p) = self.get_cached_art(video_id) {
             let _ = std::fs::remove_file(p);
         }
+        let _ = self.db.execute(
+            "DELETE FROM offline_sponsorblock WHERE video_id = ?1",
+            [video_id],
+        );
         self.db
             .execute("DELETE FROM offline WHERE video_id = ?1", [video_id])?;
         eprintln!("[CACHE] evicted offline: {video_id}");
@@ -528,7 +677,9 @@ impl MusicCache {
 
     /// Return all pinned (manually downloaded) video IDs.
     pub fn pinned_ids(&self) -> Result<Vec<String>> {
-        let mut stmt = self.db.prepare("SELECT video_id FROM offline WHERE pinned = 1")?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT video_id FROM offline WHERE pinned = 1")?;
         let ids = stmt
             .query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -584,7 +735,9 @@ impl MusicCache {
     }
 
     /// Get all offline playlists as (playlist_id, title, thumbnail_url, subtitle).
-    pub fn offline_playlists(&self) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
+    pub fn offline_playlists(
+        &self,
+    ) -> Result<Vec<(String, String, Option<String>, Option<String>)>> {
         let mut stmt = self.db.prepare(
             "SELECT playlist_id, title, thumbnail_url, subtitle
              FROM offline_playlists ORDER BY created_at DESC",
@@ -670,7 +823,9 @@ impl MusicCache {
     }
 
     pub fn clear_auto_downloads(&self) -> Result<usize> {
-        let mut stmt = self.db.prepare("SELECT video_id FROM offline WHERE pinned = 0")?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT video_id FROM offline WHERE pinned = 0")?;
         let ids: Vec<String> = stmt
             .query_map([], |row| row.get(0))?
             .filter_map(|row| row.ok())

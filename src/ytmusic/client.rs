@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
 
@@ -19,10 +19,12 @@ const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 
 // OAuth device flow for Android VR auth (premium content)
-const VR_OAUTH_CLIENT_ID: &str = "652469312169-4lvs9bnhr9lpns9v451j5oivd81vjvu1.apps.googleusercontent.com";
+const VR_OAUTH_CLIENT_ID: &str =
+    "652469312169-4lvs9bnhr9lpns9v451j5oivd81vjvu1.apps.googleusercontent.com";
 const VR_OAUTH_CLIENT_SECRET: &str = "3fTWrBJI5Uojm1TK7_iJCW5Z";
 const VR_OAUTH_TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token?prettyPrint=false";
-const VR_OAUTH_DEVICE_CODE_URL: &str = "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
+const VR_OAUTH_DEVICE_CODE_URL: &str =
+    "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SongRating {
@@ -153,7 +155,10 @@ impl TrackingInfo {
         Self::set_query_param(&mut params, "afmt", self.audio_fmt.clone());
         Self::set_query_param(&mut params, "muted", "0");
         Self::set_query_param(&mut params, "volume", "100");
-        let vis = params.get("vis").cloned().unwrap_or_else(|| "10".to_string());
+        let vis = params
+            .get("vis")
+            .cloned()
+            .unwrap_or_else(|| "10".to_string());
         Self::set_query_param(&mut params, "vis", vis);
         Self::set_query_param(&mut params, "state", state);
         Self::set_query_param(&mut params, "rt", format_millis(wall_elapsed_millis));
@@ -161,7 +166,11 @@ impl TrackingInfo {
         Self::set_query_param(&mut params, "lact", lact_millis.to_string());
 
         if state == "playing" && !final_ping {
-            Self::set_query_param(&mut params, "rtn", ((wall_elapsed_millis / 1000) + 10).to_string());
+            Self::set_query_param(
+                &mut params,
+                "rtn",
+                ((wall_elapsed_millis / 1000) + 10).to_string(),
+            );
             params.remove("final");
             params.remove("pe");
         } else if final_ping {
@@ -227,6 +236,38 @@ impl TrackingInfo {
         let auth = self.auth.clone();
         let visitor_id = self.visitor_id.clone();
         rt.spawn(async move {
+            let mut req = http
+                .get(&request.url)
+                .header("referer", request.referer)
+                .header("x-goog-authuser", "0")
+                .header("x-goog-event-time", request.event_time)
+                .header("x-goog-request-time", request.request_time);
+            if let Some(auth) = &auth {
+                req = req.header("authorization", auth.clone());
+            }
+            if let Some(visitor_id) = &visitor_id {
+                req = req.header("x-goog-visitor-id", visitor_id);
+            }
+            match req.send().await {
+                Ok(r) => eprintln!(
+                    "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
+                    request.start_millis,
+                    request.watched_millis,
+                    request.state,
+                    request.final_ping,
+                    r.status()
+                ),
+                Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
+            }
+        });
+    }
+
+    fn dispatch_watchtime_request_blocking(&self, request: PendingWatchtimeRequest) {
+        let rt = unsafe { &*self.rt };
+        let http = self.http.clone();
+        let auth = self.auth.clone();
+        let visitor_id = self.visitor_id.clone();
+        rt.block_on(async move {
             let mut req = http
                 .get(&request.url)
                 .header("referer", request.referer)
@@ -325,7 +366,9 @@ impl TrackingInfo {
         let http = self.http.clone();
         let auth = self.auth.clone();
         rt.spawn(async move {
-            let mut req = http.get(&full).header("referer", "https://music.youtube.com/");
+            let mut req = http
+                .get(&full)
+                .header("referer", "https://music.youtube.com/");
             if let Some(auth) = &auth {
                 req = req.header("authorization", auth.clone());
             }
@@ -385,6 +428,24 @@ impl TrackingInfo {
                 }
             }
         });
+    }
+
+    pub fn report_watchtime_on_exit(&self, listened_millis: u64) {
+        let last_reported_millis = self.last_reported_millis.load(Ordering::Relaxed);
+        let watched = listened_millis.min(self.length_millis);
+        let paused_request =
+            self.build_watchtime_request(last_reported_millis, watched, "paused", false);
+        if paused_request.is_some() {
+            self.last_reported_millis.store(watched, Ordering::Relaxed);
+        }
+
+        let final_start = watched.saturating_sub(7);
+        let final_end = watched.max(final_start + 1);
+        let final_request = self.build_watchtime_request(final_start, final_end, "paused", true);
+
+        for request in [paused_request, final_request].into_iter().flatten() {
+            self.dispatch_watchtime_request_blocking(request);
+        }
     }
 }
 
@@ -467,15 +528,24 @@ impl YtMusicClient {
 
         let mut headers = HeaderMap::new();
         headers.insert("cookie", HeaderValue::from_str(cookie)?);
-        headers.insert("user-agent", HeaderValue::from_static(
-            "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0"
-        ));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static(
+                "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            ),
+        );
         headers.insert("accept", HeaderValue::from_static("*/*"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         headers.insert("origin", HeaderValue::from_static(YTM_ORIGIN));
-        headers.insert("referer", HeaderValue::from_static("https://music.youtube.com/"));
+        headers.insert(
+            "referer",
+            HeaderValue::from_static("https://music.youtube.com/"),
+        );
         headers.insert("x-youtube-client-name", HeaderValue::from_static("67"));
-        headers.insert("x-youtube-client-version", HeaderValue::from_static("1.20240101.01.00"));
+        headers.insert(
+            "x-youtube-client-version",
+            HeaderValue::from_static("1.20240101.01.00"),
+        );
         headers.insert("x-origin", HeaderValue::from_static(YTM_ORIGIN));
 
         let http = reqwest::Client::builder()
@@ -501,12 +571,16 @@ impl YtMusicClient {
     }
 
     fn auth_header(&self) -> Option<String> {
-        self.sapisid.as_ref().map(|id| generate_sapisidhash(id, YTM_ORIGIN))
+        self.sapisid
+            .as_ref()
+            .map(|id| generate_sapisidhash(id, YTM_ORIGIN))
     }
 
     #[allow(dead_code)]
     fn auth_header_for_origin(&self, origin: &str) -> Option<String> {
-        self.sapisid.as_ref().map(|id| generate_sapisidhash(id, origin))
+        self.sapisid
+            .as_ref()
+            .map(|id| generate_sapisidhash(id, origin))
     }
 
     fn post(&self, url: &str) -> reqwest::RequestBuilder {
@@ -553,7 +627,8 @@ impl YtMusicClient {
             let mut body = Self::client_context();
             body["browseId"] = json!("FEmusic_home");
 
-            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
                 .json(&body)
                 .send()
                 .await
@@ -569,13 +644,17 @@ impl YtMusicClient {
             let mut body = Self::client_context();
             body["browseId"] = json!("FEmusic_history");
 
-            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
                 .json(&body)
                 .send()
                 .await
                 .context("Failed to fetch history")?;
 
-            let json: Value = resp.json().await.context("Failed to parse history response")?;
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse history response")?;
             let sections = parsers::parse_home(&json)?;
             Ok(sections.into_iter().flat_map(|s| s.contents).collect())
         })
@@ -587,13 +666,17 @@ impl YtMusicClient {
             body["query"] = json!(query);
             body["params"] = json!("EgWKAQIIAWoMEA4QChADEAQQCRAF");
 
-            let resp = self.post(&format!("{YTM_BASE_URL}/search?{YTM_PARAMS}"))
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/search?{YTM_PARAMS}"))
                 .json(&body)
                 .send()
                 .await
                 .context("Failed to search")?;
 
-            let json: Value = resp.json().await.context("Failed to parse search response")?;
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse search response")?;
             parsers::parse_search_results(&json)
         })
     }
@@ -608,13 +691,17 @@ impl YtMusicClient {
             };
             body["browseId"] = json!(browse_id);
 
-            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
                 .json(&body)
                 .send()
                 .await
                 .context("Failed to fetch playlist")?;
 
-            let json: Value = resp.json().await.context("Failed to parse playlist response")?;
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse playlist response")?;
             parsers::parse_playlist_tracks(&json)
         })
     }
@@ -624,13 +711,17 @@ impl YtMusicClient {
             let mut body = Self::client_context();
             body["browseId"] = json!("FEmusic_liked_playlists");
 
-            let resp = self.post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
                 .json(&body)
                 .send()
                 .await
                 .context("Failed to fetch library playlists")?;
 
-            let json: Value = resp.json().await.context("Failed to parse library playlists response")?;
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse library playlists response")?;
             parsers::parse_library_playlists(&json)
         })
     }
@@ -666,13 +757,16 @@ impl YtMusicClient {
             let mut body = Self::client_context();
             body["target"] = json!({ "videoId": video_id });
 
-            self.post(&format!("{YTM_BASE_URL}/{}?{YTM_PARAMS}", rating.endpoint()))
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("Failed to submit rating for {video_id}"))?
-                .error_for_status()
-                .with_context(|| format!("YouTube Music rejected rating for {video_id}"))?;
+            self.post(&format!(
+                "{YTM_BASE_URL}/{}?{YTM_PARAMS}",
+                rating.endpoint()
+            ))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to submit rating for {video_id}"))?
+            .error_for_status()
+            .with_context(|| format!("YouTube Music rejected rating for {video_id}"))?;
 
             Ok(())
         })
@@ -705,7 +799,10 @@ impl YtMusicClient {
                 .await
                 .context("Failed to fetch radio")?;
 
-            let json: Value = resp.json().await.context("Failed to parse radio response")?;
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse radio response")?;
             parsers::parse_radio(&json)
         })
     }
@@ -713,7 +810,8 @@ impl YtMusicClient {
     /// Report playback start to YouTube and return tracking info.
     /// Call this off the playback-critical path so local files can start instantly.
     pub fn start_playback_tracking(&self, video_id: &str) -> Option<TrackingInfo> {
-        self.rt.block_on(self.start_playback_tracking_async(video_id))
+        self.rt
+            .block_on(self.start_playback_tracking_async(video_id))
     }
 
     /// Get just the streaming URL without reporting anything to YouTube.
@@ -778,8 +876,12 @@ impl YtMusicClient {
                 req = req.header("authorization", auth.clone());
             }
 
-            let Ok(resp) = req.json(&body).send().await else { return None };
-            let Ok(json): Result<Value, _> = resp.json().await else { return None };
+            let Ok(resp) = req.json(&body).send().await else {
+                return None;
+            };
+            let Ok(json): Result<Value, _> = resp.json().await else {
+                return None;
+            };
 
             let tracking = &json["playbackTracking"];
             let rewrite_url = |key: &str| -> Option<String> {
@@ -894,7 +996,10 @@ impl YtMusicClient {
             .unwrap();
         let page = clean
             .get("https://www.youtube.com")
-            .header("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
+            .header(
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+            )
             .send()
             .await
             .context("Failed to fetch youtube.com")?
@@ -921,8 +1026,8 @@ impl YtMusicClient {
             Err(e) => {
                 let msg = e.to_string();
                 // Only escalate to OAuth for premium-gated content
-                let is_premium_gate = msg.contains("Music Premium")
-                    || msg.contains("Premium members");
+                let is_premium_gate =
+                    msg.contains("Music Premium") || msg.contains("Premium members");
                 let has_vr_auth = self.vr_refresh_token.lock().unwrap().is_some();
 
                 if is_premium_gate && has_vr_auth {
@@ -936,7 +1041,11 @@ impl YtMusicClient {
     }
 
     /// Send a single Android VR player request, optionally with OAuth Bearer auth.
-    async fn vr_player_request(&self, video_id: &str, access_token: Option<&str>) -> Result<String> {
+    async fn vr_player_request(
+        &self,
+        video_id: &str,
+        access_token: Option<&str>,
+    ) -> Result<String> {
         let vr_ua = "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
         let vr_client = reqwest::Client::new();
 
@@ -975,12 +1084,21 @@ impl YtMusicClient {
             req = req.header("authorization", format!("Bearer {token}"));
         }
 
-        let resp = req.json(&body).send().await
+        let resp = req
+            .json(&body)
+            .send()
+            .await
             .context("Failed to fetch Android VR player data")?;
 
-        let json: Value = resp.json().await.context("Failed to parse Android VR response")?;
+        let json: Value = resp
+            .json()
+            .await
+            .context("Failed to parse Android VR response")?;
 
-        if let Some(reason) = json.pointer("/playabilityStatus/reason").and_then(|r| r.as_str()) {
+        if let Some(reason) = json
+            .pointer("/playabilityStatus/reason")
+            .and_then(|r| r.as_str())
+        {
             bail!("Unplayable: {reason}");
         }
 
@@ -993,7 +1111,8 @@ impl YtMusicClient {
     }
 
     async fn player_request(&self, body: &Value) -> Result<Value> {
-        let resp = self.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
+        let resp = self
+            .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
             .json(body)
             .send()
             .await
@@ -1049,7 +1168,10 @@ impl YtMusicClient {
         {
             let guard = self.vr_access_token.lock().unwrap();
             if let Some((ref token, expiry)) = *guard {
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
                 if now < expiry {
                     return Ok(token.clone());
                 }
@@ -1077,17 +1199,25 @@ impl YtMusicClient {
             .await
             .context("Failed to refresh VR access token")?;
 
-        let json: Value = resp.json().await.context("Failed to parse VR token response")?;
+        let json: Value = resp
+            .json()
+            .await
+            .context("Failed to parse VR token response")?;
 
-        let access_token = json.get("access_token")
+        let access_token = json
+            .get("access_token")
             .and_then(|v| v.as_str())
             .context("No access_token in VR token response")?
             .to_string();
-        let expires_in = json.get("expires_in")
+        let expires_in = json
+            .get("expires_in")
             .and_then(|v| v.as_u64())
             .unwrap_or(3600);
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let expiry = now + expires_in - 60; // refresh 60s early
 
         eprintln!("[VR-AUTH] got access token (expires in {expires_in}s)");
@@ -1114,12 +1244,21 @@ impl YtMusicClient {
                 .context("Failed to start VR device flow")?;
 
             let json: Value = resp.json().await?;
-            let device_code = json.get("device_code").and_then(|v| v.as_str())
-                .context("No device_code")?.to_string();
-            let user_code = json.get("user_code").and_then(|v| v.as_str())
-                .context("No user_code")?.to_string();
-            let verification_url = json.get("verification_url").and_then(|v| v.as_str())
-                .unwrap_or("https://www.google.com/device").to_string();
+            let device_code = json
+                .get("device_code")
+                .and_then(|v| v.as_str())
+                .context("No device_code")?
+                .to_string();
+            let user_code = json
+                .get("user_code")
+                .and_then(|v| v.as_str())
+                .context("No user_code")?
+                .to_string();
+            let verification_url = json
+                .get("verification_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://www.google.com/device")
+                .to_string();
 
             Ok((device_code, user_code, verification_url))
         })
@@ -1150,14 +1289,24 @@ impl YtMusicClient {
                 bail!("{error}");
             }
 
-            let refresh_token = json.get("refresh_token").and_then(|v| v.as_str())
-                .context("No refresh_token in response")?.to_string();
+            let refresh_token = json
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .context("No refresh_token in response")?
+                .to_string();
 
             // Also load the access token we got
             if let Some(access_token) = json.get("access_token").and_then(|v| v.as_str()) {
-                let expires_in = json.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                *self.vr_access_token.lock().unwrap() = Some((access_token.to_string(), now + expires_in - 60));
+                let expires_in = json
+                    .get("expires_in")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3600);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                *self.vr_access_token.lock().unwrap() =
+                    Some((access_token.to_string(), now + expires_in - 60));
             }
 
             *self.vr_refresh_token.lock().unwrap() = Some(refresh_token.clone());

@@ -57,9 +57,7 @@ impl Cipher {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
 
-        let encrypted_sig = params
-            .get("s")
-            .context("No 's' param in signatureCipher")?;
+        let encrypted_sig = params.get("s").context("No 's' param in signatureCipher")?;
         let sp = params
             .get("sp")
             .cloned()
@@ -193,16 +191,11 @@ fn run_bun_stdin(script: &str) -> Result<String> {
 
     drop(child.stdin.take());
 
-    let output = child
-        .wait_with_output()
-        .context("Failed to wait for bun")?;
+    let output = child.wait_with_output().context("Failed to wait for bun")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "[CIPHER] bun stderr: {}",
-            &stderr[..stderr.len().min(500)]
-        );
+        eprintln!("[CIPHER] bun stderr: {}", &stderr[..stderr.len().min(500)]);
         bail!(
             "bun failed (exit {}): {}",
             output.status,
@@ -210,9 +203,7 @@ fn run_bun_stdin(script: &str) -> Result<String> {
         );
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(

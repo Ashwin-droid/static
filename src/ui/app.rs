@@ -1,5 +1,5 @@
 use gtk::prelude::*;
-use gtk::{gdk, Application, CssProvider};
+use gtk::{Application, CssProvider, gdk};
 
 use super::window;
 

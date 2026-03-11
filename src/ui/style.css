@@ -651,6 +651,15 @@ popover > contents {
     transform: translateX(10px) scale(1.015);
 }
 
+.drag-preview-shell {
+    background-color: rgba(24, 28, 42, 0.72);
+    border-radius: 12px;
+    padding: 2px 0;
+    box-shadow:
+        0 16px 36px rgba(0, 0, 0, 0.34),
+        inset 0 0 0 1px rgba(190, 210, 255, 0.14);
+}
+
 .queue-drop-indicator {
     margin: 0 0 0 0;
 }

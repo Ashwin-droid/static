@@ -5,15 +5,15 @@ use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use anyhow::Context;
 use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
-    gio, glib, Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource,
-    DropTarget, Entry, GestureClick, Image, Label, MessageDialog, MessageType, Orientation,
-    Overlay, Paned, Picture, Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton,
-    Stack, StackTransitionType, Switch, WidgetPaintable,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DropTarget, Entry,
+    GestureClick, Image, Label, MessageDialog, MessageType, Orientation, Overlay, Paned, Picture,
+    Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton, Stack,
+    StackTransitionType, Switch, gio, glib,
 };
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
@@ -22,7 +22,10 @@ use mpris_server::{
 use pbkdf2::pbkdf2_hmac;
 use rusqlite::Connection as SqliteConnection;
 use sha1::Sha1;
-use zbus::{blocking::Connection as ZbusConnection, zvariant::{OwnedObjectPath, OwnedValue, Value}};
+use zbus::{
+    blocking::Connection as ZbusConnection,
+    zvariant::{OwnedObjectPath, OwnedValue, Value},
+};
 
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
 const ICON_PLAY: &[u8] = include_bytes!("../../assets/icons/play.svg");
@@ -43,8 +46,12 @@ const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 use crate::cache::{AppSettings, MusicCache};
 use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, Track};
 use crate::player::Player;
-use crate::ytmusic::client::{SongRating, TrackingInfo};
+use crate::sponsorblock::{
+    SPONSORBLOCK_CATEGORY_OPTIONS, SponsorBlockClient, SponsorSegment, default_skip_categories,
+    filter_segments_for_categories, sanitize_categories,
+};
 use crate::ytmusic::YtMusicClient;
+use crate::ytmusic::client::{SongRating, TrackingInfo};
 
 const KEYRING_SERVICE: &str = "com.static.music";
 const KEYRING_USER: &str = "cookie";
@@ -98,6 +105,7 @@ impl RepeatMode {
 
 struct AppState {
     client: Option<Arc<YtMusicClient>>,
+    sponsorblock: SponsorBlockClient,
     cache: MusicCache,
     settings: AppSettings,
 }
@@ -168,6 +176,8 @@ struct PlayerState {
     queue_drop_indicator_duration: Label,
     chips: RefCell<Vec<RadioChip>>,
     seed_video_id: RefCell<String>,
+    sponsor_segments: RefCell<Vec<SponsorSegment>>,
+    sponsor_segments_reported: RefCell<HashSet<String>>,
     // Queue panel widgets
     queue_list_box: GtkBox,
     chip_bar: GtkBox,
@@ -199,8 +209,12 @@ struct QueuePreviewData {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum QueueDragPayload {
-    QueueRow { index: usize },
-    Track { track: Track },
+    QueueRow {
+        index: usize,
+    },
+    Track {
+        track: Track,
+    },
     Playlist {
         playlist_id: String,
         title: String,
@@ -284,28 +298,33 @@ impl MprisBridge {
 
         {
             let ps = ps.clone();
+            let state = state.clone();
             player.connect_seek(move |_, offset| {
                 let Some(current) = ps.player.position() else {
                     return;
                 };
                 let current_us = (current.nseconds() / 1_000) as i64;
                 let target_us = (current_us + offset.as_micros()).max(0) as u64;
-                apply_seek_position(&ps, ClockTime::from_useconds(target_us));
+                apply_seek_position(&ps, ClockTime::from_useconds(target_us), &state);
             });
         }
 
         {
             let ps = ps.clone();
+            let state = state.clone();
             player.connect_set_position(move |_, track_id, position| {
-                let now_playing = ps.now_playing_track.borrow();
-                let Some(current) = now_playing.as_ref() else {
-                    return;
-                };
-                if track_id.to_string() != mpris_track_id(&current.video_id).to_string() {
+                let matches_current_track =
+                    ps.now_playing_track
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|current| {
+                            track_id.to_string() == mpris_track_id(&current.video_id).to_string()
+                        });
+                if !matches_current_track {
                     return;
                 }
                 let target_us = position.as_micros().max(0) as u64;
-                apply_seek_position(&ps, ClockTime::from_useconds(target_us));
+                apply_seek_position(&ps, ClockTime::from_useconds(target_us), &state);
             });
         }
 
@@ -391,7 +410,8 @@ impl MprisBridge {
             .position()
             .map(|pos| (pos.nseconds() / 1_000) as i64)
             .unwrap_or(0);
-        self.player.set_position(MprisTime::from_micros(position_us));
+        self.player
+            .set_position(MprisTime::from_micros(position_us));
     }
 
     fn sync_volume(self: &Rc<Self>, ps: &PlayerState) {
@@ -541,7 +561,11 @@ fn build_mpris_metadata(ps: &PlayerState, state: &Arc<Mutex<AppState>>) -> Metad
         .lock()
         .ok()
         .and_then(|guard| guard.cache.get_cached_art(&track.video_id))
-        .and_then(|path| url::Url::from_file_path(path).ok().map(|url| url.to_string()))
+        .and_then(|path| {
+            url::Url::from_file_path(path)
+                .ok()
+                .map(|url| url.to_string())
+        })
         .or_else(|| track.thumb_url.clone());
 
     if let Some(art_url) = art_url {
@@ -637,7 +661,10 @@ where
     Ok(())
 }
 
-fn preview_auto_cache_evictions<F>(state: &Arc<Mutex<AppState>>, updater: F) -> anyhow::Result<usize>
+fn preview_auto_cache_evictions<F>(
+    state: &Arc<Mutex<AppState>>,
+    updater: F,
+) -> anyhow::Result<usize>
 where
     F: FnOnce(&mut AppSettings),
 {
@@ -660,7 +687,10 @@ fn build_settings_warning_dialog(
         .secondary_text(secondary_text)
         .build();
     dialog.add_css_class("settings-warning-dialog");
-    if let Some(window) = stack.root().and_then(|root| root.downcast::<ApplicationWindow>().ok()) {
+    if let Some(window) = stack
+        .root()
+        .and_then(|root| root.downcast::<ApplicationWindow>().ok())
+    {
         dialog.set_transient_for(Some(&window));
     }
     dialog.add_button("Cancel", ResponseType::Cancel);
@@ -669,7 +699,10 @@ fn build_settings_warning_dialog(
     dialog
 }
 
-fn persist_storage_root_override(state: &Arc<Mutex<AppState>>, raw_root: &str) -> anyhow::Result<()> {
+fn persist_storage_root_override(
+    state: &Arc<Mutex<AppState>>,
+    raw_root: &str,
+) -> anyhow::Result<()> {
     let trimmed = raw_root.trim().to_string();
     let mut guard = state.lock().unwrap();
     guard.cache.migrate_storage_root(&trimmed)?;
@@ -796,7 +829,8 @@ fn chromium_safe_storage_password() -> anyhow::Result<String> {
                 "OpenSession",
                 &("plain", Value::new("")),
             )?;
-            let (_output, session): (OwnedValue, OwnedObjectPath) = open_session.body().deserialize()?;
+            let (_output, session): (OwnedValue, OwnedObjectPath) =
+                open_session.body().deserialize()?;
 
             let secrets = connection.call_method(
                 Some("org.freedesktop.secrets"),
@@ -807,7 +841,8 @@ fn chromium_safe_storage_password() -> anyhow::Result<String> {
             )?;
             let reply: HashMap<OwnedObjectPath, SecretResponse> = secrets.body().deserialize()?;
             if let Some(secret) = reply.get(&object_path).map(|entry| &entry.2) {
-                return String::from_utf8(secret.clone()).context("Invalid Chromium secret encoding");
+                return String::from_utf8(secret.clone())
+                    .context("Invalid Chromium secret encoding");
             }
         }
     }
@@ -821,7 +856,11 @@ fn chromium_cookie_key(password: &str) -> [u8; 16] {
     output
 }
 
-fn decrypt_chromium_cookie(value: String, encrypted_value: Vec<u8>, keys: &[[u8; 16]]) -> Option<String> {
+fn decrypt_chromium_cookie(
+    value: String,
+    encrypted_value: Vec<u8>,
+    keys: &[[u8; 16]],
+) -> Option<String> {
     if !value.is_empty() {
         return Some(value);
     }
@@ -869,7 +908,8 @@ fn load_cookie_from_chromium_profile(settings: &AppSettings) -> anyhow::Result<O
         path
     };
 
-    let temp_db = std::env::temp_dir().join(format!("static-edge-cookies-{}.db", uuid::Uuid::new_v4()));
+    let temp_db =
+        std::env::temp_dir().join(format!("static-edge-cookies-{}.db", uuid::Uuid::new_v4()));
     std::fs::copy(&db_path, &temp_db)
         .with_context(|| format!("Failed to copy Edge cookie DB from {}", db_path.display()))?;
 
@@ -974,7 +1014,6 @@ pub fn build_window(app: &Application) {
         .default_height(760)
         .build();
 
-
     let stack = Stack::new();
     stack.set_transition_type(StackTransitionType::Crossfade);
     stack.set_transition_duration(300);
@@ -993,6 +1032,7 @@ pub fn build_window(app: &Application) {
     }
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
+        sponsorblock: SponsorBlockClient::new().expect("Failed to initialise SponsorBlock client"),
         cache,
         settings,
     }));
@@ -1010,7 +1050,7 @@ pub fn build_window(app: &Application) {
         let state = state.clone();
         let ps = main_widgets.player_state.clone();
         window.connect_close_request(move |_| {
-            reset_player_ui(&ps, &state);
+            reset_player_ui_on_exit(&ps, &state);
             glib::Propagation::Proceed
         });
     }
@@ -1027,7 +1067,8 @@ pub fn build_window(app: &Application) {
         let recent_list = main_widgets.recent_list.clone();
 
         stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some() {
+            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
+            {
                 clear_box(&content_box);
                 load_home(&state, &content_box, &ps, &recent_list);
                 load_sidebar_history(&state, &recent_list, &ps);
@@ -1044,7 +1085,8 @@ pub fn build_window(app: &Application) {
         let ps = main_widgets.player_state.clone();
 
         glib::timeout_add_seconds_local(60, move || {
-            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some() {
+            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
+            {
                 load_sidebar_history(&state, &recent_list, &ps);
             }
             glib::ControlFlow::Continue
@@ -1057,7 +1099,9 @@ pub fn build_window(app: &Application) {
         let state = state.clone();
         glib::spawn_future_local(async move {
             if let Ok(Some(cookie)) = gio::spawn_blocking(get_cookie).await {
-                if let Some(client) = validate_cookie_and_build_client(cookie, "keyring cookie").await {
+                if let Some(client) =
+                    validate_cookie_and_build_client(cookie, "keyring cookie").await
+                {
                     activate_authenticated_client(client, &state, &stack).await;
                     return;
                 }
@@ -1071,8 +1115,11 @@ pub fn build_window(app: &Application) {
 
             match gio::spawn_blocking(move || load_cookie_from_chromium_profile(&settings)).await {
                 Ok(Ok(Some(edge_cookie))) => {
-                    if let Some(client) =
-                        validate_cookie_and_build_client(edge_cookie.clone(), "Chromium cookie auto-sync").await
+                    if let Some(client) = validate_cookie_and_build_client(
+                        edge_cookie.clone(),
+                        "Chromium cookie auto-sync",
+                    )
+                    .await
                     {
                         let cookie_to_store = edge_cookie.clone();
                         let _ = gio::spawn_blocking(move || store_cookie(&cookie_to_store)).await;
@@ -1106,7 +1153,9 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
 
     let logo_bytes = glib::Bytes::from_static(include_bytes!("../../assets/static.png"));
     let stream = gio::MemoryInputStream::from_bytes(&logo_bytes);
-    if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, 96, 96, true, gio::Cancellable::NONE) {
+    if let Ok(pixbuf) =
+        gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(&stream, 96, 96, true, gio::Cancellable::NONE)
+    {
         let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
         let logo = Picture::for_paintable(&texture);
         logo.set_size_request(96, 96);
@@ -1136,7 +1185,7 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
          2. Open DevTools (F12) \u{2192} Network tab\n\
          3. Reload the page\n\
          4. Click any request to music.youtube.com\n\
-         5. Copy the \u{2018}Cookie\u{2019} header value"
+         5. Copy the \u{2018}Cookie\u{2019} header value",
     ));
     steps_label.add_css_class("onboarding-steps");
     steps_label.set_halign(Align::Start);
@@ -1196,14 +1245,16 @@ fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox 
                                 return Err(anyhow::anyhow!("Not connected"));
                             };
                             client.check_auth()
-                        }).await;
+                        })
+                        .await;
 
                         match result {
                             Ok(Ok(true)) | Ok(Ok(false)) => {
                                 let cookie_for_save = cookie_text.clone();
                                 let _ = gio::spawn_blocking(move || {
                                     let _ = store_cookie(&cookie_for_save);
-                                }).await;
+                                })
+                                .await;
                                 // Show VR auth step
                                 stack.set_visible_child_name("vr_auth");
                             }
@@ -1254,7 +1305,7 @@ fn build_vr_auth_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> GtkBox {
     content.append(&title);
 
     let subtitle = Label::new(Some(
-        "If you have YouTube Music Premium, sign in to play\npremium-only tracks. You can skip this step."
+        "If you have YouTube Music Premium, sign in to play\npremium-only tracks. You can skip this step.",
     ));
     subtitle.add_css_class("onboarding-subtitle");
     subtitle.set_wrap(true);
@@ -1435,9 +1486,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     sidebar.set_overflow(gtk::Overflow::Hidden);
 
     // Search
-    let search_entry = Entry::builder()
-        .placeholder_text("Search songs...")
-        .build();
+    let search_entry = Entry::builder().placeholder_text("Search songs...").build();
     search_entry.add_css_class("sidebar-search");
     sidebar.append(&search_entry);
 
@@ -1813,6 +1862,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         queue_drop_indicator_duration: queue_drop_indicator_duration.clone(),
         chips: RefCell::new(Vec::new()),
         seed_video_id: RefCell::new(String::new()),
+        sponsor_segments: RefCell::new(Vec::new()),
+        sponsor_segments_reported: RefCell::new(HashSet::new()),
         queue_list_box: queue_list_box.clone(),
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
@@ -1850,7 +1901,9 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
         let ps_drop = ps.clone();
         drop_target.connect_drop(move |_, value, _, y| {
-            let Some(payload) = parse_queue_drag_payload(value) else { return false };
+            let Some(payload) = parse_queue_drag_payload(value) else {
+                return false;
+            };
             clear_queue_drop_preview(&ps_drop);
             set_queue_drop_active(&ps_drop, false);
             let raw_slot = preview_slot_for_queue_y(&ps_drop, y);
@@ -1934,10 +1987,11 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     // Seek (progress slider)
     {
         let ps = ps.clone();
+        let state = state.clone();
         progress_slider.connect_change_value(move |_, _, value| {
             if let Some(duration) = ps.player.duration() {
                 let target = ClockTime::from_nseconds((value * duration.nseconds() as f64) as u64);
-                apply_seek_position(&ps, target);
+                apply_seek_position(&ps, target, &state);
             }
             glib::Propagation::Proceed
         });
@@ -1997,23 +2051,37 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
             if let (Some(pos), Some(dur)) = (pos, dur) {
                 note_playback_position(&ps, pos.nseconds() / 1_000_000);
+                maybe_apply_sponsorblock_skip(&state, &ps, pos);
                 let dur_ns = dur.nseconds();
                 if dur_ns > 0 {
                     let frac = pos.nseconds() as f64 / dur_ns as f64;
                     ps.progress_slider.set_value(frac);
 
                     // Auto-advance: when within 500ms of the end
-                    if !auto_advancing.get() && pos.nseconds() + 500_000_000 >= dur_ns && dur_ns > 1_000_000_000 {
+                    if !auto_advancing.get()
+                        && pos.nseconds() + 500_000_000 >= dur_ns
+                        && dur_ns > 1_000_000_000
+                    {
                         let idx = ps.queue_index.get();
                         let len = ps.queue.borrow().len();
                         let repeat = ps.repeat_mode.get();
                         let next_idx = match repeat {
                             RepeatMode::One => Some(idx),
                             RepeatMode::All => {
-                                if idx + 1 < len { Some(idx + 1) } else if len > 0 { Some(0) } else { None }
+                                if idx + 1 < len {
+                                    Some(idx + 1)
+                                } else if len > 0 {
+                                    Some(0)
+                                } else {
+                                    None
+                                }
                             }
                             RepeatMode::Off => {
-                                if idx + 1 < len { Some(idx + 1) } else { None }
+                                if idx + 1 < len {
+                                    Some(idx + 1)
+                                } else {
+                                    None
+                                }
                             }
                         };
                         if let Some(target) = next_idx {
@@ -2223,7 +2291,9 @@ fn load_settings_page(
     playback_title.set_halign(Align::Start);
     playback_section.append(&playback_title);
 
-    let playback_copy = Label::new(Some("Decide when local cache wins and how aggressively Static stages upcoming songs."));
+    let playback_copy = Label::new(Some(
+        "Decide when local cache wins and how aggressively Static stages upcoming songs.",
+    ));
     playback_copy.add_css_class("settings-card-copy");
     playback_copy.set_wrap(true);
     playback_copy.set_halign(Align::Start);
@@ -2237,7 +2307,9 @@ fn load_settings_page(
     local_label.add_css_class("settings-row-title");
     local_label.set_halign(Align::Start);
     local_copy.append(&local_label);
-    let local_hint = Label::new(Some("Play offline or prefetched audio first when it exists, then fall back to streaming."));
+    let local_hint = Label::new(Some(
+        "Play offline or prefetched audio first when it exists, then fall back to streaming.",
+    ));
     local_hint.add_css_class("settings-row-copy");
     local_hint.set_wrap(true);
     local_hint.set_halign(Align::Start);
@@ -2263,7 +2335,9 @@ fn load_settings_page(
     prefetch_label.add_css_class("settings-row-title");
     prefetch_label.set_halign(Align::Start);
     prefetch_copy.append(&prefetch_label);
-    let prefetch_hint = Label::new(Some("Downloads the next few queue items into temp cache for faster skips and rewinds."));
+    let prefetch_hint = Label::new(Some(
+        "Downloads the next few queue items into temp cache for faster skips and rewinds.",
+    ));
     prefetch_hint.add_css_class("settings-row-copy");
     prefetch_hint.set_wrap(true);
     prefetch_hint.set_halign(Align::Start);
@@ -2289,7 +2363,9 @@ fn load_settings_page(
     prefetch_count_label.add_css_class("settings-row-title");
     prefetch_count_label.set_halign(Align::Start);
     prefetch_count_copy.append(&prefetch_count_label);
-    let prefetch_count_hint = Label::new(Some("How many upcoming songs should be staged in temp cache."));
+    let prefetch_count_hint = Label::new(Some(
+        "How many upcoming songs should be staged in temp cache.",
+    ));
     prefetch_count_hint.add_css_class("settings-row-copy");
     prefetch_count_hint.set_wrap(true);
     prefetch_count_hint.set_halign(Align::Start);
@@ -2309,6 +2385,113 @@ fn load_settings_page(
 
     sections.append(&playback_section);
 
+    let sponsorblock_section = GtkBox::new(Orientation::Vertical, 12);
+    sponsorblock_section.add_css_class("settings-card");
+    let sponsorblock_title = Label::new(Some("SponsorBlock"));
+    sponsorblock_title.add_css_class("settings-card-title");
+    sponsorblock_title.set_halign(Align::Start);
+    sponsorblock_section.append(&sponsorblock_title);
+
+    let sponsorblock_copy = Label::new(Some(
+        "Choose whether Static should auto-skip community-marked segments, and which categories count.",
+    ));
+    sponsorblock_copy.add_css_class("settings-card-copy");
+    sponsorblock_copy.set_wrap(true);
+    sponsorblock_copy.set_halign(Align::Start);
+    sponsorblock_section.append(&sponsorblock_copy);
+
+    let sponsorblock_row = GtkBox::new(Orientation::Horizontal, 12);
+    sponsorblock_row.add_css_class("settings-row");
+    let sponsorblock_row_copy = GtkBox::new(Orientation::Vertical, 2);
+    sponsorblock_row_copy.set_hexpand(true);
+    let sponsorblock_label = Label::new(Some("Auto-skip SponsorBlock segments"));
+    sponsorblock_label.add_css_class("settings-row-title");
+    sponsorblock_label.set_halign(Align::Start);
+    sponsorblock_row_copy.append(&sponsorblock_label);
+    let sponsorblock_hint = Label::new(Some(
+        "Skips community-marked sponsor, self-promo, intro/outro, interaction, preview, and music-offtopic sections during playback.",
+    ));
+    sponsorblock_hint.add_css_class("settings-row-copy");
+    sponsorblock_hint.set_wrap(true);
+    sponsorblock_hint.set_halign(Align::Start);
+    sponsorblock_row_copy.append(&sponsorblock_hint);
+    sponsorblock_row.append(&sponsorblock_row_copy);
+    let sponsorblock_switch = Switch::new();
+    sponsorblock_switch.set_active(settings.sponsorblock_enabled);
+    let sponsorblock_categories_box = GtkBox::new(Orientation::Vertical, 12);
+    sponsorblock_categories_box.set_sensitive(settings.sponsorblock_enabled);
+    {
+        let state = state.clone();
+        let ps = ps.clone();
+        let sponsorblock_categories_box = sponsorblock_categories_box.clone();
+        sponsorblock_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            sponsorblock_categories_box.set_sensitive(active);
+            update_app_settings(&state, |s| s.sponsorblock_enabled = active);
+            refresh_sponsorblock_for_current_track(&state, &ps);
+        });
+    }
+    sponsorblock_row.append(&sponsorblock_switch);
+    sponsorblock_section.append(&sponsorblock_row);
+
+    let sponsorblock_categories_intro = Label::new(Some(
+        "Selected categories are skipped automatically, including after MPRIS seeks or manual rewinds into a marked segment.",
+    ));
+    sponsorblock_categories_intro.add_css_class("settings-row-copy");
+    sponsorblock_categories_intro.set_wrap(true);
+    sponsorblock_categories_intro.set_halign(Align::Start);
+    sponsorblock_categories_box.append(&sponsorblock_categories_intro);
+
+    for option in SPONSORBLOCK_CATEGORY_OPTIONS {
+        let category_row = GtkBox::new(Orientation::Horizontal, 12);
+        category_row.add_css_class("settings-row");
+        let category_copy = GtkBox::new(Orientation::Vertical, 2);
+        category_copy.set_hexpand(true);
+        let category_label = Label::new(Some(option.label));
+        category_label.add_css_class("settings-row-title");
+        category_label.set_halign(Align::Start);
+        category_copy.append(&category_label);
+        let category_hint = Label::new(Some(option.description));
+        category_hint.add_css_class("settings-row-copy");
+        category_hint.set_wrap(true);
+        category_hint.set_halign(Align::Start);
+        category_copy.append(&category_hint);
+        category_row.append(&category_copy);
+
+        let category_switch = Switch::new();
+        category_switch.set_active(
+            settings
+                .sponsorblock_categories
+                .iter()
+                .any(|category| category == option.key),
+        );
+        {
+            let state = state.clone();
+            let ps = ps.clone();
+            let category_key = option.key.to_string();
+            category_switch.connect_active_notify(move |sw| {
+                let active = sw.is_active();
+                update_app_settings(&state, |settings| {
+                    let mut categories = settings.sponsorblock_categories.clone();
+                    if active {
+                        if !categories.iter().any(|category| category == &category_key) {
+                            categories.push(category_key.clone());
+                        }
+                    } else {
+                        categories.retain(|category| category != &category_key);
+                    }
+                    settings.sponsorblock_categories = sanitize_categories(&categories);
+                });
+                refresh_sponsorblock_for_current_track(&state, &ps);
+            });
+        }
+        category_row.append(&category_switch);
+        sponsorblock_categories_box.append(&category_row);
+    }
+
+    sponsorblock_section.append(&sponsorblock_categories_box);
+    sections.append(&sponsorblock_section);
+
     let offline_section = GtkBox::new(Orientation::Vertical, 12);
     offline_section.add_css_class("settings-card");
     let offline_title = Label::new(Some("Offline Library"));
@@ -2316,7 +2499,9 @@ fn load_settings_page(
     offline_title.set_halign(Align::Start);
     offline_section.append(&offline_title);
 
-    let offline_copy = Label::new(Some("Control how opinionated the automatic offline cache should be."));
+    let offline_copy = Label::new(Some(
+        "Control how opinionated the automatic offline cache should be.",
+    ));
     offline_copy.add_css_class("settings-card-copy");
     offline_copy.set_wrap(true);
     offline_copy.set_halign(Align::Start);
@@ -2330,7 +2515,9 @@ fn load_settings_page(
     manage_label.add_css_class("settings-row-title");
     manage_label.set_halign(Align::Start);
     manage_copy.append(&manage_label);
-    let manage_hint = Label::new(Some("Keeps a rolling offline library based on your play history, without touching pinned downloads."));
+    let manage_hint = Label::new(Some(
+        "Keeps a rolling offline library based on your play history, without touching pinned downloads.",
+    ));
     manage_hint.add_css_class("settings-row-copy");
     manage_hint.set_wrap(true);
     manage_hint.set_halign(Align::Start);
@@ -2445,7 +2632,9 @@ fn load_settings_page(
     target_label.add_css_class("settings-row-title");
     target_label.set_halign(Align::Start);
     target_copy.append(&target_label);
-    let target_hint = Label::new(Some("How many frequently played songs Static should keep ready offline."));
+    let target_hint = Label::new(Some(
+        "How many frequently played songs Static should keep ready offline.",
+    ));
     target_hint.add_css_class("settings-row-copy");
     target_hint.set_wrap(true);
     target_hint.set_halign(Align::Start);
@@ -2531,7 +2720,9 @@ fn load_settings_page(
     replay_label.add_css_class("settings-row-title");
     replay_label.set_halign(Align::Start);
     replay_copy.append(&replay_label);
-    let replay_hint = Label::new(Some("How many rewatches a song needs before it becomes eligible for auto-offline caching."));
+    let replay_hint = Label::new(Some(
+        "How many rewatches a song needs before it becomes eligible for auto-offline caching.",
+    ));
     replay_hint.add_css_class("settings-row-copy");
     replay_hint.set_wrap(true);
     replay_hint.set_halign(Align::Start);
@@ -2618,7 +2809,9 @@ fn load_settings_page(
     decay_label.add_css_class("settings-row-title");
     decay_label.set_halign(Align::Start);
     decay_copy.append(&decay_label);
-    let decay_hint = Label::new(Some("How slowly songs cool off after their last play. Lower means faster decay, higher means old favorites stick around longer."));
+    let decay_hint = Label::new(Some(
+        "How slowly songs cool off after their last play. Lower means faster decay, higher means old favorites stick around longer.",
+    ));
     decay_hint.add_css_class("settings-row-copy");
     decay_hint.set_wrap(true);
     decay_hint.set_halign(Align::Start);
@@ -2705,7 +2898,9 @@ fn load_settings_page(
     score_label.add_css_class("settings-row-title");
     score_label.set_halign(Align::Start);
     score_copy.append(&score_label);
-    let score_hint = Label::new(Some("Anything below this score is ignored for downloads and evicted if it is already auto-downloaded. `0` keeps the current behavior."));
+    let score_hint = Label::new(Some(
+        "Anything below this score is ignored for downloads and evicted if it is already auto-downloaded. `0` keeps the current behavior.",
+    ));
     score_hint.add_css_class("settings-row-copy");
     score_hint.set_wrap(true);
     score_hint.set_halign(Align::Start);
@@ -2875,7 +3070,8 @@ fn load_settings_page(
                     storage_root_status.set_text("Moved Static’s local cache into the new root.");
                 }
                 Err(err) => {
-                    storage_root_status.set_text(&format!("Couldn’t move the local cache yet: {err}"));
+                    storage_root_status
+                        .set_text(&format!("Couldn’t move the local cache yet: {err}"));
                 }
             }
         });
@@ -2899,7 +3095,8 @@ fn load_settings_page(
                     storage_root_status.set_text("Static is back on the default storage root.");
                 }
                 Err(err) => {
-                    storage_root_status.set_text(&format!("Couldn’t return to the default root yet: {err}"));
+                    storage_root_status
+                        .set_text(&format!("Couldn’t return to the default root yet: {err}"));
                 }
             }
         });
@@ -2914,7 +3111,9 @@ fn load_settings_page(
     import_title.set_halign(Align::Start);
     import_section.append(&import_title);
 
-    let import_copy = Label::new(Some("Auto-sync cookies from Edge or another Chromium-family browser. Leave the path blank to auto-detect."));
+    let import_copy = Label::new(Some(
+        "Auto-sync cookies from Edge or another Chromium-family browser. Leave the path blank to auto-detect.",
+    ));
     import_copy.add_css_class("settings-card-copy");
     import_copy.set_wrap(true);
     import_copy.set_halign(Align::Start);
@@ -2928,7 +3127,9 @@ fn load_settings_page(
     import_toggle_label.add_css_class("settings-row-title");
     import_toggle_label.set_halign(Align::Start);
     import_toggle_copy.append(&import_toggle_label);
-    let import_toggle_hint = Label::new(Some("If a saved cookie is missing or stale, Static will try your Chromium-family browser before asking for manual cookies."));
+    let import_toggle_hint = Label::new(Some(
+        "If a saved cookie is missing or stale, Static will try your Chromium-family browser before asking for manual cookies.",
+    ));
     import_toggle_hint.add_css_class("settings-row-copy");
     import_toggle_hint.set_wrap(true);
     import_toggle_hint.set_halign(Align::Start);
@@ -2953,7 +3154,9 @@ fn load_settings_page(
     path_label.set_halign(Align::Start);
     path_row.append(&path_label);
 
-    let path_hint = Label::new(Some("Examples: `~/.config/microsoft-edge/Default/Cookies`, `~/.config/google-chrome/Default/Cookies`, `~/.config/chromium/Default/Cookies`."));
+    let path_hint = Label::new(Some(
+        "Examples: `~/.config/microsoft-edge/Default/Cookies`, `~/.config/google-chrome/Default/Cookies`, `~/.config/chromium/Default/Cookies`.",
+    ));
     path_hint.add_css_class("settings-row-copy");
     path_hint.set_wrap(true);
     path_hint.set_halign(Align::Start);
@@ -3002,7 +3205,9 @@ fn load_settings_page(
     session_title.set_halign(Align::Start);
     session_section.append(&session_title);
 
-    let session_copy = Label::new(Some("Sign out cleanly without touching your browser’s own cookie jar."));
+    let session_copy = Label::new(Some(
+        "Sign out cleanly without touching your browser’s own cookie jar.",
+    ));
     session_copy.add_css_class("settings-card-copy");
     session_copy.set_wrap(true);
     session_copy.set_halign(Align::Start);
@@ -3040,7 +3245,11 @@ fn svg_image(svg_bytes: &[u8], size: i32) -> Image {
     let gbytes = glib::Bytes::from(svg_bytes);
     let stream = gio::MemoryInputStream::from_bytes(&gbytes);
     if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream_at_scale(
-        &stream, size, size, true, gio::Cancellable::NONE,
+        &stream,
+        size,
+        size,
+        true,
+        gio::Cancellable::NONE,
     ) {
         let texture = gtk::gdk::Texture::for_pixbuf(&pixbuf);
         let image = Image::from_paintable(Some(&texture));
@@ -3133,6 +3342,49 @@ fn play_from_context(
 fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     flush_play_record(ps, state);
     ps.player.stop();
+    clear_sponsorblock_state(ps);
+    ps.last_mpris_length_micros.set(None);
+    ps.np_title.set_text("Nothing playing");
+    ps.np_artist.set_text("");
+    ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
+    ps.time_label.set_text("0:00 / 0:00");
+    ps.progress_slider.set_value(0.0);
+    ps.progress_slider.set_fill_level(0.0);
+    set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
+    ps.play_pause_btn.set_sensitive(false);
+    ps.prev_btn.set_sensitive(false);
+    ps.next_btn.set_sensitive(false);
+    ps.like_btn.set_sensitive(false);
+    ps.dislike_btn.set_sensitive(false);
+    update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
+    ps.menu_btn.set_sensitive(false);
+    if let Some(bridge) = ps.mpris.borrow().as_ref() {
+        bridge.sync_all(ps, state);
+    }
+}
+
+fn reset_player_ui_on_exit(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
+    let info = ps.now_playing_track.borrow_mut().take();
+    if let Some(track) = info {
+        let listened_millis = current_listened_millis(ps, &track);
+        if let Some(tracking) = track.tracking {
+            tracking.report_watchtime_on_exit(listened_millis);
+        }
+        let listened = listened_millis / 1_000;
+        if listened >= MIN_LISTEN_SECS {
+            let guard = state.lock().unwrap();
+            let _ = guard.cache.record_play(
+                &track.video_id,
+                &track.title,
+                &track.artist,
+                history_thumbnail_candidate(track.thumb_url.as_deref()),
+                listened,
+            );
+        }
+    }
+
+    ps.player.stop();
+    clear_sponsorblock_state(ps);
     ps.last_mpris_length_micros.set(None);
     ps.np_title.set_text("Nothing playing");
     ps.np_artist.set_text("");
@@ -3160,13 +3412,11 @@ fn format_clock_time(t: ClockTime) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime) {
+fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime, state: &Arc<Mutex<AppState>>) {
     let clamped_target = ps
         .player
         .duration()
-        .map(|duration| {
-            ClockTime::from_nseconds(target.nseconds().min(duration.nseconds()))
-        })
+        .map(|duration| ClockTime::from_nseconds(target.nseconds().min(duration.nseconds())))
         .unwrap_or(target);
 
     ps.is_seeking.set(true);
@@ -3201,6 +3451,164 @@ fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime) {
     });
 
     ps.is_seeking.set(false);
+    maybe_apply_sponsorblock_skip(state, ps, clamped_target);
+}
+
+fn clear_sponsorblock_state(ps: &PlayerState) {
+    ps.sponsor_segments.borrow_mut().clear();
+    ps.sponsor_segments_reported.borrow_mut().clear();
+}
+
+fn ensure_offline_sponsorblock_cache(
+    state: &Arc<Mutex<AppState>>,
+    video_id: &str,
+) -> Result<Option<(Vec<SponsorSegment>, &'static str)>, String> {
+    let all_categories = default_skip_categories();
+    let client = {
+        let guard = state.lock().unwrap();
+        if !guard.cache.is_cached(video_id) {
+            return Ok(None);
+        }
+
+        match guard.cache.get_offline_sponsor_segments(video_id) {
+            Ok(Some(segments)) => return Ok(Some((segments, "offline-cache"))),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] failed to read offline cache for {video_id}: {err}");
+            }
+        }
+
+        guard.sponsorblock.clone()
+    };
+
+    let segments = client
+        .fetch_skip_segments(video_id, &all_categories)
+        .map_err(|err| {
+            format!("Failed to hydrate offline SponsorBlock cache for {video_id}: {err}")
+        })?;
+
+    let guard = state.lock().unwrap();
+    if let Err(err) = guard
+        .cache
+        .store_offline_sponsor_segments(video_id, &segments)
+    {
+        eprintln!("[SPONSORBLOCK] failed to store offline cache for {video_id}: {err}");
+    }
+
+    Ok(Some((segments, "offline-hydrated")))
+}
+
+fn load_sponsorblock_segments_for_track(
+    state: &Arc<Mutex<AppState>>,
+    video_id: &str,
+    requested_categories: &[String],
+) -> Result<(Vec<SponsorSegment>, &'static str), String> {
+    let requested_categories = sanitize_categories(requested_categories);
+    if requested_categories.is_empty() {
+        return Ok((Vec::new(), "disabled"));
+    }
+
+    if let Some((segments, source)) = ensure_offline_sponsorblock_cache(state, video_id)? {
+        return Ok((
+            filter_segments_for_categories(&segments, &requested_categories),
+            source,
+        ));
+    }
+
+    let client = {
+        let guard = state.lock().unwrap();
+        guard.sponsorblock.clone()
+    };
+    client
+        .fetch_skip_segments(video_id, &requested_categories)
+        .map(|segments| (segments, "network"))
+        .map_err(|err| err.to_string())
+}
+
+fn refresh_sponsorblock_for_current_track(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
+    let should_run = {
+        let guard = state.lock().unwrap();
+        guard.settings.sponsorblock_enabled && !guard.settings.sponsorblock_categories.is_empty()
+    };
+
+    if !should_run {
+        clear_sponsorblock_state(ps);
+        return;
+    }
+
+    if let Some((session_id, video_id)) = ps
+        .now_playing_track
+        .borrow()
+        .as_ref()
+        .map(|track| (track.session_id, track.video_id.clone()))
+    {
+        spawn_sponsorblock_sync(state, ps, &video_id, session_id);
+    } else {
+        clear_sponsorblock_state(ps);
+    }
+}
+
+fn maybe_apply_sponsorblock_skip(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    position: ClockTime,
+) {
+    if ps.player.is_paused() {
+        return;
+    }
+
+    let Some(video_id) = ps
+        .now_playing_track
+        .borrow()
+        .as_ref()
+        .map(|track| track.video_id.clone())
+    else {
+        return;
+    };
+
+    let position_seconds = position.nseconds() as f64 / 1_000_000_000.0;
+    let segment = ps
+        .sponsor_segments
+        .borrow()
+        .iter()
+        .find(|segment| segment.should_skip_at(position_seconds))
+        .cloned();
+
+    let Some(segment) = segment else {
+        return;
+    };
+
+    let Some(target_seconds) = segment.seek_target_seconds(position_seconds) else {
+        return;
+    };
+
+    eprintln!(
+        "[SPONSORBLOCK] skipping {} segment on {} to {:.2}s",
+        segment.category, video_id, target_seconds
+    );
+    apply_seek_position(
+        ps,
+        ClockTime::from_mseconds((target_seconds * 1_000.0).round() as u64),
+        state,
+    );
+
+    if ps
+        .sponsor_segments_reported
+        .borrow_mut()
+        .insert(segment.uuid.clone())
+    {
+        let state = state.clone();
+        let segment_uuid = segment.uuid.clone();
+        let segment_category = segment.category.clone();
+        gio::spawn_blocking(move || {
+            let guard = state.lock().unwrap();
+            if let Err(err) = guard.sponsorblock.mark_segment_viewed(&segment_uuid) {
+                eprintln!(
+                    "[SPONSORBLOCK] failed to report viewed segment {segment_uuid} ({segment_category}) on {video_id}: {err}"
+                );
+            }
+        });
+    }
 }
 
 fn apply_song_rating(ps: &Rc<PlayerState>, session_id: u64, rating: SongRating) {
@@ -3235,8 +3643,86 @@ fn spawn_song_rating_sync(
 
         match result {
             Ok(Some(Ok(rating))) => apply_song_rating(&ps, session_id, rating),
-            Ok(Some(Err(err))) => eprintln!("[RATING] failed to fetch rating for {video_id}: {err}"),
+            Ok(Some(Err(err))) => {
+                eprintln!("[RATING] failed to fetch rating for {video_id}: {err}")
+            }
             _ => {}
+        }
+    });
+}
+
+fn spawn_sponsorblock_sync(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    video_id: &str,
+    session_id: u64,
+) {
+    clear_sponsorblock_state(ps);
+
+    let (enabled, categories) = {
+        let guard = state.lock().unwrap();
+        (
+            guard.settings.sponsorblock_enabled,
+            sanitize_categories(&guard.settings.sponsorblock_categories),
+        )
+    };
+    if !enabled || categories.is_empty() {
+        return;
+    }
+
+    let state = state.clone();
+    let ps = ps.clone();
+    let video_id = video_id.to_string();
+    let requested_categories = categories;
+
+    glib::spawn_future_local(async move {
+        let fetch_result = gio::spawn_blocking({
+            let state = state.clone();
+            let video_id = video_id.clone();
+            let requested_categories = requested_categories.clone();
+            move || load_sponsorblock_segments_for_track(&state, &video_id, &requested_categories)
+        })
+        .await;
+
+        match fetch_result {
+            Ok(Ok((segments, source))) => {
+                let current = ps
+                    .now_playing_track
+                    .borrow()
+                    .as_ref()
+                    .map(|track| (track.session_id, track.video_id.clone()));
+                if current.as_ref() != Some(&(session_id, video_id.clone())) {
+                    return;
+                }
+
+                let (still_enabled, current_categories) = {
+                    let guard = state.lock().unwrap();
+                    (
+                        guard.settings.sponsorblock_enabled,
+                        sanitize_categories(&guard.settings.sponsorblock_categories),
+                    )
+                };
+                if !still_enabled || current_categories != requested_categories {
+                    return;
+                }
+
+                if !segments.is_empty() {
+                    eprintln!(
+                        "[SPONSORBLOCK] loaded {} skippable segments for {} via {}",
+                        segments.len(),
+                        video_id,
+                        source
+                    );
+                }
+                *ps.sponsor_segments.borrow_mut() = segments;
+                ps.sponsor_segments_reported.borrow_mut().clear();
+            }
+            Ok(Err(err)) => {
+                eprintln!("[SPONSORBLOCK] failed to load segments for {video_id}: {err}");
+            }
+            Err(err) => {
+                eprintln!("[SPONSORBLOCK] worker failed for {video_id}: {err:?}");
+            }
         }
     });
 }
@@ -3280,7 +3766,8 @@ fn submit_song_rating(
 
 fn current_listened_millis(ps: &PlayerState, track: &NowPlayingTrack) -> u64 {
     let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
-    let current_position_millis = ps.player
+    let current_position_millis = ps
+        .player
         .position()
         .map(|pos| pos.nseconds() / 1_000_000)
         .filter(|millis| *millis > 0);
@@ -3355,9 +3842,8 @@ fn load_home(
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_home())
-        }).await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_home())).await;
 
         clear_box(&content_box);
 
@@ -3400,9 +3886,8 @@ fn load_search(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let q = query.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.search(&q))
-        }).await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.search(&q))).await;
 
         clear_box(&content_box);
 
@@ -3423,7 +3908,9 @@ fn load_search(
     });
 }
 
-fn load_offline_page_data(state: &Arc<Mutex<AppState>>) -> (Vec<PlaylistSummary>, Vec<Track>, Vec<Track>) {
+fn load_offline_page_data(
+    state: &Arc<Mutex<AppState>>,
+) -> (Vec<PlaylistSummary>, Vec<Track>, Vec<Track>) {
     let guard = state.lock().unwrap();
 
     let offline_playlists: Vec<PlaylistSummary> = guard
@@ -3566,7 +4053,9 @@ fn load_offline(
         match result {
             Ok((offline_playlists, tracks, _playable_tracks)) => {
                 if tracks.is_empty() && offline_playlists.is_empty() {
-                    let empty = Label::new(Some("No offline songs yet. Play songs to build your cache."));
+                    let empty = Label::new(Some(
+                        "No offline songs yet. Play songs to build your cache.",
+                    ));
                     empty.add_css_class("dim-label");
                     empty.set_margin_top(60);
                     content_box.append(&empty);
@@ -3602,7 +4091,13 @@ fn load_offline(
                     cards_box.set_margin_start(24);
 
                     for playlist in &offline_playlists {
-                        let card = build_offline_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
+                        let card = build_offline_playlist_card(
+                            playlist,
+                            &state,
+                            &content_box,
+                            &ps,
+                            &recent_list,
+                        );
                         cards_box.append(&card);
                     }
 
@@ -3612,7 +4107,8 @@ fn load_offline(
                 }
 
                 if !tracks.is_empty() {
-                    let count_label = Label::new(Some(&format!("{} songs available offline", tracks.len())));
+                    let count_label =
+                        Label::new(Some(&format!("{} songs available offline", tracks.len())));
                     count_label.add_css_class("dim-label");
                     count_label.set_halign(Align::Start);
                     count_label.set_margin_start(28);
@@ -3628,7 +4124,14 @@ fn load_offline(
 
                     let tracks_rc = Rc::new(tracks);
                     for (i, track) in tracks_rc.iter().enumerate() {
-                        grid.append(&build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list));
+                        grid.append(&build_track_row(
+                            track,
+                            i,
+                            &tracks_rc,
+                            &state,
+                            &ps,
+                            &recent_list,
+                        ));
                     }
 
                     content_box.append(&grid);
@@ -3660,9 +4163,9 @@ fn load_likes(
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_playlist("LM"))
-        }).await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_playlist("LM")))
+                .await;
 
         clear_box(&content_box);
 
@@ -3691,12 +4194,17 @@ fn load_likes(
                 count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
 
-                content_box.append(&build_play_controls(&tracks, &state, &ps, Some(DownloadPlaylistMeta {
-                    playlist_id: "LM".to_string(),
-                    title: "Liked Songs".to_string(),
-                    thumbnail_url: None,
-                    subtitle: None,
-                })));
+                content_box.append(&build_play_controls(
+                    &tracks,
+                    &state,
+                    &ps,
+                    Some(DownloadPlaylistMeta {
+                        playlist_id: "LM".to_string(),
+                        title: "Liked Songs".to_string(),
+                        thumbnail_url: None,
+                        subtitle: None,
+                    }),
+                ));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -3748,7 +4256,8 @@ fn load_playlists(
         let state_bg = state.clone();
         let result = gio::spawn_blocking(move || {
             app_client(&state_bg).map(|ytm| ytm.get_library_playlists())
-        }).await;
+        })
+        .await;
 
         clear_box(&content_box);
 
@@ -3786,7 +4295,8 @@ fn load_playlists(
                 flow.set_margin_top(8);
 
                 for playlist in &playlists {
-                    let card = build_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
+                    let card =
+                        build_playlist_card(playlist, &state, &content_box, &ps, &recent_list);
                     flow.insert(&card, -1);
                 }
 
@@ -3837,7 +4347,13 @@ fn build_playlist_card(
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, 150);
     } else {
-        let initial = playlist.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let initial = playlist
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
         let letter = Label::new(Some(&initial));
         letter.add_css_class("cover-art-letter");
         letter.set_vexpand(true);
@@ -3875,7 +4391,15 @@ fn build_playlist_card(
         let playlist_thumb = playlist.thumbnail_url.clone();
 
         card_btn.connect_clicked(move |_| {
-            load_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, playlist_thumb.as_deref(), &ps, &recent_list);
+            load_playlist_detail(
+                &state,
+                &content_box,
+                &playlist_id,
+                &playlist_title,
+                playlist_thumb.as_deref(),
+                &ps,
+                &recent_list,
+            );
         });
     }
 
@@ -3920,9 +4444,9 @@ fn load_playlist_detail(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let pid = playlist_id.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_playlist(&pid))
-        }).await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_playlist(&pid)))
+                .await;
 
         clear_box(&content_box);
 
@@ -3968,12 +4492,17 @@ fn load_playlist_detail(
                 count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
 
-                content_box.append(&build_play_controls(&tracks, &state, &ps, Some(DownloadPlaylistMeta {
-                    playlist_id: playlist_id.clone(),
-                    title: playlist_title.clone(),
-                    thumbnail_url: playlist_thumb.clone(),
-                    subtitle: Some(format!("{} tracks", tracks.len())),
-                })));
+                content_box.append(&build_play_controls(
+                    &tracks,
+                    &state,
+                    &ps,
+                    Some(DownloadPlaylistMeta {
+                        playlist_id: playlist_id.clone(),
+                        title: playlist_title.clone(),
+                        thumbnail_url: playlist_thumb.clone(),
+                        subtitle: Some(format!("{} tracks", tracks.len())),
+                    }),
+                ));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -4033,7 +4562,13 @@ fn build_offline_playlist_card(
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, 150);
     } else {
-        let initial = playlist.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let initial = playlist
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
         let letter = Label::new(Some(&initial));
         letter.add_css_class("cover-art-letter");
         letter.set_vexpand(true);
@@ -4070,7 +4605,14 @@ fn build_offline_playlist_card(
         let playlist_title = playlist.title.clone();
 
         card_btn.connect_clicked(move |_| {
-            load_offline_playlist_detail(&state, &content_box, &playlist_id, &playlist_title, &ps, &recent_list);
+            load_offline_playlist_detail(
+                &state,
+                &content_box,
+                &playlist_id,
+                &playlist_title,
+                &ps,
+                &recent_list,
+            );
         });
     }
 
@@ -4113,7 +4655,9 @@ fn load_offline_playlist_detail(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let playlist_id_bg = playlist_id.clone();
-        let result = gio::spawn_blocking(move || load_offline_playlist_tracks(&state_bg, &playlist_id_bg)).await;
+        let result =
+            gio::spawn_blocking(move || load_offline_playlist_tracks(&state_bg, &playlist_id_bg))
+                .await;
 
         clear_box(&content_box);
 
@@ -4177,26 +4721,23 @@ fn load_offline_playlist_detail(
                 content_box.append(&grid);
             }
             Err(e) => {
-                content_box.append(&Label::new(Some(&format!("Offline playlist load failed: {e:?}"))));
+                content_box.append(&Label::new(Some(&format!(
+                    "Offline playlist load failed: {e:?}"
+                ))));
             }
         }
     });
 }
 
-fn load_sidebar_history(
-    state: &Arc<Mutex<AppState>>,
-    recent_list: &GtkBox,
-    ps: &Rc<PlayerState>,
-) {
+fn load_sidebar_history(state: &Arc<Mutex<AppState>>, recent_list: &GtkBox, ps: &Rc<PlayerState>) {
     let state = state.clone();
     let recent_list = recent_list.clone();
     let ps = ps.clone();
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_history())
-        }).await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_history())).await;
 
         if let Ok(Some(Ok(tracks))) = result {
             clear_box(&recent_list);
@@ -4230,7 +4771,9 @@ fn render_home_view(
     recent_list: &GtkBox,
 ) {
     if sections.is_empty() {
-        let msg = Label::new(Some("No recommendations returned. Your cookie might be expired."));
+        let msg = Label::new(Some(
+            "No recommendations returned. Your cookie might be expired.",
+        ));
         msg.add_css_class("dim-label");
         msg.set_margin_top(60);
         content_box.append(&msg);
@@ -4357,7 +4900,13 @@ fn build_cover_card(
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, 300);
     } else {
-        let initial = track.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let initial = track
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
         let letter = Label::new(Some(&initial));
         letter.add_css_class("cover-art-letter");
         letter.set_vexpand(true);
@@ -4395,7 +4944,14 @@ fn build_cover_card(
         let thumb_url = track.thumbnail_url.clone();
 
         card_btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
+            play_track(
+                &state,
+                &video_id,
+                &title,
+                &artist_str,
+                thumb_url.as_deref(),
+                &ps,
+            );
             add_to_recent(&recent_list, &track, &state, &ps);
         });
     }
@@ -4497,7 +5053,13 @@ fn build_track_row(
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, 88);
     } else {
-        let initial = track.title.chars().next().unwrap_or('\u{266B}').to_uppercase().to_string();
+        let initial = track
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
         let letter = Label::new(Some(&initial));
         letter.add_css_class("track-art-letter");
         letter.set_vexpand(true);
@@ -4805,7 +5367,14 @@ fn build_sidebar_recent_item(
         let thumb_url = track.thumbnail_url.clone();
 
         btn.connect_clicked(move |_| {
-            play_track(&state, &video_id, &title, &artist_str, thumb_url.as_deref(), &ps);
+            play_track(
+                &state,
+                &video_id,
+                &title,
+                &artist_str,
+                thumb_url.as_deref(),
+                &ps,
+            );
         });
     }
 
@@ -4836,15 +5405,16 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
                 fetch_thumbnail_bytes(&url)
                     .ok_or_else(|| format!("failed to load thumbnail after retries: {url}"))
             }
-        }).await;
+        })
+        .await;
 
         if let Ok(Ok(bytes)) = result {
             let gbytes = glib::Bytes::from(&bytes);
             let stream = gio::MemoryInputStream::from_bytes(&gbytes);
             // Load at original size first so we can compute aspect ratio
-            if let Ok(pixbuf) = gtk::gdk_pixbuf::Pixbuf::from_stream(
-                &stream, gio::Cancellable::NONE,
-            ) {
+            if let Ok(pixbuf) =
+                gtk::gdk_pixbuf::Pixbuf::from_stream(&stream, gio::Cancellable::NONE)
+            {
                 let w = pixbuf.width();
                 let h = pixbuf.height();
                 // Scale so the shorter side == size, then center-crop to square
@@ -4858,7 +5428,12 @@ fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
                     .unwrap_or(pixbuf);
                 let ox = (scaled.width() - size).max(0) / 2;
                 let oy = (scaled.height() - size).max(0) / 2;
-                let cropped = scaled.new_subpixbuf(ox, oy, size.min(scaled.width()), size.min(scaled.height()));
+                let cropped = scaled.new_subpixbuf(
+                    ox,
+                    oy,
+                    size.min(scaled.width()),
+                    size.min(scaled.height()),
+                );
                 let texture = gtk::gdk::Texture::for_pixbuf(&cropped);
                 picture.set_paintable(Some(&texture));
             }
@@ -4876,7 +5451,10 @@ fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
 
     for attempt in 0..MAX_ATTEMPTS {
         let response = THUMB_CLIENT.get(url).send();
-        match response.and_then(|resp| resp.error_for_status()).and_then(|resp| resp.bytes()) {
+        match response
+            .and_then(|resp| resp.error_for_status())
+            .and_then(|resp| resp.bytes())
+        {
             Ok(bytes) => return Some(bytes.to_vec()),
             Err(err) => {
                 eprintln!(
@@ -4971,7 +5549,9 @@ fn spawn_playback_tracking(
         let video_id_bootstrap = video_id.clone();
         glib::timeout_add_local_once(std::time::Duration::from_secs(3), move || {
             let now_playing = ps_bootstrap.now_playing_track.borrow();
-            let Some(current) = now_playing.as_ref() else { return };
+            let Some(current) = now_playing.as_ref() else {
+                return;
+            };
             if current.session_id != session_id || current.video_id != video_id_bootstrap {
                 return;
             }
@@ -4988,24 +5568,25 @@ async fn prepare_playback(
 ) -> Result<PreparedPlayback, String> {
     let state_cache = state.clone();
     let vid = video_id.to_string();
-    let (prefer_local_cache_on_playback, prefetch_enabled, cached_path) = gio::spawn_blocking(move || {
-        let guard = state_cache.lock().unwrap();
-        let local_path = guard.cache.get_cached_audio(&vid).or_else(|| {
-            guard
-                .settings
-                .prefetch_enabled
-                .then(|| guard.cache.get_temp_audio(&vid))
-                .flatten()
-        });
-        (
-            guard.settings.prefer_local_cache_on_playback,
-            guard.settings.prefetch_enabled,
-            local_path,
-        )
-    })
-    .await
-    .ok()
-    .unwrap_or((true, true, None));
+    let (prefer_local_cache_on_playback, prefetch_enabled, cached_path) =
+        gio::spawn_blocking(move || {
+            let guard = state_cache.lock().unwrap();
+            let local_path = guard.cache.get_cached_audio(&vid).or_else(|| {
+                guard
+                    .settings
+                    .prefetch_enabled
+                    .then(|| guard.cache.get_temp_audio(&vid))
+                    .flatten()
+            });
+            (
+                guard.settings.prefer_local_cache_on_playback,
+                guard.settings.prefetch_enabled,
+                local_path,
+            )
+        })
+        .await
+        .ok()
+        .unwrap_or((true, true, None));
 
     if prefer_local_cache_on_playback {
         if let Some(path) = cached_path.clone() {
@@ -5039,7 +5620,8 @@ async fn prepare_playback(
             let url_bg = url.clone();
             gio::spawn_blocking(move || {
                 let guard = state_bg.lock().unwrap();
-                if !guard.settings.prefetch_enabled || guard.cache.get_temp_audio(&vid_bg).is_some() {
+                if !guard.settings.prefetch_enabled || guard.cache.get_temp_audio(&vid_bg).is_some()
+                {
                     return;
                 }
                 drop(guard);
@@ -5057,7 +5639,10 @@ async fn prepare_playback(
         }
         Ok(Err(msg)) => {
             if let Some(path) = cached_path {
-                eprintln!("[CACHE] remote failed, falling back to local: {}", path.display());
+                eprintln!(
+                    "[CACHE] remote failed, falling back to local: {}",
+                    path.display()
+                );
                 Ok(PreparedPlayback {
                     uri: format!("file://{}", path.display()),
                 })
@@ -5067,7 +5652,10 @@ async fn prepare_playback(
         }
         Err(e) => {
             if let Some(path) = cached_path {
-                eprintln!("[CACHE] worker failed, falling back to local: {}", path.display());
+                eprintln!(
+                    "[CACHE] worker failed, falling back to local: {}",
+                    path.display()
+                );
                 Ok(PreparedPlayback {
                     uri: format!("file://{}", path.display()),
                 })
@@ -5094,6 +5682,7 @@ fn play_track(
 
     // Stop immediately so stale position data can't trigger auto-advance
     ps.player.stop();
+    clear_sponsorblock_state(ps);
 
     // Immediately flush all UI state for the new track
     ps.np_title.set_text(title);
@@ -5150,6 +5739,7 @@ fn play_track(
                     tracking: None,
                 });
                 update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
+                spawn_sponsorblock_sync(&state, &ps, &video_id, session_id);
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
                 spawn_song_rating_sync(&state, &ps, &video_id, session_id);
                 sync_mpris_all(&ps, &state);
@@ -5174,7 +5764,8 @@ fn play_track(
         let vid = video_id.clone();
         let radio_result = gio::spawn_blocking(move || {
             app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
-        }).await;
+        })
+        .await;
 
         if let Ok(Some(Ok(mut radio))) = radio_result {
             // Ensure the seed track is always first in the queue
@@ -5187,14 +5778,20 @@ fn play_track(
                 }
             } else {
                 // Not in queue at all — prepend it
-                radio.tracks.insert(0, Track {
-                    video_id: video_id.clone(),
-                    title: title.clone(),
-                    artists: vec![Artist { name: artist.clone(), id: None }],
-                    album: None,
-                    duration: None,
-                    thumbnail_url: thumb_url.clone(),
-                });
+                radio.tracks.insert(
+                    0,
+                    Track {
+                        video_id: video_id.clone(),
+                        title: title.clone(),
+                        artists: vec![Artist {
+                            name: artist.clone(),
+                            id: None,
+                        }],
+                        album: None,
+                        duration: None,
+                        thumbnail_url: thumb_url.clone(),
+                    },
+                );
             }
             *ps.queue.borrow_mut() = radio.tracks;
             ps.queue_index.set(0);
@@ -5246,7 +5843,9 @@ fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>
 /// Play a track from the queue by index (no radio re-fetch).
 fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: usize) {
     let queue = ps.queue.borrow();
-    let Some(track) = queue.get(index) else { return };
+    let Some(track) = queue.get(index) else {
+        return;
+    };
     ps.queue_index.set(index);
 
     let video_id = track.video_id.clone();
@@ -5260,6 +5859,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
 
     // Stop immediately so stale position data can't trigger auto-advance
     ps.player.stop();
+    clear_sponsorblock_state(ps);
 
     // Flush UI
     ps.np_title.set_text(&title);
@@ -5312,6 +5912,7 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
                     tracking: None,
                 });
                 update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
+                spawn_sponsorblock_sync(&state, &ps, &video_id, session_id);
                 spawn_playback_tracking(&state, &ps, &video_id, session_id);
                 spawn_song_rating_sync(&state, &ps, &video_id, session_id);
                 sync_mpris_all(&ps, &state);
@@ -5369,7 +5970,9 @@ fn prefetch_upcoming(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, from_in
 
             // Get streaming URL (no playback reporting)
             let url = {
-                let Some(client) = app_client(&state) else { return };
+                let Some(client) = app_client(&state) else {
+                    return;
+                };
                 match client.get_audio_url_no_track(vid) {
                     Ok(u) => u,
                     Err(e) => {
@@ -5402,12 +6005,7 @@ fn prefetch_upcoming(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, from_in
 
 /// Set the queue to the given tracks and start playing from index 0.
 /// If `shuffle` is true, the tracks are shuffled first.
-fn play_all(
-    tracks: &[Track],
-    shuffle: bool,
-    state: &Arc<Mutex<AppState>>,
-    ps: &Rc<PlayerState>,
-) {
+fn play_all(tracks: &[Track], shuffle: bool, state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
     if tracks.is_empty() {
         return;
     }
@@ -5534,6 +6132,8 @@ fn download_all_offline(
                     if guard.cache.is_cached(vid) {
                         let _ = guard.cache.pin_offline(vid);
                         eprintln!("[DOWNLOAD] {}/{count} already cached, pinned: {vid}", i + 1);
+                        drop(guard);
+                        let _ = ensure_offline_sponsorblock_cache(&state, vid);
                         continue;
                     }
                 }
@@ -5544,7 +6144,12 @@ fn download_all_offline(
                     let artist = if track.artists.is_empty() {
                         "Unknown artist".to_string()
                     } else {
-                        track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+                        track
+                            .artists
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     };
                     let _ = guard.cache.record_play(
                         vid,
@@ -5557,7 +6162,9 @@ fn download_all_offline(
 
                 // Get streaming URL
                 let url = {
-                    let Some(client) = app_client(&state) else { return };
+                    let Some(client) = app_client(&state) else {
+                        return;
+                    };
                     match client.get_audio_url_no_track(vid) {
                         Ok(u) => u,
                         Err(e) => {
@@ -5589,10 +6196,17 @@ fn download_all_offline(
                     .and_then(|url| fetch_thumbnail_bytes(url));
 
                 // Store + pin
-                let guard = state.lock().unwrap();
-                let _ = guard.cache.store_audio(vid, &audio, art.as_deref());
-                let _ = guard.cache.pin_offline(vid);
-                eprintln!("[DOWNLOAD] {}/{count} done: {vid} ({} KB)", i + 1, audio.len() / 1024);
+                {
+                    let guard = state.lock().unwrap();
+                    let _ = guard.cache.store_audio(vid, &audio, art.as_deref());
+                    let _ = guard.cache.pin_offline(vid);
+                }
+                let _ = ensure_offline_sponsorblock_cache(&state, vid);
+                eprintln!(
+                    "[DOWNLOAD] {}/{count} done: {vid} ({} KB)",
+                    i + 1,
+                    audio.len() / 1024
+                );
             }
 
             // Store playlist metadata + cover art if this is a playlist download
@@ -5600,11 +6214,14 @@ fn download_all_offline(
                 // Download playlist cover art to disk
                 let cover_art_path = if let Some(url) = &meta.thumbnail_url {
                     fetch_thumbnail_bytes(url).map(|bytes| {
-                            let guard = state.lock().unwrap();
-                            let p = guard.cache.art_dir.join(format!("playlist_{}.jpg", meta.playlist_id));
-                            let _ = std::fs::write(&p, &bytes);
-                            format!("file://{}", p.display())
-                        })
+                        let guard = state.lock().unwrap();
+                        let p = guard
+                            .cache
+                            .art_dir
+                            .join(format!("playlist_{}.jpg", meta.playlist_id));
+                        let _ = std::fs::write(&p, &bytes);
+                        format!("file://{}", p.display())
+                    })
                 } else {
                     None
                 };
@@ -5618,11 +6235,17 @@ fn download_all_offline(
                     meta.subtitle.as_deref(),
                     &video_ids,
                 );
-                eprintln!("[DOWNLOAD] stored playlist meta: {} ({} tracks)", meta.title, video_ids.len());
+                eprintln!(
+                    "[DOWNLOAD] stored playlist meta: {} ({} tracks)",
+                    meta.title,
+                    video_ids.len()
+                );
             }
 
             eprintln!("[DOWNLOAD] finished all {count} tracks");
-        }).await.ok();
+        })
+        .await
+        .ok();
     });
 }
 
@@ -5657,62 +6280,19 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     let current_idx = ps.queue_index.get();
 
     for (i, track) in queue.iter().enumerate() {
-        let row = GtkBox::new(Orientation::Horizontal, 8);
-        row.add_css_class("queue-row");
-        row.set_margin_start(8);
-        row.set_margin_end(8);
-        row.set_margin_top(2);
-        row.set_margin_bottom(2);
-
-        if i == current_idx {
-            row.add_css_class("queue-row-active");
-        }
-
-        // Small thumbnail
-        let art = GtkBox::new(Orientation::Vertical, 0);
-        art.add_css_class("queue-thumb");
-        art.set_size_request(40, 40);
-        art.set_valign(Align::Center);
-        art.set_overflow(gtk::Overflow::Hidden);
-
-        if let Some(url) = &track.thumbnail_url {
-            let pic = Picture::new();
-            pic.set_keep_aspect_ratio(true);
-            pic.set_size_request(40, 40);
-            art.append(&pic);
-            load_thumbnail_into(&pic, url, 80);
-        }
-        row.append(&art);
-
-        let info = GtkBox::new(Orientation::Vertical, 0);
-        info.set_hexpand(true);
-        info.set_valign(Align::Center);
-
-        let title_lbl = Label::new(Some(&track.title));
-        title_lbl.set_halign(Align::Start);
-        title_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        title_lbl.add_css_class("queue-track-title");
-        info.append(&title_lbl);
-
-        let artist_str = artist_string(track);
-        let artist_lbl = Label::new(Some(&artist_str));
-        artist_lbl.set_halign(Align::Start);
-        artist_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        artist_lbl.add_css_class("queue-track-artist");
-        info.append(&artist_lbl);
-
-        row.append(&info);
-
-        if let Some(dur) = &track.duration {
-            let dur_lbl = Label::new(Some(dur));
-            dur_lbl.add_css_class("queue-track-duration");
-            dur_lbl.set_valign(Align::Center);
-            row.append(&dur_lbl);
-        }
+        let preview = QueuePreviewData {
+            title: track.title.clone(),
+            subtitle: artist_string(track),
+            thumbnail_url: track.thumbnail_url.clone(),
+            duration: track.duration.clone(),
+        };
+        let row = build_queue_row_visual(&preview, i == current_idx, true, None);
 
         // Wrap row content in a GtkBox (not Button) to avoid drag conflicts
         let row_wrapper = GtkBox::new(Orientation::Vertical, 0);
         row_wrapper.add_css_class("queue-row-btn");
+        row_wrapper.set_hexpand(true);
+        row_wrapper.set_halign(Align::Fill);
         row_wrapper.append(&row);
 
         // Click to play
@@ -5785,19 +6365,17 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
         {
             let ps = ps.clone();
             let row_wrapper_ref = row_wrapper.clone();
-            let drag_source_ref = drag_source.clone();
             let preview_payload = QueueDragPayload::QueueRow { index: i };
-            drag_source.connect_drag_begin(move |_, _| {
+            drag_source.connect_drag_begin(move |_, drag| {
+                if let Some(preview) = queue_preview_data_for_payload(&ps, &preview_payload) {
+                    let (width, height) = drag_preview_size(&ps);
+                    set_drag_icon_from_preview(drag, &preview, width, height);
+                }
                 ps.queue_drag_source_index.set(Some(i));
-                ps.queue_drag_preview_payload.replace(Some(preview_payload.clone()));
+                ps.queue_drag_preview_payload
+                    .replace(Some(preview_payload.clone()));
                 ps.queue_list_box.add_css_class("queue-drag-active");
                 row_wrapper_ref.add_css_class("queue-row-dragging");
-                let paintable = WidgetPaintable::new(Some(&row_wrapper_ref));
-                drag_source_ref.set_icon(
-                    Some(&paintable),
-                    28,
-                    (row_wrapper_ref.allocated_height() / 2).max(1),
-                );
             });
         }
         {
@@ -5849,7 +6427,9 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
             let state = state.clone();
             let row_wrapper_ref = row_wrapper.clone();
             drop_target.connect_drop(move |_, value, _, y| {
-                let Some(payload) = parse_queue_drag_payload(value) else { return false };
+                let Some(payload) = parse_queue_drag_payload(value) else {
+                    return false;
+                };
                 let raw_slot = preview_slot_for_pointer(i, y, row_wrapper_ref.allocated_height());
                 clear_queue_drop_preview(&ps);
                 set_queue_drop_active(&ps, false);
@@ -5863,7 +6443,12 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
 }
 
 /// Switch radio filter (chip click).
-fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlist_id: &str, params: Option<&str>) {
+fn load_radio_filter(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    playlist_id: &str,
+    params: Option<&str>,
+) {
     let state = state.clone();
     let ps = ps.clone();
     let seed = ps.seed_video_id.borrow().clone();
@@ -5882,7 +6467,8 @@ fn load_radio_filter(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, playlis
         let p = params.clone();
         let result = gio::spawn_blocking(move || {
             app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, Some(&plid), p.as_deref()))
-        }).await;
+        })
+        .await;
 
         if let Ok(Some(Ok(mut radio))) = result {
             // Ensure seed track is always first
@@ -5940,7 +6526,10 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         if !enabled {
             return;
         }
-        let top = match guard.cache.auto_offline_candidates(&guard.settings, cache_target) {
+        let top = match guard
+            .cache
+            .auto_offline_candidates(&guard.settings, cache_target)
+        {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("[CACHE] failed to compute offline candidates: {e}");
@@ -5965,7 +6554,8 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
     }
 
     // Download songs that are in top 100 but not cached
-    let to_download: Vec<String> = top.into_iter()
+    let to_download: Vec<String> = top
+        .into_iter()
         .take(cache_target)
         .filter(|id| !cached.contains(id))
         .collect();
@@ -5977,7 +6567,9 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
     for vid in to_download {
         // Get streaming URL (brief lock)
         let url = {
-            let Some(client) = app_client(state) else { return };
+            let Some(client) = app_client(state) else {
+                return;
+            };
             match client.get_audio_url_no_track(&vid) {
                 Ok(u) => u,
                 Err(e) => {
@@ -5996,7 +6588,10 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
             .send()
             .and_then(|r| {
                 let status = r.status();
-                eprintln!("[CACHE] {vid} response: {status}, content-length: {:?}", r.content_length());
+                eprintln!(
+                    "[CACHE] {vid} response: {status}, content-length: {:?}",
+                    r.content_length()
+                );
                 r.bytes()
             }) {
             Ok(b) => {
@@ -6017,8 +6612,11 @@ fn sync_offline_cache(state: &Arc<Mutex<AppState>>) {
         let art = thumb_url.and_then(|url| fetch_thumbnail_bytes(&url));
 
         // Store to disk + DB (brief lock)
-        let guard = state.lock().unwrap();
-        let _ = guard.cache.store_audio(&vid, &audio, art.as_deref());
+        {
+            let guard = state.lock().unwrap();
+            let _ = guard.cache.store_audio(&vid, &audio, art.as_deref());
+        }
+        let _ = ensure_offline_sponsorblock_cache(state, &vid);
     }
 }
 
@@ -6026,7 +6624,12 @@ fn artist_string(track: &Track) -> String {
     if track.artists.is_empty() {
         "Unknown artist".to_string()
     } else {
-        track.artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+        track
+            .artists
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -6036,7 +6639,10 @@ fn clear_box(container: &GtkBox) {
     }
 }
 
-fn queue_preview_data_for_payload(ps: &PlayerState, payload: &QueueDragPayload) -> Option<QueuePreviewData> {
+fn queue_preview_data_for_payload(
+    ps: &PlayerState,
+    payload: &QueueDragPayload,
+) -> Option<QueuePreviewData> {
     match payload {
         QueueDragPayload::QueueRow { index } => {
             let queue = ps.queue.borrow();
@@ -6068,6 +6674,108 @@ fn queue_preview_data_for_payload(ps: &PlayerState, payload: &QueueDragPayload) 
     }
 }
 
+fn build_queue_row_visual(
+    preview: &QueuePreviewData,
+    active: bool,
+    with_outer_margins: bool,
+    forced_width: Option<i32>,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 8);
+    row.add_css_class("queue-row");
+    row.set_hexpand(true);
+    row.set_halign(Align::Fill);
+    row.set_overflow(gtk::Overflow::Hidden);
+    row.set_size_request(-1, 48);
+    if with_outer_margins {
+        row.set_margin_start(8);
+        row.set_margin_end(8);
+        row.set_margin_top(2);
+        row.set_margin_bottom(2);
+    }
+    if let Some(width) = forced_width {
+        row.set_width_request(width);
+    }
+
+    if active {
+        row.add_css_class("queue-row-active");
+    }
+
+    let art = GtkBox::new(Orientation::Vertical, 0);
+    art.add_css_class("queue-thumb");
+    art.set_size_request(40, 40);
+    art.set_valign(Align::Center);
+    art.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = preview.thumbnail_url.as_deref() {
+        let pic = Picture::new();
+        pic.set_keep_aspect_ratio(true);
+        pic.set_size_request(40, 40);
+        art.append(&pic);
+        load_thumbnail_into(&pic, url, 80);
+    }
+
+    row.append(&art);
+
+    let info = GtkBox::new(Orientation::Vertical, 0);
+    info.set_hexpand(true);
+    info.set_halign(Align::Fill);
+    info.set_valign(Align::Center);
+    info.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(width) = forced_width {
+        let margins = if with_outer_margins { 16 } else { 0 };
+        let duration = if preview.duration.is_some() { 44 } else { 0 };
+        let reserved_width = (width - (40 + 8 + duration + margins)).max(72);
+
+        let title_lbl = Label::new(Some(&preview.title));
+        title_lbl.set_halign(Align::Start);
+        title_lbl.add_css_class("queue-track-title");
+        let title_sw = label_scroller(&title_lbl, 18);
+        title_sw.set_hexpand(true);
+        title_sw.set_max_content_width(reserved_width);
+        info.append(&title_sw);
+
+        let artist_lbl = Label::new(Some(&preview.subtitle));
+        artist_lbl.set_halign(Align::Start);
+        artist_lbl.add_css_class("queue-track-artist");
+        let artist_sw = label_scroller(&artist_lbl, 16);
+        artist_sw.set_hexpand(true);
+        artist_sw.set_max_content_width(reserved_width);
+        info.append(&artist_sw);
+    } else {
+        let title_lbl = Label::new(Some(&preview.title));
+        title_lbl.set_halign(Align::Start);
+        title_lbl.set_hexpand(true);
+        title_lbl.set_wrap(false);
+        title_lbl.set_single_line_mode(true);
+        title_lbl.set_width_chars(1);
+        title_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title_lbl.add_css_class("queue-track-title");
+        info.append(&title_lbl);
+
+        let artist_lbl = Label::new(Some(&preview.subtitle));
+        artist_lbl.set_halign(Align::Start);
+        artist_lbl.set_hexpand(true);
+        artist_lbl.set_wrap(false);
+        artist_lbl.set_single_line_mode(true);
+        artist_lbl.set_width_chars(1);
+        artist_lbl.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        artist_lbl.add_css_class("queue-track-artist");
+        info.append(&artist_lbl);
+    }
+
+    row.append(&info);
+
+    if let Some(dur) = preview.duration.as_deref() {
+        let dur_lbl = Label::new(Some(dur));
+        dur_lbl.add_css_class("queue-track-duration");
+        dur_lbl.set_valign(Align::Center);
+        row.append(&dur_lbl);
+    }
+
+    row
+}
+
 fn refresh_queue_drop_indicator(ps: &PlayerState) {
     let preview = ps
         .queue_drag_preview_payload
@@ -6084,14 +6792,16 @@ fn refresh_queue_drop_indicator(ps: &PlayerState) {
             ps.queue_drop_indicator_thumb.set_visible(true);
             load_thumbnail_into(&ps.queue_drop_indicator_thumb, url, 80);
         } else {
-            ps.queue_drop_indicator_thumb.set_paintable(Option::<&gtk::gdk::Paintable>::None);
+            ps.queue_drop_indicator_thumb
+                .set_paintable(Option::<&gtk::gdk::Paintable>::None);
             ps.queue_drop_indicator_thumb.set_visible(false);
         }
     } else {
         ps.queue_drop_indicator_title.set_text("Drop into queue");
         ps.queue_drop_indicator_subtitle.set_text("");
         ps.queue_drop_indicator_duration.set_text("");
-        ps.queue_drop_indicator_thumb.set_paintable(Option::<&gtk::gdk::Paintable>::None);
+        ps.queue_drop_indicator_thumb
+            .set_paintable(Option::<&gtk::gdk::Paintable>::None);
         ps.queue_drop_indicator_thumb.set_visible(false);
     }
 }
@@ -6132,7 +6842,8 @@ fn set_queue_drop_preview(ps: &PlayerState, slot: Option<usize>) {
     if queue_len == 0 {
         ps.queue_list_box.add_css_class("queue-drop-empty");
         refresh_queue_drop_indicator(ps);
-        ps.queue_drop_indicator.set_margin_top(ps.queue_list_box.margin_top());
+        ps.queue_drop_indicator
+            .set_margin_top(ps.queue_list_box.margin_top());
         ps.queue_drop_indicator.set_visible(true);
         ps.queue_drop_preview_slot.set(Some(0));
         return;
@@ -6204,7 +6915,11 @@ fn normalized_preview_slot(ps: &PlayerState, raw_slot: usize) -> Option<usize> {
     ps.queue_drag_source_index
         .get()
         .and_then(|from| {
-            let normalized = if from < raw_slot { raw_slot.saturating_sub(1) } else { raw_slot };
+            let normalized = if from < raw_slot {
+                raw_slot.saturating_sub(1)
+            } else {
+                raw_slot
+            };
             (normalized != from).then_some(raw_slot)
         })
         .or(Some(raw_slot))
@@ -6213,6 +6928,51 @@ fn normalized_preview_slot(ps: &PlayerState, raw_slot: usize) -> Option<usize> {
 fn queue_drag_provider(payload: &QueueDragPayload) -> Option<gtk::gdk::ContentProvider> {
     let json = serde_json::to_string(payload).ok()?;
     Some(gtk::gdk::ContentProvider::for_value(&json.to_value()))
+}
+
+fn drag_preview_size(ps: &PlayerState) -> (i32, i32) {
+    if let Some(first_row) = ps.queue_list_box.first_child() {
+        let row_width = first_row.allocated_width();
+        let row_height = first_row.allocated_height();
+        if row_width > 0 {
+            return (row_width, row_height.max(52));
+        }
+    }
+
+    let list_width = ps.queue_list_box.allocated_width();
+    if list_width > 0 {
+        return (list_width, 52);
+    }
+
+    let queue_width = ps.queue_panel.allocated_width();
+    if queue_width > 0 {
+        ((queue_width - 24).clamp(220, 420), 52)
+    } else {
+        (360, 52)
+    }
+}
+
+fn build_drag_preview_widget(preview: &QueuePreviewData, width: i32, height: i32) -> GtkBox {
+    let root = GtkBox::new(Orientation::Vertical, 0);
+    root.add_css_class("queue-row-btn");
+    root.add_css_class("drag-preview-shell");
+    root.set_halign(Align::Start);
+    root.set_valign(Align::Start);
+    root.set_overflow(gtk::Overflow::Hidden);
+    root.set_size_request(width, height);
+    root.append(&build_queue_row_visual(preview, false, false, Some(width)));
+    root
+}
+
+fn set_drag_icon_from_preview(
+    drag: &gtk::gdk::Drag,
+    preview: &QueuePreviewData,
+    width: i32,
+    height: i32,
+) {
+    let icon = gtk::DragIcon::for_drag(drag);
+    let widget = build_drag_preview_widget(preview, width, height);
+    icon.set_child(Some(&widget));
 }
 
 fn parse_queue_drag_payload(value: &glib::Value) -> Option<QueueDragPayload> {
@@ -6234,18 +6994,14 @@ fn attach_queue_drag_source(
     }
 
     {
-        let drag_source_ref = drag_source.clone();
-        let widget_ref: gtk::Widget = widget.as_ref().clone();
         let payload = payload.clone();
         let ps = ps.clone();
-        drag_source.connect_drag_begin(move |_, _| {
+        drag_source.connect_drag_begin(move |_, drag| {
             ps.queue_drag_preview_payload.replace(Some(payload.clone()));
-            let paintable = WidgetPaintable::new(Some(&widget_ref));
-            drag_source_ref.set_icon(
-                Some(&paintable),
-                28,
-                (widget_ref.allocated_height() / 2).max(1),
-            );
+            if let Some(preview) = queue_preview_data_for_payload(&ps, &payload) {
+                let (width, height) = drag_preview_size(&ps);
+                set_drag_icon_from_preview(drag, &preview, width, height);
+            }
         });
     }
 
@@ -6318,7 +7074,11 @@ fn handle_queue_drop_payload(
 ) -> bool {
     match payload {
         QueueDragPayload::QueueRow { index: from } => {
-            let insert_at = if from < raw_slot { raw_slot.saturating_sub(1) } else { raw_slot };
+            let insert_at = if from < raw_slot {
+                raw_slot.saturating_sub(1)
+            } else {
+                raw_slot
+            };
             if insert_at == from {
                 return false;
             }

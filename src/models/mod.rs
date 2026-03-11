@@ -66,3 +66,11 @@ pub struct RadioQueue {
     /// Opaque token for loading more tracks.
     pub continuation: Option<String>,
 }
+
+/// The locally-managed virtual-playlist state for a radio queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RadioVirtualPlaylist {
+    pub source_video_id: String,
+    pub touched_len: usize,
+    pub chips: Vec<RadioChip>,
+}

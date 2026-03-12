@@ -36,7 +36,36 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HomeSection {
     pub title: String,
-    pub contents: Vec<Track>,
+    pub contents: Vec<HomeItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomePage {
+    pub sections: Vec<HomeSection>,
+    pub continuation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HomeItem {
+    Track(Track),
+    BrowseCard(HomeBrowseCard),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeBrowseCard {
+    pub browse_id: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub page_type: HomeBrowsePageType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HomeBrowsePageType {
+    Playlist,
+    Album,
+    Artist,
+    UserChannel,
 }
 
 /// Lightweight summary for a playlist in the user's library listing (no embedded tracks).

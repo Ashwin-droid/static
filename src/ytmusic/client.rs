@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
 
-use crate::models::{HomeSection, PlaylistSummary, RadioQueue, Track};
+use crate::models::{HomeItem, HomePage, PlaylistSummary, RadioQueue, Track};
 
 use super::cipher::Cipher;
 use super::parsers;
@@ -622,10 +622,14 @@ impl YtMusicClient {
         Ok(c)
     }
 
-    pub fn get_home(&self) -> Result<Vec<HomeSection>> {
+    pub fn get_home_page(&self, continuation: Option<&str>) -> Result<HomePage> {
         self.rt.block_on(async {
             let mut body = Self::client_context();
-            body["browseId"] = json!("FEmusic_home");
+            if let Some(continuation) = continuation {
+                body["continuation"] = json!(continuation);
+            } else {
+                body["browseId"] = json!("FEmusic_home");
+            }
 
             let resp = self
                 .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
@@ -635,7 +639,7 @@ impl YtMusicClient {
                 .context("Failed to fetch home page")?;
 
             let json: Value = resp.json().await.context("Failed to parse home response")?;
-            parsers::parse_home(&json)
+            parsers::parse_home_page(&json)
         })
     }
 
@@ -656,7 +660,14 @@ impl YtMusicClient {
                 .await
                 .context("Failed to parse history response")?;
             let sections = parsers::parse_home(&json)?;
-            Ok(sections.into_iter().flat_map(|s| s.contents).collect())
+            Ok(sections
+                .into_iter()
+                .flat_map(|section| section.contents)
+                .filter_map(|item| match item {
+                    HomeItem::Track(track) => Some(track),
+                    HomeItem::BrowseCard(_) => None,
+                })
+                .collect())
         })
     }
 
@@ -703,6 +714,26 @@ impl YtMusicClient {
                 .await
                 .context("Failed to parse playlist response")?;
             parsers::parse_playlist_tracks(&json)
+        })
+    }
+
+    pub fn get_browse_tracks(&self, browse_id: &str) -> Result<Vec<Track>> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["browseId"] = json!(browse_id);
+
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("Failed to fetch browse page {browse_id}"))?;
+
+            let json: Value = resp
+                .json()
+                .await
+                .with_context(|| format!("Failed to parse browse response for {browse_id}"))?;
+            parsers::parse_browse_tracks(&json)
         })
     }
 

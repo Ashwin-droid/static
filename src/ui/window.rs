@@ -42,7 +42,10 @@ const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{PlaybackSnapshot, RepeatMode};
-use crate::models::{Artist, HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, Track};
+use crate::models::{
+    Artist, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
+    PlaylistSummary, RadioChip, RadioVirtualPlaylist, Track,
+};
 use crate::player::Player;
 use crate::sponsorblock::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SponsorBlockClient, SponsorSegment, default_skip_categories,
@@ -88,7 +91,8 @@ struct AppState {
     sponsorblock: SponsorBlockClient,
     cache: MusicCache,
     settings: AppSettings,
-    home_cache: Option<Vec<HomeSection>>,
+    home_cache: Option<HomePage>,
+    home_scroll_position: f64,
 }
 
 /// Tracks the currently playing song so we can record listen time when navigating away.
@@ -103,16 +107,24 @@ fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<YtMusicClient>> {
     state.lock().unwrap().client.clone()
 }
 
-fn cached_home_sections(state: &Arc<Mutex<AppState>>) -> Option<Vec<HomeSection>> {
+fn cached_home_page(state: &Arc<Mutex<AppState>>) -> Option<HomePage> {
     state.lock().unwrap().home_cache.clone()
 }
 
-fn store_home_cache(state: &Arc<Mutex<AppState>>, sections: &[HomeSection]) {
-    state.lock().unwrap().home_cache = Some(sections.to_vec());
+fn store_home_cache(state: &Arc<Mutex<AppState>>, page: &HomePage) {
+    state.lock().unwrap().home_cache = Some(page.clone());
 }
 
 fn invalidate_home_cache(state: &Arc<Mutex<AppState>>) {
     state.lock().unwrap().home_cache = None;
+}
+
+fn cached_home_scroll_position(state: &Arc<Mutex<AppState>>) -> f64 {
+    state.lock().unwrap().home_scroll_position
+}
+
+fn store_home_scroll_position(state: &Arc<Mutex<AppState>>, position: f64) {
+    state.lock().unwrap().home_scroll_position = position.max(0.0);
 }
 
 #[allow(dead_code)]
@@ -172,9 +184,27 @@ struct PlayerState {
 struct MainPageWidgets {
     page: GtkBox,
     content_box: GtkBox,
+    content_scroll: ScrolledWindow,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
     home_btn: Button,
+    home_pagination: Rc<HomePaginationState>,
+}
+
+#[derive(Debug, Clone)]
+enum DirectMusicUrlTarget {
+    Video {
+        video_id: String,
+    },
+    Browse {
+        browse_id: String,
+        page_type: HomeBrowsePageType,
+    },
+}
+
+struct HomePaginationState {
+    continuation: RefCell<Option<String>>,
+    loading: Cell<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -817,6 +847,7 @@ pub fn build_window(app: &Application) {
         cache,
         settings,
         home_cache: None,
+        home_scroll_position: 0.0,
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -850,6 +881,8 @@ pub fn build_window(app: &Application) {
         let state = state.clone();
         let stack = stack.clone();
         let content_box = main_widgets.content_box.clone();
+        let content_scroll = main_widgets.content_scroll.clone();
+        let home_pagination = main_widgets.home_pagination.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
         let home_btn = main_widgets.home_btn.clone();
@@ -862,7 +895,15 @@ pub fn build_window(app: &Application) {
                 && home_btn.has_css_class("nav-item-active")
             {
                 invalidate_home_cache(&state);
-                load_home(&state, &content_box, &ps, &recent_list, true);
+                load_home(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                    true,
+                );
                 return glib::Propagation::Stop;
             }
             glib::Propagation::Proceed
@@ -876,6 +917,8 @@ pub fn build_window(app: &Application) {
     {
         let state = state.clone();
         let content_box = main_widgets.content_box.clone();
+        let content_scroll = main_widgets.content_scroll.clone();
+        let home_pagination = main_widgets.home_pagination.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
 
@@ -883,7 +926,15 @@ pub fn build_window(app: &Application) {
             if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
             {
                 clear_box(&content_box);
-                load_home(&state, &content_box, &ps, &recent_list, false);
+                load_home(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                    false,
+                );
                 load_sidebar_history(&state, &recent_list, &ps);
             }
         });
@@ -1403,6 +1454,11 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     content_box.set_margin_start(28);
     content_box.set_margin_end(28);
 
+    let home_pagination = Rc::new(HomePaginationState {
+        continuation: RefCell::new(None),
+        loading: Cell::new(false),
+    });
+
     scrolled.set_child(Some(&content_box));
 
     let content_overlay = Overlay::new();
@@ -1919,17 +1975,67 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         settings_btn.clone(),
     ]);
 
+    {
+        let state_for_value = state.clone();
+        let content_box_for_value = content_box.clone();
+        let content_scroll_for_value = scrolled.clone();
+        let home_pagination_for_value = home_pagination.clone();
+        let ps_for_value = ps.clone();
+        let recent_list_for_value = recent_list.clone();
+        scrolled.vadjustment().connect_value_changed(move |_| {
+            if content_box_for_value.has_css_class("home-view-active") {
+                let value = content_scroll_for_value.vadjustment().value();
+                store_home_scroll_position(&state_for_value, value);
+            }
+            maybe_load_more_home_if_needed(
+                &state_for_value,
+                &content_box_for_value,
+                &content_scroll_for_value,
+                &home_pagination_for_value,
+                &ps_for_value,
+                &recent_list_for_value,
+            );
+        });
+
+        let state_for_changed = state.clone();
+        let content_box_for_changed = content_box.clone();
+        let content_scroll_for_changed = scrolled.clone();
+        let home_pagination_for_changed = home_pagination.clone();
+        let ps_for_changed = ps.clone();
+        let recent_list_for_changed = recent_list.clone();
+        scrolled.vadjustment().connect_changed(move |_| {
+            maybe_load_more_home_if_needed(
+                &state_for_changed,
+                &content_box_for_changed,
+                &content_scroll_for_changed,
+                &home_pagination_for_changed,
+                &ps_for_changed,
+                &recent_list_for_changed,
+            );
+        });
+    }
+
     // Home button
     {
         let state = state.clone();
         let content_box = content_box.clone();
+        let content_scroll = scrolled.clone();
+        let home_pagination = home_pagination.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
 
         home_btn.connect_clicked(move |btn| {
             set_active_nav(btn, &nav);
-            load_home(&state, &content_box, &ps, &recent_list, false);
+            load_home(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                &ps,
+                &recent_list,
+                false,
+            );
         });
     }
 
@@ -1993,24 +2099,41 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     {
         let state = state.clone();
         let content_box = content_box.clone();
+        let content_scroll = scrolled.clone();
+        let home_pagination = home_pagination.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
 
         search_entry.connect_activate(move |entry| {
-            let query = entry.text().to_string();
+            let query = entry.text().trim().to_string();
             if query.is_empty() {
                 return;
             }
-            load_search(&state, &content_box, &query, &ps, &recent_list);
+            if let Some(target) = parse_direct_music_url(&query) {
+                autoplay_direct_music_url(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &query,
+                    target,
+                    &ps,
+                    &recent_list,
+                );
+            } else {
+                load_search(&state, &content_box, &query, &ps, &recent_list);
+            }
         });
     }
 
     MainPageWidgets {
         page,
         content_box,
+        content_scroll: scrolled,
         player_state: ps,
         recent_list,
         home_btn,
+        home_pagination,
     }
 }
 
@@ -3594,19 +3717,52 @@ fn maybe_flush_watchtime_progress(ps: &PlayerState) {
 fn load_home(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
     force_refresh: bool,
 ) {
+    if force_refresh {
+        store_home_scroll_position(state, 0.0);
+        content_scroll.vadjustment().set_value(0.0);
+    }
+
     if !force_refresh {
-        if let Some(sections) = cached_home_sections(state) {
+        if let Some(page) = cached_home_page(state) {
             clear_box(content_box);
-            render_home_view(content_box, &sections, state, ps, recent_list);
+            content_box.add_css_class("home-view-active");
+            home_pagination
+                .continuation
+                .replace(page.continuation.clone());
+            home_pagination.loading.set(false);
+            render_home_view(
+                content_box,
+                &page.sections,
+                state,
+                content_scroll,
+                home_pagination,
+                ps,
+                recent_list,
+                false,
+            );
+            restore_home_scroll_position_later(state, content_scroll);
+            queue_home_lazy_load_check(
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                ps,
+                recent_list,
+            );
             return;
         }
     }
 
     clear_box(content_box);
+    content_box.add_css_class("home-view-active");
+    home_pagination.continuation.replace(None);
+    home_pagination.loading.set(true);
     let loading = Label::new(Some("Loading recommendations..."));
     loading.add_css_class("dim-label");
     loading.set_margin_top(60);
@@ -3614,20 +3770,29 @@ fn load_home(
 
     let state = state.clone();
     let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
     let ps = ps.clone();
     let recent_list = recent_list.clone();
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result =
-            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_home())).await;
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_home_page(None))
+        })
+        .await;
 
+        home_pagination.loading.set(false);
         clear_box(&content_box);
+        content_box.add_css_class("home-view-active");
 
         match result {
-            Ok(Some(Ok(sections))) => {
-                store_home_cache(&state, &sections);
-                let listen_again_tracks = extract_listen_again_tracks(&sections);
+            Ok(Some(Ok(page))) => {
+                store_home_cache(&state, &page);
+                home_pagination
+                    .continuation
+                    .replace(page.continuation.clone());
+                let listen_again_tracks = extract_listen_again_tracks(&page.sections);
                 let state_bg = state.clone();
                 let _ = gio::spawn_blocking(move || {
                     let guard = state_bg.lock().unwrap();
@@ -3646,18 +3811,196 @@ fn load_home(
                     guard.cache.store_listen_again_snapshot(&listen_again_ids)
                 })
                 .await;
-                render_home_view(&content_box, &sections, &state, &ps, &recent_list);
+                render_home_view(
+                    &content_box,
+                    &page.sections,
+                    &state,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                    false,
+                );
+                if force_refresh {
+                    content_scroll.vadjustment().set_value(0.0);
+                } else {
+                    restore_home_scroll_position_later(&state, &content_scroll);
+                }
+                queue_home_lazy_load_check(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                );
             }
             Ok(Some(Err(e))) => {
+                home_pagination.continuation.replace(None);
                 content_box.append(&Label::new(Some(&format!("Error: {e}"))));
             }
             Ok(None) => {
+                home_pagination.continuation.replace(None);
                 content_box.append(&Label::new(Some("Not connected.")));
             }
             Err(e) => {
+                home_pagination.continuation.replace(None);
                 content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
             }
         }
+    });
+}
+
+fn restore_home_scroll_position_later(
+    state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+) {
+    let state = state.clone();
+    let content_scroll = content_scroll.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = content_scroll.vadjustment();
+        let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        let target = cached_home_scroll_position(&state).min(max_value);
+        adjustment.set_value(target);
+    });
+}
+
+fn queue_home_lazy_load_check(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+
+    glib::idle_add_local_once(move || {
+        maybe_load_more_home_if_needed(
+            &state,
+            &content_box,
+            &content_scroll,
+            &home_pagination,
+            &ps,
+            &recent_list,
+        );
+    });
+}
+
+fn maybe_load_more_home_if_needed(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    if !content_box.has_css_class("home-view-active") || home_pagination.loading.get() {
+        return;
+    }
+
+    if home_pagination.continuation.borrow().is_none() {
+        return;
+    }
+
+    let adjustment = content_scroll.vadjustment();
+    let remaining = adjustment.upper() - (adjustment.value() + adjustment.page_size());
+    if remaining > 720.0 {
+        return;
+    }
+
+    load_more_home(
+        state,
+        content_box,
+        content_scroll,
+        home_pagination,
+        ps,
+        recent_list,
+    );
+}
+
+fn load_more_home(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    let Some(continuation) = home_pagination.continuation.borrow().clone() else {
+        return;
+    };
+    home_pagination.loading.set(true);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let token = continuation.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_home_page(Some(&token)))
+        })
+        .await;
+
+        home_pagination.loading.set(false);
+
+        let Ok(Some(Ok(page))) = result else {
+            return;
+        };
+
+        if !content_box.has_css_class("home-view-active") {
+            return;
+        }
+
+        let next_continuation = page
+            .continuation
+            .clone()
+            .filter(|token| token != &continuation);
+        home_pagination
+            .continuation
+            .replace(next_continuation.clone());
+
+        {
+            let mut guard = state.lock().unwrap();
+            if let Some(cached) = guard.home_cache.as_mut() {
+                cached.sections.extend(page.sections.clone());
+                cached.continuation = next_continuation.clone();
+            } else {
+                guard.home_cache = Some(HomePage {
+                    sections: page.sections.clone(),
+                    continuation: next_continuation.clone(),
+                });
+            }
+        }
+
+        render_home_view(
+            &content_box,
+            &page.sections,
+            &state,
+            &content_scroll,
+            &home_pagination,
+            &ps,
+            &recent_list,
+            true,
+        );
+        queue_home_lazy_load_check(
+            &state,
+            &content_box,
+            &content_scroll,
+            &home_pagination,
+            &ps,
+            &recent_list,
+        );
     });
 }
 
@@ -3702,6 +4045,174 @@ fn load_search(
                 content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
             }
         }
+    });
+}
+
+fn parse_direct_music_url(input: &str) -> Option<DirectMusicUrlTarget> {
+    let url = url::Url::parse(input.trim()).ok()?;
+    let host = url.host_str()?.trim_start_matches("www.");
+
+    match host {
+        "youtu.be" => {
+            let video_id = url
+                .path_segments()
+                .and_then(|mut segments| segments.next())
+                .filter(|segment| !segment.is_empty())?;
+            Some(DirectMusicUrlTarget::Video {
+                video_id: video_id.to_string(),
+            })
+        }
+        "youtube.com" | "music.youtube.com" => {
+            let path = url.path().trim_end_matches('/');
+            if path == "/watch" {
+                if let Some(video_id) = url
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "v").then_some(value.into_owned()))
+                {
+                    return Some(DirectMusicUrlTarget::Video { video_id });
+                }
+
+                if let Some(list_id) = url
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "list").then_some(value.into_owned()))
+                {
+                    return Some(DirectMusicUrlTarget::Browse {
+                        browse_id: normalize_playlist_browse_id(&list_id),
+                        page_type: infer_browse_page_type(&list_id),
+                    });
+                }
+            }
+
+            if path == "/playlist" {
+                let list_id = url
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "list").then_some(value.into_owned()))?;
+                return Some(DirectMusicUrlTarget::Browse {
+                    browse_id: normalize_playlist_browse_id(&list_id),
+                    page_type: infer_browse_page_type(&list_id),
+                });
+            }
+
+            if let Some(browse_id) = path.strip_prefix("/browse/").filter(|value| !value.is_empty())
+            {
+                return Some(DirectMusicUrlTarget::Browse {
+                    browse_id: browse_id.to_string(),
+                    page_type: infer_browse_page_type(browse_id),
+                });
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn normalize_playlist_browse_id(list_id: &str) -> String {
+    if list_id.starts_with("VL") {
+        list_id.to_string()
+    } else {
+        format!("VL{list_id}")
+    }
+}
+
+fn infer_browse_page_type(browse_id: &str) -> HomeBrowsePageType {
+    if browse_id.starts_with("MPRE") {
+        HomeBrowsePageType::Album
+    } else if browse_id.starts_with("UC") {
+        HomeBrowsePageType::UserChannel
+    } else if browse_id.starts_with("VL") || browse_id.starts_with("OLAK") || browse_id.starts_with("RD")
+    {
+        HomeBrowsePageType::Playlist
+    } else {
+        HomeBrowsePageType::Artist
+    }
+}
+
+fn autoplay_direct_music_url(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    raw_url: &str,
+    target: DirectMusicUrlTarget,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    match target {
+        DirectMusicUrlTarget::Video { video_id } => autoplay_video_url(state, raw_url, &video_id, ps, recent_list),
+        DirectMusicUrlTarget::Browse {
+            browse_id,
+            page_type,
+        } => load_browse_detail(
+            state,
+            content_box,
+            content_scroll,
+            home_pagination,
+            &browse_id,
+            raw_url,
+            None,
+            page_type,
+            ps,
+            recent_list,
+            true,
+        ),
+    }
+}
+
+fn autoplay_video_url(
+    state: &Arc<Mutex<AppState>>,
+    raw_url: &str,
+    video_id: &str,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    let state = state.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let video_id = video_id.to_string();
+    let fallback_title = raw_url.to_string();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let vid = video_id.clone();
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None)))
+                .await;
+
+        let fallback_track = Track {
+            video_id: video_id.clone(),
+            title: fallback_title.clone(),
+            artists: vec![Artist {
+                name: "Unknown artist".to_string(),
+                id: None,
+            }],
+            album: None,
+            duration: None,
+            thumbnail_url: None,
+        };
+
+        let track = match result {
+            Ok(Some(Ok(radio))) => {
+                let tracks = radio.tracks;
+                tracks
+                    .iter()
+                    .find(|track| track.video_id == video_id)
+                    .cloned()
+                    .or_else(|| tracks.into_iter().next())
+                    .unwrap_or(fallback_track)
+            }
+            _ => fallback_track,
+        };
+
+        play_track(
+            &state,
+            &track.video_id,
+            &track.title,
+            &artist_string(&track),
+            track.thumbnail_url.as_deref(),
+            &ps,
+        );
+        add_to_recent(&recent_list, &track, &state, &ps);
     });
 }
 
@@ -4199,6 +4710,72 @@ fn load_playlists(
     });
 }
 
+fn build_home_item_card(
+    item: &HomeItem,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> Button {
+    match item {
+        HomeItem::Track(track) => build_cover_card(track, state, ps, recent_list),
+        HomeItem::BrowseCard(card) => build_home_browse_card(
+            card,
+            state,
+            content_box,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+        ),
+    }
+}
+
+fn build_home_browse_card(
+    card: &HomeBrowseCard,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> Button {
+    let button = build_browse_summary_card(&card.title, card.subtitle.as_deref(), card.thumbnail_url.as_deref());
+
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let content_scroll = content_scroll.clone();
+        let home_pagination = home_pagination.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let browse_id = card.browse_id.clone();
+        let title = card.title.clone();
+        let thumb = card.thumbnail_url.clone();
+        let page_type = card.page_type;
+
+        button.connect_clicked(move |_| {
+            load_browse_detail(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                &browse_id,
+                &title,
+                thumb.as_deref(),
+                page_type,
+                &ps,
+                &recent_list,
+                false,
+            );
+        });
+    }
+
+    button
+}
+
 fn build_playlist_card(
     playlist: &PlaylistSummary,
     state: &Arc<Mutex<AppState>>,
@@ -4206,64 +4783,11 @@ fn build_playlist_card(
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) -> Button {
-    let card_btn = Button::new();
-    card_btn.add_css_class("cover-card");
-    card_btn.set_size_request(166, -1);
-    card_btn.set_hexpand(false);
-    card_btn.set_halign(Align::Start);
-    card_btn.set_valign(Align::Start);
-
-    let card = GtkBox::new(Orientation::Vertical, 6);
-    card.set_size_request(150, -1);
-    card.set_hexpand(false);
-
-    let art_container = GtkBox::new(Orientation::Vertical, 0);
-    art_container.add_css_class("cover-art");
-    art_container.set_size_request(150, 150);
-    art_container.set_hexpand(false);
-    art_container.set_overflow(gtk::Overflow::Hidden);
-
-    if let Some(url) = &playlist.thumbnail_url {
-        let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
-        picture.set_size_request(150, 150);
-        picture.set_hexpand(false);
-        art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 150);
-    } else {
-        let initial = playlist
-            .title
-            .chars()
-            .next()
-            .unwrap_or('\u{266B}')
-            .to_uppercase()
-            .to_string();
-        let letter = Label::new(Some(&initial));
-        letter.add_css_class("cover-art-letter");
-        letter.set_vexpand(true);
-        letter.set_valign(Align::Center);
-        art_container.append(&letter);
-    }
-
-    card.append(&art_container);
-
-    let name = Label::new(Some(&playlist.title));
-    name.add_css_class("cover-card-title");
-    name.set_halign(Align::Start);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    name.set_max_width_chars(18);
-    card.append(&name);
-
-    if let Some(sub) = &playlist.subtitle {
-        let subtitle = Label::new(Some(sub));
-        subtitle.add_css_class("cover-card-artist");
-        subtitle.set_halign(Align::Start);
-        subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        subtitle.set_max_width_chars(18);
-        card.append(&subtitle);
-    }
-
-    card_btn.set_child(Some(&card));
+    let card_btn = build_browse_summary_card(
+        &playlist.title,
+        playlist.subtitle.as_deref(),
+        playlist.thumbnail_url.as_deref(),
+    );
 
     {
         let state = state.clone();
@@ -4299,6 +4823,67 @@ fn build_playlist_card(
         ps,
     );
 
+    card_btn
+}
+
+fn build_browse_summary_card(title: &str, subtitle: Option<&str>, thumbnail_url: Option<&str>) -> Button {
+    let card_btn = Button::new();
+    card_btn.add_css_class("cover-card");
+    card_btn.set_size_request(166, -1);
+    card_btn.set_hexpand(false);
+    card_btn.set_halign(Align::Start);
+    card_btn.set_valign(Align::Start);
+
+    let card = GtkBox::new(Orientation::Vertical, 6);
+    card.set_size_request(150, -1);
+    card.set_hexpand(false);
+
+    let art_container = GtkBox::new(Orientation::Vertical, 0);
+    art_container.add_css_class("cover-art");
+    art_container.set_size_request(150, 150);
+    art_container.set_hexpand(false);
+    art_container.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = thumbnail_url {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(false);
+        picture.set_size_request(150, 150);
+        picture.set_hexpand(false);
+        art_container.append(&picture);
+        load_thumbnail_into(&picture, url, 150);
+    } else {
+        let initial = title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("cover-art-letter");
+        letter.set_vexpand(true);
+        letter.set_valign(Align::Center);
+        art_container.append(&letter);
+    }
+
+    card.append(&art_container);
+
+    let name = Label::new(Some(title));
+    name.add_css_class("cover-card-title");
+    name.set_halign(Align::Start);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.set_max_width_chars(18);
+    card.append(&name);
+
+    if let Some(subtitle) = subtitle {
+        let subtitle_label = Label::new(Some(subtitle));
+        subtitle_label.add_css_class("cover-card-artist");
+        subtitle_label.set_halign(Align::Start);
+        subtitle_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        subtitle_label.set_max_width_chars(18);
+        card.append(&subtitle_label);
+    }
+
+    card_btn.set_child(Some(&card));
     card_btn
 }
 
@@ -4387,6 +4972,144 @@ fn load_playlist_detail(
                         subtitle: Some(format!("{} tracks", tracks.len())),
                     }),
                 ));
+
+                let grid = gtk::Grid::new();
+                grid.set_column_spacing(12);
+                grid.set_row_spacing(8);
+                grid.set_column_homogeneous(true);
+                grid.set_margin_top(4);
+                grid.set_margin_start(20);
+                grid.set_margin_end(20);
+
+                let tracks_rc = Rc::new(tracks);
+                for (i, track) in tracks_rc.iter().enumerate() {
+                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
+                    grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+                }
+
+                content_box.append(&grid);
+            }
+            Ok(Some(Err(e))) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e}"))));
+            }
+            Ok(None) => {
+                content_box.append(&Label::new(Some("Not connected.")));
+            }
+            Err(e) => {
+                content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
+            }
+        }
+    });
+}
+
+fn load_browse_detail(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    browse_id: &str,
+    browse_title: &str,
+    browse_thumb: Option<&str>,
+    page_type: HomeBrowsePageType,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+    autoplay: bool,
+) {
+    clear_box(content_box);
+    let loading = Label::new(Some(&format!("Loading \"{}\"...", browse_title)));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let browse_id = browse_id.to_string();
+    let browse_title = browse_title.to_string();
+    let browse_thumb = browse_thumb.map(str::to_string);
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let bid = browse_id.clone();
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_browse_tracks(&bid)))
+                .await;
+
+        clear_box(&content_box);
+
+        match result {
+            Ok(Some(Ok(tracks))) => {
+                let back_btn = Button::with_label("\u{2190} Back to Home");
+                back_btn.add_css_class("nav-item");
+                back_btn.set_halign(Align::Start);
+                back_btn.set_margin_start(24);
+                back_btn.set_margin_top(12);
+                {
+                    let state = state.clone();
+                    let content_box = content_box.clone();
+                    let content_scroll = content_scroll.clone();
+                    let home_pagination = home_pagination.clone();
+                    let ps = ps.clone();
+                    let recent_list = recent_list.clone();
+                    back_btn.connect_clicked(move |_| {
+                        load_home(
+                            &state,
+                            &content_box,
+                            &content_scroll,
+                            &home_pagination,
+                            &ps,
+                            &recent_list,
+                            false,
+                        );
+                    });
+                }
+                content_box.append(&back_btn);
+
+                let header = Label::new(Some(&browse_title));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(12);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if tracks.is_empty() {
+                    let msg = Label::new(Some("No playable tracks found for this page."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
+
+                if autoplay {
+                    play_from_context(&state, &ps, &tracks, 0);
+                    if let Some(first_track) = tracks.first() {
+                        add_to_recent(&recent_list, first_track, &state, &ps);
+                    }
+                }
+
+                let count_label = Label::new(Some(&format!("{} tracks", tracks.len())));
+                count_label.add_css_class("dim-label");
+                count_label.set_halign(Align::Start);
+                count_label.set_margin_start(28);
+                count_label.set_margin_bottom(4);
+                content_box.append(&count_label);
+
+                let download_meta = matches!(
+                    page_type,
+                    HomeBrowsePageType::Playlist | HomeBrowsePageType::Album
+                )
+                .then(|| DownloadPlaylistMeta {
+                    playlist_id: browse_id.clone(),
+                    title: browse_title.clone(),
+                    thumbnail_url: browse_thumb.clone(),
+                    subtitle: Some(format!("{} tracks", tracks.len())),
+                });
+
+                content_box.append(&build_play_controls(&tracks, &state, &ps, download_meta));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -4651,8 +5374,11 @@ fn render_home_view(
     content_box: &GtkBox,
     sections: &[HomeSection],
     state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
+    prepend_separator: bool,
 ) {
     if sections.is_empty() {
         let msg = Label::new(Some(
@@ -4666,6 +5392,9 @@ fn render_home_view(
 
     // First section -> horizontal cover art cards
     if let Some(first) = sections.first() {
+        if prepend_separator && content_box.first_child().is_some() {
+            content_box.append(&Separator::new(Orientation::Horizontal));
+        }
         let header = Label::new(Some(&first.title));
         header.add_css_class("section-header");
         header.set_halign(Align::Start);
@@ -4681,8 +5410,16 @@ fn render_home_view(
         cards_box.set_margin_top(4);
         cards_box.set_margin_bottom(8);
 
-        for track in &first.contents {
-            cards_box.append(&build_cover_card(track, state, ps, recent_list));
+        for item in &first.contents {
+            cards_box.append(&build_home_item_card(
+                item,
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                ps,
+                recent_list,
+            ));
         }
 
         cards_scroll.set_child(Some(&cards_box));
@@ -4699,19 +5436,47 @@ fn render_home_view(
         header.set_margin_top(8);
         content_box.append(&header);
 
-        let grid = gtk::Grid::new();
-        grid.set_column_spacing(12);
-        grid.set_row_spacing(8);
-        grid.set_column_homogeneous(true);
-        grid.set_margin_top(4);
+        let tracks = home_section_tracks(section);
+        if tracks.len() == section.contents.len() {
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(12);
+            grid.set_row_spacing(8);
+            grid.set_column_homogeneous(true);
+            grid.set_margin_top(4);
 
-        let section_tracks = Rc::new(section.contents.clone());
-        for (i, track) in section_tracks.iter().enumerate() {
-            let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
-            grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            let section_tracks = Rc::new(tracks);
+            for (i, track) in section_tracks.iter().enumerate() {
+                let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
+                grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
+            content_box.append(&grid);
+        } else {
+            let cards_scroll = ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .build();
+            cards_scroll.add_css_class("cards-scroll");
+
+            let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+            cards_box.set_margin_top(4);
+            cards_box.set_margin_bottom(8);
+
+            for item in &section.contents {
+                cards_box.append(&build_home_item_card(
+                    item,
+                    state,
+                    content_box,
+                    content_scroll,
+                    home_pagination,
+                    ps,
+                    recent_list,
+                ));
+            }
+
+            cards_scroll.set_child(Some(&cards_box));
+            content_box.append(&cards_scroll);
         }
-
-        content_box.append(&grid);
     }
 }
 
@@ -4724,8 +5489,19 @@ fn extract_listen_again_tracks(sections: &[HomeSection]) -> Vec<Track> {
                 .iter()
                 .find(|section| section.title.to_ascii_lowercase().contains("listen again"))
         })
-        .map(|section| section.contents.clone())
+        .map(home_section_tracks)
         .unwrap_or_default()
+}
+
+fn home_section_tracks(section: &HomeSection) -> Vec<Track> {
+    section
+        .contents
+        .iter()
+        .filter_map(|item| match item {
+            HomeItem::Track(track) => Some(track.clone()),
+            HomeItem::BrowseCard(_) => None,
+        })
+        .collect()
 }
 
 fn render_search_view(
@@ -6541,6 +7317,7 @@ fn artist_string(track: &Track) -> String {
 }
 
 fn clear_box(container: &GtkBox) {
+    container.remove_css_class("home-view-active");
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }

@@ -43,7 +43,7 @@ const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{PlaybackSnapshot, RepeatMode};
 use crate::models::{
-    Artist, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
+    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
     PlaylistSummary, RadioChip, RadioVirtualPlaylist, Track,
 };
 use crate::player::Player;
@@ -205,6 +205,16 @@ enum DirectMusicUrlTarget {
 struct HomePaginationState {
     continuation: RefCell<Option<String>>,
     loading: Cell<bool>,
+}
+
+enum BrowseDetailData {
+    Tracks(Vec<Track>),
+    Sections(BrowseSectionsPage),
+}
+
+struct ArtistSections<'a> {
+    top_songs: Option<&'a HomeSection>,
+    remaining: Vec<&'a HomeSection>,
 }
 
 #[derive(Debug, Clone)]
@@ -4049,7 +4059,23 @@ fn load_search(
 }
 
 fn parse_direct_music_url(input: &str) -> Option<DirectMusicUrlTarget> {
-    let url = url::Url::parse(input.trim()).ok()?;
+    let trimmed = input.trim();
+
+    if let Some(target) = parse_direct_music_reference(trimmed) {
+        return Some(target);
+    }
+
+    let normalized = if trimmed.starts_with("music.youtube.com/")
+        || trimmed.starts_with("youtube.com/")
+        || trimmed.starts_with("www.youtube.com/")
+        || trimmed.starts_with("youtu.be/")
+    {
+        format!("https://{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+
+    let url = url::Url::parse(&normalized).ok()?;
     let host = url.host_str()?.trim_start_matches("www.");
 
     match host {
@@ -4101,10 +4127,51 @@ fn parse_direct_music_url(input: &str) -> Option<DirectMusicUrlTarget> {
                 });
             }
 
+            if let Some(browse_id) = path
+                .strip_prefix("/channel/")
+                .filter(|value| !value.is_empty())
+            {
+                return Some(DirectMusicUrlTarget::Browse {
+                    browse_id: browse_id.to_string(),
+                    page_type: infer_browse_page_type(browse_id),
+                });
+            }
+
             None
         }
         _ => None,
     }
+}
+
+fn parse_direct_music_reference(input: &str) -> Option<DirectMusicUrlTarget> {
+    let normalized = input.trim().trim_end_matches('/');
+
+    if let Some(browse_id) = normalized
+        .strip_prefix("/browse/")
+        .or_else(|| normalized.strip_prefix("/channel/"))
+        .filter(|value| !value.is_empty())
+    {
+        return Some(DirectMusicUrlTarget::Browse {
+            browse_id: browse_id.to_string(),
+            page_type: infer_browse_page_type(browse_id),
+        });
+    }
+
+    let bare = normalized.trim_start_matches('/');
+    if !bare.is_empty()
+        && (bare.starts_with("UC")
+            || bare.starts_with("MPRE")
+            || bare.starts_with("VL")
+            || bare.starts_with("OLAK")
+            || bare.starts_with("RD"))
+    {
+        return Some(DirectMusicUrlTarget::Browse {
+            browse_id: bare.to_string(),
+            page_type: infer_browse_page_type(bare),
+        });
+    }
+
+    None
 }
 
 fn normalize_playlist_browse_id(list_id: &str) -> String {
@@ -5034,14 +5101,131 @@ fn load_browse_detail(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let bid = browse_id.clone();
-        let result =
-            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_browse_tracks(&bid)))
-                .await;
+        let page_type_bg = page_type;
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| match page_type_bg {
+                HomeBrowsePageType::UserChannel | HomeBrowsePageType::Artist => ytm
+                    .get_channel_page(&bid)
+                    .map(BrowseDetailData::Sections),
+                _ => ytm.get_browse_tracks(&bid).map(BrowseDetailData::Tracks),
+            })
+        })
+        .await;
 
         clear_box(&content_box);
 
         match result {
-            Ok(Some(Ok(tracks))) => {
+            Ok(Some(Ok(BrowseDetailData::Sections(page)))) => {
+                let display_title = page
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| browse_title.clone());
+                let display_thumb = page
+                    .thumbnail_url
+                    .clone()
+                    .or_else(|| browse_thumb.clone());
+                let sections = page.sections;
+                let back_btn = Button::with_label("\u{2190} Back to Home");
+                back_btn.add_css_class("nav-item");
+                back_btn.set_halign(Align::Start);
+                back_btn.set_margin_start(24);
+                back_btn.set_margin_top(12);
+                {
+                    let state = state.clone();
+                    let content_box = content_box.clone();
+                    let content_scroll = content_scroll.clone();
+                    let home_pagination = home_pagination.clone();
+                    let ps = ps.clone();
+                    let recent_list = recent_list.clone();
+                    back_btn.connect_clicked(move |_| {
+                        load_home(
+                            &state,
+                            &content_box,
+                            &content_scroll,
+                            &home_pagination,
+                            &ps,
+                            &recent_list,
+                            false,
+                        );
+                    });
+                }
+                content_box.append(&back_btn);
+
+                let header = Label::new(Some(&display_title));
+                header.add_css_class("section-header");
+                header.set_halign(Align::Start);
+                header.set_margin_start(28);
+                header.set_margin_top(12);
+                header.set_margin_bottom(8);
+                content_box.append(&header);
+
+                if sections.is_empty() {
+                    let msg = Label::new(Some("No sections found for this channel."));
+                    msg.add_css_class("dim-label");
+                    msg.set_margin_top(20);
+                    content_box.append(&msg);
+                    return;
+                }
+
+                if autoplay {
+                    let tracks = flatten_section_tracks(&sections);
+                    if let Some(first_track) = tracks.first() {
+                        play_from_context(&state, &ps, &tracks, 0);
+                        add_to_recent(&recent_list, first_track, &state, &ps);
+                    } else if let Some(card) = first_playable_browse_card(&sections) {
+                        let state_bg = state.clone();
+                        let card = card.clone();
+                        if let Ok(Some(Some(fallback_tracks))) = gio::spawn_blocking(move || {
+                            let client = app_client(&state_bg)?;
+                            let tracks = match card.page_type {
+                                HomeBrowsePageType::Playlist | HomeBrowsePageType::Album => {
+                                    client.get_browse_tracks(&card.browse_id).ok()
+                                }
+                                HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => {
+                                    client
+                                        .get_channel_page(&card.browse_id)
+                                        .ok()
+                                        .map(|page| flatten_section_tracks(&page.sections))
+                                }
+                            }?;
+                            Some(Some(tracks))
+                        })
+                        .await
+                        {
+                            if let Some(first_track) = fallback_tracks.first() {
+                                play_from_context(&state, &ps, &fallback_tracks, 0);
+                                add_to_recent(&recent_list, first_track, &state, &ps);
+                            }
+                        }
+                    }
+                }
+
+                if page_type == HomeBrowsePageType::Artist || is_artist_sections(&sections) {
+                    render_artist_view(
+                        &content_box,
+                        &display_title,
+                        display_thumb.as_deref(),
+                        &sections,
+                        &state,
+                        &content_scroll,
+                        &home_pagination,
+                        &ps,
+                        &recent_list,
+                    );
+                } else {
+                    render_home_view(
+                        &content_box,
+                        &sections,
+                        &state,
+                        &content_scroll,
+                        &home_pagination,
+                        &ps,
+                        &recent_list,
+                        false,
+                    );
+                }
+            }
+            Ok(Some(Ok(BrowseDetailData::Tracks(tracks)))) => {
                 let back_btn = Button::with_label("\u{2190} Back to Home");
                 back_btn.add_css_class("nav-item");
                 back_btn.set_halign(Align::Start);
@@ -5392,6 +5576,7 @@ fn render_home_view(
 
     // First section -> horizontal cover art cards
     if let Some(first) = sections.first() {
+        let first_tracks = home_section_tracks(first);
         if prepend_separator && content_box.first_child().is_some() {
             content_box.append(&Separator::new(Orientation::Horizontal));
         }
@@ -5399,6 +5584,10 @@ fn render_home_view(
         header.add_css_class("section-header");
         header.set_halign(Align::Start);
         content_box.append(&header);
+
+        if first_tracks.len() == first.contents.len() && !first_tracks.is_empty() {
+            content_box.append(&build_play_controls(&first_tracks, state, ps, None));
+        }
 
         let cards_scroll = ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -5438,6 +5627,9 @@ fn render_home_view(
 
         let tracks = home_section_tracks(section);
         if tracks.len() == section.contents.len() {
+            if !tracks.is_empty() {
+                content_box.append(&build_play_controls(&tracks, state, ps, None));
+            }
             let grid = gtk::Grid::new();
             grid.set_column_spacing(12);
             grid.set_row_spacing(8);
@@ -5480,6 +5672,160 @@ fn render_home_view(
     }
 }
 
+fn render_artist_view(
+    content_box: &GtkBox,
+    artist_name: &str,
+    thumbnail_url: Option<&str>,
+    sections: &[HomeSection],
+    state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    let ArtistSections {
+        top_songs,
+        remaining,
+    } = split_artist_sections(sections);
+
+    let hero = GtkBox::new(Orientation::Horizontal, 18);
+    hero.set_margin_top(8);
+    hero.set_margin_bottom(8);
+    hero.set_margin_start(28);
+    hero.set_margin_end(28);
+
+    let art_frame = GtkBox::new(Orientation::Vertical, 0);
+    art_frame.add_css_class("cover-art");
+    art_frame.set_size_request(180, 180);
+    art_frame.set_overflow(gtk::Overflow::Hidden);
+    if let Some(url) = thumbnail_url {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(false);
+        picture.set_size_request(180, 180);
+        art_frame.append(&picture);
+        load_thumbnail_into(&picture, url, 300);
+    } else {
+        let initial = artist_name
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("cover-art-letter");
+        letter.set_vexpand(true);
+        letter.set_valign(Align::Center);
+        art_frame.append(&letter);
+    }
+    hero.append(&art_frame);
+
+    let meta = GtkBox::new(Orientation::Vertical, 8);
+    meta.set_hexpand(true);
+    meta.set_valign(Align::Center);
+
+    let eyebrow = Label::new(Some("Artist"));
+    eyebrow.add_css_class("dim-label");
+    eyebrow.set_halign(Align::Start);
+    meta.append(&eyebrow);
+
+    let title = Label::new(Some(artist_name));
+    title.add_css_class("section-header");
+    title.set_halign(Align::Start);
+    title.set_wrap(true);
+    meta.append(&title);
+
+    let summary = if let Some(top_songs) = top_songs {
+        format!(
+            "{} top songs  •  {} featured sections",
+            home_section_tracks(top_songs).len(),
+            remaining.len()
+        )
+    } else {
+        format!("{} featured sections", remaining.len())
+    };
+    let summary_label = Label::new(Some(&summary));
+    summary_label.add_css_class("dim-label");
+    summary_label.set_halign(Align::Start);
+    meta.append(&summary_label);
+
+    if let Some(top_songs) = top_songs {
+        let tracks = home_section_tracks(top_songs);
+        if !tracks.is_empty() {
+            meta.append(&build_play_controls(&tracks, state, ps, None));
+        }
+    }
+
+    hero.append(&meta);
+    content_box.append(&hero);
+
+    if let Some(top_songs) = top_songs {
+        content_box.append(&Separator::new(Orientation::Horizontal));
+
+        let header = Label::new(Some(&top_songs.title));
+        header.add_css_class("section-header");
+        header.set_halign(Align::Start);
+        header.set_margin_top(8);
+        content_box.append(&header);
+
+        let tracks = home_section_tracks(top_songs);
+        if !tracks.is_empty() {
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(12);
+            grid.set_row_spacing(8);
+            grid.set_column_homogeneous(true);
+            grid.set_margin_top(4);
+
+            let section_tracks = Rc::new(tracks);
+            for (i, track) in section_tracks.iter().enumerate() {
+                let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
+                grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
+            content_box.append(&grid);
+        }
+    }
+
+    for section in remaining {
+        content_box.append(&Separator::new(Orientation::Horizontal));
+
+        let header = Label::new(Some(&section.title));
+        header.add_css_class("section-header");
+        header.set_halign(Align::Start);
+        header.set_margin_top(8);
+        content_box.append(&header);
+
+        let tracks = home_section_tracks(section);
+        if tracks.len() == section.contents.len() && !tracks.is_empty() {
+            content_box.append(&build_play_controls(&tracks, state, ps, None));
+        }
+
+        let cards_scroll = ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        cards_scroll.add_css_class("cards-scroll");
+
+        let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+        cards_box.set_margin_top(4);
+        cards_box.set_margin_bottom(8);
+
+        for item in &section.contents {
+            cards_box.append(&build_home_item_card(
+                item,
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                ps,
+                recent_list,
+            ));
+        }
+
+        cards_scroll.set_child(Some(&cards_box));
+        content_box.append(&cards_scroll);
+    }
+}
+
 fn extract_listen_again_tracks(sections: &[HomeSection]) -> Vec<Track> {
     sections
         .iter()
@@ -5502,6 +5848,46 @@ fn home_section_tracks(section: &HomeSection) -> Vec<Track> {
             HomeItem::BrowseCard(_) => None,
         })
         .collect()
+}
+
+fn flatten_section_tracks(sections: &[HomeSection]) -> Vec<Track> {
+    sections.iter().flat_map(home_section_tracks).collect()
+}
+
+fn first_playable_browse_card(sections: &[HomeSection]) -> Option<HomeBrowseCard> {
+    sections.iter().find_map(|section| {
+        section.contents.iter().find_map(|item| match item {
+            HomeItem::BrowseCard(card) => Some(card.clone()),
+            HomeItem::Track(_) => None,
+        })
+    })
+}
+
+fn is_artist_sections(sections: &[HomeSection]) -> bool {
+    sections.iter().any(|section| {
+        matches!(
+            section.title.as_str(),
+            "Top songs" | "Albums" | "Singles & EPs" | "Featured on" | "Fans might also like"
+        )
+    })
+}
+
+fn split_artist_sections<'a>(sections: &'a [HomeSection]) -> ArtistSections<'a> {
+    let mut top_songs = None;
+    let mut remaining = Vec::new();
+
+    for section in sections {
+        if top_songs.is_none() && section.title == "Top songs" {
+            top_songs = Some(section);
+        } else {
+            remaining.push(section);
+        }
+    }
+
+    ArtistSections {
+        top_songs,
+        remaining,
+    }
 }
 
 fn render_search_view(

@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::models::{
-    Artist, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
+    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
     PlaylistSummary, RadioChip, RadioQueue, Track,
 };
 
@@ -49,6 +49,53 @@ pub fn parse_home_page(json: &Value) -> Result<HomePage> {
     Ok(HomePage {
         sections,
         continuation: extract_home_continuation(json),
+    })
+}
+
+pub fn parse_channel_page(json: &Value) -> Result<BrowseSectionsPage> {
+    let contents = json
+        .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents")
+        .or_else(|| {
+            json.pointer(
+                "/contents/twoColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents",
+            )
+        })
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let title = [
+        "/header/musicImmersiveHeaderRenderer/title/runs/0/text",
+        "/header/musicVisualHeaderRenderer/title/runs/0/text",
+        "/header/musicDetailHeaderRenderer/title/runs/0/text",
+    ]
+    .iter()
+    .find_map(|path| {
+        json.pointer(path)
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    });
+
+    let thumbnail_url = [
+        "/header/musicImmersiveHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+        "/header/musicVisualHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+        "/header/musicDetailHeaderRenderer/thumbnail/croppedSquareThumbnailRenderer/thumbnail/thumbnails",
+        "/header/musicDetailHeaderRenderer/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails",
+    ]
+    .iter()
+    .find_map(|path| {
+        json.pointer(path)
+            .and_then(|value| value.as_array())
+            .and_then(|thumbs| thumbs.last())
+            .and_then(|thumb| thumb.get("url"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+    });
+
+    Ok(BrowseSectionsPage {
+        title,
+        thumbnail_url,
+        sections: parse_home_sections(&contents),
     })
 }
 

@@ -45,6 +45,13 @@ pub struct HomePage {
     pub continuation: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseSectionsPage {
+    pub title: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub sections: Vec<HomeSection>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HomeItem {
     Track(Track),

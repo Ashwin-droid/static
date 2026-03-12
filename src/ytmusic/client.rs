@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
 
-use crate::models::{HomeItem, HomePage, PlaylistSummary, RadioQueue, Track};
+use crate::models::{BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, Track};
 
 use super::cipher::Cipher;
 use super::parsers;
@@ -734,6 +734,26 @@ impl YtMusicClient {
                 .await
                 .with_context(|| format!("Failed to parse browse response for {browse_id}"))?;
             parsers::parse_browse_tracks(&json)
+        })
+    }
+
+    pub fn get_channel_page(&self, browse_id: &str) -> Result<BrowseSectionsPage> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["browseId"] = json!(browse_id);
+
+            let resp = self
+                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("Failed to fetch channel page {browse_id}"))?;
+
+            let json: Value = resp
+                .json()
+                .await
+                .with_context(|| format!("Failed to parse channel response for {browse_id}"))?;
+            parsers::parse_channel_page(&json)
         })
     }
 

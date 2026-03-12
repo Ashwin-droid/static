@@ -44,6 +44,13 @@ static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
         .unwrap()
 });
 
+static THUMB_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
+    BlockingClient::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+});
+
 struct ActiveTrack {
     video_id: String,
     title: String,
@@ -74,6 +81,8 @@ struct DaemonState {
     last_radio_append_anchor: Option<String>,
     background_tx: mpsc::Sender<BackgroundEvent>,
     deferred_actions: VecDeque<DeferredAction>,
+    offline_sync_in_flight: bool,
+    offline_sync_pending: bool,
     last_duration_micros: Cell<Option<i64>>,
     mpris: RefCell<Option<Rc<DaemonMprisBridge>>>,
     shutting_down: Cell<bool>,
@@ -98,6 +107,7 @@ enum BackgroundEvent {
         tracks: Vec<Track>,
         chips: Vec<crate::models::RadioChip>,
     },
+    OfflineSyncFinished,
 }
 
 enum DeferredAction {
@@ -399,10 +409,17 @@ pub fn run() -> Result<()> {
         last_radio_append_anchor: None,
         background_tx,
         deferred_actions: VecDeque::new(),
+        offline_sync_in_flight: false,
+        offline_sync_pending: false,
         last_duration_micros: Cell::new(None),
         mpris: RefCell::new(None),
         shutting_down: Cell::new(false),
     }));
+
+    {
+        let mut state = state.borrow_mut();
+        schedule_offline_cache_sync(&mut state);
+    }
 
     {
         let state = state.clone();
@@ -626,6 +643,13 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
 
             if added > 0 {
                 sync_mpris(state);
+            }
+        }
+        BackgroundEvent::OfflineSyncFinished => {
+            state.offline_sync_in_flight = false;
+            if state.offline_sync_pending {
+                state.offline_sync_pending = false;
+                schedule_offline_cache_sync(state);
             }
         }
     }
@@ -867,9 +891,323 @@ fn reload_settings(state: &mut DaemonState) {
             state.settings = settings;
             refresh_sponsorblock_for_current_track(state);
             prefetch_upcoming(state);
+            schedule_offline_cache_sync(state);
         }
         Err(err) => eprintln!("[STATICD] failed to reload settings: {err}"),
     }
+}
+
+fn schedule_offline_cache_sync(state: &mut DaemonState) {
+    if state.offline_sync_in_flight {
+        state.offline_sync_pending = true;
+        return;
+    }
+
+    state.offline_sync_in_flight = true;
+
+    let settings = state.settings.clone();
+    let background_tx = state.background_tx.clone();
+    let cookie = get_cookie();
+    let vr_refresh_token = get_vr_refresh_token();
+    let storage_root = get_storage_root();
+
+    std::thread::spawn(move || {
+        if let Err(err) = run_offline_cache_sync(
+            &settings,
+            cookie.as_deref(),
+            vr_refresh_token.as_deref(),
+            storage_root.as_deref(),
+        ) {
+            eprintln!("[OFFLINE_SYNC] failed: {err}");
+        }
+        let _ = background_tx.send(BackgroundEvent::OfflineSyncFinished);
+    });
+}
+
+fn run_offline_cache_sync(
+    settings: &AppSettings,
+    cookie: Option<&str>,
+    vr_refresh_token: Option<&str>,
+    storage_root: Option<&str>,
+) -> Result<()> {
+    let mut cache = MusicCache::new().context("Failed to initialise music cache")?;
+    if let Some(root) = storage_root {
+        if let Err(err) = cache.migrate_storage_root(root) {
+            eprintln!("[OFFLINE_SYNC] failed to apply storage root override: {err}");
+            let _ = cache.apply_storage_root("");
+        }
+    }
+
+    let client = cookie.and_then(|cookie| match YtMusicClient::new(cookie) {
+        Ok(client) => {
+            if let Some(token) = vr_refresh_token {
+                client.set_vr_refresh_token(token);
+            }
+            Some(client)
+        }
+        Err(err) => {
+            eprintln!("[OFFLINE_SYNC] failed to initialize YT Music client: {err}");
+            None
+        }
+    });
+
+    sync_downloaded_playlists(&mut cache, client.as_ref());
+    sync_auto_offline_cache(&mut cache, settings, client.as_ref());
+
+    Ok(())
+}
+
+fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&YtMusicClient>) {
+    let offline_playlists = cache.offline_playlists().unwrap_or_default();
+    if offline_playlists.is_empty() {
+        return;
+    }
+
+    let Some(client) = client else {
+        return;
+    };
+
+    for (playlist_id, title, thumbnail_url, subtitle) in offline_playlists {
+        let local_ids = cache
+            .offline_playlist_track_ids(&playlist_id)
+            .unwrap_or_default();
+
+        let upstream_tracks = match client.get_playlist(&playlist_id) {
+            Ok(tracks) => tracks,
+            Err(err) => {
+                eprintln!("[PLAYLIST_SYNC] failed to fetch {playlist_id}: {err}");
+                continue;
+            }
+        };
+        let upstream_ids: Vec<String> = upstream_tracks
+            .iter()
+            .map(|track| track.video_id.clone())
+            .collect();
+
+        if upstream_ids == local_ids {
+            continue;
+        }
+
+        let local_set = local_ids.iter().cloned().collect::<HashSet<_>>();
+        let upstream_set = upstream_ids.iter().cloned().collect::<HashSet<_>>();
+        let removed_ids = local_ids
+            .iter()
+            .filter(|video_id| !upstream_set.contains(*video_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for track in upstream_tracks
+            .iter()
+            .filter(|track| !local_set.contains(&track.video_id))
+        {
+            eprintln!(
+                "[PLAYLIST_SYNC] caching new track for {}: {}",
+                playlist_id, track.video_id
+            );
+            let _ = ensure_track_available_offline(cache, client, track, true, "PLAYLIST_SYNC");
+        }
+
+        let _ = cache.store_offline_playlist(
+            &playlist_id,
+            &title,
+            thumbnail_url.as_deref(),
+            subtitle.as_deref(),
+            &upstream_ids,
+        );
+
+        for video_id in removed_ids {
+            let still_needed = cache.is_track_in_any_offline_playlist(&video_id).unwrap_or(false);
+            if !still_needed {
+                let _ = cache.remove_cached(&video_id);
+            }
+        }
+
+        eprintln!("[PLAYLIST_SYNC] refreshed downloaded playlist: {playlist_id}");
+    }
+}
+
+fn sync_auto_offline_cache(
+    cache: &mut MusicCache,
+    settings: &AppSettings,
+    client: Option<&YtMusicClient>,
+) {
+    if !settings.auto_manage_offline_cache {
+        return;
+    }
+
+    let cache_target = settings.offline_cache_target as usize;
+    let top = match cache.auto_offline_candidates(settings, cache_target) {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            eprintln!("[CACHE] failed to compute offline candidates: {err}");
+            return;
+        }
+    };
+    let cached = cache.cached_ids().unwrap_or_default();
+    let pinned = cache.pinned_ids().unwrap_or_default();
+
+    for id in &cached {
+        if !top.contains(id) && !pinned.contains(id) {
+            let _ = cache.remove_cached(id);
+        }
+    }
+
+    let to_download: Vec<String> = top
+        .into_iter()
+        .take(cache_target)
+        .filter(|id| !cached.contains(id))
+        .collect();
+
+    if to_download.is_empty() {
+        return;
+    }
+
+    let Some(client) = client else {
+        return;
+    };
+
+    for video_id in to_download {
+        let url = match client.get_audio_url_no_track(&video_id) {
+            Ok(url) => url,
+            Err(err) => {
+                eprintln!("[CACHE] failed to get URL for {video_id}: {err}");
+                continue;
+            }
+        };
+
+        eprintln!("[CACHE] downloading {video_id} for offline...");
+        let audio = match DOWNLOAD_CLIENT
+            .get(&url)
+            .header("Range", "bytes=0-")
+            .send()
+            .and_then(|response| {
+                let status = response.status();
+                eprintln!(
+                    "[CACHE] {video_id} response: {status}, content-length: {:?}",
+                    response.content_length()
+                );
+                response.bytes()
+            }) {
+            Ok(bytes) => {
+                eprintln!("[CACHE] {video_id} downloaded {} KB", bytes.len() / 1024);
+                bytes
+            }
+            Err(err) => {
+                eprintln!("[CACHE] download failed for {video_id}: {err}");
+                continue;
+            }
+        };
+
+        let thumb_url = cache.get_thumbnail_url(&video_id);
+        let art = thumb_url.as_deref().and_then(fetch_thumbnail_bytes);
+
+        let _ = cache.store_audio(&video_id, &audio, art.as_deref());
+        hydrate_offline_sponsorblock_cache(cache, &video_id);
+    }
+}
+
+fn ensure_track_available_offline(
+    cache: &mut MusicCache,
+    client: &YtMusicClient,
+    track: &Track,
+    pin: bool,
+    log_prefix: &str,
+) -> bool {
+    let video_id = &track.video_id;
+
+    if cache.is_cached(video_id) {
+        if pin {
+            let _ = cache.pin_offline(video_id);
+        }
+        hydrate_offline_sponsorblock_cache(cache, video_id);
+        return true;
+    }
+
+    let artist = artist_string(track);
+    let _ = cache.record_play(
+        video_id,
+        &track.title,
+        &artist,
+        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        0,
+    );
+
+    let url = match client.get_audio_url_no_track(video_id) {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!("[{log_prefix}] failed URL for {video_id}: {err}");
+            return false;
+        }
+    };
+
+    let audio = match DOWNLOAD_CLIENT
+        .get(&url)
+        .header("Range", "bytes=0-")
+        .send()
+        .and_then(|response| response.bytes())
+    {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("[{log_prefix}] download failed for {video_id}: {err}");
+            return false;
+        }
+    };
+
+    let art = track
+        .thumbnail_url
+        .as_ref()
+        .and_then(|url| fetch_thumbnail_bytes(url));
+
+    let _ = cache.store_audio(video_id, &audio, art.as_deref());
+    if pin {
+        let _ = cache.pin_offline(video_id);
+    }
+    hydrate_offline_sponsorblock_cache(cache, video_id);
+    true
+}
+
+fn hydrate_offline_sponsorblock_cache(cache: &mut MusicCache, video_id: &str) {
+    match cache.get_offline_sponsor_segments(video_id) {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("[SPONSORBLOCK] failed to read offline cache for {video_id}: {err}");
+        }
+    }
+
+    let sponsorblock = match SponsorBlockClient::new() {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!("[SPONSORBLOCK] failed to initialize client for {video_id}: {err}");
+            return;
+        }
+    };
+
+    let segments = match sponsorblock.fetch_skip_segments(video_id, &default_skip_categories()) {
+        Ok(segments) => segments,
+        Err(err) => {
+            eprintln!("[SPONSORBLOCK] failed to hydrate offline cache for {video_id}: {err}");
+            return;
+        }
+    };
+
+    if let Err(err) = cache.store_offline_sponsor_segments(video_id, &segments) {
+        eprintln!("[SPONSORBLOCK] failed to store offline cache for {video_id}: {err}");
+    }
+}
+
+fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
+    if let Some(path) = url.strip_prefix("file://") {
+        return std::fs::read(path).ok();
+    }
+
+    THUMB_CLIENT
+        .get(url)
+        .send()
+        .ok()?
+        .bytes()
+        .ok()
+        .map(|bytes| bytes.to_vec())
 }
 
 fn maybe_run_deferred_action(state: &mut DaemonState) {

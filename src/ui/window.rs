@@ -171,6 +171,7 @@ struct PlayerState {
     sponsor_segments: RefCell<Vec<SponsorSegment>>,
     sponsor_segments_reported: RefCell<HashSet<String>>,
     daemon_refresh_in_flight: Cell<bool>,
+    play_request_serial: Cell<u64>,
     // Queue panel widgets
     queue_list_box: GtkBox,
     chip_bar: GtkBox,
@@ -320,6 +321,16 @@ fn sync_remote_queue(ps: &Rc<PlayerState>) {
         ps.radio_virtual_playlist.borrow().clone(),
         ps.repeat_mode.get(),
     );
+}
+
+fn next_play_request_serial(ps: &PlayerState) -> u64 {
+    let next = ps.play_request_serial.get().wrapping_add(1);
+    ps.play_request_serial.set(next);
+    next
+}
+
+fn is_current_play_request(ps: &PlayerState, request_serial: u64) -> bool {
+    ps.play_request_serial.get() == request_serial
 }
 
 fn apply_remote_snapshot(
@@ -1413,6 +1424,9 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     recent_scroll.set_max_content_width(SIDEBAR_WIDTH);
     recent_scroll.set_propagate_natural_width(false);
     recent_scroll.set_child(Some(&recent_list));
+    install_vertical_scroll_capture(&sidebar, &recent_scroll, "sidebar-shell");
+    install_vertical_scroll_capture(&recent_scroll, &recent_scroll, "sidebar-scroll");
+    install_vertical_scroll_capture(&recent_list, &recent_scroll, "sidebar-list");
     sidebar.append(&recent_scroll);
 
     // Bottom: Settings
@@ -1470,6 +1484,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     });
 
     scrolled.set_child(Some(&content_box));
+    install_vertical_scroll_capture(&scrolled, &scrolled, "content-scroll");
+    install_vertical_scroll_capture(&content_box, &scrolled, "content-box");
 
     let content_overlay = Overlay::new();
     content_overlay.set_hexpand(true);
@@ -1667,6 +1683,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         .vexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .build();
+    install_vertical_scroll_passthrough(&chip_scroll, &queue_scroll, "queue-chip-scroll");
     let queue_overlay = Overlay::new();
     let queue_list_box = GtkBox::new(Orientation::Vertical, 0);
     queue_list_box.set_margin_top(4);
@@ -1760,6 +1777,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         sponsor_segments: RefCell::new(Vec::new()),
         sponsor_segments_reported: RefCell::new(HashSet::new()),
         daemon_refresh_in_flight: Cell::new(false),
+        play_request_serial: Cell::new(0),
         queue_list_box: queue_list_box.clone(),
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
@@ -1853,9 +1871,19 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let ps = ps.clone();
         let state = state.clone();
         next_btn.connect_clicked(move |_| {
-            if let Ok(snapshot) = ps.player.next() {
-                apply_remote_snapshot(&ps, &state, snapshot);
-            }
+            let request_serial = next_play_request_serial(&ps);
+            let client = ps.player.daemon_client();
+            let ps = ps.clone();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || client.next()).await;
+                if !is_current_play_request(&ps, request_serial) {
+                    return;
+                }
+                if let Ok(Ok(snapshot)) = result {
+                    apply_remote_snapshot(&ps, &state, snapshot);
+                }
+            });
         });
     }
 
@@ -1864,9 +1892,19 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         let ps = ps.clone();
         let state = state.clone();
         prev_btn.connect_clicked(move |_| {
-            if let Ok(snapshot) = ps.player.previous() {
-                apply_remote_snapshot(&ps, &state, snapshot);
-            }
+            let request_serial = next_play_request_serial(&ps);
+            let client = ps.player.daemon_client();
+            let ps = ps.clone();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || client.previous()).await;
+                if !is_current_play_request(&ps, request_serial) {
+                    return;
+                }
+                if let Ok(Ok(snapshot)) = result {
+                    apply_remote_snapshot(&ps, &state, snapshot);
+                }
+            });
         });
     }
 
@@ -2081,13 +2119,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     {
         let state = state.clone();
         let content_box = content_box.clone();
+        let content_scroll = scrolled.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
 
         offline_btn.connect_clicked(move |btn| {
             set_active_nav(btn, &nav);
-            load_offline(&state, &content_box, &ps, &recent_list);
+            load_offline(&state, &content_box, &content_scroll, &ps, &recent_list);
         });
     }
 
@@ -3902,6 +3941,99 @@ fn queue_home_lazy_load_check(
     });
 }
 
+fn apply_vertical_scroll_delta(scroll: &ScrolledWindow, dy: f64) -> bool {
+    if dy.abs() <= f64::EPSILON {
+        return false;
+    }
+
+    let adjustment = scroll.vadjustment();
+    let lower = adjustment.lower();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+    if upper <= lower {
+        return false;
+    }
+
+    let delta = if dy.abs() <= 4.0 { dy * 48.0 } else { dy };
+    let current = adjustment.value();
+    let target = (adjustment.value() + delta).clamp(lower, upper);
+    if (target - current).abs() <= f64::EPSILON {
+        return false;
+    }
+
+    adjustment.set_value(target);
+    true
+}
+
+fn install_vertical_scroll_capture<W: IsA<gtk::Widget>>(
+    widget: &W,
+    scroll: &ScrolledWindow,
+    _source: &'static str,
+) {
+    let scroll = scroll.clone();
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_propagation_limit(gtk::PropagationLimit::None);
+    controller.connect_scroll(move |controller, dx, dy| {
+        if dy.abs() <= f64::EPSILON || dy.abs() <= dx.abs() {
+            return glib::Propagation::Proceed;
+        }
+
+        if controller
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SHIFT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+
+        if apply_vertical_scroll_delta(&scroll, dy) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    widget.as_ref().add_controller(controller);
+}
+
+fn build_horizontal_cards_scroll(parent_scroll: &ScrolledWindow) -> ScrolledWindow {
+    let cards_scroll = ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    cards_scroll.add_css_class("cards-scroll");
+    install_vertical_scroll_passthrough(&cards_scroll, parent_scroll, "horizontal-cards");
+    cards_scroll
+}
+
+fn install_vertical_scroll_passthrough(
+    child_scroll: &ScrolledWindow,
+    parent_scroll: &ScrolledWindow,
+    _source: &'static str,
+) {
+    let parent_scroll = parent_scroll.clone();
+    let controller = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+    controller.set_propagation_limit(gtk::PropagationLimit::None);
+    controller.connect_scroll(move |controller, dx, dy| {
+        if dy.abs() <= f64::EPSILON || dy.abs() <= dx.abs() {
+            return glib::Propagation::Proceed;
+        }
+
+        if controller
+            .current_event_state()
+            .contains(gtk::gdk::ModifierType::SHIFT_MASK)
+        {
+            return glib::Propagation::Proceed;
+        }
+
+        if apply_vertical_scroll_delta(&parent_scroll, dy) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    child_scroll.add_controller(controller);
+}
+
 fn maybe_load_more_home_if_needed(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -4492,6 +4624,7 @@ fn offline_thumbnail_url(cache: &MusicCache, video_id: &str) -> Option<String> {
 fn load_offline(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
@@ -4503,6 +4636,7 @@ fn load_offline(
 
     let state = state.clone();
     let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
     let ps = ps.clone();
     let recent_list = recent_list.clone();
 
@@ -4541,11 +4675,7 @@ fn load_offline(
                     pl_header.set_margin_bottom(4);
                     content_box.append(&pl_header);
 
-                    let cards_scroll = ScrolledWindow::builder()
-                        .hscrollbar_policy(gtk::PolicyType::Automatic)
-                        .vscrollbar_policy(gtk::PolicyType::Never)
-                        .build();
-                    cards_scroll.add_css_class("cards-scroll");
+                    let cards_scroll = build_horizontal_cards_scroll(&content_scroll);
 
                     let cards_box = GtkBox::new(Orientation::Horizontal, 14);
                     cards_box.set_margin_top(4);
@@ -4557,6 +4687,7 @@ fn load_offline(
                             playlist,
                             &state,
                             &content_box,
+                            &content_scroll,
                             &ps,
                             &recent_list,
                         );
@@ -5311,6 +5442,7 @@ fn build_offline_playlist_card(
     playlist: &PlaylistSummary,
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) -> Button {
@@ -5373,6 +5505,7 @@ fn build_offline_playlist_card(
     {
         let state = state.clone();
         let content_box = content_box.clone();
+        let content_scroll = content_scroll.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let playlist_id = playlist.playlist_id.clone();
@@ -5382,6 +5515,7 @@ fn build_offline_playlist_card(
             load_offline_playlist_detail(
                 &state,
                 &content_box,
+                &content_scroll,
                 &playlist_id,
                 &playlist_title,
                 &ps,
@@ -5408,6 +5542,7 @@ fn build_offline_playlist_card(
 fn load_offline_playlist_detail(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
     playlist_id: &str,
     playlist_title: &str,
     ps: &Rc<PlayerState>,
@@ -5421,6 +5556,7 @@ fn load_offline_playlist_detail(
 
     let state = state.clone();
     let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
     let ps = ps.clone();
     let recent_list = recent_list.clone();
     let playlist_id = playlist_id.to_string();
@@ -5448,7 +5584,7 @@ fn load_offline_playlist_detail(
                     let ps = ps.clone();
                     let recent_list = recent_list.clone();
                     back_btn.connect_clicked(move |_| {
-                        load_offline(&state, &content_box, &ps, &recent_list);
+                        load_offline(&state, &content_box, &content_scroll, &ps, &recent_list);
                     });
                 }
                 content_box.append(&back_btn);
@@ -5572,11 +5708,7 @@ fn render_home_view(
             content_box.append(&build_play_controls(&first_tracks, state, ps, None));
         }
 
-        let cards_scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        cards_scroll.add_css_class("cards-scroll");
+        let cards_scroll = build_horizontal_cards_scroll(content_scroll);
 
         let cards_box = GtkBox::new(Orientation::Horizontal, 14);
         cards_box.set_margin_top(4);
@@ -5627,11 +5759,7 @@ fn render_home_view(
 
             content_box.append(&grid);
         } else {
-            let cards_scroll = ScrolledWindow::builder()
-                .hscrollbar_policy(gtk::PolicyType::Automatic)
-                .vscrollbar_policy(gtk::PolicyType::Never)
-                .build();
-            cards_scroll.add_css_class("cards-scroll");
+            let cards_scroll = build_horizontal_cards_scroll(content_scroll);
 
             let cards_box = GtkBox::new(Orientation::Horizontal, 14);
             cards_box.set_margin_top(4);
@@ -5783,11 +5911,7 @@ fn render_artist_view(
             content_box.append(&build_play_controls(&tracks, state, ps, None));
         }
 
-        let cards_scroll = ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .vscrollbar_policy(gtk::PolicyType::Never)
-            .build();
-        cards_scroll.add_css_class("cards-scroll");
+        let cards_scroll = build_horizontal_cards_scroll(content_scroll);
 
         let cards_box = GtkBox::new(Orientation::Horizontal, 14);
         cards_box.set_margin_top(4);
@@ -6244,6 +6368,8 @@ fn label_scroller(label: &Label, height: i32) -> ScrolledWindow {
     sw.set_propagate_natural_width(false);
     sw.set_propagate_natural_height(false);
     sw.set_min_content_width(0);
+    sw.set_can_target(false);
+    label.set_can_target(false);
     sw.set_child(Some(label));
 
     // Start marquee when text changes
@@ -6319,6 +6445,7 @@ fn scrolling_label(text: &str, css_class: &str, height: i32) -> ScrolledWindow {
     sw.set_vexpand(false);
     sw.set_propagate_natural_width(false);
     sw.set_min_content_width(0);
+    sw.set_can_target(false);
     // Keep marquee labels from inflating the sidebar's preferred width while
     // still allowing the label to scroll inside the fixed 240 px sidebar.
     sw.set_max_content_width(SIDEBAR_RECENT_CONTENT_WIDTH);
@@ -6326,6 +6453,7 @@ fn scrolling_label(text: &str, css_class: &str, height: i32) -> ScrolledWindow {
     let label = Label::new(Some(text));
     label.add_css_class(css_class);
     label.set_halign(Align::Start);
+    label.set_can_target(false);
     sw.set_child(Some(&label));
 
     // After 1 s, if text overflows, start a smooth scroll loop
@@ -6616,22 +6744,32 @@ fn play_track(
     let state = state.clone();
     let video_id = video_id.to_string();
     let ps = ps.clone();
+    let request_serial = next_play_request_serial(&ps);
+    let client = ps.player.daemon_client();
+    let queue = ps.queue.borrow().clone();
+    let radio_virtual_playlist = ps.radio_virtual_playlist.borrow().clone();
+    let repeat_mode = ps.repeat_mode.get();
 
     glib::spawn_future_local(async move {
-        match ps
-            .player
-            .play_queue_at(
-                ps.queue.borrow().clone(),
-                0,
-                ps.radio_virtual_playlist.borrow().clone(),
-                ps.repeat_mode.get(),
-            )
-        {
-            Ok(snapshot) => {
-                apply_remote_snapshot(&ps, &state, snapshot);
+        let playback_result = gio::spawn_blocking(move || {
+            client.play_queue_at(queue, 0, radio_virtual_playlist, repeat_mode)
+        })
+        .await;
+
+        if !is_current_play_request(&ps, request_serial) {
+            return;
+        }
+
+        match playback_result {
+            Ok(Ok(snapshot)) => apply_remote_snapshot(&ps, &state, snapshot),
+            Ok(Err(err)) => {
+                ps.np_title.set_text(&err.to_string());
+                ps.np_artist.set_text("");
+                return;
             }
-            Err(msg) => {
-                ps.np_title.set_text(&msg);
+            Err(err) => {
+                ps.np_title
+                    .set_text(&format!("Playback start failed: {err:?}"));
                 ps.np_artist.set_text("");
                 return;
             }
@@ -6644,6 +6782,10 @@ fn play_track(
             app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
         })
         .await;
+
+        if !is_current_play_request(&ps, request_serial) {
+            return;
+        }
 
         if let Ok(Some(Ok(mut radio))) = radio_result {
             // Ensure the seed track is always first in the queue
@@ -6841,22 +6983,37 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     // Re-render queue to highlight current track
     render_queue_panel(ps, state);
     maybe_extend_radio_queue(state, ps);
+    let state = state.clone();
+    let ps = ps.clone();
+    let request_serial = next_play_request_serial(&ps);
+    let client = ps.player.daemon_client();
+    let queue = ps.queue.borrow().clone();
+    let radio_virtual_playlist = ps.radio_virtual_playlist.borrow().clone();
+    let repeat_mode = ps.repeat_mode.get();
 
-    match ps
-        .player
-        .play_queue_at(
-            ps.queue.borrow().clone(),
-            index,
-            ps.radio_virtual_playlist.borrow().clone(),
-            ps.repeat_mode.get(),
-        )
-    {
-        Ok(snapshot) => apply_remote_snapshot(ps, state, snapshot),
-        Err(msg) => {
-            ps.np_title.set_text(&msg);
-            ps.np_artist.set_text("");
+    glib::spawn_future_local(async move {
+        let playback_result = gio::spawn_blocking(move || {
+            client.play_queue_at(queue, index, radio_virtual_playlist, repeat_mode)
+        })
+        .await;
+
+        if !is_current_play_request(&ps, request_serial) {
+            return;
         }
-    }
+
+        match playback_result {
+            Ok(Ok(snapshot)) => apply_remote_snapshot(&ps, &state, snapshot),
+            Ok(Err(err)) => {
+                ps.np_title.set_text(&err.to_string());
+                ps.np_artist.set_text("");
+            }
+            Err(err) => {
+                ps.np_title
+                    .set_text(&format!("Playback start failed: {err:?}"));
+                ps.np_artist.set_text("");
+            }
+        }
+    });
 }
 
 /// Prefetch the next N songs in the queue to ~/Music/Static/temp/.

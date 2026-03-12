@@ -1086,14 +1086,10 @@ impl YtMusicClient {
         match self.vr_player_request(video_id, None).await {
             Ok(url) => return Ok(url),
             Err(e) => {
-                let msg = e.to_string();
-                // Only escalate to OAuth for premium-gated content
-                let is_premium_gate =
-                    msg.contains("Music Premium") || msg.contains("Premium members");
                 let has_vr_auth = self.vr_refresh_token.lock().unwrap().is_some();
 
-                if is_premium_gate && has_vr_auth {
-                    eprintln!("[PLAYER] premium-gated, retrying with VR OAuth...");
+                if has_vr_auth {
+                    eprintln!("[PLAYER] Android VR failed, retrying with VR OAuth: {e}");
                     let token = self.ensure_vr_access_token().await?;
                     return self.vr_player_request(video_id, Some(&token)).await;
                 }

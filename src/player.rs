@@ -24,18 +24,6 @@ impl Player {
         self.snapshot.borrow().clone()
     }
 
-    pub fn play_queue_at(
-        &self,
-        queue: Vec<Track>,
-        index: usize,
-        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
-        repeat_mode: RepeatMode,
-    ) -> Result<PlaybackSnapshot, String> {
-        self.run_command(|client| {
-            client.play_queue_at(queue, index, radio_virtual_playlist, repeat_mode)
-        })
-    }
-
     pub fn set_queue(
         &self,
         queue: Vec<Track>,
@@ -64,14 +52,6 @@ impl Player {
 
     pub fn stop(&self) -> Result<PlaybackSnapshot, String> {
         self.run_command(|client| client.stop())
-    }
-
-    pub fn next(&self) -> Result<PlaybackSnapshot, String> {
-        self.run_command(|client| client.next())
-    }
-
-    pub fn previous(&self) -> Result<PlaybackSnapshot, String> {
-        self.run_command(|client| client.previous())
     }
 
     pub fn seek(&self, position: ClockTime) -> Result<PlaybackSnapshot, String> {

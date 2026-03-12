@@ -161,6 +161,9 @@ struct PlayerState {
     radio_append_in_flight: Cell<bool>,
     last_radio_append_anchor: RefCell<Option<String>>,
     queue_drag_source_index: Cell<Option<usize>>,
+    queue_drag_hover_viewport_y: Cell<Option<f64>>,
+    queue_autoscroll_velocity: Cell<f64>,
+    queue_autoscroll_source: RefCell<Option<glib::SourceId>>,
     queue_drop_preview_slot: Cell<Option<usize>>,
     queue_drag_preview_payload: RefCell<Option<QueueDragPayload>>,
     queue_drop_indicator: GtkBox,
@@ -173,6 +176,7 @@ struct PlayerState {
     daemon_refresh_in_flight: Cell<bool>,
     play_request_serial: Cell<u64>,
     // Queue panel widgets
+    queue_scroll: ScrolledWindow,
     queue_list_box: GtkBox,
     chip_bar: GtkBox,
     queue_panel: GtkBox,
@@ -847,8 +851,8 @@ pub fn build_window(app: &Application) {
         .build();
 
     let stack = Stack::new();
-    stack.set_transition_type(StackTransitionType::Crossfade);
-    stack.set_transition_duration(300);
+    stack.set_transition_type(StackTransitionType::None);
+    stack.set_transition_duration(0);
 
     let cache = MusicCache::new().expect("Failed to initialise music cache");
     let mut cache = cache;
@@ -1767,6 +1771,9 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         radio_append_in_flight: Cell::new(false),
         last_radio_append_anchor: RefCell::new(None),
         queue_drag_source_index: Cell::new(None),
+        queue_drag_hover_viewport_y: Cell::new(None),
+        queue_autoscroll_velocity: Cell::new(0.0),
+        queue_autoscroll_source: RefCell::new(None),
         queue_drop_preview_slot: Cell::new(None),
         queue_drag_preview_payload: RefCell::new(None),
         queue_drop_indicator: queue_drop_indicator.clone(),
@@ -1778,6 +1785,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         sponsor_segments_reported: RefCell::new(HashSet::new()),
         daemon_refresh_in_flight: Cell::new(false),
         play_request_serial: Cell::new(0),
+        queue_scroll: queue_scroll.clone(),
         queue_list_box: queue_list_box.clone(),
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
@@ -1803,6 +1811,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             let raw_slot = preview_slot_for_queue_y(&ps_enter, y);
             let preview_slot = normalized_preview_slot(&ps_enter, raw_slot);
             set_queue_drop_preview(&ps_enter, preview_slot);
+            let viewport_y = y - ps_enter.queue_scroll.vadjustment().value();
+            update_queue_drag_hover(&ps_enter, Some(viewport_y));
             gtk::gdk::DragAction::MOVE
         });
 
@@ -1812,11 +1822,14 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             let raw_slot = preview_slot_for_queue_y(&ps_motion, y);
             let preview_slot = normalized_preview_slot(&ps_motion, raw_slot);
             set_queue_drop_preview(&ps_motion, preview_slot);
+            let viewport_y = y - ps_motion.queue_scroll.vadjustment().value();
+            update_queue_drag_hover(&ps_motion, Some(viewport_y));
             gtk::gdk::DragAction::MOVE
         });
 
         let ps_leave = ps.clone();
         drop_target.connect_leave(move |_| {
+            stop_queue_autoscroll(&ps_leave);
             clear_queue_drop_preview(&ps_leave);
             set_queue_drop_active(&ps_leave, false);
         });
@@ -1826,6 +1839,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
             let Some(payload) = parse_queue_drag_payload(value) else {
                 return false;
             };
+            stop_queue_autoscroll(&ps_drop);
             clear_queue_drop_preview(&ps_drop);
             set_queue_drop_active(&ps_drop, false);
             let raw_slot = preview_slot_for_queue_y(&ps_drop, y);
@@ -7498,6 +7512,7 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                 ps.queue_drag_source_index.set(None);
                 ps.queue_drag_preview_payload.replace(None);
                 ps.queue_list_box.remove_css_class("queue-drag-active");
+                stop_queue_autoscroll(&ps);
                 clear_queue_drop_preview(&ps);
             });
         }
@@ -7513,6 +7528,11 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                 set_queue_drop_active(&ps, true);
                 let preview_slot = normalized_preview_slot(&ps, raw_slot);
                 set_queue_drop_preview(&ps, preview_slot);
+                let viewport_y = row_wrapper_ref
+                    .translate_coordinates(&ps.queue_list_box, 0.0, y)
+                    .map(|(_, y)| y - ps.queue_scroll.vadjustment().value())
+                    .unwrap_or(y);
+                update_queue_drag_hover(&ps, Some(viewport_y));
                 gtk::gdk::DragAction::MOVE
             });
         }
@@ -7524,12 +7544,18 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                 set_queue_drop_active(&ps, true);
                 let preview_slot = normalized_preview_slot(&ps, raw_slot);
                 set_queue_drop_preview(&ps, preview_slot);
+                let viewport_y = row_wrapper_ref
+                    .translate_coordinates(&ps.queue_list_box, 0.0, y)
+                    .map(|(_, y)| y - ps.queue_scroll.vadjustment().value())
+                    .unwrap_or(y);
+                update_queue_drag_hover(&ps, Some(viewport_y));
                 gtk::gdk::DragAction::MOVE
             });
         }
         {
             let ps = ps.clone();
             drop_target.connect_leave(move |_| {
+                stop_queue_autoscroll(&ps);
                 clear_queue_drop_preview(&ps);
                 set_queue_drop_active(&ps, false);
             });
@@ -7543,6 +7569,7 @@ fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
                     return false;
                 };
                 let raw_slot = preview_slot_for_pointer(i, y, row_wrapper_ref.allocated_height());
+                stop_queue_autoscroll(&ps);
                 clear_queue_drop_preview(&ps);
                 set_queue_drop_active(&ps, false);
                 handle_queue_drop_payload(payload, raw_slot, &ps, &state)
@@ -8003,6 +8030,101 @@ fn is_queue_row_widget(widget: &gtk::Widget) -> bool {
     widget.has_css_class("queue-row-btn")
 }
 
+fn queue_drag_autoscroll_velocity(viewport_y: f64, viewport_height: f64) -> f64 {
+    const EDGE_ZONE: f64 = 72.0;
+    const MIN_STEP: f64 = 8.0;
+    const MAX_STEP: f64 = 28.0;
+
+    if viewport_height <= 0.0 {
+        return 0.0;
+    }
+
+    let edge = EDGE_ZONE.min((viewport_height / 2.0).max(24.0));
+    let clamped_y = viewport_y.clamp(0.0, viewport_height);
+
+    if clamped_y < edge {
+        let intensity = (1.0 - (clamped_y / edge)).clamp(0.0, 1.0);
+        -(MIN_STEP + ((MAX_STEP - MIN_STEP) * intensity))
+    } else if clamped_y > viewport_height - edge {
+        let distance = (viewport_height - clamped_y).clamp(0.0, edge);
+        let intensity = (1.0 - (distance / edge)).clamp(0.0, 1.0);
+        MIN_STEP + ((MAX_STEP - MIN_STEP) * intensity)
+    } else {
+        0.0
+    }
+}
+
+fn stop_queue_autoscroll(ps: &PlayerState) {
+    ps.queue_drag_hover_viewport_y.set(None);
+    ps.queue_autoscroll_velocity.set(0.0);
+    if let Some(source_id) = ps.queue_autoscroll_source.borrow_mut().take() {
+        source_id.remove();
+    }
+}
+
+fn ensure_queue_autoscroll(ps: &Rc<PlayerState>) {
+    if ps.queue_autoscroll_source.borrow().is_some() {
+        return;
+    }
+
+    let ps_for_timer = ps.clone();
+    let source_id = glib::timeout_add_local(std::time::Duration::from_millis(16), move || {
+        let Some(viewport_y) = ps_for_timer.queue_drag_hover_viewport_y.get() else {
+            ps_for_timer.queue_autoscroll_source.borrow_mut().take();
+            return glib::ControlFlow::Break;
+        };
+
+        let velocity = ps_for_timer.queue_autoscroll_velocity.get();
+        if velocity.abs() <= f64::EPSILON || ps_for_timer.queue_drag_preview_payload.borrow().is_none() {
+            ps_for_timer.queue_autoscroll_source.borrow_mut().take();
+            return glib::ControlFlow::Break;
+        }
+
+        let adjustment = ps_for_timer.queue_scroll.vadjustment();
+        let lower = adjustment.lower();
+        let upper = (adjustment.upper() - adjustment.page_size()).max(lower);
+        if upper <= lower {
+            ps_for_timer.queue_autoscroll_source.borrow_mut().take();
+            return glib::ControlFlow::Break;
+        }
+
+        let current = adjustment.value();
+        let target = (current + velocity).clamp(lower, upper);
+        if (target - current).abs() <= f64::EPSILON {
+            return glib::ControlFlow::Continue;
+        }
+
+        adjustment.set_value(target);
+
+        let content_y = viewport_y + target;
+        let raw_slot = preview_slot_for_queue_y(&ps_for_timer, content_y);
+        let preview_slot = normalized_preview_slot(&ps_for_timer, raw_slot);
+        set_queue_drop_preview(&ps_for_timer, preview_slot);
+
+        glib::ControlFlow::Continue
+    });
+
+    ps.queue_autoscroll_source.replace(Some(source_id));
+}
+
+fn update_queue_drag_hover(ps: &Rc<PlayerState>, viewport_y: Option<f64>) {
+    ps.queue_drag_hover_viewport_y.set(viewport_y);
+
+    let velocity = viewport_y
+        .map(|y| queue_drag_autoscroll_velocity(y, ps.queue_scroll.allocated_height() as f64))
+        .unwrap_or(0.0);
+    ps.queue_autoscroll_velocity.set(velocity);
+
+    if velocity.abs() <= f64::EPSILON {
+        if let Some(source_id) = ps.queue_autoscroll_source.borrow_mut().take() {
+            source_id.remove();
+        }
+        return;
+    }
+
+    ensure_queue_autoscroll(ps);
+}
+
 fn refresh_queue_drop_indicator(ps: &PlayerState) {
     let preview = ps
         .queue_drag_preview_payload
@@ -8254,6 +8376,7 @@ fn attach_queue_drag_source(
         let ps = ps.clone();
         drag_source.connect_drag_end(move |_, _, _| {
             ps.queue_drag_preview_payload.replace(None);
+            stop_queue_autoscroll(&ps);
             clear_queue_drop_preview(&ps);
             set_queue_drop_active(&ps, false);
         });

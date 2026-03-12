@@ -11,7 +11,7 @@
 @define-color theme_unfocused_selected_fg_color #d8e2ff;
 
 window {
-    background-color: transparent;
+    background-color: #0b0d12;
     color: #e0e0e8;
 }
 

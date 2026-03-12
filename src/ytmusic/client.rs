@@ -877,9 +877,11 @@ impl YtMusicClient {
             }
 
             let Ok(resp) = req.json(&body).send().await else {
+                eprintln!("[TRACKING] player bootstrap request failed for {video_id}");
                 return None;
             };
             let Ok(json): Result<Value, _> = resp.json().await else {
+                eprintln!("[TRACKING] player bootstrap response was not valid JSON for {video_id}");
                 return None;
             };
 
@@ -893,6 +895,15 @@ impl YtMusicClient {
 
             let playback_url = rewrite_url("videostatsPlaybackUrl");
             let watchtime_url = rewrite_url("videostatsWatchtimeUrl");
+            if tracking.is_null() {
+                eprintln!("[TRACKING] playbackTracking block missing for {video_id}");
+            }
+            if playback_url.is_none() {
+                eprintln!("[TRACKING] playback bootstrap URL missing for {video_id}");
+            }
+            if watchtime_url.is_none() {
+                eprintln!("[TRACKING] watchtime URL missing for {video_id}");
+            }
             let flush_points_millis = tracking
                 .get("videostatsScheduledFlushWalltimeSeconds")
                 .and_then(|v| v.as_array())

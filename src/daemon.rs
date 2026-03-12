@@ -104,6 +104,8 @@ enum BackgroundEvent {
 enum DeferredAction {
     StartPlaybackTracking {
         video_id: String,
+        attempt: u8,
+        not_before: Instant,
     },
 }
 
@@ -792,6 +794,8 @@ fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
     state.paused_since = None;
     state.deferred_actions.push_back(DeferredAction::StartPlaybackTracking {
         video_id: track.video_id.clone(),
+        attempt: 0,
+        not_before: Instant::now(),
     });
     refresh_sponsorblock_for_current_track(state);
     prefetch_upcoming(state);
@@ -848,7 +852,9 @@ fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<YtMusicClient>> {
         return Ok(client.clone());
     }
 
-    let cookie = get_cookie().ok_or_else(|| anyhow!("Not authenticated"))?;
+    let cookie = get_cookie().ok_or_else(|| {
+        anyhow!("Not authenticated: no playable cookie available in the keyring")
+    })?;
     let client = Rc::new(YtMusicClient::new(&cookie)?);
     if let Some(token) = get_vr_refresh_token() {
         client.set_vr_refresh_token(&token);
@@ -869,21 +875,113 @@ fn reload_settings(state: &mut DaemonState) {
 }
 
 fn maybe_run_deferred_action(state: &mut DaemonState) {
+    let Some(ready) = state.deferred_actions.front().map(|action| match action {
+        DeferredAction::StartPlaybackTracking { not_before, .. } => Instant::now() >= *not_before,
+    }) else {
+        return;
+    };
+    if !ready {
+        return;
+    }
+
     let Some(action) = state.deferred_actions.pop_front() else {
         return;
     };
 
     match action {
-        DeferredAction::StartPlaybackTracking { video_id } => {
-            let tracking = state
-                .client
-                .as_ref()
-                .and_then(|client| client.start_playback_tracking(&video_id));
-            let _ = state
-                .background_tx
-                .send(BackgroundEvent::TrackingReady { video_id, tracking });
+        DeferredAction::StartPlaybackTracking {
+            video_id,
+            attempt,
+            ..
+        } => {
+            let tracking = start_playback_tracking_with_retry(state, &video_id, attempt);
+            let tracking_ready = tracking.is_some();
+            let _ = state.background_tx.send(BackgroundEvent::TrackingReady {
+                video_id: video_id.clone(),
+                tracking,
+            });
+
+            if !tracking_ready
+                && state
+                    .active_track
+                    .as_ref()
+                    .is_some_and(|track| track.video_id == video_id)
+                && attempt < 2
+            {
+                let next_attempt = attempt + 1;
+                let retry_delay = Duration::from_secs(next_attempt as u64 * 2);
+                eprintln!(
+                    "[TRACKING] scheduling retry {} for {} in {}s",
+                    next_attempt + 1,
+                    video_id,
+                    retry_delay.as_secs()
+                );
+                state
+                    .deferred_actions
+                    .push_back(DeferredAction::StartPlaybackTracking {
+                        video_id,
+                        attempt: next_attempt,
+                        not_before: Instant::now() + retry_delay,
+                    });
+            }
         }
     }
+}
+
+fn start_playback_tracking_with_retry(
+    state: &mut DaemonState,
+    video_id: &str,
+    attempt: u8,
+) -> Option<TrackingInfo> {
+    let current_attempt = attempt + 1;
+
+    if state.client.is_none() {
+        match ensure_client_loaded(state) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!(
+                    "[TRACKING] attempt {current_attempt} for {video_id} could not load auth client: {err}"
+                );
+                return None;
+            }
+        }
+    }
+
+    if let Some(tracking) = state
+        .client
+        .as_ref()
+        .and_then(|client| client.start_playback_tracking(video_id))
+    {
+        if current_attempt > 1 {
+            eprintln!(
+                "[TRACKING] recovered telemetry bootstrap for {video_id} on attempt {current_attempt}"
+            );
+        }
+        return Some(tracking);
+    }
+
+    eprintln!(
+        "[TRACKING] attempt {current_attempt} for {video_id} returned no watchtime tracker; refreshing auth client"
+    );
+    state.client = None;
+
+    let refreshed_client = match ensure_client_loaded(state) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "[TRACKING] attempt {current_attempt} for {video_id} could not refresh auth client: {err}"
+            );
+            return None;
+        }
+    };
+
+    let tracking = refreshed_client.start_playback_tracking(video_id);
+    if tracking.is_none() {
+        eprintln!(
+            "[TRACKING] attempt {current_attempt} for {video_id} still produced no watchtime tracker after client refresh"
+        );
+    }
+    tracking
 }
 
 fn maybe_extend_radio_queue(state: &mut DaemonState) {
@@ -966,6 +1064,11 @@ fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, 
             } else {
                 tracking.report_watchtime(listened_millis);
             }
+        } else {
+            eprintln!(
+                "[TRACKING] no watchtime tracker was attached for {} before flush",
+                track.video_id
+            );
         }
 
         let listened_secs = listened_millis / 1_000;
@@ -1450,8 +1553,21 @@ fn ensure_local_icon_for_current_exe(exe: &std::path::Path, data_home: &std::pat
 }
 
 fn get_cookie() -> Option<String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
-    entry.get_password().ok()
+    let entry = match Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        Ok(entry) => entry,
+        Err(err) => {
+            eprintln!("[AUTH] failed to open cookie keyring entry: {err}");
+            return None;
+        }
+    };
+
+    match entry.get_password() {
+        Ok(cookie) => Some(cookie),
+        Err(err) => {
+            eprintln!("[AUTH] failed to read cookie from keyring: {err}");
+            None
+        }
+    }
 }
 
 fn get_vr_refresh_token() -> Option<String> {

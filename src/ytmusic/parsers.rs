@@ -95,6 +95,7 @@ pub fn parse_channel_page(json: &Value) -> Result<BrowseSectionsPage> {
     Ok(BrowseSectionsPage {
         title,
         thumbnail_url,
+        artist_like: json.pointer("/header/musicImmersiveHeaderRenderer").is_some(),
         sections: parse_home_sections(&contents),
     })
 }

@@ -5124,6 +5124,7 @@ fn load_browse_detail(
                     .thumbnail_url
                     .clone()
                     .or_else(|| browse_thumb.clone());
+                let artist_like = page.artist_like;
                 let sections = page.sections;
                 let back_btn = Button::with_label("\u{2190} Back to Home");
                 back_btn.add_css_class("nav-item");
@@ -5150,14 +5151,6 @@ fn load_browse_detail(
                     });
                 }
                 content_box.append(&back_btn);
-
-                let header = Label::new(Some(&display_title));
-                header.add_css_class("section-header");
-                header.set_halign(Align::Start);
-                header.set_margin_start(28);
-                header.set_margin_top(12);
-                header.set_margin_bottom(8);
-                content_box.append(&header);
 
                 if sections.is_empty() {
                     let msg = Label::new(Some("No sections found for this channel."));
@@ -5200,30 +5193,20 @@ fn load_browse_detail(
                     }
                 }
 
-                if page_type == HomeBrowsePageType::Artist || is_artist_sections(&sections) {
-                    render_artist_view(
-                        &content_box,
-                        &display_title,
-                        display_thumb.as_deref(),
-                        &sections,
-                        &state,
-                        &content_scroll,
-                        &home_pagination,
-                        &ps,
-                        &recent_list,
-                    );
-                } else {
-                    render_home_view(
-                        &content_box,
-                        &sections,
-                        &state,
-                        &content_scroll,
-                        &home_pagination,
-                        &ps,
-                        &recent_list,
-                        false,
-                    );
-                }
+                let use_artist_chrome =
+                    page_type == HomeBrowsePageType::Artist || artist_like || is_artist_sections(&sections);
+                render_artist_view(
+                    &content_box,
+                    if use_artist_chrome { "Artist" } else { "Channel" },
+                    &display_title,
+                    display_thumb.as_deref(),
+                    &sections,
+                    &state,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                );
             }
             Ok(Some(Ok(BrowseDetailData::Tracks(tracks)))) => {
                 let back_btn = Button::with_label("\u{2190} Back to Home");
@@ -5674,6 +5657,7 @@ fn render_home_view(
 
 fn render_artist_view(
     content_box: &GtkBox,
+    eyebrow_label: &str,
     artist_name: &str,
     thumbnail_url: Option<&str>,
     sections: &[HomeSection],
@@ -5723,7 +5707,7 @@ fn render_artist_view(
     meta.set_hexpand(true);
     meta.set_valign(Align::Center);
 
-    let eyebrow = Label::new(Some("Artist"));
+    let eyebrow = Label::new(Some(eyebrow_label));
     eyebrow.add_css_class("dim-label");
     eyebrow.set_halign(Align::Start);
     meta.append(&eyebrow);

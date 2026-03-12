@@ -49,6 +49,7 @@ pub struct HomePage {
 pub struct BrowseSectionsPage {
     pub title: Option<String>,
     pub thumbnail_url: Option<String>,
+    pub artist_like: bool,
     pub sections: Vec<HomeSection>,
 }
 

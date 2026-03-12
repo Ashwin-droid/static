@@ -62,7 +62,6 @@ struct DaemonState {
     cache: MusicCache,
     settings: AppSettings,
     client: Option<Rc<YtMusicClient>>,
-    sponsorblock: SponsorBlockClient,
     queue: Vec<Track>,
     queue_index: usize,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
@@ -388,7 +387,6 @@ pub fn run() -> Result<()> {
         cache,
         settings,
         client: None,
-        sponsorblock: SponsorBlockClient::new().context("Failed to initialise SponsorBlock client")?,
         queue: Vec::new(),
         queue_index: 0,
         radio_virtual_playlist: None,
@@ -1283,12 +1281,27 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
     }
 
     if state.sponsor_segments_reported.insert(segment.uuid.clone()) {
-        if let Err(err) = state.sponsorblock.mark_segment_viewed(&segment.uuid) {
-            eprintln!(
-                "[SPONSORBLOCK] failed to report viewed segment {} on {}: {}",
-                segment.uuid, video_id, err
-            );
-        }
+        let uuid = segment.uuid.clone();
+        let video_id_for_report = video_id.clone();
+        std::thread::spawn(move || {
+            let client = match SponsorBlockClient::new() {
+                Ok(client) => client,
+                Err(err) => {
+                    eprintln!(
+                        "[SPONSORBLOCK] failed to initialize report client for {} on {}: {}",
+                        uuid, video_id_for_report, err
+                    );
+                    return;
+                }
+            };
+
+            if let Err(err) = client.mark_segment_viewed(&uuid) {
+                eprintln!(
+                    "[SPONSORBLOCK] failed to report viewed segment {} on {}: {}",
+                    uuid, video_id_for_report, err
+                );
+            }
+        });
     }
 }
 

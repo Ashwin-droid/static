@@ -88,7 +88,6 @@ thread_local! {
 
 struct AppState {
     client: Option<Arc<YtMusicClient>>,
-    sponsorblock: SponsorBlockClient,
     cache: MusicCache,
     settings: AppSettings,
     home_cache: Option<HomePage>,
@@ -868,7 +867,6 @@ pub fn build_window(app: &Application) {
     }
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
-        sponsorblock: SponsorBlockClient::new().expect("Failed to initialise SponsorBlock client"),
         cache,
         settings,
         home_cache: None,
@@ -3635,7 +3633,7 @@ fn ensure_offline_sponsorblock_cache(
     video_id: &str,
 ) -> Result<Option<(Vec<SponsorSegment>, &'static str)>, String> {
     let all_categories = default_skip_categories();
-    let client = {
+    {
         let guard = state.lock().unwrap();
         if !guard.cache.is_cached(video_id) {
             return Ok(None);
@@ -3648,9 +3646,11 @@ fn ensure_offline_sponsorblock_cache(
                 eprintln!("[SPONSORBLOCK] failed to read offline cache for {video_id}: {err}");
             }
         }
+    }
 
-        guard.sponsorblock.clone()
-    };
+    let client = SponsorBlockClient::new().map_err(|err| {
+        format!("Failed to initialize SponsorBlock client for {video_id}: {err}")
+    })?;
 
     let segments = client
         .fetch_skip_segments(video_id, &all_categories)

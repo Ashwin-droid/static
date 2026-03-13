@@ -24,7 +24,14 @@ pub fn build_app() -> Application {
     });
 
     app.connect_activate(|app| {
-        window::build_window(app);
+        if let Some(existing) = app
+            .active_window()
+            .or_else(|| app.windows().into_iter().next())
+        {
+            existing.present();
+        } else {
+            window::build_window(app);
+        }
     });
 
     app

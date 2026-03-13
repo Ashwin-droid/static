@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::models::{
-    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
-    PlaylistSummary, RadioChip, RadioQueue, Track,
+    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
+    HomeSection, PlaylistSummary, RadioChip, RadioQueue, Track,
 };
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
@@ -95,7 +95,9 @@ pub fn parse_channel_page(json: &Value) -> Result<BrowseSectionsPage> {
     Ok(BrowseSectionsPage {
         title,
         thumbnail_url,
-        artist_like: json.pointer("/header/musicImmersiveHeaderRenderer").is_some(),
+        artist_like: json
+            .pointer("/header/musicImmersiveHeaderRenderer")
+            .is_some(),
         sections: parse_home_sections(&contents),
     })
 }
@@ -126,15 +128,9 @@ fn parse_carousel_shelf(shelf: &Value) -> Option<HomeSection> {
 
     let items = shelf.pointer("/contents").and_then(|c| c.as_array())?;
 
-    let contents: Vec<HomeItem> = items
-        .iter()
-        .filter_map(parse_home_item)
-        .collect();
+    let contents: Vec<HomeItem> = items.iter().filter_map(parse_home_item).collect();
 
-    Some(HomeSection {
-        title,
-        contents,
-    })
+    Some(HomeSection { title, contents })
 }
 
 fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
@@ -153,10 +149,7 @@ fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
         })
         .collect();
 
-    Some(HomeSection {
-        title,
-        contents,
-    })
+    Some(HomeSection { title, contents })
 }
 
 fn parse_home_item(item: &Value) -> Option<HomeItem> {
@@ -172,9 +165,7 @@ fn parse_home_item(item: &Value) -> Option<HomeItem> {
 fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
     let browse = renderer.pointer("/navigationEndpoint/browseEndpoint")?;
     let page_type = browse
-        .pointer(
-            "/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType",
-        )
+        .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
         .and_then(|value| value.as_str())
         .and_then(|page_type| match page_type {
             "MUSIC_PAGE_TYPE_PLAYLIST" => Some(HomeBrowsePageType::Playlist),

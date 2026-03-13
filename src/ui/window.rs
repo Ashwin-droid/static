@@ -43,8 +43,8 @@ const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{PlaybackSnapshot, RepeatMode};
 use crate::models::{
-    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, HomeSection,
-    PlaylistSummary, RadioChip, RadioVirtualPlaylist, Track,
+    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
+    HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, Track,
 };
 use crate::player::Player;
 use crate::sponsorblock::{
@@ -888,9 +888,7 @@ pub fn build_window(app: &Application) {
             if snapshot.paused && snapshot.current_track.is_some() {
                 let client = ps.player.daemon_client();
                 if let Err(err) = client.shutdown() {
-                    eprintln!(
-                        "[STATIC] failed to stop paused staticd while closing window: {err}"
-                    );
+                    eprintln!("[STATIC] failed to stop paused staticd while closing window: {err}");
                 }
             }
             glib::Propagation::Proceed
@@ -3507,7 +3505,10 @@ fn append_radio_recommendations(ps: &PlayerState, tracks: Vec<Track>) -> usize {
 }
 
 fn maybe_extend_radio_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
-    if !is_radio_queue(ps) || ps.radio_append_in_flight.get() || ps.repeat_mode.get() == RepeatMode::All {
+    if !is_radio_queue(ps)
+        || ps.radio_append_in_flight.get()
+        || ps.repeat_mode.get() == RepeatMode::All
+    {
         return;
     }
 
@@ -3539,6 +3540,22 @@ fn maybe_extend_radio_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) 
             app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
         })
         .await;
+
+        let should_apply = is_radio_queue(&ps)
+            && ps.repeat_mode.get() != RepeatMode::All
+            && ps.last_radio_append_anchor.borrow().as_deref() == Some(last_video_id.as_str())
+            && ps
+                .queue
+                .borrow()
+                .last()
+                .is_some_and(|track| track.video_id == last_video_id);
+        if !should_apply {
+            if ps.last_radio_append_anchor.borrow().as_deref() == Some(last_video_id.as_str()) {
+                *ps.last_radio_append_anchor.borrow_mut() = None;
+            }
+            ps.radio_append_in_flight.set(false);
+            return;
+        }
 
         if let Ok(Some(Ok(radio))) = result {
             if append_radio_recommendations(&ps, radio.tracks) > 0 {
@@ -3647,9 +3664,8 @@ fn ensure_offline_sponsorblock_cache(
         }
     }
 
-    let client = SponsorBlockClient::new().map_err(|err| {
-        format!("Failed to initialize SponsorBlock client for {video_id}: {err}")
-    })?;
+    let client = SponsorBlockClient::new()
+        .map_err(|err| format!("Failed to initialize SponsorBlock client for {video_id}: {err}"))?;
 
     let segments = client
         .fetch_skip_segments(video_id, &all_categories)
@@ -3839,10 +3855,9 @@ fn load_home(
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_home_page(None))
-        })
-        .await;
+        let result =
+            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_home_page(None)))
+                .await;
 
         home_pagination.loading.set(false);
         clear_box(&content_box);
@@ -4264,7 +4279,9 @@ fn parse_direct_music_url(input: &str) -> Option<DirectMusicUrlTarget> {
                 });
             }
 
-            if let Some(browse_id) = path.strip_prefix("/browse/").filter(|value| !value.is_empty())
+            if let Some(browse_id) = path
+                .strip_prefix("/browse/")
+                .filter(|value| !value.is_empty())
             {
                 return Some(DirectMusicUrlTarget::Browse {
                     browse_id: browse_id.to_string(),
@@ -4332,7 +4349,9 @@ fn infer_browse_page_type(browse_id: &str) -> HomeBrowsePageType {
         HomeBrowsePageType::Album
     } else if browse_id.starts_with("UC") {
         HomeBrowsePageType::UserChannel
-    } else if browse_id.starts_with("VL") || browse_id.starts_with("OLAK") || browse_id.starts_with("RD")
+    } else if browse_id.starts_with("VL")
+        || browse_id.starts_with("OLAK")
+        || browse_id.starts_with("RD")
     {
         HomeBrowsePageType::Playlist
     } else {
@@ -4351,7 +4370,9 @@ fn autoplay_direct_music_url(
     recent_list: &GtkBox,
 ) {
     match target {
-        DirectMusicUrlTarget::Video { video_id } => autoplay_video_url(state, raw_url, &video_id, ps, recent_list),
+        DirectMusicUrlTarget::Video { video_id } => {
+            autoplay_video_url(state, raw_url, &video_id, ps, recent_list)
+        }
         DirectMusicUrlTarget::Browse {
             browse_id,
             page_type,
@@ -4387,9 +4408,10 @@ fn autoplay_video_url(
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let vid = video_id.clone();
-        let result =
-            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None)))
-                .await;
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
+        })
+        .await;
 
         let fallback_track = Track {
             video_id: video_id.clone(),
@@ -4953,7 +4975,11 @@ fn build_home_browse_card(
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) -> Button {
-    let button = build_browse_summary_card(&card.title, card.subtitle.as_deref(), card.thumbnail_url.as_deref());
+    let button = build_browse_summary_card(
+        &card.title,
+        card.subtitle.as_deref(),
+        card.thumbnail_url.as_deref(),
+    );
 
     {
         let state = state.clone();
@@ -5037,7 +5063,11 @@ fn build_playlist_card(
     card_btn
 }
 
-fn build_browse_summary_card(title: &str, subtitle: Option<&str>, thumbnail_url: Option<&str>) -> Button {
+fn build_browse_summary_card(
+    title: &str,
+    subtitle: Option<&str>,
+    thumbnail_url: Option<&str>,
+) -> Button {
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
     card_btn.set_size_request(166, -1);
@@ -5248,9 +5278,9 @@ fn load_browse_detail(
         let page_type_bg = page_type;
         let result = gio::spawn_blocking(move || {
             app_client(&state_bg).map(|ytm| match page_type_bg {
-                HomeBrowsePageType::UserChannel | HomeBrowsePageType::Artist => ytm
-                    .get_channel_page(&bid)
-                    .map(BrowseDetailData::Sections),
+                HomeBrowsePageType::UserChannel | HomeBrowsePageType::Artist => {
+                    ytm.get_channel_page(&bid).map(BrowseDetailData::Sections)
+                }
                 _ => ytm.get_browse_tracks(&bid).map(BrowseDetailData::Tracks),
             })
         })
@@ -5260,14 +5290,8 @@ fn load_browse_detail(
 
         match result {
             Ok(Some(Ok(BrowseDetailData::Sections(page)))) => {
-                let display_title = page
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| browse_title.clone());
-                let display_thumb = page
-                    .thumbnail_url
-                    .clone()
-                    .or_else(|| browse_thumb.clone());
+                let display_title = page.title.clone().unwrap_or_else(|| browse_title.clone());
+                let display_thumb = page.thumbnail_url.clone().or_else(|| browse_thumb.clone());
                 let artist_like = page.artist_like;
                 let sections = page.sections;
                 let back_btn = Button::with_label("\u{2190} Back to Home");
@@ -5337,11 +5361,16 @@ fn load_browse_detail(
                     }
                 }
 
-                let use_artist_chrome =
-                    page_type == HomeBrowsePageType::Artist || artist_like || is_artist_sections(&sections);
+                let use_artist_chrome = page_type == HomeBrowsePageType::Artist
+                    || artist_like
+                    || is_artist_sections(&sections);
                 render_artist_view(
                     &content_box,
-                    if use_artist_chrome { "Artist" } else { "Channel" },
+                    if use_artist_chrome {
+                        "Artist"
+                    } else {
+                        "Channel"
+                    },
                     &display_title,
                     display_thumb.as_deref(),
                     &sections,
@@ -6839,15 +6868,23 @@ fn play_track(
 fn queue_play_next(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     let insert_at = ps.queue_index.get() + 1;
     ps.queue.borrow_mut().insert(insert_at, track);
+    extend_radio_touched_for_insert(ps, insert_at, 1);
     *ps.last_radio_append_anchor.borrow_mut() = None;
     render_queue_panel(ps, state);
     sync_remote_queue(ps);
     sync_mpris_transport(ps, state);
 }
 
-/// Append a track to the end of the queue.
+/// Append a track to the queue, or to the virtual-playlist boundary for radio.
 fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
-    ps.queue.borrow_mut().push(track);
+    let queue_len = ps.queue.borrow().len();
+    let insert_at = radio_touched_len(ps).unwrap_or(queue_len).min(queue_len);
+    if insert_at == queue_len {
+        ps.queue.borrow_mut().push(track);
+    } else {
+        ps.queue.borrow_mut().insert(insert_at, track);
+        extend_radio_touched_for_insert(ps, insert_at, 1);
+    }
     *ps.last_radio_append_anchor.borrow_mut() = None;
     render_queue_panel(ps, state);
     sync_remote_queue(ps);
@@ -7882,7 +7919,9 @@ fn ensure_queue_autoscroll(ps: &Rc<PlayerState>) {
         };
 
         let velocity = ps_for_timer.queue_autoscroll_velocity.get();
-        if velocity.abs() <= f64::EPSILON || ps_for_timer.queue_drag_preview_payload.borrow().is_none() {
+        if velocity.abs() <= f64::EPSILON
+            || ps_for_timer.queue_drag_preview_payload.borrow().is_none()
+        {
             ps_for_timer.queue_autoscroll_source.borrow_mut().take();
             return glib::ControlFlow::Break;
         }

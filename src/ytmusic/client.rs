@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
 
-use crate::models::{BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, Track};
+use crate::models::{
+    BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult, Track,
+};
 
 use super::cipher::Cipher;
 use super::parsers;
@@ -671,11 +673,10 @@ impl YtMusicClient {
         })
     }
 
-    pub fn search(&self, query: &str) -> Result<Vec<Track>> {
+    pub fn search(&self, query: &str) -> Result<SearchResult> {
         self.rt.block_on(async {
             let mut body = Self::client_context();
             body["query"] = json!(query);
-            body["params"] = json!("EgWKAQIIAWoMEA4QChADEAQQCRAF");
 
             let resp = self
                 .post(&format!("{YTM_BASE_URL}/search?{YTM_PARAMS}"))

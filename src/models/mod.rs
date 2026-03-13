@@ -16,23 +16,6 @@ pub struct Artist {
     pub id: Option<String>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Playlist {
-    pub playlist_id: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub tracks: Vec<Track>,
-    pub thumbnail_url: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    pub tracks: Vec<Track>,
-    pub playlists: Vec<Playlist>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HomeSection {
     pub title: String,
@@ -74,6 +57,23 @@ pub enum HomeBrowsePageType {
     Album,
     Artist,
     UserChannel,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Playlist {
+    pub playlist_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub tracks: Vec<Track>,
+    pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub tracks: Vec<Track>,
+    pub playlists: Vec<HomeBrowseCard>,
+    pub artists: Vec<HomeBrowseCard>,
 }
 
 /// Lightweight summary for a playlist in the user's library listing (no embedded tracks).

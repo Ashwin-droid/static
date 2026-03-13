@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::models::{
     Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    HomeSection, PlaylistSummary, RadioChip, RadioQueue, Track,
+    HomeSection, PlaylistSummary, RadioChip, RadioQueue, SearchResult, Track,
 };
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
@@ -157,28 +157,9 @@ fn parse_home_item(item: &Value) -> Option<HomeItem> {
 }
 
 fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
-    let browse = renderer.pointer("/navigationEndpoint/browseEndpoint")?;
-    let page_type = browse
-        .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
-        .and_then(|value| value.as_str())
-        .and_then(|page_type| match page_type {
-            "MUSIC_PAGE_TYPE_PLAYLIST" => Some(HomeBrowsePageType::Playlist),
-            "MUSIC_PAGE_TYPE_ALBUM" => Some(HomeBrowsePageType::Album),
-            "MUSIC_PAGE_TYPE_ARTIST" => Some(HomeBrowsePageType::Artist),
-            "MUSIC_PAGE_TYPE_USER_CHANNEL" => Some(HomeBrowsePageType::UserChannel),
-            _ => None,
-        })?;
-
-    let browse_id = browse.get("browseId")?.as_str()?.to_string();
-    let title = renderer
-        .pointer("/title/runs/0/text")
-        .and_then(|value| value.as_str())?
-        .to_string();
-    let subtitle = renderer
-        .pointer("/subtitle/runs")
-        .and_then(|runs| runs.as_array())
-        .map(|runs| join_runs(runs))
-        .filter(|subtitle| !subtitle.trim().is_empty());
+    let (browse_id, page_type) = extract_browse_id_and_page_type(renderer)?;
+    let title = extract_browse_title(renderer)?;
+    let subtitle = extract_browse_subtitle(renderer);
 
     Some(HomeBrowseCard {
         browse_id,
@@ -271,6 +252,70 @@ fn extract_watch_video_id(renderer: &Value) -> Option<String> {
             .and_then(|value| value.as_str())
             .map(str::to_string)
     })
+}
+
+fn extract_browse_id_and_page_type(renderer: &Value) -> Option<(String, HomeBrowsePageType)> {
+    [
+        "/navigationEndpoint/browseEndpoint",
+        "/title/runs/0/navigationEndpoint/browseEndpoint",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/browseEndpoint",
+    ]
+    .iter()
+    .find_map(|path| {
+        let browse = renderer.pointer(path)?;
+        let page_type = browse
+            .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+            .and_then(|value| value.as_str())
+            .and_then(|page_type| match page_type {
+                "MUSIC_PAGE_TYPE_PLAYLIST" => Some(HomeBrowsePageType::Playlist),
+                "MUSIC_PAGE_TYPE_ALBUM" => Some(HomeBrowsePageType::Album),
+                "MUSIC_PAGE_TYPE_ARTIST" => Some(HomeBrowsePageType::Artist),
+                "MUSIC_PAGE_TYPE_USER_CHANNEL" => Some(HomeBrowsePageType::UserChannel),
+                _ => None,
+            })?;
+        let browse_id = browse.get("browseId")?.as_str()?.to_string();
+        Some((browse_id, page_type))
+    })
+}
+
+fn extract_browse_title(renderer: &Value) -> Option<String> {
+    renderer
+        .pointer("/title/runs/0/text")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            renderer
+                .pointer(
+                    "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text",
+                )
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string)
+}
+
+fn extract_browse_subtitle(renderer: &Value) -> Option<String> {
+    renderer
+        .pointer("/subtitle/runs")
+        .and_then(|runs| runs.as_array())
+        .map(|runs| join_runs(runs))
+        .or_else(|| {
+            renderer
+                .pointer("/subtitle/simpleText")
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            renderer
+                .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/runs")
+                .and_then(|runs| runs.as_array())
+                .map(|runs| join_runs(runs))
+        })
+        .or_else(|| {
+            renderer
+                .pointer("/flexColumns/1/musicResponsiveListItemFlexColumnRenderer/text/simpleText")
+                .and_then(|text| text.as_str())
+                .map(str::to_string)
+        })
+        .filter(|subtitle| !subtitle.trim().is_empty())
 }
 
 fn extract_artists_from_subtitle(renderer: &Value) -> Vec<Artist> {
@@ -431,8 +476,11 @@ fn looks_like_duration(text: &str) -> bool {
     })
 }
 
-pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
-    let mut tracks = Vec::new();
+pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
+    let mut results = SearchResult::default();
+    let mut seen_tracks = HashSet::new();
+    let mut seen_playlists = HashSet::new();
+    let mut seen_artists = HashSet::new();
 
     let contents = json
         .pointer("/contents/tabbedSearchResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents")
@@ -440,7 +488,7 @@ pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
 
     let Some(sections) = contents else {
         tracing::warn!("No search results found");
-        return Ok(tracks);
+        return Ok(results);
     };
 
     for section in sections {
@@ -451,22 +499,48 @@ pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
         let Some(items) = items else { continue };
 
         for item in items {
-            if let Some(renderer) = item.get("musicResponsiveListItemRenderer") {
-                if let Some(track) = parse_track_from_renderer(renderer) {
-                    tracks.push(track);
+            let Some(renderer) = item
+                .get("musicResponsiveListItemRenderer")
+                .or_else(|| item.get("musicTwoRowItemRenderer"))
+            else {
+                continue;
+            };
+
+            if let Some(track) = parse_track_from_renderer(renderer) {
+                if seen_tracks.insert(track.video_id.clone()) {
+                    results.tracks.push(track);
+                }
+                continue;
+            }
+
+            if let Some(card) = parse_home_browse_card(renderer) {
+                match card.page_type {
+                    HomeBrowsePageType::Playlist => {
+                        if seen_playlists.insert(card.browse_id.clone()) {
+                            results.playlists.push(card);
+                        }
+                    }
+                    HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => {
+                        if seen_artists.insert(card.browse_id.clone()) {
+                            results.artists.push(card);
+                        }
+                    }
+                    HomeBrowsePageType::Album => {}
                 }
             }
         }
     }
 
-    Ok(tracks)
+    Ok(results)
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::parse_track_from_renderer;
+    use crate::models::HomeBrowsePageType;
+
+    use super::{parse_search_results, parse_track_from_renderer};
 
     #[test]
     fn responsive_history_items_fall_back_to_user_channel_name() {
@@ -709,6 +783,150 @@ mod tests {
 
         let track = parse_track_from_renderer(&renderer).expect("track should parse");
         assert_eq!(track.duration.as_deref(), Some("10:02"));
+    }
+
+    #[test]
+    fn search_results_include_tracks_playlists_and_artists() {
+        let json = json!({
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicShelfRenderer": {
+                                            "contents": [
+                                                {
+                                                    "musicResponsiveListItemRenderer": {
+                                                        "flexColumns": [
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{
+                                                                            "text": "Study Music",
+                                                                            "navigationEndpoint": {
+                                                                                "watchEndpoint": {
+                                                                                    "videoId": "track123"
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{
+                                                                            "text": "Focus Artist",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseId": "artist-track",
+                                                                                    "browseEndpointContextSupportedConfigs": {
+                                                                                        "browseEndpointContextMusicConfig": {
+                                                                                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    }
+                                                                }
+                                                            }
+                                                        ],
+                                                        "fixedColumns": [{
+                                                            "musicResponsiveListItemFixedColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{ "text": "3:21" }]
+                                                                }
+                                                            }
+                                                        }]
+                                                    }
+                                                },
+                                                {
+                                                    "musicResponsiveListItemRenderer": {
+                                                        "flexColumns": [
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{
+                                                                            "text": "Coding Mix",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseId": "VLPL123",
+                                                                                    "browseEndpointContextSupportedConfigs": {
+                                                                                        "browseEndpointContextMusicConfig": {
+                                                                                            "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{ "text": "Playlist • 54 songs" }]
+                                                                    }
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                },
+                                                {
+                                                    "musicResponsiveListItemRenderer": {
+                                                        "flexColumns": [
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{
+                                                                            "text": "Lofi Producer",
+                                                                            "navigationEndpoint": {
+                                                                                "browseEndpoint": {
+                                                                                    "browseId": "UCartist123",
+                                                                                    "browseEndpointContextSupportedConfigs": {
+                                                                                        "browseEndpointContextMusicConfig": {
+                                                                                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{ "text": "Artist" }]
+                                                                    }
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let results = parse_search_results(&json).expect("search results should parse");
+        assert_eq!(results.tracks.len(), 1);
+        assert_eq!(results.playlists.len(), 1);
+        assert_eq!(results.artists.len(), 1);
+        assert_eq!(results.tracks[0].video_id, "track123");
+        assert_eq!(results.playlists[0].title, "Coding Mix");
+        assert_eq!(results.playlists[0].page_type, HomeBrowsePageType::Playlist);
+        assert_eq!(results.artists[0].title, "Lofi Producer");
+        assert_eq!(results.artists[0].page_type, HomeBrowsePageType::Artist);
     }
 }
 

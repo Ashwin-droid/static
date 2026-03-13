@@ -244,6 +244,13 @@ enum QueueDragPayload {
         subtitle: Option<String>,
         source: QueuePlaylistSource,
     },
+    BrowseCollection {
+        browse_id: String,
+        title: String,
+        thumbnail_url: Option<String>,
+        subtitle: Option<String>,
+        page_type: HomeBrowsePageType,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4996,6 +5003,10 @@ fn build_home_browse_card(
         card.thumbnail_url.as_deref(),
     );
 
+    if let Some(payload) = queue_drag_payload_for_browse_card(card) {
+        attach_queue_drag_source(&button, payload, ps);
+    }
+
     {
         let state = state.clone();
         let content_box = content_box.clone();
@@ -5103,6 +5114,10 @@ fn build_home_browse_row(
     row.append(&info);
     row_btn.set_child(Some(&row));
 
+    if let Some(payload) = queue_drag_payload_for_browse_card(card) {
+        attach_queue_drag_source(&row_btn, payload, ps);
+    }
+
     {
         let state = state.clone();
         let content_box = content_box.clone();
@@ -5134,6 +5149,21 @@ fn build_home_browse_row(
 
     wrapper.append(&row_btn);
     wrapper
+}
+
+fn queue_drag_payload_for_browse_card(card: &HomeBrowseCard) -> Option<QueueDragPayload> {
+    match card.page_type {
+        HomeBrowsePageType::Album | HomeBrowsePageType::Playlist => {
+            Some(QueueDragPayload::BrowseCollection {
+                browse_id: card.browse_id.clone(),
+                title: card.title.clone(),
+                thumbnail_url: card.thumbnail_url.clone(),
+                subtitle: card.subtitle.clone(),
+                page_type: card.page_type,
+            })
+        }
+        HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => None,
+    }
 }
 
 fn build_playlist_card(
@@ -7156,16 +7186,24 @@ fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppSta
 
 fn dismiss_queue_after_current(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     let keep_len = ps.queue_index.get().saturating_add(1);
+    let mut changed = false;
     {
         let mut queue = ps.queue.borrow_mut();
-        if queue.len() <= keep_len {
-            return;
+        if queue.len() > keep_len {
+            queue.truncate(keep_len);
+            changed = true;
         }
-        queue.truncate(keep_len);
     }
 
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.touched_len = radio.touched_len.min(keep_len);
+        if radio.touched_len != keep_len {
+            radio.touched_len = keep_len;
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return;
     }
 
     ps.radio_append_in_flight.set(false);
@@ -8016,6 +8054,23 @@ fn queue_preview_data_for_payload(
             thumbnail_url: thumbnail_url.clone(),
             duration: None,
         }),
+        QueueDragPayload::BrowseCollection {
+            title,
+            subtitle,
+            thumbnail_url,
+            page_type,
+            ..
+        } => Some(QueuePreviewData {
+            title: title.clone(),
+            subtitle: subtitle.clone().unwrap_or_else(|| match page_type {
+                HomeBrowsePageType::Album => "Album".to_string(),
+                HomeBrowsePageType::Playlist => "Playlist".to_string(),
+                HomeBrowsePageType::Artist => "Artist".to_string(),
+                HomeBrowsePageType::UserChannel => "Channel".to_string(),
+            }),
+            thumbnail_url: thumbnail_url.clone(),
+            duration: None,
+        }),
     }
 }
 
@@ -8527,7 +8582,7 @@ fn insert_tracks_into_queue(
     sync_mpris_transport(ps, state);
 }
 
-fn resolve_dragged_playlist_tracks(
+fn resolve_dragged_collection_tracks(
     payload: &QueueDragPayload,
     state: &Arc<Mutex<AppState>>,
 ) -> Result<Vec<Track>, String> {
@@ -8545,6 +8600,14 @@ fn resolve_dragged_playlist_tracks(
                 client.get_playlist(playlist_id).map_err(|e| e.to_string())
             }
         },
+        QueueDragPayload::BrowseCollection { browse_id, .. } => {
+            let Some(client) = app_client(state) else {
+                return Err("Not connected.".to_string());
+            };
+            client
+                .get_browse_tracks(browse_id)
+                .map_err(|e| e.to_string())
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -8594,21 +8657,22 @@ fn handle_queue_drop_payload(
             insert_tracks_into_queue(vec![track], raw_slot, true, ps, state);
             true
         }
-        payload @ QueueDragPayload::Playlist { .. } => {
+        payload @ QueueDragPayload::Playlist { .. }
+        | payload @ QueueDragPayload::BrowseCollection { .. } => {
             let ps = ps.clone();
             let state = state.clone();
             glib::spawn_future_local(async move {
                 let payload_bg = payload.clone();
                 let state_bg = state.clone();
                 let result = gio::spawn_blocking(move || {
-                    resolve_dragged_playlist_tracks(&payload_bg, &state_bg)
+                    resolve_dragged_collection_tracks(&payload_bg, &state_bg)
                 })
                 .await;
 
                 match result {
                     Ok(Ok(tracks)) => insert_tracks_into_queue(tracks, raw_slot, true, &ps, &state),
-                    Ok(Err(err)) => eprintln!("[QUEUE] failed to expand playlist drop: {err}"),
-                    Err(err) => eprintln!("[QUEUE] failed to load playlist drop: {err:?}"),
+                    Ok(Err(err)) => eprintln!("[QUEUE] failed to expand collection drop: {err}"),
+                    Err(err) => eprintln!("[QUEUE] failed to load collection drop: {err:?}"),
                 }
             });
             true

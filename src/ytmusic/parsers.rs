@@ -151,9 +151,9 @@ fn parse_home_item(item: &Value) -> Option<HomeItem> {
         .get("musicTwoRowItemRenderer")
         .or_else(|| item.get("musicResponsiveListItemRenderer"))?;
 
-    parse_home_browse_card(renderer)
-        .map(HomeItem::BrowseCard)
-        .or_else(|| parse_track_from_renderer(renderer).map(HomeItem::Track))
+    parse_track_from_renderer(renderer)
+        .map(HomeItem::Track)
+        .or_else(|| parse_home_browse_card(renderer).map(HomeItem::BrowseCard))
 }
 
 fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
@@ -362,12 +362,20 @@ fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
         .collect::<Vec<_>>()
         .join("");
 
-    // Split on " • " and take the first part as artist
-    let artist_name = full_text
+    let segments: Vec<&str> = full_text
         .split(" \u{2022} ")
-        .next()
-        .unwrap_or(&full_text)
-        .trim()
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    // Some home carousels expose generic prefixes like "Song • Artist Name"
+    // without artist browse endpoints. Skip the media-type prefix so the UI
+    // still shows the same label users see in history/sidebar surfaces.
+    let artist_name = segments
+        .iter()
+        .copied()
+        .find(|segment| !is_generic_media_label(segment))
+        .unwrap_or_else(|| segments.first().copied().unwrap_or(full_text.trim()))
         .to_string();
 
     if artist_name.is_empty() {
@@ -378,6 +386,13 @@ fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
             id: None,
         }]
     }
+}
+
+fn is_generic_media_label(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "song" | "single" | "album" | "ep" | "video"
+    )
 }
 
 fn extract_thumbnail(renderer: &Value) -> Option<String> {
@@ -538,9 +553,9 @@ pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
 mod tests {
     use serde_json::json;
 
-    use crate::models::HomeBrowsePageType;
+    use crate::models::{HomeBrowsePageType, HomeItem};
 
-    use super::{parse_search_results, parse_track_from_renderer};
+    use super::{parse_home_item, parse_search_results, parse_track_from_renderer};
 
     #[test]
     fn responsive_history_items_fall_back_to_user_channel_name() {
@@ -783,6 +798,111 @@ mod tests {
 
         let track = parse_track_from_renderer(&renderer).expect("track should parse");
         assert_eq!(track.duration.as_deref(), Some("10:02"));
+    }
+
+    #[test]
+    fn home_items_prefer_track_for_playable_two_row_recommendations() {
+        let item = json!({
+            "musicTwoRowItemRenderer": {
+                "title": {
+                    "runs": [
+                        {
+                            "text": "Eternity in a Breath (Instrumental)",
+                            "navigationEndpoint": {
+                                "watchEndpoint": {
+                                    "videoId": "XRHBLS2qfeA"
+                                }
+                            }
+                        }
+                    ]
+                },
+                "subtitle": {
+                    "runs": [
+                        {
+                            "text": "Wuthering Waves",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "MPREb_example_album",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        { "text": " • " },
+                        {
+                            "text": "jixwang",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "artist_jixwang",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        { "text": " & " },
+                        {
+                            "text": "markmiliian",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "artist_markmiliian",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        { "text": " • Song" }
+                    ]
+                }
+            }
+        });
+
+        let parsed = parse_home_item(&item).expect("home item should parse");
+        let HomeItem::Track(track) = parsed else {
+            panic!("playable two-row recommendation should parse as track");
+        };
+
+        assert_eq!(track.video_id, "XRHBLS2qfeA");
+        assert_eq!(track.artists.len(), 2);
+        assert_eq!(track.artists[0].name, "jixwang");
+        assert_eq!(track.artists[1].name, "markmiliian");
+    }
+
+    #[test]
+    fn two_row_song_prefix_falls_back_to_following_artist_segment() {
+        let renderer = json!({
+            "title": {
+                "runs": [
+                    {
+                        "text": "Eternity in a Breath (Instrumental)",
+                        "navigationEndpoint": {
+                            "watchEndpoint": {
+                                "videoId": "XRHBLS2qfeA"
+                            }
+                        }
+                    }
+                ]
+            },
+            "subtitle": {
+                "runs": [
+                    { "text": "Song" },
+                    { "text": " • " },
+                    { "text": "Wuthering Waves, jixwang, & markmilian" }
+                ]
+            }
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("track should parse");
+        assert_eq!(track.artists.len(), 1);
+        assert_eq!(track.artists[0].name, "Wuthering Waves, jixwang, & markmilian");
     }
 
     #[test]

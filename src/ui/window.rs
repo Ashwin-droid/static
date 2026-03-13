@@ -252,6 +252,12 @@ enum QueuePlaylistSource {
     Offline,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackRowClickBehavior {
+    PlayFromContext,
+    StartRadio,
+}
+
 fn sync_mpris_transport(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     if let Ok(snapshot) = ps.player.replace_queue(
         ps.queue.borrow().clone(),
@@ -4759,6 +4765,7 @@ fn load_offline(
                             &state,
                             &ps,
                             &recent_list,
+                            TrackRowClickBehavior::PlayFromContext,
                         ));
                     }
 
@@ -4844,7 +4851,15 @@ fn load_likes(
 
                 let tracks_rc = Rc::new(tracks);
                 for (i, track) in tracks_rc.iter().enumerate() {
-                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
+                    let row = build_track_row(
+                        track,
+                        i,
+                        &tracks_rc,
+                        &state,
+                        &ps,
+                        &recent_list,
+                        TrackRowClickBehavior::PlayFromContext,
+                    );
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -5013,6 +5028,114 @@ fn build_home_browse_card(
     button
 }
 
+fn build_home_browse_row(
+    card: &HomeBrowseCard,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> GtkBox {
+    let wrapper = GtkBox::new(Orientation::Horizontal, 0);
+    wrapper.add_css_class("track-row-wrapper");
+
+    let row_btn = Button::new();
+    row_btn.add_css_class("track-row");
+    row_btn.set_hexpand(true);
+
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+
+    let art_container = GtkBox::new(Orientation::Vertical, 0);
+    art_container.add_css_class("track-art");
+    art_container.set_size_request(44, 44);
+    art_container.set_valign(Align::Center);
+    art_container.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = card.thumbnail_url.as_deref() {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(true);
+        picture.set_size_request(44, 44);
+        art_container.append(&picture);
+        load_thumbnail_into(&picture, url, 88);
+    } else {
+        let initial = card
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("track-art-letter");
+        letter.set_vexpand(true);
+        letter.set_valign(Align::Center);
+        letter.set_halign(Align::Center);
+        art_container.append(&letter);
+    }
+    row.append(&art_container);
+
+    let info = GtkBox::new(Orientation::Vertical, 1);
+    info.set_hexpand(true);
+    info.set_valign(Align::Center);
+
+    let title_label = Label::new(Some(&card.title));
+    title_label.set_halign(Align::Start);
+    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title_label.add_css_class("track-title");
+    info.append(&title_label);
+
+    let subtitle = card
+        .subtitle
+        .clone()
+        .unwrap_or_else(|| match card.page_type {
+            HomeBrowsePageType::Album => "Album".to_string(),
+            HomeBrowsePageType::Playlist => "Playlist".to_string(),
+            HomeBrowsePageType::Artist => "Artist".to_string(),
+            HomeBrowsePageType::UserChannel => "Channel".to_string(),
+        });
+    let subtitle_label = Label::new(Some(&subtitle));
+    subtitle_label.set_halign(Align::Start);
+    subtitle_label.add_css_class("track-artist");
+    subtitle_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    info.append(&subtitle_label);
+
+    row.append(&info);
+    row_btn.set_child(Some(&row));
+
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let content_scroll = content_scroll.clone();
+        let home_pagination = home_pagination.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let browse_id = card.browse_id.clone();
+        let title = card.title.clone();
+        let thumb = card.thumbnail_url.clone();
+        let page_type = card.page_type;
+
+        row_btn.connect_clicked(move |_| {
+            load_browse_detail(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                &browse_id,
+                &title,
+                thumb.as_deref(),
+                page_type,
+                &ps,
+                &recent_list,
+                false,
+            );
+        });
+    }
+
+    wrapper.append(&row_btn);
+    wrapper
+}
+
 fn build_playlist_card(
     playlist: &PlaylistSummary,
     state: &Arc<Mutex<AppState>>,
@@ -5071,45 +5194,24 @@ fn build_browse_summary_card(
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
     card_btn.set_size_request(166, -1);
+    card_btn.set_width_request(166);
     card_btn.set_hexpand(false);
     card_btn.set_halign(Align::Start);
     card_btn.set_valign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);
+    card.set_width_request(150);
+    card.set_halign(Align::Start);
+    card.set_valign(Align::Start);
     card.set_hexpand(false);
 
-    let art_container = GtkBox::new(Orientation::Vertical, 0);
-    art_container.add_css_class("cover-art");
-    art_container.set_size_request(150, 150);
-    art_container.set_hexpand(false);
-    art_container.set_overflow(gtk::Overflow::Hidden);
-
-    if let Some(url) = thumbnail_url {
-        let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
-        picture.set_size_request(150, 150);
-        picture.set_hexpand(false);
-        art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 150);
-    } else {
-        let initial = title
-            .chars()
-            .next()
-            .unwrap_or('\u{266B}')
-            .to_uppercase()
-            .to_string();
-        let letter = Label::new(Some(&initial));
-        letter.add_css_class("cover-art-letter");
-        letter.set_vexpand(true);
-        letter.set_valign(Align::Center);
-        art_container.append(&letter);
-    }
-
+    let art_container = build_square_cover_art(thumbnail_url, title, 150);
     card.append(&art_container);
 
     let name = Label::new(Some(title));
     name.add_css_class("cover-card-title");
+    name.set_width_request(150);
     name.set_halign(Align::Start);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     name.set_max_width_chars(18);
@@ -5118,6 +5220,7 @@ fn build_browse_summary_card(
     if let Some(subtitle) = subtitle {
         let subtitle_label = Label::new(Some(subtitle));
         subtitle_label.add_css_class("cover-card-artist");
+        subtitle_label.set_width_request(150);
         subtitle_label.set_halign(Align::Start);
         subtitle_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
         subtitle_label.set_max_width_chars(18);
@@ -5224,7 +5327,15 @@ fn load_playlist_detail(
 
                 let tracks_rc = Rc::new(tracks);
                 for (i, track) in tracks_rc.iter().enumerate() {
-                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
+                    let row = build_track_row(
+                        track,
+                        i,
+                        &tracks_rc,
+                        &state,
+                        &ps,
+                        &recent_list,
+                        TrackRowClickBehavior::PlayFromContext,
+                    );
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -5461,7 +5572,15 @@ fn load_browse_detail(
 
                 let tracks_rc = Rc::new(tracks);
                 for (i, track) in tracks_rc.iter().enumerate() {
-                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
+                    let row = build_track_row(
+                        track,
+                        i,
+                        &tracks_rc,
+                        &state,
+                        &ps,
+                        &recent_list,
+                        TrackRowClickBehavior::PlayFromContext,
+                    );
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -5491,43 +5610,25 @@ fn build_offline_playlist_card(
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
     card_btn.set_size_request(166, -1);
+    card_btn.set_width_request(166);
     card_btn.set_hexpand(false);
     card_btn.set_halign(Align::Start);
     card_btn.set_valign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);
+    card.set_width_request(150);
+    card.set_halign(Align::Start);
+    card.set_valign(Align::Start);
+    card.set_hexpand(false);
 
-    let art_container = GtkBox::new(Orientation::Vertical, 0);
-    art_container.add_css_class("cover-art");
-    art_container.set_size_request(150, 150);
-    art_container.set_overflow(gtk::Overflow::Hidden);
-
-    if let Some(url) = &playlist.thumbnail_url {
-        let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
-        picture.set_size_request(150, 150);
-        art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 150);
-    } else {
-        let initial = playlist
-            .title
-            .chars()
-            .next()
-            .unwrap_or('\u{266B}')
-            .to_uppercase()
-            .to_string();
-        let letter = Label::new(Some(&initial));
-        letter.add_css_class("cover-art-letter");
-        letter.set_vexpand(true);
-        letter.set_valign(Align::Center);
-        art_container.append(&letter);
-    }
-
+    let art_container =
+        build_square_cover_art(playlist.thumbnail_url.as_deref(), &playlist.title, 150);
     card.append(&art_container);
 
     let name = Label::new(Some(&playlist.title));
     name.add_css_class("cover-card-title");
+    name.set_width_request(150);
     name.set_halign(Align::Start);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     name.set_max_width_chars(18);
@@ -5536,6 +5637,7 @@ fn build_offline_playlist_card(
     if let Some(sub) = &playlist.subtitle {
         let subtitle = Label::new(Some(sub));
         subtitle.add_css_class("cover-card-artist");
+        subtitle.set_width_request(150);
         subtitle.set_halign(Align::Start);
         subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
         subtitle.set_max_width_chars(18);
@@ -5666,7 +5768,15 @@ fn load_offline_playlist_detail(
 
                 let tracks_rc = Rc::new(tracks);
                 for (i, track) in tracks_rc.iter().enumerate() {
-                    let row = build_track_row(track, i, &tracks_rc, &state, &ps, &recent_list);
+                    let row = build_track_row(
+                        track,
+                        i,
+                        &tracks_rc,
+                        &state,
+                        &ps,
+                        &recent_list,
+                        TrackRowClickBehavior::PlayFromContext,
+                    );
                     grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
                 }
 
@@ -5783,6 +5893,7 @@ fn render_home_view(
         content_box.append(&header);
 
         let tracks = home_section_tracks(section);
+        let browse_cards = home_section_browse_cards(section);
         if tracks.len() == section.contents.len() {
             if !tracks.is_empty() {
                 content_box.append(&build_play_controls(&tracks, state, ps, None));
@@ -5795,7 +5906,36 @@ fn render_home_view(
 
             let section_tracks = Rc::new(tracks);
             for (i, track) in section_tracks.iter().enumerate() {
-                let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
+                let row = build_track_row(
+                    track,
+                    i,
+                    &section_tracks,
+                    state,
+                    ps,
+                    recent_list,
+                    TrackRowClickBehavior::StartRadio,
+                );
+                grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
+            content_box.append(&grid);
+        } else if browse_cards.len() == section.contents.len() && !browse_cards.is_empty() {
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(12);
+            grid.set_row_spacing(8);
+            grid.set_column_homogeneous(true);
+            grid.set_margin_top(4);
+
+            for (i, card) in browse_cards.iter().enumerate() {
+                let row = build_home_browse_row(
+                    card,
+                    state,
+                    content_box,
+                    content_scroll,
+                    home_pagination,
+                    ps,
+                    recent_list,
+                );
                 grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
             }
 
@@ -5931,7 +6071,15 @@ fn render_artist_view(
 
             let section_tracks = Rc::new(tracks);
             for (i, track) in section_tracks.iter().enumerate() {
-                let row = build_track_row(track, i, &section_tracks, state, ps, recent_list);
+                let row = build_track_row(
+                    track,
+                    i,
+                    &section_tracks,
+                    state,
+                    ps,
+                    recent_list,
+                    TrackRowClickBehavior::StartRadio,
+                );
                 grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
             }
 
@@ -5949,30 +6097,73 @@ fn render_artist_view(
         content_box.append(&header);
 
         let tracks = home_section_tracks(section);
+        let browse_cards = home_section_browse_cards(section);
         if tracks.len() == section.contents.len() && !tracks.is_empty() {
             content_box.append(&build_play_controls(&tracks, state, ps, None));
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(12);
+            grid.set_row_spacing(8);
+            grid.set_column_homogeneous(true);
+            grid.set_margin_top(4);
+
+            let section_tracks = Rc::new(tracks);
+            for (i, track) in section_tracks.iter().enumerate() {
+                let row = build_track_row(
+                    track,
+                    i,
+                    &section_tracks,
+                    state,
+                    ps,
+                    recent_list,
+                    TrackRowClickBehavior::StartRadio,
+                );
+                grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
+            content_box.append(&grid);
+        } else if browse_cards.len() == section.contents.len() && !browse_cards.is_empty() {
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(12);
+            grid.set_row_spacing(8);
+            grid.set_column_homogeneous(true);
+            grid.set_margin_top(4);
+
+            for (i, card) in browse_cards.iter().enumerate() {
+                let row = build_home_browse_row(
+                    card,
+                    state,
+                    content_box,
+                    content_scroll,
+                    home_pagination,
+                    ps,
+                    recent_list,
+                );
+                grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+            }
+
+            content_box.append(&grid);
+        } else {
+            let cards_scroll = build_horizontal_cards_scroll(content_scroll);
+
+            let cards_box = GtkBox::new(Orientation::Horizontal, 14);
+            cards_box.set_margin_top(4);
+            cards_box.set_margin_bottom(8);
+
+            for item in &section.contents {
+                cards_box.append(&build_home_item_card(
+                    item,
+                    state,
+                    content_box,
+                    content_scroll,
+                    home_pagination,
+                    ps,
+                    recent_list,
+                ));
+            }
+
+            cards_scroll.set_child(Some(&cards_box));
+            content_box.append(&cards_scroll);
         }
-
-        let cards_scroll = build_horizontal_cards_scroll(content_scroll);
-
-        let cards_box = GtkBox::new(Orientation::Horizontal, 14);
-        cards_box.set_margin_top(4);
-        cards_box.set_margin_bottom(8);
-
-        for item in &section.contents {
-            cards_box.append(&build_home_item_card(
-                item,
-                state,
-                content_box,
-                content_scroll,
-                home_pagination,
-                ps,
-                recent_list,
-            ));
-        }
-
-        cards_scroll.set_child(Some(&cards_box));
-        content_box.append(&cards_scroll);
     }
 }
 
@@ -5996,6 +6187,17 @@ fn home_section_tracks(section: &HomeSection) -> Vec<Track> {
         .filter_map(|item| match item {
             HomeItem::Track(track) => Some(track.clone()),
             HomeItem::BrowseCard(_) => None,
+        })
+        .collect()
+}
+
+fn home_section_browse_cards(section: &HomeSection) -> Vec<HomeBrowseCard> {
+    section
+        .contents
+        .iter()
+        .filter_map(|item| match item {
+            HomeItem::BrowseCard(card) => Some(card.clone()),
+            HomeItem::Track(_) => None,
         })
         .collect()
 }
@@ -6073,7 +6275,15 @@ fn render_search_view(
 
     let tracks_rc = Rc::new(tracks.to_vec());
     for (i, track) in tracks_rc.iter().enumerate() {
-        let row = build_track_row(track, i, &tracks_rc, state, ps, recent_list);
+        let row = build_track_row(
+            track,
+            i,
+            &tracks_rc,
+            state,
+            ps,
+            recent_list,
+            TrackRowClickBehavior::PlayFromContext,
+        );
         grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
     }
 
@@ -6084,6 +6294,53 @@ fn render_search_view(
 // WIDGETS
 // ============================================================
 
+fn build_square_cover_art(
+    thumbnail_url: Option<&str>,
+    fallback_label: &str,
+    load_size: i32,
+) -> GtkBox {
+    let art_container = GtkBox::new(Orientation::Vertical, 0);
+    art_container.add_css_class("cover-art");
+    art_container.set_size_request(150, 150);
+    art_container.set_width_request(150);
+    art_container.set_height_request(150);
+    art_container.set_halign(Align::Start);
+    art_container.set_valign(Align::Start);
+    art_container.set_hexpand(false);
+    art_container.set_vexpand(false);
+    art_container.set_overflow(gtk::Overflow::Hidden);
+
+    if let Some(url) = thumbnail_url {
+        let picture = Picture::new();
+        picture.set_size_request(150, 150);
+        picture.set_width_request(150);
+        picture.set_height_request(150);
+        picture.set_halign(Align::Start);
+        picture.set_valign(Align::Start);
+        picture.set_hexpand(false);
+        picture.set_vexpand(false);
+        picture.set_keep_aspect_ratio(false);
+        art_container.append(&picture);
+        load_thumbnail_into(&picture, url, load_size);
+    } else {
+        let initial = fallback_label
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("cover-art-letter");
+        letter.set_halign(Align::Center);
+        letter.set_valign(Align::Center);
+        letter.set_hexpand(true);
+        letter.set_vexpand(true);
+        art_container.append(&letter);
+    }
+
+    art_container
+}
+
 fn build_cover_card(
     track: &Track,
     state: &Arc<Mutex<AppState>>,
@@ -6092,41 +6349,25 @@ fn build_cover_card(
 ) -> Button {
     let card_btn = Button::new();
     card_btn.add_css_class("cover-card");
+    card_btn.set_size_request(166, -1);
+    card_btn.set_width_request(166);
+    card_btn.set_hexpand(false);
+    card_btn.set_halign(Align::Start);
+    card_btn.set_valign(Align::Start);
 
     let card = GtkBox::new(Orientation::Vertical, 6);
     card.set_size_request(150, -1);
+    card.set_width_request(150);
+    card.set_halign(Align::Start);
+    card.set_valign(Align::Start);
+    card.set_hexpand(false);
 
-    // Cover art
-    let art_container = GtkBox::new(Orientation::Vertical, 0);
-    art_container.add_css_class("cover-art");
-    art_container.set_size_request(150, 150);
-    art_container.set_overflow(gtk::Overflow::Hidden);
-
-    if let Some(url) = &track.thumbnail_url {
-        let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
-        picture.set_size_request(150, 150);
-        art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 300);
-    } else {
-        let initial = track
-            .title
-            .chars()
-            .next()
-            .unwrap_or('\u{266B}')
-            .to_uppercase()
-            .to_string();
-        let letter = Label::new(Some(&initial));
-        letter.add_css_class("cover-art-letter");
-        letter.set_vexpand(true);
-        letter.set_valign(Align::Center);
-        art_container.append(&letter);
-    }
-
+    let art_container = build_square_cover_art(track.thumbnail_url.as_deref(), &track.title, 300);
     card.append(&art_container);
 
     let name = Label::new(Some(&track.title));
     name.add_css_class("cover-card-title");
+    name.set_width_request(150);
     name.set_halign(Align::Start);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     name.set_max_width_chars(18);
@@ -6135,6 +6376,7 @@ fn build_cover_card(
     let artist_str = artist_string(track);
     let artist = Label::new(Some(&artist_str));
     artist.add_css_class("cover-card-artist");
+    artist.set_width_request(150);
     artist.set_halign(Align::Start);
     artist.set_ellipsize(gtk::pango::EllipsizeMode::End);
     artist.set_max_width_chars(18);
@@ -6240,6 +6482,7 @@ fn build_track_row(
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
+    click_behavior: TrackRowClickBehavior,
 ) -> GtkBox {
     let wrapper = GtkBox::new(Orientation::Horizontal, 0);
     wrapper.add_css_class("track-row-wrapper");
@@ -6308,16 +6551,36 @@ fn build_track_row(
 
     row_btn.set_child(Some(&row));
 
-    // Left-click: play from this track's context (sets queue to all tracks)
+    // Left-click behavior depends on the surface:
+    // discovery sections start radio from the clicked song, while playlist-like
+    // views play from the current list context.
     {
         let state = state.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let track = track.clone();
         let all_tracks = all_tracks.clone();
+        let video_id = track.video_id.clone();
+        let title = track.title.clone();
+        let artist_str = artist_str.clone();
+        let thumb_url = track.thumbnail_url.clone();
 
         row_btn.connect_clicked(move |_| {
-            play_from_context(&state, &ps, &all_tracks, index);
+            match click_behavior {
+                TrackRowClickBehavior::PlayFromContext => {
+                    play_from_context(&state, &ps, &all_tracks, index);
+                }
+                TrackRowClickBehavior::StartRadio => {
+                    play_track(
+                        &state,
+                        &video_id,
+                        &title,
+                        &artist_str,
+                        thumb_url.as_deref(),
+                        &ps,
+                    );
+                }
+            }
             add_to_recent(&recent_list, &track, &state, &ps);
         });
     }

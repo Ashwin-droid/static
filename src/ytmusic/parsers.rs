@@ -141,13 +141,7 @@ fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
 
     let items = shelf.pointer("/contents").and_then(|c| c.as_array())?;
 
-    let contents: Vec<HomeItem> = items
-        .iter()
-        .filter_map(|item| {
-            let renderer = item.get("musicResponsiveListItemRenderer")?;
-            parse_track_from_renderer(renderer).map(HomeItem::Track)
-        })
-        .collect();
+    let contents: Vec<HomeItem> = items.iter().filter_map(parse_home_item).collect();
 
     Some(HomeSection { title, contents })
 }
@@ -157,9 +151,9 @@ fn parse_home_item(item: &Value) -> Option<HomeItem> {
         .get("musicTwoRowItemRenderer")
         .or_else(|| item.get("musicResponsiveListItemRenderer"))?;
 
-    parse_track_from_renderer(renderer)
-        .map(HomeItem::Track)
-        .or_else(|| parse_home_browse_card(renderer).map(HomeItem::BrowseCard))
+    parse_home_browse_card(renderer)
+        .map(HomeItem::BrowseCard)
+        .or_else(|| parse_track_from_renderer(renderer).map(HomeItem::Track))
 }
 
 fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
@@ -225,11 +219,7 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
         };
 
         let thumbnail_url = extract_thumbnail(renderer);
-
-        let duration = renderer
-            .pointer("/fixedColumns/0/musicResponsiveListItemFixedColumnRenderer/text/runs/0/text")
-            .and_then(|d| d.as_str())
-            .map(String::from);
+        let duration = extract_duration(renderer);
 
         return Some(Track {
             video_id,
@@ -257,7 +247,7 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             title,
             artists,
             album: None,
-            duration: None,
+            duration: extract_duration(renderer),
             thumbnail_url,
         });
     }
@@ -356,6 +346,89 @@ fn extract_thumbnail(renderer: &Value) -> Option<String> {
         .and_then(|t| t.get("url"))
         .and_then(|u| u.as_str())
         .map(String::from)
+}
+
+fn extract_duration(renderer: &Value) -> Option<String> {
+    renderer
+        .pointer("/lengthText/runs")
+        .and_then(|runs| runs.as_array())
+        .and_then(|runs| extract_duration_from_runs(runs))
+        .or_else(|| {
+            renderer
+                .pointer("/lengthText/simpleText")
+                .and_then(|text| text.as_str())
+                .and_then(normalize_duration_text)
+        })
+        .or_else(|| {
+            renderer
+                .pointer("/fixedColumns")
+                .and_then(|columns| columns.as_array())
+                .and_then(|columns| {
+                    columns
+                        .iter()
+                        .find_map(extract_duration_from_fixed_column)
+                })
+        })
+        .or_else(|| {
+            extract_duration_from_overlay_path(
+                renderer,
+                "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/thumbnailOverlayTimeStatusRenderer/text",
+            )
+        })
+        .or_else(|| {
+            extract_duration_from_overlay_path(
+                renderer,
+                "/overlay/musicItemThumbnailOverlayRenderer/content/thumbnailOverlayTimeStatusRenderer/text",
+            )
+        })
+}
+
+fn extract_duration_from_fixed_column(column: &Value) -> Option<String> {
+    column
+        .pointer("/musicResponsiveListItemFixedColumnRenderer/text/runs")
+        .and_then(|runs| runs.as_array())
+        .and_then(|runs| extract_duration_from_runs(runs))
+        .or_else(|| {
+            column
+                .pointer("/musicResponsiveListItemFixedColumnRenderer/text/simpleText")
+                .and_then(|text| text.as_str())
+                .and_then(normalize_duration_text)
+        })
+}
+
+fn extract_duration_from_overlay_path(renderer: &Value, base_path: &str) -> Option<String> {
+    renderer
+        .pointer(&format!("{base_path}/runs"))
+        .and_then(|runs| runs.as_array())
+        .and_then(|runs| extract_duration_from_runs(runs))
+        .or_else(|| {
+            renderer
+                .pointer(&format!("{base_path}/simpleText"))
+                .and_then(|text| text.as_str())
+                .and_then(normalize_duration_text)
+        })
+}
+
+fn extract_duration_from_runs(runs: &[Value]) -> Option<String> {
+    normalize_duration_text(&join_runs(runs))
+}
+
+fn normalize_duration_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    looks_like_duration(trimmed).then(|| trimmed.to_string())
+}
+
+fn looks_like_duration(text: &str) -> bool {
+    let parts: Vec<_> = text.split(':').collect();
+    if !(parts.len() == 2 || parts.len() == 3) {
+        return false;
+    }
+
+    parts.iter().enumerate().all(|(index, part)| {
+        !part.is_empty()
+            && part.chars().all(|ch| ch.is_ascii_digit())
+            && (index == 0 || part.len() == 2)
+    })
 }
 
 pub fn parse_search_results(json: &Value) -> Result<Vec<Track>> {
@@ -519,6 +592,123 @@ mod tests {
             track.artists[1].id.as_deref(),
             Some("UCgTaSNshxaxU52vJa6Pe47A")
         );
+    }
+
+    #[test]
+    fn responsive_items_find_duration_in_later_fixed_columns() {
+        let renderer = json!({
+            "flexColumns": [
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Song Title",
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {
+                                            "videoId": "song123"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Artist Name",
+                                    "navigationEndpoint": {
+                                        "browseEndpoint": {
+                                            "browseId": "artist123",
+                                            "browseEndpointContextSupportedConfigs": {
+                                                "browseEndpointContextMusicConfig": {
+                                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "fixedColumns": [
+                {
+                    "musicResponsiveListItemFixedColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                { "text": "E" }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "musicResponsiveListItemFixedColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                { "text": "3:45" }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("track should parse");
+        assert_eq!(track.duration.as_deref(), Some("3:45"));
+    }
+
+    #[test]
+    fn two_row_items_extract_duration_from_overlay() {
+        let renderer = json!({
+            "title": {
+                "runs": [
+                    {
+                        "text": "Another Song",
+                        "navigationEndpoint": {
+                            "watchEndpoint": {
+                                "videoId": "song456"
+                            }
+                        }
+                    }
+                ]
+            },
+            "subtitle": {
+                "runs": [
+                    {
+                        "text": "Artist Name",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {
+                                "browseId": "artist456",
+                                "browseEndpointContextSupportedConfigs": {
+                                    "browseEndpointContextMusicConfig": {
+                                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "thumbnailOverlay": {
+                "musicItemThumbnailOverlayRenderer": {
+                    "content": {
+                        "thumbnailOverlayTimeStatusRenderer": {
+                            "text": {
+                                "simpleText": "10:02"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("track should parse");
+        assert_eq!(track.duration.as_deref(), Some("10:02"));
     }
 }
 

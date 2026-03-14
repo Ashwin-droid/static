@@ -9,6 +9,12 @@ use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 use crate::models::{
     BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult, Track,
 };

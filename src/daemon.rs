@@ -30,6 +30,12 @@ use crate::sponsorblock::{
 use crate::ytmusic::YtMusicClient;
 use crate::ytmusic::client::{SongRating, TrackingInfo};
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 const KEYRING_SERVICE: &str = "com.static.music";
 const KEYRING_USER: &str = "cookie";
 const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
@@ -394,13 +400,9 @@ pub fn run() -> Result<()> {
         }
     }
 
-    let mut cache = MusicCache::new().context("Failed to initialise music cache")?;
-    if let Some(root) = get_storage_root() {
-        if let Err(err) = cache.migrate_storage_root(&root) {
-            eprintln!("[STATICD] failed to apply storage root override: {err}");
-            let _ = cache.apply_storage_root("");
-        }
-    }
+    let storage_root = get_storage_root();
+    let cache = MusicCache::new_with_storage_root(storage_root.as_deref())
+        .context("Failed to initialise music cache")?;
     let settings = cache.load_settings().unwrap_or_default();
     let (command_tx, command_rx) = mpsc::channel::<CommandEnvelope>();
     let (background_tx, background_rx) = mpsc::channel::<BackgroundEvent>();
@@ -565,6 +567,12 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.repeat_mode = repeat_mode;
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::LogMessage { source, message } => {
+            match crate::logging::append_log(source, &message) {
+                Ok(()) => DaemonResponse::Ok,
+                Err(err) => DaemonResponse::Error(format!("Failed to write log: {err}")),
+            }
         }
         DaemonRequest::ReloadSettings => {
             reload_settings(state);
@@ -1017,13 +1025,8 @@ fn run_offline_cache_sync(
     vr_refresh_token: Option<&str>,
     storage_root: Option<&str>,
 ) -> Result<()> {
-    let mut cache = MusicCache::new().context("Failed to initialise music cache")?;
-    if let Some(root) = storage_root {
-        if let Err(err) = cache.migrate_storage_root(root) {
-            eprintln!("[OFFLINE_SYNC] failed to apply storage root override: {err}");
-            let _ = cache.apply_storage_root("");
-        }
-    }
+    let mut cache = MusicCache::new_with_storage_root(storage_root)
+        .context("Failed to initialise music cache")?;
 
     let client = cookie.and_then(|cookie| match YtMusicClient::new(cookie) {
         Ok(client) => {
@@ -1499,19 +1502,14 @@ fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, 
             return;
         }
 
-        let mut cache = match MusicCache::new() {
+        let storage_root = get_storage_root();
+        let cache = match MusicCache::new_with_storage_root(storage_root.as_deref()) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("[STATICD] failed to initialise music cache for history flush: {err}");
                 return;
             }
         };
-        if let Some(root) = get_storage_root() {
-            if let Err(err) = cache.migrate_storage_root(&root) {
-                eprintln!("[STATICD] failed to apply storage root override: {err}");
-                let _ = cache.apply_storage_root("");
-            }
-        }
 
         if let Err(err) = cache.record_play(
             &track.video_id,
@@ -1641,19 +1639,14 @@ fn refresh_sponsorblock_for_current_track(state: &mut DaemonState) {
     let background_tx = state.background_tx.clone();
 
     std::thread::spawn(move || {
-        let mut cache = match MusicCache::new() {
+        let storage_root = get_storage_root();
+        let mut cache = match MusicCache::new_with_storage_root(storage_root.as_deref()) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("[SPONSORBLOCK] failed to initialize music cache for {video_id}: {err}");
                 return;
             }
         };
-        if let Some(root) = get_storage_root() {
-            if let Err(err) = cache.migrate_storage_root(&root) {
-                eprintln!("[SPONSORBLOCK] failed to apply storage root override: {err}");
-                let _ = cache.apply_storage_root("");
-            }
-        }
         let sponsorblock = match SponsorBlockClient::new() {
             Ok(client) => client,
             Err(err) => {
@@ -1768,19 +1761,13 @@ fn prefetch_upcoming(state: &mut DaemonState) {
             return;
         };
 
-        let mut cache = match MusicCache::new() {
+        let cache = match MusicCache::new_with_storage_root(storage_root.as_deref()) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("[PREFETCH] failed to initialize music cache: {err}");
                 return;
             }
         };
-        if let Some(root) = storage_root.as_deref() {
-            if let Err(err) = cache.migrate_storage_root(root) {
-                eprintln!("[PREFETCH] failed to apply storage root override: {err}");
-                let _ = cache.apply_storage_root("");
-            }
-        }
 
         let client = match YtMusicClient::new(&cookie) {
             Ok(client) => client,

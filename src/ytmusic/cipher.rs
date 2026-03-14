@@ -5,6 +5,12 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use serde_json::{Value, json};
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 const SOLVER_LIB: &str = include_str!("solver/yt.solver.bun.lib.js");
 const SOLVER_CORE: &str = include_str!("solver/yt.solver.core.js");
 

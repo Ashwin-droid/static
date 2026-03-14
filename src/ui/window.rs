@@ -22,6 +22,12 @@ use zbus::{
     zvariant::{OwnedObjectPath, OwnedValue, Value},
 };
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 const ICON_PREV: &[u8] = include_bytes!("../../assets/icons/prev.svg");
 const ICON_PLAY: &[u8] = include_bytes!("../../assets/icons/play.svg");
 const ICON_PAUSE: &[u8] = include_bytes!("../../assets/icons/pause.svg");
@@ -865,18 +871,14 @@ pub fn build_window(app: &Application) {
     stack.set_transition_type(StackTransitionType::None);
     stack.set_transition_duration(0);
 
-    let cache = MusicCache::new().expect("Failed to initialise music cache");
-    let mut cache = cache;
+    let storage_root = get_storage_root();
+    let cache = MusicCache::new_with_storage_root(storage_root.as_deref())
+        .expect("Failed to initialise music cache");
+    let cache = cache;
     let settings = cache.load_settings().unwrap_or_else(|err| {
         eprintln!("[SETTINGS] failed to load persisted settings: {err}");
         AppSettings::default()
     });
-    if let Some(root) = get_storage_root() {
-        if let Err(err) = cache.migrate_storage_root(&root) {
-            eprintln!("[SETTINGS] failed to apply storage root override: {err}");
-            let _ = cache.apply_storage_root("");
-        }
-    }
     let state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         client: None,
         cache,

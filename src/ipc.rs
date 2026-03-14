@@ -6,6 +6,7 @@ use gstreamer::ClockTime;
 use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
 
+use crate::logging::LogSource;
 use crate::models::{RadioVirtualPlaylist, Track};
 use crate::ytmusic::client::SongRating;
 
@@ -101,6 +102,10 @@ pub enum DaemonRequest {
     SetRepeatMode {
         repeat_mode: RepeatMode,
     },
+    LogMessage {
+        source: LogSource,
+        message: String,
+    },
     ReloadSettings,
     Shutdown,
 }
@@ -170,6 +175,14 @@ pub fn ensure_daemon_running() -> Result<()> {
     }
 
     bail!("Playback daemon did not become ready in time")
+}
+
+pub fn forward_log_message(source: LogSource, message: String) -> Result<()> {
+    match send_request_raw(&DaemonRequest::LogMessage { source, message })? {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error(err) => bail!(err),
+        other => bail!("Unexpected daemon response: {other:?}"),
+    }
 }
 
 #[derive(Clone)]

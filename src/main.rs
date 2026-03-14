@@ -1,6 +1,7 @@
 mod cache;
 mod daemon;
 mod ipc;
+mod logging;
 mod models;
 mod playback_engine;
 mod player;

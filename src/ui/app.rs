@@ -4,12 +4,19 @@ use gtk::{Application, CssProvider, gdk};
 use super::window;
 use crate::ipc;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 const APP_ID: &str = "com.static.music";
 
 pub fn build_app() -> Application {
     let app = Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
+        let _ = crate::logging::reset_session_log();
         let provider = CssProvider::new();
         provider.load_from_data(include_str!("style.css"));
         gtk::style_context_add_provider_for_display(

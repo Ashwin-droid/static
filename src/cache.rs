@@ -7,6 +7,12 @@ use crate::sponsorblock::{
     SponsorSegment, default_skip_categories, normalize_segments, sanitize_categories,
 };
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSettings {
     pub auto_sync_chromium_cookies: bool,
@@ -105,8 +111,31 @@ impl MusicCache {
         Ok((offline_dir, art_dir, temp_dir))
     }
 
+    #[allow(dead_code)]
     pub fn new() -> Result<Self> {
-        let base = Self::default_base_dir();
+        Self::new_with_storage_root(None)
+    }
+
+    pub fn new_with_storage_root(raw_root: Option<&str>) -> Result<Self> {
+        let default_base = Self::default_base_dir();
+        let base = raw_root
+            .map(Self::resolve_storage_root)
+            .unwrap_or_else(|| default_base.clone());
+
+        if let Some(raw_root) = raw_root {
+            let desired_db_path = base.join("data.db");
+            let default_db_path = default_base.join("data.db");
+            if base != default_base && !desired_db_path.exists() && default_db_path.exists() {
+                let mut cache = Self::open_at_base(default_base)?;
+                cache.migrate_storage_root(raw_root)?;
+                return Ok(cache);
+            }
+        }
+
+        Self::open_at_base(base)
+    }
+
+    fn open_at_base(base: PathBuf) -> Result<Self> {
         let (offline_dir, art_dir, temp_dir) = Self::ensure_storage_layout(&base)?;
         // Clean stale prefetch files on startup
         if let Ok(entries) = std::fs::read_dir(&temp_dir) {
@@ -115,8 +144,25 @@ impl MusicCache {
             }
         }
 
-        let db = Connection::open(base.join("data.db")).context("Failed to open cache database")?;
+        let db = Self::open_database(&base)?;
 
+        Ok(Self {
+            db,
+            base_dir: base,
+            offline_dir,
+            art_dir,
+            temp_dir,
+        })
+    }
+
+    fn open_database(base: &Path) -> Result<Connection> {
+        let db =
+            Connection::open(base.join("data.db")).context("Failed to open cache database")?;
+        Self::initialize_database(&db)?;
+        Ok(db)
+    }
+
+    fn initialize_database(db: &Connection) -> Result<()> {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS plays (
                 video_id     TEXT PRIMARY KEY,
@@ -174,13 +220,7 @@ impl MusicCache {
             );",
         )?;
 
-        Ok(Self {
-            db,
-            base_dir: base,
-            offline_dir,
-            art_dir,
-            temp_dir,
-        })
+        Ok(())
     }
 
     pub fn apply_storage_root(&mut self, raw_root: &str) -> Result<()> {
@@ -201,11 +241,13 @@ impl MusicCache {
         }
 
         let old_base = self.base_dir.clone();
+        let old_db_path = old_base.join("data.db");
         let old_offline_dir = self.offline_dir.clone();
         let old_art_dir = self.art_dir.clone();
         let old_temp_dir = self.temp_dir.clone();
 
         let (new_offline_dir, new_art_dir, new_temp_dir) = Self::ensure_storage_layout(&new_base)?;
+        let new_db_path = new_base.join("data.db");
 
         move_dir_contents(&old_art_dir, &new_art_dir)?;
         move_dir_contents(&old_offline_dir, &new_offline_dir)?;
@@ -238,11 +280,34 @@ impl MusicCache {
             ],
         )?;
 
+        let placeholder = Connection::open_in_memory().context("Failed to prepare DB migration")?;
+        let old_db = std::mem::replace(&mut self.db, placeholder);
+        match old_db.close() {
+            Ok(()) => {}
+            Err((conn, err)) => {
+                self.db = conn;
+                return Err(err).context("Failed to close cache database before migration");
+            }
+        }
+
+        copy_file_contents(&old_db_path, &new_db_path)?;
+        match Self::open_database(&new_base) {
+            Ok(db) => {
+                self.db = db;
+            }
+            Err(err) => {
+                self.db = Self::open_database(&old_base)
+                    .context("Failed to reopen original cache database after migration error")?;
+                return Err(err).context("Failed to open migrated cache database");
+            }
+        }
+
         self.base_dir = new_base;
         self.offline_dir = new_offline_dir;
         self.art_dir = new_art_dir;
         self.temp_dir = new_temp_dir;
 
+        let _ = std::fs::remove_file(old_db_path);
         let _ = std::fs::remove_dir(old_art_dir);
         let _ = std::fs::remove_dir(old_offline_dir);
         let _ = std::fs::remove_dir(old_temp_dir);
@@ -1039,5 +1104,22 @@ fn move_dir_contents(from: &Path, to: &Path) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn copy_file_contents(from: &Path, to: &Path) -> Result<()> {
+    if !from.exists() || from == to {
+        return Ok(());
+    }
+
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    if to.exists() {
+        let _ = std::fs::remove_file(to);
+    }
+
+    std::fs::copy(from, to)?;
     Ok(())
 }

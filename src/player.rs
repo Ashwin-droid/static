@@ -5,6 +5,12 @@ use gstreamer::ClockTime;
 use crate::ipc::{DaemonClient, PlaybackSnapshot, RepeatMode, millis_to_clock_time};
 use crate::models::{RadioVirtualPlaylist, Track};
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 pub struct Player {
     client: DaemonClient,
     snapshot: RefCell<PlaybackSnapshot>,

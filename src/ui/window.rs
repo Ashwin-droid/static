@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use anyhow::Context;
@@ -179,6 +180,8 @@ struct PlayerState {
     sponsor_segments: RefCell<Vec<SponsorSegment>>,
     sponsor_segments_reported: RefCell<HashSet<String>>,
     daemon_refresh_in_flight: Cell<bool>,
+    daemon_refresh_started_at: Cell<Option<Instant>>,
+    daemon_refresh_serial: Cell<u64>,
     play_request_serial: Cell<u64>,
     // Queue panel widgets
     queue_scroll: ScrolledWindow,
@@ -360,6 +363,8 @@ fn apply_remote_snapshot(
     state: &Arc<Mutex<AppState>>,
     snapshot: PlaybackSnapshot,
 ) {
+    ps.player.apply_snapshot(snapshot.clone());
+
     let queue_changed = {
         let queue = ps.queue.borrow();
         *queue != snapshot.queue || ps.queue_index.get() != snapshot.queue_index
@@ -389,7 +394,7 @@ fn apply_remote_snapshot(
         .as_ref()
         .map(|track| track.video_id.clone());
 
-    match snapshot.current_track {
+    match snapshot.current_track.as_ref() {
         Some(track) => {
             let is_new_track = previous_video_id.as_deref() != Some(track.video_id.as_str());
             let persisted_rating = ps
@@ -449,6 +454,8 @@ fn apply_remote_snapshot(
                 spawn_sponsorblock_sync(state, ps, &track.video_id, session_id);
                 spawn_song_rating_sync(state, ps, &track.video_id, session_id);
             }
+
+            apply_snapshot_playback_ui(ps, &snapshot);
         }
         None => {
             ps.now_playing_track.borrow_mut().take();
@@ -477,6 +484,46 @@ fn apply_remote_snapshot(
     if queue_changed {
         render_queue_panel(ps, state);
     }
+}
+
+fn apply_snapshot_playback_ui(ps: &PlayerState, snapshot: &PlaybackSnapshot) {
+    let pos = snapshot.position_millis.map(ClockTime::from_mseconds);
+    let dur = snapshot.duration_millis.map(ClockTime::from_mseconds);
+
+    if let Some(position_millis) = snapshot.position_millis {
+        note_playback_position(ps, position_millis);
+    }
+
+    match (pos, dur) {
+        (Some(pos), Some(dur)) => {
+            let dur_ns = dur.nseconds();
+            if dur_ns > 0 {
+                let frac = pos.nseconds() as f64 / dur_ns as f64;
+                ps.progress_slider.set_value(frac.clamp(0.0, 1.0));
+            } else {
+                ps.progress_slider.set_value(0.0);
+            }
+            ps.time_label.set_text(&format!(
+                "{} / {}",
+                format_clock_time(pos),
+                format_clock_time(dur),
+            ));
+        }
+        (Some(pos), None) => {
+            ps.progress_slider.set_value(0.0);
+            ps.time_label
+                .set_text(&format!("{} / 0:00", format_clock_time(pos)));
+        }
+        (None, Some(dur)) => {
+            ps.progress_slider.set_value(0.0);
+            ps.time_label
+                .set_text(&format!("0:00 / {}", format_clock_time(dur)));
+        }
+        (None, None) => {}
+    }
+
+    ps.progress_slider
+        .set_fill_level(snapshot.buffered_fraction);
 }
 
 fn update_app_settings<F>(state: &Arc<Mutex<AppState>>, updater: F)
@@ -1794,6 +1841,8 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         sponsor_segments: RefCell::new(Vec::new()),
         sponsor_segments_reported: RefCell::new(HashSet::new()),
         daemon_refresh_in_flight: Cell::new(false),
+        daemon_refresh_started_at: Cell::new(None),
+        daemon_refresh_serial: Cell::new(0),
         play_request_serial: Cell::new(0),
         queue_scroll: queue_scroll.clone(),
         queue_list_box: queue_list_box.clone(),
@@ -1983,23 +2032,41 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     {
         let ps = ps.clone();
         let state = state.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(400), move || {
-            if ps.daemon_refresh_in_flight.replace(true) {
-                return glib::ControlFlow::Continue;
+        glib::timeout_add_local(Duration::from_millis(400), move || {
+            if ps.daemon_refresh_in_flight.get() {
+                let refresh_stuck = ps
+                    .daemon_refresh_started_at
+                    .get()
+                    .is_some_and(|started_at| started_at.elapsed() >= Duration::from_secs(3));
+                if !refresh_stuck {
+                    return glib::ControlFlow::Continue;
+                }
+
+                eprintln!("[UI] daemon state poll timed out locally; retrying");
             }
+
+            let refresh_serial = ps.daemon_refresh_serial.get().wrapping_add(1);
+            ps.daemon_refresh_serial.set(refresh_serial);
+            ps.daemon_refresh_in_flight.set(true);
+            ps.daemon_refresh_started_at.set(Some(Instant::now()));
 
             let ps_for_ui = ps.clone();
             let state_for_ui = state.clone();
             let client = ps.player.daemon_client();
             glib::spawn_future_local(async move {
                 let snapshot = gio::spawn_blocking(move || client.state()).await;
+
+                if ps_for_ui.daemon_refresh_serial.get() != refresh_serial {
+                    return;
+                }
+
                 ps_for_ui.daemon_refresh_in_flight.set(false);
+                ps_for_ui.daemon_refresh_started_at.set(None);
 
                 let Ok(Ok(snapshot)) = snapshot else {
                     return;
                 };
 
-                ps_for_ui.player.apply_snapshot(snapshot.clone());
                 apply_remote_snapshot(&ps_for_ui, &state_for_ui, snapshot.clone());
 
                 if ps_for_ui.is_seeking.get() {
@@ -3585,7 +3652,6 @@ fn maybe_extend_radio_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) 
                 render_queue_panel(&ps, &state);
                 sync_remote_queue(&ps);
                 sync_mpris_transport(&ps, &state);
-                prefetch_upcoming(&state, &ps, ps.queue_index.get());
             }
         }
 
@@ -7495,75 +7561,6 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     });
 }
 
-/// Prefetch the next N songs in the queue to ~/Music/Static/temp/.
-/// No playback reporting — just download audio bytes to disk.
-fn prefetch_upcoming(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, from_index: usize) {
-    let settings = app_settings(state);
-    if !settings.prefetch_enabled {
-        return;
-    }
-    let prefetch_ahead = settings.prefetch_ahead.clamp(1, 12) as usize;
-    let queue = ps.queue.borrow();
-    let mut to_fetch: Vec<(String, Option<String>)> = Vec::new();
-
-    for i in 1..=prefetch_ahead {
-        let idx = from_index + i;
-        if let Some(track) = queue.get(idx) {
-            to_fetch.push((track.video_id.clone(), track.thumbnail_url.clone()));
-        }
-    }
-    drop(queue);
-
-    if to_fetch.is_empty() {
-        return;
-    }
-
-    let state = state.clone();
-    gio::spawn_blocking(move || {
-        for (vid, _thumb_url) in &to_fetch {
-            // Skip if already in offline cache or temp cache
-            {
-                let guard = state.lock().unwrap();
-                if guard.cache.is_cached(vid) || guard.cache.get_temp_audio(vid).is_some() {
-                    continue;
-                }
-            }
-
-            // Get streaming URL (no playback reporting)
-            let url = {
-                let Some(client) = app_client(&state) else {
-                    return;
-                };
-                match client.get_audio_url_no_track(vid) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        eprintln!("[PREFETCH] failed URL for {vid}: {e}");
-                        continue;
-                    }
-                }
-            };
-
-            // Download audio bytes
-            let audio = match DOWNLOAD_CLIENT
-                .get(&url)
-                .header("Range", "bytes=0-")
-                .send()
-                .and_then(|r| r.bytes())
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    eprintln!("[PREFETCH] download failed for {vid}: {e}");
-                    continue;
-                }
-            };
-
-            // Write to temp dir (not pinned, not in offline DB)
-            let guard = state.lock().unwrap();
-            guard.cache.store_temp_audio(vid, &audio);
-        }
-    });
-}
-
 /// Set the queue to the given tracks and start playing from index 0.
 /// If `shuffle` is true, the tracks are shuffled first.
 fn play_all(tracks: &[Track], shuffle: bool, state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
@@ -7730,7 +7727,8 @@ fn ensure_track_available_offline(
         .get(&url)
         .header("Range", "bytes=0-")
         .send()
-        .and_then(|r| r.bytes())
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.bytes())
     {
         Ok(bytes) => bytes,
         Err(err) => {

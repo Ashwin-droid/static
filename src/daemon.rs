@@ -520,6 +520,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.radio_append_in_flight = false;
             state.last_radio_append_anchor = None;
             state.repeat_mode = repeat_mode;
+            prefetch_upcoming(state);
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -1178,7 +1179,7 @@ fn sync_auto_offline_cache(
                     "[CACHE] {video_id} response: {status}, content-length: {:?}",
                     response.content_length()
                 );
-                response.bytes()
+                response.error_for_status()?.bytes()
             }) {
             Ok(bytes) => {
                 eprintln!("[CACHE] {video_id} downloaded {} KB", bytes.len() / 1024);
@@ -1236,6 +1237,7 @@ fn ensure_track_available_offline(
         .get(&url)
         .header("Range", "bytes=0-")
         .send()
+        .and_then(|response| response.error_for_status())
         .and_then(|response| response.bytes())
     {
         Ok(bytes) => bytes,
@@ -1793,6 +1795,7 @@ fn prefetch_upcoming(state: &mut DaemonState) {
                 .get(&url)
                 .header("Range", "bytes=0-")
                 .send()
+                .and_then(|response| response.error_for_status())
                 .and_then(|response| response.bytes())
             else {
                 continue;

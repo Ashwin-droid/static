@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
+use uuid::Uuid;
 
 use crate::sponsorblock::{
     SponsorSegment, default_skip_categories, normalize_segments, sanitize_categories,
@@ -156,8 +157,7 @@ impl MusicCache {
     }
 
     fn open_database(base: &Path) -> Result<Connection> {
-        let db =
-            Connection::open(base.join("data.db")).context("Failed to open cache database")?;
+        let db = Connection::open(base.join("data.db")).context("Failed to open cache database")?;
         Self::initialize_database(&db)?;
         Ok(db)
     }
@@ -985,7 +985,14 @@ impl MusicCache {
     /// Write prefetched audio to the temp directory.
     pub fn store_temp_audio(&self, video_id: &str, data: &[u8]) {
         let path = self.temp_dir.join(format!("{video_id}.audio"));
-        if let Err(e) = std::fs::write(&path, data) {
+        let part_path = self
+            .temp_dir
+            .join(format!("{video_id}.{}.part", Uuid::new_v4()));
+
+        let write_result =
+            std::fs::write(&part_path, data).and_then(|_| std::fs::rename(&part_path, &path));
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&part_path);
             eprintln!("[PREFETCH] failed to write temp {video_id}: {e}");
         } else {
             eprintln!("[PREFETCH] cached {video_id} ({} KB)", data.len() / 1024);

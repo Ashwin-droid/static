@@ -7,6 +7,12 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_play as gst_play;
 
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 pub struct PlaybackEngine {
     inner: gst_play::Play,
     paused: Cell<bool>,
@@ -29,6 +35,23 @@ impl PlaybackEngine {
                     if let gst_play::PlayMessage::Buffering(buffering) = play_msg {
                         bp.set(buffering.percent());
                     }
+                }
+
+                match msg.view() {
+                    gst::MessageView::Error(err) => {
+                        eprintln!(
+                            "[PLAYER] gstreamer error from {}: {} ({})",
+                            err.src()
+                                .map(|src| src.path_string())
+                                .unwrap_or_else(|| "unknown".into()),
+                            err.error(),
+                            err.debug().unwrap_or_else(|| "no debug details".into())
+                        );
+                    }
+                    gst::MessageView::Eos(..) => {
+                        eprintln!("[PLAYER] reached end of stream");
+                    }
+                    _ => {}
                 }
                 glib::ControlFlow::Continue
             })

@@ -727,19 +727,29 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_run_deferred_action(state);
     maybe_extend_radio_queue(state);
 
-    let next_target = match (state.player.position(), state.player.duration()) {
+    let reached_track_end = matches!(
+        (state.player.position(), state.player.duration()),
         (Some(position), Some(duration))
             if duration > ClockTime::from_seconds(1)
-                && position + ClockTime::from_mseconds(500) >= duration =>
-        {
-            queue_target_index(state, true)
-        }
-        _ => None,
-    };
+                && position + ClockTime::from_mseconds(500) >= duration
+    );
 
-    if let Some(target) = next_target {
-        if let Err(err) = play_index(state, target) {
-            eprintln!("[DAEMON] failed to auto-advance: {err}");
+    if reached_track_end {
+        let queue_len = effective_queue_len(
+            state.queue.len(),
+            state.repeat_mode,
+            state
+                .radio_virtual_playlist
+                .as_ref()
+                .map(|radio| radio.touched_len),
+        );
+        match natural_end_target_index(queue_len, state.queue_index, state.repeat_mode) {
+            Some(target) => {
+                if let Err(err) = play_index(state, target) {
+                    eprintln!("[DAEMON] failed to auto-advance: {err}");
+                }
+            }
+            None => stop_playback(state, false),
         }
     }
 }
@@ -829,6 +839,28 @@ fn effective_queue_len(
             .unwrap_or(queue_len)
     } else {
         queue_len
+    }
+}
+
+fn natural_end_target_index(
+    queue_len: usize,
+    queue_index: usize,
+    repeat_mode: RepeatMode,
+) -> Option<usize> {
+    if queue_len == 0 {
+        return None;
+    }
+
+    if repeat_mode == RepeatMode::One {
+        return Some(queue_index.min(queue_len.saturating_sub(1)));
+    }
+
+    if queue_index + 1 < queue_len {
+        Some(queue_index + 1)
+    } else if repeat_mode == RepeatMode::All {
+        Some(0)
+    } else {
+        None
     }
 }
 
@@ -2129,7 +2161,8 @@ fn get_storage_root() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREVIOUS_TRACK_THRESHOLD_MILLIS, PreviousAction, effective_queue_len, previous_action,
+        PREVIOUS_TRACK_THRESHOLD_MILLIS, PreviousAction, effective_queue_len,
+        natural_end_target_index, previous_action,
     };
     use crate::ipc::RepeatMode;
 
@@ -2181,5 +2214,20 @@ mod tests {
     fn repeat_all_radio_uses_touched_len_as_loop_boundary() {
         assert_eq!(effective_queue_len(5, RepeatMode::All, Some(1)), 1);
         assert_eq!(effective_queue_len(5, RepeatMode::All, Some(3)), 3);
+    }
+
+    #[test]
+    fn natural_end_repeats_current_track_in_repeat_one_mode() {
+        assert_eq!(natural_end_target_index(5, 2, RepeatMode::One), Some(2));
+    }
+
+    #[test]
+    fn natural_end_wraps_in_repeat_all_mode() {
+        assert_eq!(natural_end_target_index(3, 2, RepeatMode::All), Some(0));
+    }
+
+    #[test]
+    fn natural_end_stops_after_last_track_when_repeat_is_off() {
+        assert_eq!(natural_end_target_index(3, 2, RepeatMode::Off), None);
     }
 }

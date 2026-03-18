@@ -512,7 +512,7 @@ fn apply_snapshot_playback_ui(ps: &PlayerState, snapshot: &PlaybackSnapshot) {
         (Some(pos), None) => {
             ps.progress_slider.set_value(0.0);
             ps.time_label
-                .set_text(&format!("{} / 0:00", format_clock_time(pos)));
+                .set_text(&format!("{} / --:--", format_clock_time(pos)));
         }
         (None, Some(dur)) => {
             ps.progress_slider.set_value(0.0);
@@ -5975,7 +5975,7 @@ fn render_home_view(
         header.set_halign(Align::Start);
         content_box.append(&header);
 
-        if first_tracks.len() == first.contents.len() && !first_tracks.is_empty() {
+        if should_show_home_play_controls(first, &first_tracks) {
             content_box.append(&build_play_controls(&first_tracks, state, ps, None));
         }
 
@@ -6013,10 +6013,10 @@ fn render_home_view(
 
         let tracks = home_section_tracks(section);
         let browse_cards = home_section_browse_cards(section);
+        if should_show_home_play_controls(section, &tracks) {
+            content_box.append(&build_play_controls(&tracks, state, ps, None));
+        }
         if tracks.len() == section.contents.len() {
-            if !tracks.is_empty() {
-                content_box.append(&build_play_controls(&tracks, state, ps, None));
-            }
             let grid = gtk::Grid::new();
             grid.set_column_spacing(12);
             grid.set_row_spacing(8);
@@ -6297,6 +6297,16 @@ fn extract_listen_again_tracks(sections: &[HomeSection]) -> Vec<Track> {
         })
         .map(home_section_tracks)
         .unwrap_or_default()
+}
+
+fn should_show_home_play_controls(section: &HomeSection, tracks: &[Track]) -> bool {
+    !tracks.is_empty()
+        && (tracks.len() == section.contents.len() || is_listen_again_section(&section.title))
+}
+
+fn is_listen_again_section(title: &str) -> bool {
+    title.eq_ignore_ascii_case("Listen again")
+        || title.to_ascii_lowercase().contains("listen again")
 }
 
 fn home_section_tracks(section: &HomeSection) -> Vec<Track> {

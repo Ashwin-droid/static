@@ -116,7 +116,10 @@ pub fn log_current_process_message(message: String) {
     match current_process_source() {
         LogSource::Daemon => {
             if let Err(err) = append_log(LogSource::Daemon, &message) {
-                let _ = writeln!(std::io::stderr().lock(), "[LOGGER] failed to write daemon log: {err}");
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[LOGGER] failed to write daemon log: {err}"
+                );
             }
         }
         LogSource::Ui => {

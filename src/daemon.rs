@@ -65,12 +65,20 @@ struct ActiveTrack {
     title: String,
     artist: String,
     thumb_url: Option<String>,
+    playback_source: PlaybackSource,
     rating: SongRating,
     tracking: Option<TrackingInfo>,
     started_at: Instant,
     last_position_millis: u64,
     awaiting_fresh_position: bool,
     bootstrapped_watchtime: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackSource {
+    OfflineCache,
+    TempPrefetch,
+    RemoteStream,
 }
 
 struct DaemonState {
@@ -673,6 +681,11 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
 }
 
 fn maintain_playback(state: &mut DaemonState) {
+    if let Some(error) = state.player.take_error() {
+        handle_playback_failure(state, error);
+        return;
+    }
+
     if state.active_track.is_some() {
         if state.player.is_paused() {
             if state.paused_since.is_none() {
@@ -889,7 +902,7 @@ fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
         .get(index)
         .cloned()
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
-    let prepared_uri = prepare_playback(state, &track.video_id)?;
+    let (prepared_uri, playback_source) = prepare_playback(state, &track.video_id)?;
     state.queue_index = index;
     mark_radio_touched_through(state, index);
     state.player.play_uri(&prepared_uri);
@@ -899,6 +912,7 @@ fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
         title: track.title.clone(),
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
+        playback_source,
         rating: SongRating::Indifferent,
         tracking: None,
         started_at: Instant::now(),
@@ -944,17 +958,17 @@ fn stop_playback(state: &mut DaemonState, exiting: bool) {
     sync_mpris(state);
 }
 
-fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<String> {
+fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<(String, PlaybackSource)> {
     if state.settings.prefer_local_cache_on_playback {
         if let Some(cached_path) = state.cache.get_cached_audio(video_id) {
             return url::Url::from_file_path(cached_path)
-                .map(|url| url.to_string())
+                .map(|url| (url.to_string(), PlaybackSource::OfflineCache))
                 .map_err(|_| anyhow!("Failed to build file URL for cached audio"));
         }
         if state.settings.prefetch_enabled {
             if let Some(temp_path) = state.cache.get_temp_audio(video_id) {
                 return url::Url::from_file_path(temp_path)
-                    .map(|url| url.to_string())
+                    .map(|url| (url.to_string(), PlaybackSource::TempPrefetch))
                     .map_err(|_| anyhow!("Failed to build file URL for prefetched audio"));
             }
         }
@@ -963,7 +977,44 @@ fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<String> {
     let client = ensure_client_loaded(state)?;
     client
         .get_audio_url_no_track(video_id)
+        .map(|url| (url, PlaybackSource::RemoteStream))
         .map_err(|err| anyhow!("Playback failed: {err}"))
+}
+
+fn handle_playback_failure(state: &mut DaemonState, error: String) {
+    let Some(active) = state.active_track.as_ref() else {
+        eprintln!("[DAEMON] playback engine reported an error without an active track: {error}");
+        state.player.stop();
+        return;
+    };
+
+    let video_id = active.video_id.clone();
+    let playback_source = active.playback_source;
+    let queue_index = state.queue_index;
+
+    eprintln!("[DAEMON] playback failed for {video_id}: {error}");
+
+    if playback_source == PlaybackSource::TempPrefetch {
+        eprintln!("[DAEMON] removing prefetched temp audio for {video_id} and retrying");
+        state.cache.remove_temp_audio(&video_id);
+        if let Err(err) = play_index(state, queue_index) {
+            eprintln!("[DAEMON] retry after temp-cache eviction failed for {video_id}: {err}");
+        }
+        return;
+    }
+
+    if let Some(target) = queue_target_index(state, true) {
+        if target != queue_index {
+            eprintln!("[DAEMON] skipping failed track {video_id}");
+            if let Err(err) = play_index(state, target) {
+                eprintln!("[DAEMON] failed to advance after playback failure on {video_id}: {err}");
+                stop_playback(state, false);
+            }
+            return;
+        }
+    }
+
+    stop_playback(state, false);
 }
 
 fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<YtMusicClient>> {
@@ -1811,6 +1862,11 @@ fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
 }
 
 fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
+    let hide_timing = state
+        .active_track
+        .as_ref()
+        .is_some_and(|track| track.awaiting_fresh_position);
+
     PlaybackSnapshot {
         current_track: state
             .active_track
@@ -1828,8 +1884,12 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         repeat_mode: state.repeat_mode,
         paused: state.player.is_paused(),
         volume: state.player.volume(),
-        position_millis: state.player.position().map(|position| position.mseconds()),
-        duration_millis: state.player.duration().map(|duration| duration.mseconds()),
+        position_millis: (!hide_timing)
+            .then(|| state.player.position().map(|position| position.mseconds()))
+            .flatten(),
+        duration_millis: (!hide_timing)
+            .then(|| state.player.duration().map(|duration| duration.mseconds()))
+            .flatten(),
         buffered_fraction: state.player.buffered_fraction(),
     }
 }
@@ -1963,6 +2023,7 @@ fn ensure_desktop_entry_for_current_exe(exe: &std::path::Path) -> Result<()> {
             std::fs::remove_file(&desktop_path)
                 .with_context(|| format!("Failed to remove {}", desktop_path.display()))?;
         }
+        remove_local_icon_override(&data_home)?;
         return Ok(());
     }
 
@@ -1978,6 +2039,16 @@ fn ensure_desktop_entry_for_current_exe(exe: &std::path::Path) -> Result<()> {
     if needs_write {
         std::fs::write(&desktop_path, desktop_entry)
             .with_context(|| format!("Failed to write {}", desktop_path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn remove_local_icon_override(data_home: &std::path::Path) -> Result<()> {
+    let icon_path = data_home.join("icons/hicolor/256x256/apps/com.static.music.png");
+    if icon_path.exists() {
+        std::fs::remove_file(&icon_path)
+            .with_context(|| format!("Failed to remove {}", icon_path.display()))?;
     }
 
     Ok(())
@@ -2004,19 +2075,20 @@ fn ensure_local_icon_for_current_exe(
         .with_context(|| format!("Failed to create {}", icon_dir.display()))?;
     let target_icon = icon_dir.join("com.static.music.png");
 
-    let needs_copy = match (
-        std::fs::metadata(&source_icon),
-        std::fs::metadata(&target_icon),
-    ) {
-        (Ok(source), Ok(target)) => source.len() != target.len(),
-        (Ok(_), Err(_)) => true,
-        _ => false,
+    let source_bytes = std::fs::read(&source_icon)
+        .with_context(|| format!("Failed to read {}", source_icon.display()))?;
+    let needs_copy = match std::fs::read(&target_icon) {
+        Ok(target_bytes) => target_bytes != source_bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to read {}", target_icon.display()));
+        }
     };
 
     if needs_copy {
-        std::fs::copy(&source_icon, &target_icon).with_context(|| {
+        std::fs::write(&target_icon, &source_bytes).with_context(|| {
             format!(
-                "Failed to copy icon from {} to {}",
+                "Failed to write icon from {} to {}",
                 source_icon.display(),
                 target_icon.display()
             )

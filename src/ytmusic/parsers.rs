@@ -902,7 +902,10 @@ mod tests {
 
         let track = parse_track_from_renderer(&renderer).expect("track should parse");
         assert_eq!(track.artists.len(), 1);
-        assert_eq!(track.artists[0].name, "Wuthering Waves, jixwang, & markmilian");
+        assert_eq!(
+            track.artists[0].name,
+            "Wuthering Waves, jixwang, & markmilian"
+        );
     }
 
     #[test]

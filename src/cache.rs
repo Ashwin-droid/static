@@ -1009,6 +1009,16 @@ impl MusicCache {
         }
     }
 
+    pub fn remove_temp_audio(&self, video_id: &str) {
+        if let Some(path) = self.get_temp_audio(video_id) {
+            if let Err(err) = std::fs::remove_file(&path) {
+                eprintln!("[PREFETCH] failed to evict temp {video_id}: {err}");
+            } else {
+                eprintln!("[PREFETCH] evicted temp {video_id}");
+            }
+        }
+    }
+
     pub fn clear_auto_downloads(&self) -> Result<usize> {
         let mut stmt = self
             .db

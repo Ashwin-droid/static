@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gstreamer as gst;
@@ -17,6 +17,7 @@ pub struct PlaybackEngine {
     inner: gst_play::Play,
     paused: Cell<bool>,
     buf_percent: Rc<Cell<u32>>,
+    last_error: Rc<RefCell<Option<String>>>,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -28,6 +29,8 @@ impl PlaybackEngine {
 
         let buf_percent = Rc::new(Cell::new(0u32));
         let bp = buf_percent.clone();
+        let last_error = Rc::new(RefCell::new(None));
+        let last_error_for_watch = last_error.clone();
         let bus = inner.message_bus();
         let bus_watch = bus
             .add_watch_local(move |_, msg| {
@@ -39,11 +42,21 @@ impl PlaybackEngine {
 
                 match msg.view() {
                     gst::MessageView::Error(err) => {
+                        let source = err
+                            .src()
+                            .map(|src| src.path_string().to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        let message = format!(
+                            "{source}: {} ({})",
+                            err.error(),
+                            err.debug()
+                                .map(|debug| debug.to_string())
+                                .unwrap_or_else(|| "no debug details".to_string())
+                        );
+                        *last_error_for_watch.borrow_mut() = Some(message.clone());
                         eprintln!(
                             "[PLAYER] gstreamer error from {}: {} ({})",
-                            err.src()
-                                .map(|src| src.path_string())
-                                .unwrap_or_else(|| "unknown".into()),
+                            source,
                             err.error(),
                             err.debug().unwrap_or_else(|| "no debug details".into())
                         );
@@ -61,6 +74,7 @@ impl PlaybackEngine {
             inner,
             paused: Cell::new(false),
             buf_percent,
+            last_error,
             _bus_watch: bus_watch,
         }
     }
@@ -68,6 +82,7 @@ impl PlaybackEngine {
     pub fn play_uri(&self, uri: &str) {
         self.inner.stop();
         self.buf_percent.set(0);
+        self.last_error.borrow_mut().take();
         self.inner.set_uri(Some(uri));
         self.inner.play();
         self.paused.set(false);
@@ -99,6 +114,7 @@ impl PlaybackEngine {
         self.inner.stop();
         self.paused.set(false);
         self.buf_percent.set(0);
+        self.last_error.borrow_mut().take();
     }
 
     pub fn seek(&self, position: ClockTime) {
@@ -123,5 +139,9 @@ impl PlaybackEngine {
 
     pub fn buffered_fraction(&self) -> f64 {
         (self.buf_percent.get() as f64 / 100.0).clamp(0.0, 1.0)
+    }
+
+    pub fn take_error(&self) -> Option<String> {
+        self.last_error.borrow_mut().take()
     }
 }

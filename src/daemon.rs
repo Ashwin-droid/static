@@ -186,15 +186,18 @@ impl ExternalMprisCoordinator {
                     Err(err) => self.log_error(format!(
                         "[MPRIS] failed to read PlaybackStatus from {bus_name}: {err}"
                     )),
-                }
+                },
                 Err(err) => self.log_error(format!(
                     "[MPRIS] failed to create peer client for {bus_name}: {err}"
                 )),
             }
         }
 
-        self.playing_services
-            .retain(|service| !paused.iter().any(|paused_service| paused_service == service));
+        self.playing_services.retain(|service| {
+            !paused
+                .iter()
+                .any(|paused_service| paused_service == service)
+        });
         paused
     }
 
@@ -225,6 +228,13 @@ impl ExternalMprisCoordinator {
     }
 
     fn clear_waiting(&mut self) {
+        self.waiting_for_services.clear();
+    }
+
+    fn deactivate(&mut self) {
+        self.last_poll_at = None;
+        self.playing_services.clear();
+        self.last_logged_playing_services.clear();
         self.waiting_for_services.clear();
     }
 
@@ -1369,6 +1379,9 @@ fn reload_settings(state: &mut DaemonState) {
     match state.cache.load_settings() {
         Ok(settings) => {
             state.settings = settings;
+            if !state.settings.respect_other_mpris_players {
+                state.peer_mpris.deactivate();
+            }
             refresh_sponsorblock_for_current_track(state);
             prefetch_upcoming(state);
             schedule_offline_cache_sync(state);
@@ -2241,6 +2254,11 @@ fn sync_mpris(state: &DaemonState) {
 }
 
 fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
+    if !state.settings.respect_other_mpris_players {
+        state.peer_mpris.clear_waiting();
+        return;
+    }
+
     if state.active_track.is_none() || state.player.is_paused() {
         return;
     }
@@ -2261,6 +2279,10 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
 
 fn pause_other_mpris_players(state: &mut DaemonState) {
     state.peer_mpris.clear_waiting();
+    if !state.settings.respect_other_mpris_players {
+        return;
+    }
+
     let paused_services = state.peer_mpris.pause_other_playing_services();
     if paused_services.is_empty() {
         return;
@@ -2273,6 +2295,11 @@ fn pause_other_mpris_players(state: &mut DaemonState) {
 }
 
 fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
+    if !state.settings.respect_other_mpris_players {
+        state.peer_mpris.clear_waiting();
+        return;
+    }
+
     if state.active_track.is_none()
         || !state.player.is_paused()
         || !state.peer_mpris.is_waiting_for_peer_pause()
@@ -2296,6 +2323,11 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
 }
 
 fn poll_external_mpris(state: &mut DaemonState) {
+    if !state.settings.respect_other_mpris_players {
+        state.peer_mpris.deactivate();
+        return;
+    }
+
     if state.active_track.is_none() {
         return;
     }

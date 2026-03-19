@@ -27,6 +27,7 @@ pub struct AppSettings {
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
+    pub respect_other_mpris_players: bool,
     pub sponsorblock_enabled: bool,
     pub sponsorblock_categories: Vec<String>,
 }
@@ -45,6 +46,7 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
+            respect_other_mpris_players: true,
             sponsorblock_enabled: true,
             sponsorblock_categories: default_skip_categories(),
         }
@@ -387,6 +389,10 @@ impl MusicCache {
                     settings.prefer_local_cache_on_playback =
                         parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
                 }
+                "respect_other_mpris_players" => {
+                    settings.respect_other_mpris_players =
+                        parse_bool_setting(&row.1, settings.respect_other_mpris_players);
+                }
                 "sponsorblock_enabled" => {
                     settings.sponsorblock_enabled =
                         parse_bool_setting(&row.1, settings.sponsorblock_enabled);
@@ -445,6 +451,10 @@ impl MusicCache {
             (
                 "prefer_local_cache_on_playback",
                 bool_setting(settings.prefer_local_cache_on_playback),
+            ),
+            (
+                "respect_other_mpris_players",
+                bool_setting(settings.respect_other_mpris_players),
             ),
             (
                 "sponsorblock_enabled",

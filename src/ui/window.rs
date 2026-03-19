@@ -2396,6 +2396,33 @@ fn load_settings_page(
     local_row.append(&local_switch);
     playback_section.append(&local_row);
 
+    let mpris_row = GtkBox::new(Orientation::Horizontal, 12);
+    mpris_row.add_css_class("settings-row");
+    let mpris_copy = GtkBox::new(Orientation::Vertical, 2);
+    mpris_copy.set_hexpand(true);
+    let mpris_label = Label::new(Some("Respect other MPRIS players"));
+    mpris_label.add_css_class("settings-row-title");
+    mpris_label.set_halign(Align::Start);
+    mpris_copy.append(&mpris_label);
+    let mpris_hint = Label::new(Some(
+        "Pause Static when another media app starts playing, and pause that app when you resume here.",
+    ));
+    mpris_hint.add_css_class("settings-row-copy");
+    mpris_hint.set_wrap(true);
+    mpris_hint.set_halign(Align::Start);
+    mpris_copy.append(&mpris_hint);
+    mpris_row.append(&mpris_copy);
+    let mpris_switch = settings_switch(settings.respect_other_mpris_players);
+    {
+        let state = state.clone();
+        mpris_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            update_app_settings(&state, |s| s.respect_other_mpris_players = active);
+        });
+    }
+    mpris_row.append(&mpris_switch);
+    playback_section.append(&mpris_row);
+
     let prefetch_row = GtkBox::new(Orientation::Horizontal, 12);
     prefetch_row.add_css_class("settings-row");
     let prefetch_copy = GtkBox::new(Orientation::Vertical, 2);

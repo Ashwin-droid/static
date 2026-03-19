@@ -5,9 +5,11 @@ use std::sync::{LazyLock, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use dbus::ffidisp::{BusType as DbusBusType, Connection as DbusConnection};
 use gstreamer::ClockTime;
 use gstreamer::glib;
 use keyring::Entry;
+use mpris::{PlaybackStatus as PeerPlaybackStatus, Player as PeerMprisPlayer};
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
     Player as MprisPlayer, Time as MprisTime, TrackId,
@@ -47,6 +49,13 @@ const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
 const PLAYBACK_START_RETRY_LIMIT: u8 = 1;
 const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
 const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
+const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const EXTERNAL_MPRIS_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const DBUS_SERVICE: &str = "org.freedesktop.DBus";
+const DBUS_OBJECT_PATH: &str = "/org/freedesktop/DBus";
+const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
+const STATIC_MPRIS_BUS_NAME: &str = "org.mpris.MediaPlayer2.static";
+const PEER_MPRIS_TIMEOUT_MS: i32 = 500;
 
 static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
     BlockingClient::builder()
@@ -106,7 +115,153 @@ struct DaemonState {
     offline_sync_pending: bool,
     last_duration_micros: Cell<Option<i64>>,
     mpris: RefCell<Option<Rc<DaemonMprisBridge>>>,
+    peer_mpris: ExternalMprisCoordinator,
     shutting_down: Cell<bool>,
+}
+
+struct ExternalMprisCoordinator {
+    last_poll_at: Option<Instant>,
+    last_error_log_at: Option<Instant>,
+    playing_services: Vec<String>,
+    last_logged_playing_services: Vec<String>,
+    waiting_for_services: Vec<String>,
+}
+
+impl ExternalMprisCoordinator {
+    fn new() -> Self {
+        Self {
+            last_poll_at: None,
+            last_error_log_at: None,
+            playing_services: Vec::new(),
+            last_logged_playing_services: Vec::new(),
+            waiting_for_services: Vec::new(),
+        }
+    }
+
+    fn poll_if_due(&mut self) {
+        if self
+            .last_poll_at
+            .is_some_and(|last_poll_at| last_poll_at.elapsed() < EXTERNAL_MPRIS_POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_poll_at = Some(Instant::now());
+        self.poll_now();
+    }
+
+    fn poll_now(&mut self) {
+        match self.scan_other_playing_services() {
+            Ok(services) => {
+                self.playing_services = services;
+                self.log_playing_services_snapshot_change();
+            }
+            Err(err) => {
+                self.log_error(format!("[MPRIS] failed to inspect peer players: {err}"));
+                self.playing_services.clear();
+                self.log_playing_services_snapshot_change();
+            }
+        }
+    }
+
+    fn playing_services(&self) -> &[String] {
+        &self.playing_services
+    }
+
+    fn pause_other_playing_services(&mut self) -> Vec<String> {
+        self.poll_now();
+        let mut paused = Vec::new();
+        for bus_name in self.playing_services.clone() {
+            match peer_player_for_bus(&bus_name) {
+                Ok(player) => match player.get_playback_status() {
+                    Ok(PeerPlaybackStatus::Playing) => {
+                        if let Err(err) = player.pause() {
+                            self.log_error(format!(
+                                "[MPRIS] failed to pause peer player {bus_name}: {err}"
+                            ));
+                        } else {
+                            paused.push(bus_name);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => self.log_error(format!(
+                        "[MPRIS] failed to read PlaybackStatus from {bus_name}: {err}"
+                    )),
+                }
+                Err(err) => self.log_error(format!(
+                    "[MPRIS] failed to create peer client for {bus_name}: {err}"
+                )),
+            }
+        }
+
+        self.playing_services
+            .retain(|service| !paused.iter().any(|paused_service| paused_service == service));
+        paused
+    }
+
+    fn scan_other_playing_services(&mut self) -> Result<Vec<String>> {
+        let services = list_other_mpris_services()?;
+        let mut playing = Vec::new();
+
+        for bus_name in services {
+            match peer_player_for_bus(&bus_name) {
+                Ok(player) => match player.get_playback_status() {
+                    Ok(PeerPlaybackStatus::Playing) => playing.push(bus_name),
+                    Ok(_) => {}
+                    Err(err) => self.log_error(format!(
+                        "[MPRIS] failed to read PlaybackStatus from {bus_name}: {err}"
+                    )),
+                },
+                Err(err) => self.log_error(format!(
+                    "[MPRIS] failed to create peer client for {bus_name}: {err}"
+                )),
+            }
+        }
+
+        Ok(playing)
+    }
+
+    fn set_waiting_for_services(&mut self, services: &[String]) {
+        self.waiting_for_services = services.to_vec();
+    }
+
+    fn clear_waiting(&mut self) {
+        self.waiting_for_services.clear();
+    }
+
+    fn is_waiting_for_peer_pause(&self) -> bool {
+        !self.waiting_for_services.is_empty()
+    }
+
+    fn waiting_for_services(&self) -> &[String] {
+        &self.waiting_for_services
+    }
+
+    fn log_error(&mut self, message: String) {
+        let should_log = self
+            .last_error_log_at
+            .is_none_or(|last_log_at| last_log_at.elapsed() >= EXTERNAL_MPRIS_ERROR_LOG_INTERVAL);
+        if should_log {
+            self.last_error_log_at = Some(Instant::now());
+            eprintln!("{message}");
+        }
+    }
+
+    fn log_playing_services_snapshot_change(&mut self) {
+        if self.playing_services == self.last_logged_playing_services {
+            return;
+        }
+
+        if self.playing_services.is_empty() {
+            eprintln!("[MPRIS] peer playing set is now empty");
+        } else {
+            eprintln!(
+                "[MPRIS] peer playing set changed: {}",
+                self.playing_services.join(", ")
+            );
+        }
+
+        self.last_logged_playing_services = self.playing_services.clone();
+    }
 }
 
 struct CommandEnvelope {
@@ -191,19 +346,17 @@ impl DaemonMprisBridge {
         {
             let state = state.clone();
             player.connect_play_pause(move |_| {
-                let state = state.borrow_mut();
-                state.player.toggle_pause();
-                sync_mpris(&state);
+                let mut state = state.borrow_mut();
+                toggle_pause_for_user_action(&mut state);
             });
         }
 
         {
             let state = state.clone();
             player.connect_play(move |_| {
-                let state = state.borrow_mut();
+                let mut state = state.borrow_mut();
                 if state.active_track.is_some() && state.player.is_paused() {
-                    state.player.resume();
-                    sync_mpris(&state);
+                    resume_for_user_action(&mut state);
                 }
             });
         }
@@ -211,8 +364,9 @@ impl DaemonMprisBridge {
         {
             let state = state.clone();
             player.connect_pause(move |_| {
-                let state = state.borrow_mut();
+                let mut state = state.borrow_mut();
                 if state.active_track.is_some() && !state.player.is_paused() {
+                    state.peer_mpris.clear_waiting();
                     state.player.pause();
                     sync_mpris(&state);
                 }
@@ -439,6 +593,7 @@ pub fn run() -> Result<()> {
         offline_sync_pending: false,
         last_duration_micros: Cell::new(None),
         mpris: RefCell::new(None),
+        peer_mpris: ExternalMprisCoordinator::new(),
         shutting_down: Cell::new(false),
     }));
 
@@ -516,10 +671,15 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             index,
             radio_virtual_playlist,
             repeat_mode,
-        } => match play_queue_at(state, queue, index, radio_virtual_playlist, repeat_mode) {
-            Ok(()) => DaemonResponse::State(state_snapshot(state)),
-            Err(err) => DaemonResponse::Error(err.to_string()),
-        },
+        } => {
+            if !queue.is_empty() {
+                pause_other_mpris_players(state);
+            }
+            match play_queue_at(state, queue, index, radio_virtual_playlist, repeat_mode) {
+                Ok(()) => DaemonResponse::State(state_snapshot(state)),
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
         DaemonRequest::ReplaceQueue {
             queue,
             index,
@@ -537,18 +697,17 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::TogglePause => {
-            state.player.toggle_pause();
-            sync_mpris(state);
+            toggle_pause_for_user_action(state);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Pause => {
+            state.peer_mpris.clear_waiting();
             state.player.pause();
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Resume => {
-            state.player.resume();
-            sync_mpris(state);
+            resume_for_user_action(state);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Stop => {
@@ -556,11 +715,11 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
         }
-        DaemonRequest::Next => match advance_queue(state, true) {
+        DaemonRequest::Next => match advance_queue_for_user_action(state, true) {
             Ok(()) => DaemonResponse::State(state_snapshot(state)),
             Err(err) => DaemonResponse::Error(err.to_string()),
         },
-        DaemonRequest::Previous => match handle_previous(state) {
+        DaemonRequest::Previous => match handle_previous_for_user_action(state) {
             Ok(()) => DaemonResponse::State(state_snapshot(state)),
             Err(err) => DaemonResponse::Error(err.to_string()),
         },
@@ -690,6 +849,10 @@ fn maintain_playback(state: &mut DaemonState) {
         return;
     }
 
+    poll_external_mpris(state);
+    maybe_resume_after_external_mpris(state);
+    maybe_pause_for_external_mpris(state);
+
     if state.active_track.is_some() {
         if state.player.is_paused() {
             if state.paused_since.is_none() {
@@ -796,6 +959,13 @@ fn advance_queue(state: &mut DaemonState, forward: bool) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn advance_queue_for_user_action(state: &mut DaemonState, forward: bool) -> Result<()> {
+    if queue_target_index(state, forward).is_some() {
+        pause_other_mpris_players(state);
+    }
+    advance_queue(state, forward)
 }
 
 fn queue_target_index(state: &DaemonState, forward: bool) -> Option<usize> {
@@ -998,6 +1168,55 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
     }
 }
 
+fn handle_previous_for_user_action(state: &mut DaemonState) -> Result<()> {
+    let position_millis = state
+        .player
+        .position()
+        .map(|position| position.nseconds() / 1_000_000);
+    let queue_len = effective_queue_len(
+        state.queue.len(),
+        state.repeat_mode,
+        state
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.touched_len),
+    );
+
+    if matches!(
+        previous_action(
+            queue_len,
+            state.queue_index,
+            state.repeat_mode,
+            position_millis,
+            state.active_track.is_some(),
+        ),
+        PreviousAction::PlayIndex(_)
+    ) {
+        pause_other_mpris_players(state);
+    }
+
+    handle_previous(state)
+}
+
+fn toggle_pause_for_user_action(state: &mut DaemonState) {
+    if state.player.is_paused() && state.active_track.is_some() {
+        pause_other_mpris_players(state);
+    } else {
+        state.peer_mpris.clear_waiting();
+    }
+    state.player.toggle_pause();
+    sync_mpris(state);
+}
+
+fn resume_for_user_action(state: &mut DaemonState) {
+    state.peer_mpris.clear_waiting();
+    if state.active_track.is_some() {
+        pause_other_mpris_players(state);
+    }
+    state.player.resume();
+    sync_mpris(state);
+}
+
 fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
     play_index_with_startup_retries(state, index, 0)
 }
@@ -1068,6 +1287,7 @@ fn stop_playback(state: &mut DaemonState, exiting: bool) {
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
+    state.peer_mpris.clear_waiting();
     sync_mpris(state);
 }
 
@@ -2018,6 +2238,87 @@ fn sync_mpris(state: &DaemonState) {
     if let Some(bridge) = state.mpris.borrow().as_ref() {
         bridge.sync_all(state);
     }
+}
+
+fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
+    if state.active_track.is_none() || state.player.is_paused() {
+        return;
+    }
+
+    let playing_services = state.peer_mpris.playing_services().to_vec();
+    if playing_services.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "[MPRIS] pausing local playback because another player is active: {}",
+        playing_services.join(", ")
+    );
+    state.peer_mpris.set_waiting_for_services(&playing_services);
+    state.player.pause();
+    sync_mpris(state);
+}
+
+fn pause_other_mpris_players(state: &mut DaemonState) {
+    state.peer_mpris.clear_waiting();
+    let paused_services = state.peer_mpris.pause_other_playing_services();
+    if paused_services.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "[MPRIS] paused peer player(s) before starting local playback: {}",
+        paused_services.join(", ")
+    );
+}
+
+fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
+    if state.active_track.is_none()
+        || !state.player.is_paused()
+        || !state.peer_mpris.is_waiting_for_peer_pause()
+    {
+        return;
+    }
+
+    let playing_services = state.peer_mpris.playing_services().to_vec();
+    if !playing_services.is_empty() {
+        state.peer_mpris.set_waiting_for_services(&playing_services);
+        return;
+    }
+
+    let waited_for = state.peer_mpris.waiting_for_services().join(", ");
+    state.peer_mpris.clear_waiting();
+    eprintln!(
+        "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
+    );
+    state.player.resume();
+    sync_mpris(state);
+}
+
+fn poll_external_mpris(state: &mut DaemonState) {
+    if state.active_track.is_none() {
+        return;
+    }
+
+    state.peer_mpris.poll_if_due();
+}
+
+fn list_other_mpris_services() -> Result<Vec<String>> {
+    let connection = Connection::session().context("Failed to connect to the session D-Bus")?;
+    let proxy = Proxy::new(&connection, DBUS_SERVICE, DBUS_OBJECT_PATH, DBUS_INTERFACE)
+        .context("Failed to create D-Bus proxy")?;
+    let names: Vec<String> = proxy.call("ListNames", &())?;
+    Ok(names
+        .into_iter()
+        .filter(|name| name.starts_with("org.mpris.MediaPlayer2.") && name != STATIC_MPRIS_BUS_NAME)
+        .collect())
+}
+
+fn peer_player_for_bus(bus_name: &str) -> Result<PeerMprisPlayer> {
+    let connection = DbusConnection::get_private(DbusBusType::Session)
+        .map_err(|err| anyhow!("Failed to connect D-Bus MPRIS client: {err}"))?;
+    PeerMprisPlayer::new(connection, bus_name.to_string(), PEER_MPRIS_TIMEOUT_MS)
+        .map_err(|err| anyhow!("Failed to initialize MPRIS peer {bus_name}: {err}"))
 }
 
 fn signal_mpris_seeked(state: &DaemonState, position: ClockTime) {

@@ -43,8 +43,10 @@ urlencoding = "2"
 keyring = { version = "3", features = ["sync-secret-service"] }
 
 # GStreamer audio playback
+dbus = "0.9"
 gstreamer = "0.25"
 gstreamer-play = "0.25"
+mpris = "2"
 mpris-server = "0.9"
 
 # Error handling

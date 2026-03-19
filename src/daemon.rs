@@ -43,6 +43,9 @@ const KEYRING_STORAGE_ROOT: &str = "storage_root";
 const UI_APP_OBJECT_PATH: &str = "/com/static/music";
 const MIN_LISTEN_SECS: u64 = 10;
 const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
+const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
+const PLAYBACK_START_RETRY_LIMIT: u8 = 1;
+const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
 const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 
 static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
@@ -70,6 +73,7 @@ struct ActiveTrack {
     tracking: Option<TrackingInfo>,
     started_at: Instant,
     last_position_millis: u64,
+    startup_retries: u8,
     awaiting_fresh_position: bool,
     bootstrapped_watchtime: bool,
 }
@@ -722,6 +726,10 @@ fn maintain_playback(state: &mut DaemonState) {
         sync_mpris(state);
     }
 
+    if maybe_recover_stalled_playback_start(state) {
+        return;
+    }
+
     maybe_flush_watchtime_progress(state);
     maybe_apply_sponsorblock_skip(state);
     maybe_run_deferred_action(state);
@@ -864,6 +872,70 @@ fn natural_end_target_index(
     }
 }
 
+fn playback_start_stalled(
+    started_at: Instant,
+    last_position_millis: u64,
+    current_position_millis: Option<u64>,
+) -> bool {
+    started_at.elapsed() >= PLAYBACK_START_TIMEOUT
+        && last_position_millis < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+        && current_position_millis.unwrap_or_default() < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+}
+
+fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
+    if state.player.is_paused() {
+        return false;
+    }
+
+    let Some(active) = state.active_track.as_ref() else {
+        return false;
+    };
+
+    let current_position_millis = state.player.position().map(|position| position.mseconds());
+    if !playback_start_stalled(
+        active.started_at,
+        active.last_position_millis,
+        current_position_millis,
+    ) {
+        return false;
+    }
+
+    let video_id = active.video_id.clone();
+    let playback_source = active.playback_source;
+    let queue_index = state.queue_index;
+    let startup_retries = active.startup_retries;
+    let elapsed_secs = active.started_at.elapsed().as_secs_f32();
+    let buffered_percent = state.player.buffered_fraction() * 100.0;
+
+    if startup_retries < PLAYBACK_START_RETRY_LIMIT {
+        let next_retry = startup_retries.saturating_add(1);
+        eprintln!(
+            "[DAEMON] playback start stalled for {video_id} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%); retrying ({next_retry}/{PLAYBACK_START_RETRY_LIMIT})"
+        );
+
+        if playback_source == PlaybackSource::TempPrefetch {
+            eprintln!(
+                "[DAEMON] removing prefetched temp audio for {video_id} before startup retry"
+            );
+            state.cache.remove_temp_audio(&video_id);
+        }
+
+        if let Err(err) = play_index_with_startup_retries(state, queue_index, next_retry) {
+            eprintln!("[DAEMON] startup retry failed for {video_id}: {err}");
+            stop_playback(state, false);
+        }
+    } else {
+        handle_playback_failure(
+            state,
+            format!(
+                "Timed out waiting for playback to start after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%)"
+            ),
+        );
+    }
+
+    true
+}
+
 fn previous_action(
     queue_len: usize,
     queue_index: usize,
@@ -927,6 +999,14 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
 }
 
 fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
+    play_index_with_startup_retries(state, index, 0)
+}
+
+fn play_index_with_startup_retries(
+    state: &mut DaemonState,
+    index: usize,
+    startup_retries: u8,
+) -> Result<()> {
     stop_playback(state, false);
 
     let track = state
@@ -949,6 +1029,7 @@ fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
         tracking: None,
         started_at: Instant::now(),
         last_position_millis: 0,
+        startup_retries,
         awaiting_fresh_position: true,
         bootstrapped_watchtime: false,
     });
@@ -1612,6 +1693,13 @@ fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, 
 }
 
 fn current_listened_millis(current_position_millis: Option<u64>, track: &ActiveTrack) -> u64 {
+    if track.awaiting_fresh_position
+        && track.last_position_millis < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+        && current_position_millis.unwrap_or_default() < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+    {
+        return 0;
+    }
+
     let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
     let current_position_millis = current_position_millis.filter(|millis| *millis > 0);
 
@@ -2161,10 +2249,30 @@ fn get_storage_root() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREVIOUS_TRACK_THRESHOLD_MILLIS, PreviousAction, effective_queue_len,
-        natural_end_target_index, previous_action,
+        ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
+        PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
+        natural_end_target_index, playback_start_stalled, previous_action,
     };
     use crate::ipc::RepeatMode;
+    use crate::ytmusic::client::SongRating;
+    use std::time::{Duration, Instant};
+
+    fn test_active_track(started_at: Instant) -> ActiveTrack {
+        ActiveTrack {
+            video_id: "test-video".to_string(),
+            title: "Test Track".to_string(),
+            artist: "Test Artist".to_string(),
+            thumb_url: None,
+            playback_source: PlaybackSource::RemoteStream,
+            rating: SongRating::Indifferent,
+            tracking: None,
+            started_at,
+            last_position_millis: 0,
+            startup_retries: 0,
+            awaiting_fresh_position: true,
+            bootstrapped_watchtime: false,
+        }
+    }
 
     #[test]
     fn previous_restarts_current_track_on_first_item_before_threshold() {
@@ -2229,5 +2337,26 @@ mod tests {
     #[test]
     fn natural_end_stops_after_last_track_when_repeat_is_off() {
         assert_eq!(natural_end_target_index(3, 2, RepeatMode::Off), None);
+    }
+
+    #[test]
+    fn playback_start_is_marked_stalled_after_timeout_without_progress() {
+        let started_at = Instant::now() - (PLAYBACK_START_TIMEOUT + Duration::from_secs(1));
+        assert!(playback_start_stalled(started_at, 0, None));
+        assert!(playback_start_stalled(started_at, 0, Some(0)));
+    }
+
+    #[test]
+    fn playback_start_is_not_stalled_once_position_moves() {
+        let started_at = Instant::now() - (PLAYBACK_START_TIMEOUT + Duration::from_secs(1));
+        assert!(!playback_start_stalled(started_at, 1_500, Some(1_500)));
+    }
+
+    #[test]
+    fn flush_ignores_waiting_time_before_first_real_position() {
+        let started_at = Instant::now() - Duration::from_secs(MIN_LISTEN_SECS + 5);
+        let track = test_active_track(started_at);
+        assert_eq!(current_listened_millis(None, &track), 0);
+        assert_eq!(current_listened_millis(Some(0), &track), 0);
     }
 }

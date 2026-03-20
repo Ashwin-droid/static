@@ -2423,6 +2423,131 @@ fn load_settings_page(
     mpris_row.append(&mpris_switch);
     playback_section.append(&mpris_row);
 
+    let pipewire_row = GtkBox::new(Orientation::Horizontal, 12);
+    pipewire_row.add_css_class("settings-row");
+    let pipewire_copy = GtkBox::new(Orientation::Vertical, 2);
+    pipewire_copy.set_hexpand(true);
+    let pipewire_label = Label::new(Some("PipeWire audio ducking"));
+    pipewire_label.add_css_class("settings-row-title");
+    pipewire_label.set_halign(Align::Start);
+    pipewire_copy.append(&pipewire_label);
+    let pipewire_hint = Label::new(Some(
+        "Lower Static when non-MPRIS audio streams like games or calls stay active for a few seconds.",
+    ));
+    pipewire_hint.add_css_class("settings-row-copy");
+    pipewire_hint.set_wrap(true);
+    pipewire_hint.set_halign(Align::Start);
+    pipewire_copy.append(&pipewire_hint);
+    pipewire_row.append(&pipewire_copy);
+    let pipewire_switch = settings_switch(settings.pipewire_ducking_enabled);
+    pipewire_row.append(&pipewire_switch);
+    playback_section.append(&pipewire_row);
+
+    let pipewire_pause_row = GtkBox::new(Orientation::Horizontal, 12);
+    pipewire_pause_row.add_css_class("settings-row");
+    let pipewire_pause_copy = GtkBox::new(Orientation::Vertical, 2);
+    pipewire_pause_copy.set_hexpand(true);
+    let pipewire_pause_label = Label::new(Some("Duck pause"));
+    pipewire_pause_label.add_css_class("settings-row-title");
+    pipewire_pause_label.set_halign(Align::Start);
+    pipewire_pause_copy.append(&pipewire_pause_label);
+    let pipewire_pause_hint = Label::new(Some(
+        "Pause Static instead of lowering volume once the PipeWire threshold is reached.",
+    ));
+    pipewire_pause_hint.add_css_class("settings-row-copy");
+    pipewire_pause_hint.set_wrap(true);
+    pipewire_pause_hint.set_halign(Align::Start);
+    pipewire_pause_copy.append(&pipewire_pause_hint);
+    pipewire_pause_row.append(&pipewire_pause_copy);
+    let pipewire_pause_switch = settings_switch(settings.pipewire_duck_pause);
+    pipewire_pause_switch.set_sensitive(settings.pipewire_ducking_enabled);
+    {
+        let state = state.clone();
+        pipewire_pause_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            update_app_settings(&state, |s| s.pipewire_duck_pause = active);
+        });
+    }
+    pipewire_pause_row.append(&pipewire_pause_switch);
+    playback_section.append(&pipewire_pause_row);
+
+    let pipewire_threshold_row = GtkBox::new(Orientation::Horizontal, 12);
+    pipewire_threshold_row.add_css_class("settings-row");
+    let pipewire_threshold_copy = GtkBox::new(Orientation::Vertical, 2);
+    pipewire_threshold_copy.set_hexpand(true);
+    let pipewire_threshold_label = Label::new(Some("PipeWire trigger delay"));
+    pipewire_threshold_label.add_css_class("settings-row-title");
+    pipewire_threshold_label.set_halign(Align::Start);
+    pipewire_threshold_copy.append(&pipewire_threshold_label);
+    let pipewire_threshold_hint = Label::new(Some(
+        "How long a foreign audio stream must stay active before ducking or pausing starts.",
+    ));
+    pipewire_threshold_hint.add_css_class("settings-row-copy");
+    pipewire_threshold_hint.set_wrap(true);
+    pipewire_threshold_hint.set_halign(Align::Start);
+    pipewire_threshold_copy.append(&pipewire_threshold_hint);
+    pipewire_threshold_row.append(&pipewire_threshold_copy);
+    let pipewire_threshold_spin = SpinButton::with_range(1.0, 30.0, 1.0);
+    pipewire_threshold_spin.set_value(settings.pipewire_ducking_threshold_secs as f64);
+    pipewire_threshold_spin.set_sensitive(settings.pipewire_ducking_enabled);
+    {
+        let state = state.clone();
+        pipewire_threshold_spin.connect_value_changed(move |spin| {
+            let value = spin.value() as u32;
+            update_app_settings(&state, |s| {
+                s.pipewire_ducking_threshold_secs = value.clamp(1, 30)
+            });
+        });
+    }
+    pipewire_threshold_row.append(&pipewire_threshold_spin);
+    playback_section.append(&pipewire_threshold_row);
+
+    let pipewire_volume_row = GtkBox::new(Orientation::Horizontal, 12);
+    pipewire_volume_row.add_css_class("settings-row");
+    let pipewire_volume_copy = GtkBox::new(Orientation::Vertical, 2);
+    pipewire_volume_copy.set_hexpand(true);
+    let pipewire_volume_label = Label::new(Some("PipeWire duck volume"));
+    pipewire_volume_label.add_css_class("settings-row-title");
+    pipewire_volume_label.set_halign(Align::Start);
+    pipewire_volume_copy.append(&pipewire_volume_label);
+    let pipewire_volume_hint = Label::new(Some(
+        "Temporary playback level while foreign audio is active.",
+    ));
+    pipewire_volume_hint.add_css_class("settings-row-copy");
+    pipewire_volume_hint.set_wrap(true);
+    pipewire_volume_hint.set_halign(Align::Start);
+    pipewire_volume_copy.append(&pipewire_volume_hint);
+    pipewire_volume_row.append(&pipewire_volume_copy);
+    let pipewire_volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.05);
+    pipewire_volume_scale.set_value(settings.pipewire_ducking_volume);
+    pipewire_volume_scale.set_digits(2);
+    pipewire_volume_scale.set_draw_value(true);
+    pipewire_volume_scale.set_size_request(160, -1);
+    pipewire_volume_scale.set_sensitive(settings.pipewire_ducking_enabled);
+    {
+        let state = state.clone();
+        pipewire_volume_scale.connect_value_changed(move |scale| {
+            let value = scale.value().clamp(0.0, 1.0);
+            update_app_settings(&state, |s| s.pipewire_ducking_volume = value);
+        });
+    }
+    pipewire_volume_row.append(&pipewire_volume_scale);
+    playback_section.append(&pipewire_volume_row);
+
+    {
+        let state = state.clone();
+        let pipewire_pause_switch = pipewire_pause_switch.clone();
+        let pipewire_threshold_spin = pipewire_threshold_spin.clone();
+        let pipewire_volume_scale = pipewire_volume_scale.clone();
+        pipewire_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            pipewire_pause_switch.set_sensitive(active);
+            pipewire_threshold_spin.set_sensitive(active);
+            pipewire_volume_scale.set_sensitive(active);
+            update_app_settings(&state, |s| s.pipewire_ducking_enabled = active);
+        });
+    }
+
     let prefetch_row = GtkBox::new(Orientation::Horizontal, 12);
     prefetch_row.add_css_class("settings-row");
     let prefetch_copy = GtkBox::new(Orientation::Vertical, 2);

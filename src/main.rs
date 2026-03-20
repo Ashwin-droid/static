@@ -3,6 +3,7 @@ mod daemon;
 mod ipc;
 mod logging;
 mod models;
+mod pipewire_monitor;
 mod playback_engine;
 mod player;
 mod sponsorblock;

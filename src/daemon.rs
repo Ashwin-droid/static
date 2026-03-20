@@ -24,6 +24,7 @@ use crate::ipc::{
     PlaybackSnapshot, RepeatMode,
 };
 use crate::models::{RadioVirtualPlaylist, Track};
+use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
 use crate::sponsorblock::{
     SponsorBlockClient, SponsorSegment, default_skip_categories, filter_segments_for_categories,
@@ -51,6 +52,8 @@ const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
 const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
 const DBUS_OBJECT_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
@@ -94,6 +97,20 @@ enum PlaybackSource {
     RemoteStream,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeWireSuppressionMode {
+    None,
+    Duck,
+    Pause,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VolumeRamp {
+    started_at: Instant,
+    start_volume: f64,
+    target_volume: f64,
+}
+
 struct DaemonState {
     player: PlaybackEngine,
     cache: MusicCache,
@@ -117,6 +134,13 @@ struct DaemonState {
     last_duration_micros: Cell<Option<i64>>,
     mpris: RefCell<Option<Rc<DaemonMprisBridge>>>,
     peer_mpris: ExternalMprisCoordinator,
+    pipewire_monitor: PipeWireMonitor,
+    pipewire_trigger_active: bool,
+    last_pipewire_poll_at: Option<Instant>,
+    ducked: bool,
+    pipewire_pause_active: bool,
+    pre_duck_volume: f64,
+    volume_ramp: Option<VolumeRamp>,
     shutting_down: Cell<bool>,
 }
 
@@ -465,8 +489,8 @@ impl DaemonMprisBridge {
         {
             let state = state.clone();
             player.connect_set_volume(move |_, volume| {
-                let state = state.borrow_mut();
-                state.player.set_volume(volume);
+                let mut state = state.borrow_mut();
+                set_logical_volume(&mut state, volume);
                 sync_mpris(&state);
             });
         }
@@ -566,7 +590,7 @@ impl DaemonMprisBridge {
 
     fn sync_volume(self: &Rc<Self>, state: &DaemonState) {
         let bridge = self.clone();
-        let volume = state.player.volume();
+        let volume = logical_volume(state);
         glib::spawn_future_local(async move {
             let _ = bridge.player.set_volume(volume).await;
         });
@@ -584,10 +608,12 @@ pub fn run() -> Result<()> {
     let cache = MusicCache::new_with_storage_root(storage_root.as_deref())
         .context("Failed to initialise music cache")?;
     let settings = cache.load_settings().unwrap_or_default();
+    let player = PlaybackEngine::new();
+    let initial_volume = player.volume();
     let (command_tx, command_rx) = mpsc::channel::<CommandEnvelope>();
     let (background_tx, background_rx) = mpsc::channel::<BackgroundEvent>();
     let state = Rc::new(RefCell::new(DaemonState {
-        player: PlaybackEngine::new(),
+        player,
         cache,
         settings,
         client: None,
@@ -609,6 +635,13 @@ pub fn run() -> Result<()> {
         last_duration_micros: Cell::new(None),
         mpris: RefCell::new(None),
         peer_mpris: ExternalMprisCoordinator::new(),
+        pipewire_monitor: PipeWireMonitor::new(),
+        pipewire_trigger_active: false,
+        last_pipewire_poll_at: None,
+        ducked: false,
+        pipewire_pause_active: false,
+        pre_duck_volume: initial_volume,
+        volume_ramp: None,
         shutting_down: Cell::new(false),
     }));
 
@@ -746,7 +779,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::SetVolume { volume } => {
-            state.player.set_volume(volume.clamp(0.0, 1.0));
+            set_logical_volume(state, volume);
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -870,6 +903,10 @@ fn maintain_playback(state: &mut DaemonState) {
     poll_external_mpris(state);
     maybe_resume_after_external_mpris(state);
     maybe_pause_for_external_mpris(state);
+    poll_pipewire_streams(state);
+    maybe_unduck_for_pipewire(state);
+    maybe_duck_for_pipewire(state);
+    advance_volume_ramp(state);
 
     if state.active_track.is_some() {
         if state.player.is_paused() {
@@ -1255,6 +1292,11 @@ fn play_index_with_startup_retries(
     state.queue_index = index;
     mark_radio_touched_through(state, index);
     state.player.play_uri(&prepared_uri);
+    if state.volume_ramp.is_some() {
+        advance_volume_ramp(state);
+    } else {
+        state.player.set_volume(current_output_volume(state));
+    }
     state.last_duration_micros.set(None);
     state.active_track = Some(ActiveTrack {
         video_id: track.video_id.clone(),
@@ -1282,6 +1324,10 @@ fn play_index_with_startup_retries(
         });
     refresh_sponsorblock_for_current_track(state);
     prefetch_upcoming(state);
+    state.last_pipewire_poll_at = None;
+    poll_pipewire_streams(state);
+    maybe_unduck_for_pipewire(state);
+    maybe_duck_for_pipewire(state);
     signal_mpris_seeked(state, ClockTime::ZERO);
     sync_mpris(state);
     Ok(())
@@ -1390,6 +1436,10 @@ fn reload_settings(state: &mut DaemonState) {
             if !state.settings.respect_other_mpris_players {
                 state.peer_mpris.deactivate();
             }
+            state.last_pipewire_poll_at = None;
+            poll_pipewire_streams(state);
+            maybe_unduck_for_pipewire(state);
+            maybe_duck_for_pipewire(state);
             refresh_sponsorblock_for_current_track(state);
             prefetch_upcoming(state);
             schedule_offline_cache_sync(state);
@@ -2265,7 +2315,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         paused: state.player.is_paused(),
-        volume: state.player.volume(),
+        volume: logical_volume(state),
         position_millis: (!hide_timing)
             .then(|| state.player.position().map(|position| position.mseconds()))
             .flatten(),
@@ -2279,6 +2329,185 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
 fn sync_mpris(state: &DaemonState) {
     if let Some(bridge) = state.mpris.borrow().as_ref() {
         bridge.sync_all(state);
+    }
+}
+
+fn logical_volume(state: &DaemonState) -> f64 {
+    if state.ducked || is_restoring_from_pipewire_duck(state) {
+        state.pre_duck_volume
+    } else {
+        state.player.volume()
+    }
+}
+
+fn is_restoring_from_pipewire_duck(state: &DaemonState) -> bool {
+    state
+        .volume_ramp
+        .is_some_and(|ramp| volumes_match(ramp.target_volume, state.pre_duck_volume))
+}
+
+fn current_output_volume(state: &DaemonState) -> f64 {
+    state
+        .volume_ramp
+        .map(volume_ramp_value)
+        .unwrap_or_else(|| {
+            if state.ducked {
+                pipewire_duck_output_volume(state)
+            } else {
+                logical_volume(state)
+            }
+        })
+        .clamp(0.0, 1.0)
+}
+
+fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
+    (state.pre_duck_volume * state.settings.pipewire_ducking_volume.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
+fn set_logical_volume(state: &mut DaemonState, volume: f64) {
+    let volume = volume.clamp(0.0, 1.0);
+    state.pre_duck_volume = volume;
+
+    if state.ducked {
+        start_volume_ramp(state, pipewire_duck_output_volume(state));
+    } else {
+        state.volume_ramp = None;
+        state.player.set_volume(volume);
+    }
+}
+
+fn start_volume_ramp(state: &mut DaemonState, target_volume: f64) {
+    let target_volume = target_volume.clamp(0.0, 1.0);
+    let current_volume = state.player.volume();
+    if volumes_match(current_volume, target_volume) {
+        state.volume_ramp = None;
+        state.player.set_volume(target_volume);
+        return;
+    }
+
+    state.volume_ramp = Some(VolumeRamp {
+        started_at: Instant::now(),
+        start_volume: current_volume,
+        target_volume,
+    });
+}
+
+fn advance_volume_ramp(state: &mut DaemonState) {
+    let Some(ramp) = state.volume_ramp else {
+        return;
+    };
+
+    let next_volume = volume_ramp_value(ramp);
+    state.player.set_volume(next_volume);
+
+    if volumes_match(next_volume, ramp.target_volume) {
+        state.player.set_volume(ramp.target_volume);
+        state.volume_ramp = None;
+    }
+}
+
+fn volume_ramp_value(ramp: VolumeRamp) -> f64 {
+    let progress = (ramp.started_at.elapsed().as_secs_f64()
+        / PIPEWIRE_VOLUME_RAMP_DURATION.as_secs_f64())
+    .clamp(0.0, 1.0);
+    (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress).clamp(0.0, 1.0)
+}
+
+fn volumes_match(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 0.0001
+}
+
+fn desired_pipewire_suppression_mode(state: &DaemonState) -> PipeWireSuppressionMode {
+    if !state.settings.pipewire_ducking_enabled
+        || !state.pipewire_trigger_active
+        || state.active_track.is_none()
+    {
+        return PipeWireSuppressionMode::None;
+    }
+
+    if state.settings.pipewire_duck_pause {
+        if state.pipewire_pause_active || !state.player.is_paused() {
+            PipeWireSuppressionMode::Pause
+        } else {
+            PipeWireSuppressionMode::None
+        }
+    } else if state.player.is_paused() {
+        PipeWireSuppressionMode::None
+    } else {
+        PipeWireSuppressionMode::Duck
+    }
+}
+
+fn poll_pipewire_streams(state: &mut DaemonState) {
+    if state
+        .last_pipewire_poll_at
+        .is_some_and(|last_poll_at| last_poll_at.elapsed() < PIPEWIRE_STREAM_POLL_INTERVAL)
+    {
+        return;
+    }
+
+    state.last_pipewire_poll_at = Some(Instant::now());
+    let threshold = Duration::from_secs(
+        state
+            .settings
+            .pipewire_ducking_threshold_secs
+            .clamp(1, 30)
+            .into(),
+    );
+
+    state.pipewire_trigger_active = state
+        .pipewire_monitor
+        .active_streams()
+        .values()
+        .any(|first_seen| first_seen.elapsed() >= threshold);
+}
+
+fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
+    let desired = desired_pipewire_suppression_mode(state);
+
+    if state.ducked && desired != PipeWireSuppressionMode::Duck {
+        state.ducked = false;
+        start_volume_ramp(state, state.pre_duck_volume);
+    }
+
+    if state.pipewire_pause_active && desired != PipeWireSuppressionMode::Pause {
+        let should_resume = state.active_track.is_some()
+            && state.player.is_paused()
+            && !state.peer_mpris.is_waiting_for_peer_pause();
+        state.pipewire_pause_active = false;
+        if should_resume {
+            state.player.resume();
+            sync_mpris(state);
+        }
+    }
+}
+
+fn maybe_duck_for_pipewire(state: &mut DaemonState) {
+    match desired_pipewire_suppression_mode(state) {
+        PipeWireSuppressionMode::Duck => {
+            let target_volume = pipewire_duck_output_volume(state);
+            if !state.ducked {
+                state.pre_duck_volume = logical_volume(state);
+                state.ducked = true;
+                start_volume_ramp(state, target_volume);
+            } else if state.volume_ramp.map_or(true, |ramp| {
+                !volumes_match(ramp.target_volume, target_volume)
+            }) && !volumes_match(state.player.volume(), target_volume)
+            {
+                start_volume_ramp(state, target_volume);
+            }
+        }
+        PipeWireSuppressionMode::Pause => {
+            if !state.pipewire_pause_active {
+                state.pre_duck_volume = logical_volume(state);
+                state.pipewire_pause_active = true;
+            }
+            if !state.player.is_paused() {
+                state.player.pause();
+                sync_mpris(state);
+            }
+        }
+        PipeWireSuppressionMode::None => {}
     }
 }
 

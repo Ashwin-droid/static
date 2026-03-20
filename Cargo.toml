@@ -48,6 +48,7 @@ gstreamer = "0.25"
 gstreamer-play = "0.25"
 mpris = "2"
 mpris-server = "0.9"
+pipewire = "0.8"
 
 # Error handling
 anyhow = "1"
@@ -64,3 +65,7 @@ aes = "0.8"
 cbc = "0.1"
 pbkdf2 = "0.12"
 zbus = { version = "4", features = ["blocking"] }
+
+[patch.crates-io]
+libspa-sys = { path = "vendor/libspa-sys" }
+pipewire-sys = { path = "vendor/pipewire-sys" }

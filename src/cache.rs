@@ -28,6 +28,10 @@ pub struct AppSettings {
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
     pub respect_other_mpris_players: bool,
+    pub pipewire_ducking_enabled: bool,
+    pub pipewire_duck_pause: bool,
+    pub pipewire_ducking_threshold_secs: u32,
+    pub pipewire_ducking_volume: f64,
     pub sponsorblock_enabled: bool,
     pub sponsorblock_categories: Vec<String>,
 }
@@ -47,6 +51,10 @@ impl Default for AppSettings {
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
             respect_other_mpris_players: true,
+            pipewire_ducking_enabled: false,
+            pipewire_duck_pause: false,
+            pipewire_ducking_threshold_secs: 5,
+            pipewire_ducking_volume: 0.3,
             sponsorblock_enabled: true,
             sponsorblock_categories: default_skip_categories(),
         }
@@ -393,6 +401,30 @@ impl MusicCache {
                     settings.respect_other_mpris_players =
                         parse_bool_setting(&row.1, settings.respect_other_mpris_players);
                 }
+                "pipewire_ducking_enabled" => {
+                    settings.pipewire_ducking_enabled =
+                        parse_bool_setting(&row.1, settings.pipewire_ducking_enabled);
+                }
+                "pipewire_duck_pause" => {
+                    settings.pipewire_duck_pause =
+                        parse_bool_setting(&row.1, settings.pipewire_duck_pause);
+                }
+                "pipewire_ducking_threshold_secs" => {
+                    settings.pipewire_ducking_threshold_secs = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.pipewire_ducking_threshold_secs)
+                        .clamp(1, 30);
+                }
+                "pipewire_ducking_volume" => {
+                    settings.pipewire_ducking_volume = row
+                        .1
+                        .parse::<f64>()
+                        .ok()
+                        .unwrap_or(settings.pipewire_ducking_volume)
+                        .clamp(0.0, 1.0);
+                }
                 "sponsorblock_enabled" => {
                     settings.sponsorblock_enabled =
                         parse_bool_setting(&row.1, settings.sponsorblock_enabled);
@@ -455,6 +487,22 @@ impl MusicCache {
             (
                 "respect_other_mpris_players",
                 bool_setting(settings.respect_other_mpris_players),
+            ),
+            (
+                "pipewire_ducking_enabled",
+                bool_setting(settings.pipewire_ducking_enabled),
+            ),
+            (
+                "pipewire_duck_pause",
+                bool_setting(settings.pipewire_duck_pause),
+            ),
+            (
+                "pipewire_ducking_threshold_secs",
+                settings.pipewire_ducking_threshold_secs.to_string(),
+            ),
+            (
+                "pipewire_ducking_volume",
+                settings.pipewire_ducking_volume.to_string(),
             ),
             (
                 "sponsorblock_enabled",

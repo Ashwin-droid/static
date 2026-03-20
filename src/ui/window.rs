@@ -3679,6 +3679,26 @@ fn extend_radio_touched_for_insert(ps: &PlayerState, insert_at: usize, added: us
     }
 }
 
+fn radio_touched_len_after_reorder(touched_len: usize, from: usize, insert_at: usize) -> usize {
+    let mut touched_len = touched_len;
+
+    if from < touched_len {
+        touched_len = touched_len.saturating_sub(1);
+    }
+
+    if insert_at < touched_len {
+        touched_len + 1
+    } else {
+        touched_len.max(insert_at.saturating_add(1))
+    }
+}
+
+fn update_radio_touched_for_reorder(ps: &PlayerState, from: usize, insert_at: usize) {
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        radio.touched_len = radio_touched_len_after_reorder(radio.touched_len, from, insert_at);
+    }
+}
+
 fn shrink_radio_touched_for_remove(ps: &PlayerState, remove_at: usize) {
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
         if radio.touched_len == 0 {
@@ -8933,7 +8953,7 @@ fn handle_queue_drop_payload(
                     ps.queue_index.set(current + 1);
                 }
             }
-            mark_radio_touched_through(ps, insert_at);
+            update_radio_touched_for_reorder(ps, from, insert_at);
             *ps.last_radio_append_anchor.borrow_mut() = None;
 
             render_queue_panel(ps, state);
@@ -8965,5 +8985,25 @@ fn handle_queue_drop_payload(
             });
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::radio_touched_len_after_reorder;
+
+    #[test]
+    fn reordering_generated_track_into_touched_prefix_extends_boundary() {
+        assert_eq!(radio_touched_len_after_reorder(3, 5, 1), 4);
+    }
+
+    #[test]
+    fn reordering_touched_track_farther_down_marks_drop_location() {
+        assert_eq!(radio_touched_len_after_reorder(3, 1, 5), 6);
+    }
+
+    #[test]
+    fn reordering_within_touched_prefix_preserves_boundary_width() {
+        assert_eq!(radio_touched_len_after_reorder(4, 1, 2), 4);
     }
 }

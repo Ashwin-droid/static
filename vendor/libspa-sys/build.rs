@@ -15,6 +15,7 @@ fn main() {
     cc.files(["src/type-info.c", "src/static_fns.c"]);
     cc.include(env!("CARGO_MANIFEST_DIR"));
     cc.includes(libs.all_include_paths());
+    cc.flag_if_supported("-Wno-unused-parameter");
 
     #[cfg(feature = "v0_3_65")]
     cc.define("FEATURE_0_3_65", "1");

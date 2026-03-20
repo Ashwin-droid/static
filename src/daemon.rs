@@ -106,6 +106,7 @@ struct DaemonState {
     active_track: Option<ActiveTrack>,
     sponsor_segments: Vec<SponsorSegment>,
     sponsor_segments_reported: HashSet<String>,
+    prefetch_in_flight: HashSet<String>,
     paused_since: Option<Instant>,
     radio_append_in_flight: bool,
     last_radio_append_anchor: Option<String>,
@@ -283,6 +284,9 @@ enum BackgroundEvent {
     TrackingReady {
         video_id: String,
         tracking: Option<TrackingInfo>,
+    },
+    PrefetchFinished {
+        video_id: String,
     },
     SponsorSegmentsReady {
         video_id: String,
@@ -594,6 +598,7 @@ pub fn run() -> Result<()> {
         active_track: None,
         sponsor_segments: Vec::new(),
         sponsor_segments_reported: HashSet::new(),
+        prefetch_in_flight: HashSet::new(),
         paused_since: None,
         radio_append_in_flight: false,
         last_radio_append_anchor: None,
@@ -777,6 +782,9 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
                     active.tracking = tracking;
                 }
             }
+        }
+        BackgroundEvent::PrefetchFinished { video_id } => {
+            state.prefetch_in_flight.remove(&video_id);
         }
         BackgroundEvent::SponsorSegmentsReady { video_id, segments } => {
             if state
@@ -2151,6 +2159,11 @@ fn prefetch_upcoming(state: &mut DaemonState) {
         .iter()
         .skip(start)
         .take(prefetch_ahead)
+        .filter(|track| {
+            !state.cache.is_cached(&track.video_id)
+                && state.cache.get_temp_audio(&track.video_id).is_none()
+                && !state.prefetch_in_flight.contains(&track.video_id)
+        })
         .map(|track| track.video_id.clone())
         .collect::<Vec<_>>();
 
@@ -2158,12 +2171,18 @@ fn prefetch_upcoming(state: &mut DaemonState) {
         return;
     }
 
+    state.prefetch_in_flight.extend(to_fetch.iter().cloned());
+
     let cookie = get_cookie();
     let vr_refresh_token = get_vr_refresh_token();
     let storage_root = get_storage_root();
+    let background_tx = state.background_tx.clone();
 
     std::thread::spawn(move || {
         let Some(cookie) = cookie else {
+            for video_id in to_fetch {
+                let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
+            }
             return;
         };
 
@@ -2171,6 +2190,9 @@ fn prefetch_upcoming(state: &mut DaemonState) {
             Ok(cache) => cache,
             Err(err) => {
                 eprintln!("[PREFETCH] failed to initialize music cache: {err}");
+                for video_id in to_fetch {
+                    let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
+                }
                 return;
             }
         };
@@ -2179,6 +2201,9 @@ fn prefetch_upcoming(state: &mut DaemonState) {
             Ok(client) => client,
             Err(err) => {
                 eprintln!("[PREFETCH] failed to initialize YT Music client: {err}");
+                for video_id in to_fetch {
+                    let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
+                }
                 return;
             }
         };
@@ -2188,10 +2213,12 @@ fn prefetch_upcoming(state: &mut DaemonState) {
 
         for video_id in to_fetch {
             if cache.is_cached(&video_id) || cache.get_temp_audio(&video_id).is_some() {
+                let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             }
 
             let Ok(url) = client.get_audio_url_no_track(&video_id) else {
+                let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             };
 
@@ -2202,10 +2229,12 @@ fn prefetch_upcoming(state: &mut DaemonState) {
                 .and_then(|response| response.error_for_status())
                 .and_then(|response| response.bytes())
             else {
+                let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             };
 
             cache.store_temp_audio(&video_id, &audio);
+            let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
         }
     });
 }

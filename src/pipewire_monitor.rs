@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
@@ -18,6 +19,11 @@ macro_rules! eprintln {
 pub struct PipeWireMonitor {
     active_streams: Arc<Mutex<HashMap<u32, Instant>>>,
     _thread: JoinHandle<()>,
+}
+
+struct TrackedNode {
+    _node: pw::node::Node,
+    _listener: pw::node::NodeListener,
 }
 
 impl PipeWireMonitor {
@@ -78,6 +84,7 @@ fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
 
     let main_loop_weak = main_loop.downgrade();
     let active_streams_for_error = active_streams.clone();
+    let tracked_nodes = Rc::new(RefCell::new(HashMap::<u32, TrackedNode>::new()));
     let _core_listener = core
         .add_listener_local()
         .error(move |id, _, res, message| {
@@ -93,8 +100,11 @@ fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
         })
         .register();
 
+    let registry_weak = Rc::downgrade(&registry);
     let active_streams_for_global = active_streams.clone();
     let active_streams_for_remove = active_streams.clone();
+    let tracked_nodes_for_global = tracked_nodes.clone();
+    let tracked_nodes_for_remove = tracked_nodes.clone();
     let _registry_listener = registry
         .add_listener_local()
         .global(move |obj| {
@@ -111,11 +121,37 @@ fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
                 return;
             }
 
-            lock_streams(&active_streams_for_global)
-                .entry(obj.id)
-                .or_insert_with(Instant::now);
+            let Some(registry) = registry_weak.upgrade() else {
+                return;
+            };
+
+            let node_id = obj.id;
+            let node: pw::node::Node = match registry.bind(obj) {
+                Ok(node) => node,
+                Err(err) => {
+                    eprintln!("[PIPEWIRE] failed to bind node {node_id}: {err}");
+                    return;
+                }
+            };
+
+            let active_streams_for_info = active_streams_for_global.clone();
+            let listener = node
+                .add_listener_local()
+                .info(move |info: &pw::node::NodeInfoRef| {
+                    update_stream_state(&active_streams_for_info, node_id, info.state());
+                })
+                .register();
+
+            tracked_nodes_for_global.borrow_mut().insert(
+                node_id,
+                TrackedNode {
+                    _node: node,
+                    _listener: listener,
+                },
+            );
         })
         .global_remove(move |id| {
+            tracked_nodes_for_remove.borrow_mut().remove(&id);
             lock_streams(&active_streams_for_remove).remove(&id);
         })
         .register();
@@ -176,6 +212,26 @@ fn own_process_identifiers() -> HashSet<String> {
 
 fn normalize_identifier(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn update_stream_state(
+    active_streams: &Arc<Mutex<HashMap<u32, Instant>>>,
+    node_id: u32,
+    state: pw::node::NodeState<'_>,
+) {
+    let mut active_streams = lock_streams(active_streams);
+
+    match state {
+        pw::node::NodeState::Running => {
+            active_streams.entry(node_id).or_insert_with(Instant::now);
+        }
+        pw::node::NodeState::Creating
+        | pw::node::NodeState::Suspended
+        | pw::node::NodeState::Idle
+        | pw::node::NodeState::Error(_) => {
+            active_streams.remove(&node_id);
+        }
+    }
 }
 
 fn clear_streams(active_streams: &Arc<Mutex<HashMap<u32, Instant>>>) {

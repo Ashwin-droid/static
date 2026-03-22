@@ -16,7 +16,8 @@ macro_rules! eprintln {
 }
 
 use crate::models::{
-    BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult, Track,
+    BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult,
+    SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
 };
 
 use super::parsers;
@@ -87,6 +88,39 @@ struct PendingWatchtimeRequest {
     watched_millis: u64,
     state: String,
     final_ping: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CaptionTrack {
+    base_url: String,
+    language_code: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+}
+
+impl CaptionTrack {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            base_url: value.get("baseUrl")?.as_str()?.to_string(),
+            language_code: value
+                .get("languageCode")
+                .and_then(|language| language.as_str())
+                .map(str::to_string),
+            kind: value
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .map(str::to_string),
+            name: text_from_navigation_text(value.get("name")),
+        })
+    }
+
+    fn source(&self) -> SyncedLyricsSource {
+        if self.kind.as_deref() == Some("asr") {
+            SyncedLyricsSource::AutoCaptions
+        } else {
+            SyncedLyricsSource::Captions
+        }
+    }
 }
 
 // TrackingInfo contains a raw pointer to the runtime which lives in YtMusicClient
@@ -473,6 +507,54 @@ fn parse_secs_to_millis(value: Option<&str>) -> Option<u64> {
         .map(|secs| (secs * 1000.0).round() as u64)
 }
 
+fn parse_json_u64(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|number| (number >= 0).then_some(number as u64)))
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
+}
+
+fn text_from_navigation_text(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    value
+        .get("simpleText")
+        .and_then(|text| text.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("runs")
+                .and_then(|runs| runs.as_array())
+                .map(|runs| {
+                    runs.iter()
+                        .filter_map(|run| run.get("text").and_then(|text| text.as_str()))
+                        .collect::<String>()
+                })
+                .filter(|text| !text.trim().is_empty())
+        })
+}
+
+fn decode_basic_html_entities(input: &str) -> String {
+    input
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn normalize_synced_lyric_text(raw: &str) -> String {
+    let without_zero_width = raw.replace('\u{200b}', "");
+    let decoded = decode_basic_html_entities(&without_zero_width);
+    decoded
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn format_millis(millis: u64) -> String {
     let mut rendered = format!("{:.3}", millis as f64 / 1000.0);
     while rendered.contains('.') && rendered.ends_with('0') {
@@ -789,6 +871,30 @@ impl YtMusicClient {
             Ok(Self::find_like_status(&json)
                 .map(SongRating::from_ytmusic)
                 .unwrap_or(SongRating::Indifferent))
+        })
+    }
+
+    pub fn get_synced_lyrics(&self, video_id: &str) -> Result<Option<SyncedLyrics>> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["videoId"] = json!(video_id);
+
+            let player = self.player_request(&body).await?;
+            let Some(track) = Self::best_caption_track(&player) else {
+                return Ok(None);
+            };
+            let caption_url = Self::json3_caption_url(&track.base_url)?;
+            let response = self
+                .http
+                .get(&caption_url)
+                .send()
+                .await
+                .with_context(|| format!("Failed to fetch synced lyrics for {video_id}"))?;
+            let captions: Value = response
+                .json()
+                .await
+                .with_context(|| format!("Failed to parse synced lyrics response for {video_id}"))?;
+            Ok(Self::parse_synced_lyrics(track, &captions))
         })
     }
 
@@ -1169,6 +1275,119 @@ impl YtMusicClient {
         resp.json().await.context("Failed to parse player response")
     }
 
+    fn best_caption_track(json: &Value) -> Option<CaptionTrack> {
+        json.pointer("/captions/playerCaptionsTracklistRenderer/captionTracks")
+            .and_then(|tracks| tracks.as_array())
+            .and_then(|tracks| {
+                tracks
+                    .iter()
+                    .filter_map(CaptionTrack::from_value)
+                    .max_by_key(Self::caption_track_score)
+            })
+    }
+
+    fn caption_track_score(track: &CaptionTrack) -> (u8, u8, u8, u8) {
+        let has_manual_timings = u8::from(track.kind.as_deref() != Some("asr"));
+        let mentions_lyrics = u8::from(
+            track
+                .name
+                .as_deref()
+                .map(|name| name.to_ascii_lowercase().contains("lyric"))
+                .unwrap_or(false),
+        );
+        let english_preference = track.language_code.as_deref().map_or(0, |language| {
+            if matches!(language, "en" | "en-US" | "en-GB") {
+                2
+            } else if language.starts_with("en-") {
+                1
+            } else {
+                0
+            }
+        });
+        let has_label = u8::from(track.name.is_some());
+        (
+            has_manual_timings,
+            mentions_lyrics,
+            english_preference,
+            has_label,
+        )
+    }
+
+    fn json3_caption_url(base_url: &str) -> Result<String> {
+        let mut url = Url::parse(base_url).context("Caption track URL was invalid")?;
+        let params = url
+            .query_pairs()
+            .filter(|(key, _)| key != "fmt")
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(&key, &value);
+            }
+            pairs.append_pair("fmt", "json3");
+        }
+        Ok(url.to_string())
+    }
+
+    fn parse_synced_lyrics(track: CaptionTrack, json: &Value) -> Option<SyncedLyrics> {
+        let events = json.get("events").and_then(|events| events.as_array())?;
+        let mut lines = Vec::new();
+
+        for event in events {
+            let Some(start_millis) = parse_json_u64(event.get("tStartMs")) else {
+                continue;
+            };
+            let text = event
+                .get("segs")
+                .and_then(|segments| segments.as_array())
+                .map(|segments| {
+                    segments
+                        .iter()
+                        .filter_map(|segment| segment.get("utf8").and_then(|text| text.as_str()))
+                        .collect::<String>()
+                })
+                .map(|text| normalize_synced_lyric_text(&text))
+                .unwrap_or_default();
+            if text.is_empty() {
+                continue;
+            }
+
+            let end_millis = parse_json_u64(event.get("dDurationMs"))
+                .filter(|duration| *duration > 0)
+                .map(|duration| start_millis.saturating_add(duration));
+
+            lines.push(SyncedLyricLine {
+                start_millis,
+                end_millis,
+                text,
+            });
+        }
+
+        if lines.is_empty() {
+            return None;
+        }
+
+        for index in 0..lines.len() {
+            let next_start = lines.get(index + 1).map(|line| line.start_millis);
+            let computed_end = match (lines[index].end_millis, next_start) {
+                (Some(end_millis), Some(next_start)) => end_millis.max(next_start),
+                (Some(end_millis), None) => end_millis,
+                (None, Some(next_start)) => next_start,
+                (None, None) => lines[index].start_millis.saturating_add(4_000),
+            };
+            lines[index].end_millis = Some(computed_end.max(lines[index].start_millis + 1));
+        }
+
+        Some(SyncedLyrics {
+            source: track.source(),
+            language_code: track.language_code.filter(|language| !language.trim().is_empty()),
+            track_name: track.name.filter(|name| !name.trim().is_empty()),
+            lines,
+        })
+    }
+
     fn find_like_status(value: &Value) -> Option<&str> {
         if let Some(status) = value.get("likeStatus").and_then(|status| status.as_str()) {
             return Some(status);
@@ -1418,7 +1637,7 @@ impl YtMusicClient {
 
 #[cfg(test)]
 mod tests {
-    use super::YtMusicClient;
+    use super::{CaptionTrack, YtMusicClient};
     use serde_json::json;
 
     #[test]
@@ -1445,5 +1664,41 @@ mod tests {
             YtMusicClient::format_direct_url(formats[0]),
             Some("https://example.com/direct")
         );
+    }
+
+    #[test]
+    fn parse_synced_lyrics_json3_normalizes_lines_and_end_times() {
+        let track = CaptionTrack {
+            base_url: "https://example.com/api/timedtext".to_string(),
+            language_code: Some("en".to_string()),
+            kind: None,
+            name: Some("English".to_string()),
+        };
+        let json = json!({
+            "events": [
+                {
+                    "tStartMs": "1000",
+                    "dDurationMs": "1500",
+                    "segs": [
+                        { "utf8": "Hello   " },
+                        { "utf8": "world" }
+                    ]
+                },
+                {
+                    "tStartMs": "3500",
+                    "segs": [
+                        { "utf8": "Next &amp; final" }
+                    ]
+                }
+            ]
+        });
+
+        let lyrics = YtMusicClient::parse_synced_lyrics(track, &json).expect("synced lyrics");
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "Hello world");
+        assert_eq!(lyrics.lines[0].start_millis, 1000);
+        assert_eq!(lyrics.lines[0].end_millis, Some(3500));
+        assert_eq!(lyrics.lines[1].text, "Next & final");
+        assert_eq!(lyrics.lines[1].end_millis, Some(7500));
     }
 }

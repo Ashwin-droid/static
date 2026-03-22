@@ -598,10 +598,62 @@ popover > contents {
         border-color 180ms ease;
 }
 
-.queue-header {
-    font-size: 15px;
-    font-weight: 700;
+.detail-tab-btn {
+    min-height: 34px;
+    padding: 0 14px;
+    border-radius: 999px;
+    background-color: rgba(255, 255, 255, 0.04);
+    color: rgba(255, 255, 255, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.detail-tab-btn:hover {
     color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+.detail-tab-btn-active {
+    color: #ffffff;
+    background-color: rgba(130, 160, 255, 0.18);
+    border-color: rgba(160, 186, 255, 0.3);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.lyrics-panel {
+    min-width: 320px;
+}
+
+.lyrics-meta {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(160, 186, 255, 0.74);
+}
+
+.lyrics-status {
+    font-size: 13px;
+    line-height: 1.6;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.lyrics-list {
+    margin-bottom: 8px;
+}
+
+.lyrics-line {
+    font-size: 18px;
+    font-weight: 600;
+    line-height: 1.45;
+    color: rgba(255, 255, 255, 0.3);
+    transition:
+        color 140ms ease,
+        transform 160ms ease;
+}
+
+.lyrics-line-active {
+    color: #f5f7ff;
+    transform: translateX(4px);
 }
 
 .queue-chip {

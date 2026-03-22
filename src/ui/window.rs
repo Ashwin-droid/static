@@ -54,7 +54,8 @@ use crate::ipc::{
 };
 use crate::models::{
     Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, Track,
+    HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult,
+    SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
 };
 use crate::player::Player;
 use crate::sponsorblock::{
@@ -112,6 +113,21 @@ struct NowPlayingTrack {
     last_observed_position_millis: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPanelView {
+    Queue,
+    Lyrics,
+}
+
+impl DetailPanelView {
+    fn stack_name(self) -> &'static str {
+        match self {
+            DetailPanelView::Queue => "queue",
+            DetailPanelView::Lyrics => "lyrics",
+        }
+    }
+}
+
 fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<YtMusicClient>> {
     state.lock().unwrap().client.clone()
 }
@@ -134,6 +150,201 @@ fn cached_home_scroll_position(state: &Arc<Mutex<AppState>>) -> f64 {
 
 fn store_home_scroll_position(state: &Arc<Mutex<AppState>>, position: f64) {
     state.lock().unwrap().home_scroll_position = position.max(0.0);
+}
+
+fn detail_tab_button(label: &str, active: bool) -> Button {
+    let button = Button::with_label(label);
+    button.add_css_class("detail-tab-btn");
+    if active {
+        button.add_css_class("detail-tab-btn-active");
+    }
+    button
+}
+
+fn set_detail_panel_view(ps: &PlayerState, view: DetailPanelView) {
+    ps.detail_panel_mode.set(view);
+    ps.detail_panel_stack.set_visible_child_name(view.stack_name());
+    ps.queue_dismiss_btn
+        .set_visible(view == DetailPanelView::Queue);
+
+    if view == DetailPanelView::Queue {
+        ps.detail_queue_tab_btn
+            .add_css_class("detail-tab-btn-active");
+        ps.detail_lyrics_tab_btn
+            .remove_css_class("detail-tab-btn-active");
+    } else {
+        ps.detail_lyrics_tab_btn
+            .add_css_class("detail-tab-btn-active");
+        ps.detail_queue_tab_btn
+            .remove_css_class("detail-tab-btn-active");
+        clear_queue_drop_preview(ps);
+        set_queue_drop_active(ps, false);
+    }
+}
+
+fn synced_lyrics_meta_text(lyrics: &SyncedLyrics) -> String {
+    let source = match lyrics.source {
+        SyncedLyricsSource::Captions => "Synced captions".to_string(),
+        SyncedLyricsSource::AutoCaptions => "Auto-synced captions".to_string(),
+    };
+    let track_name = lyrics
+        .track_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty());
+    let language = lyrics
+        .language_code
+        .as_deref()
+        .filter(|code| !code.trim().is_empty());
+
+    [Some(source.as_str()), track_name, language]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  •  ")
+}
+
+fn show_lyrics_status(ps: &PlayerState, meta: Option<&str>, message: &str) {
+    clear_box(&ps.lyrics_list_box);
+    ps.lyrics_line_widgets.borrow_mut().clear();
+    ps.lyrics_lines.borrow_mut().clear();
+    ps.lyrics_active_line.set(None);
+
+    if let Some(meta) = meta.filter(|meta| !meta.trim().is_empty()) {
+        ps.lyrics_meta_label.set_text(meta);
+        ps.lyrics_meta_label.set_visible(true);
+    } else {
+        ps.lyrics_meta_label.set_text("");
+        ps.lyrics_meta_label.set_visible(false);
+    }
+
+    ps.lyrics_status_label.set_text(message);
+    ps.lyrics_status_label.set_visible(true);
+    ps.lyrics_scroll.set_visible(false);
+}
+
+fn show_lyrics_loading(ps: &PlayerState) {
+    show_lyrics_status(ps, Some("Syncing lyrics"), "Loading timed lines for this track...");
+}
+
+fn show_lyrics_idle(ps: &PlayerState) {
+    show_lyrics_status(
+        ps,
+        None,
+        "Play something to see synced lyrics when YouTube exposes timed text.",
+    );
+}
+
+fn scroll_active_lyric_into_view(ps: &PlayerState, line: &Label) {
+    if ps.detail_panel_mode.get() != DetailPanelView::Lyrics {
+        return;
+    }
+
+    let adjustment = ps.lyrics_scroll.vadjustment();
+    let allocation = line.allocation();
+    let top = allocation.y() as f64;
+    let bottom = top + allocation.height() as f64;
+    let padding = 72.0;
+    let current_top = adjustment.value();
+    let current_bottom = current_top + adjustment.page_size();
+    let upper = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+
+    let target = if top < current_top + padding {
+        top - padding
+    } else if bottom > current_bottom - padding {
+        bottom - adjustment.page_size() + padding
+    } else {
+        return;
+    };
+
+    adjustment.set_value(target.clamp(adjustment.lower(), upper));
+}
+
+fn update_active_lyric_line(ps: &PlayerState, position_millis: Option<u64>) {
+    let next_index = position_millis.and_then(|position| {
+        let lines = ps.lyrics_lines.borrow();
+        lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| {
+                let end = line.end_millis.unwrap_or(u64::MAX);
+                position >= line.start_millis && position < end
+            })
+            .map(|(index, _)| index)
+            .or_else(|| {
+                lines
+                    .iter()
+                    .enumerate()
+                    .rfind(|(_, line)| position >= line.start_millis)
+                    .map(|(index, _)| index)
+            })
+    });
+
+    let previous_index = ps.lyrics_active_line.replace(next_index);
+    if previous_index == next_index {
+        return;
+    }
+
+    if let Some(previous_index) = previous_index {
+        if let Some(previous_line) = ps.lyrics_line_widgets.borrow().get(previous_index).cloned() {
+            previous_line.remove_css_class("lyrics-line-active");
+        }
+    }
+
+    if let Some(next_index) = next_index {
+        if let Some(next_line) = ps.lyrics_line_widgets.borrow().get(next_index).cloned() {
+            next_line.add_css_class("lyrics-line-active");
+            scroll_active_lyric_into_view(ps, &next_line);
+        }
+    }
+}
+
+fn render_synced_lyrics(ps: &PlayerState, lyrics: &SyncedLyrics, position_millis: Option<u64>) {
+    clear_box(&ps.lyrics_list_box);
+
+    let mut line_widgets = Vec::with_capacity(lyrics.lines.len());
+    for line in &lyrics.lines {
+        let label = Label::new(Some(&line.text));
+        label.add_css_class("lyrics-line");
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_halign(Align::Start);
+        label.set_xalign(0.0);
+        label.set_selectable(false);
+        ps.lyrics_list_box.append(&label);
+        line_widgets.push(label);
+    }
+
+    *ps.lyrics_lines.borrow_mut() = lyrics.lines.clone();
+    *ps.lyrics_line_widgets.borrow_mut() = line_widgets;
+    ps.lyrics_active_line.set(None);
+
+    let meta = synced_lyrics_meta_text(lyrics);
+    if meta.is_empty() {
+        ps.lyrics_meta_label.set_text("");
+        ps.lyrics_meta_label.set_visible(false);
+    } else {
+        ps.lyrics_meta_label.set_text(&meta);
+        ps.lyrics_meta_label.set_visible(true);
+    }
+
+    ps.lyrics_status_label.set_visible(false);
+    ps.lyrics_scroll.set_visible(true);
+    update_active_lyric_line(ps, position_millis);
+}
+
+fn lyrics_request_is_current(
+    ps: &PlayerState,
+    session_id: u64,
+    request_serial: u64,
+    video_id: &str,
+) -> bool {
+    if ps.lyrics_request_serial.get() != request_serial {
+        return false;
+    }
+
+    ps.now_playing_track.borrow().as_ref().is_some_and(|track| {
+        track.session_id == session_id && track.video_id == video_id
+    })
 }
 
 #[allow(dead_code)]
@@ -193,6 +404,18 @@ struct PlayerState {
     chip_bar: GtkBox,
     queue_panel: GtkBox,
     queue_dismiss_btn: Button,
+    detail_panel_stack: Stack,
+    detail_queue_tab_btn: Button,
+    detail_lyrics_tab_btn: Button,
+    detail_panel_mode: Cell<DetailPanelView>,
+    lyrics_status_label: Label,
+    lyrics_meta_label: Label,
+    lyrics_scroll: ScrolledWindow,
+    lyrics_list_box: GtkBox,
+    lyrics_lines: RefCell<Vec<SyncedLyricLine>>,
+    lyrics_line_widgets: RefCell<Vec<Label>>,
+    lyrics_active_line: Cell<Option<usize>>,
+    lyrics_request_serial: Cell<u64>,
     // Play tracking — records listen time when navigating away
     now_playing_track: RefCell<Option<NowPlayingTrack>>,
     playback_session_id: Cell<u64>,
@@ -622,6 +845,7 @@ fn apply_remote_snapshot(
             if is_new_track {
                 spawn_sponsorblock_sync(state, ps, &track.video_id, session_id);
                 spawn_song_rating_sync(state, ps, &track.video_id, session_id);
+                spawn_synced_lyrics_sync(state, ps, &track.video_id, session_id);
             }
 
             apply_snapshot_playback_ui(ps, &snapshot);
@@ -630,6 +854,9 @@ fn apply_remote_snapshot(
             ps.now_playing_track.borrow_mut().take();
             clear_sponsorblock_state(ps);
             ps.last_mpris_length_micros.set(None);
+            ps.lyrics_request_serial
+                .set(ps.lyrics_request_serial.get().wrapping_add(1));
+            show_lyrics_idle(ps);
             ps.np_title.set_text("Nothing playing");
             ps.np_artist.set_text("");
             ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
@@ -662,6 +889,7 @@ fn apply_snapshot_playback_ui(ps: &PlayerState, snapshot: &PlaybackSnapshot) {
     if let Some(position_millis) = snapshot.position_millis {
         note_playback_position(ps, position_millis);
     }
+    update_active_lyric_line(ps, snapshot.position_millis);
 
     match (pos, dur) {
         (Some(pos), Some(dur)) => {
@@ -1871,7 +2099,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     hbox.append(&content_outer);
 
-    // ======= QUEUE PANEL (right side, like YTM's "Up Next") =======
+    // ======= DETAIL PANEL (right side: queue + synced lyrics) =======
     let queue_panel = GtkBox::new(Orientation::Vertical, 0);
     queue_panel.add_css_class("queue-panel");
     queue_panel.set_visible(false);
@@ -1882,11 +2110,16 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     queue_header_row.set_margin_top(12);
     queue_header_row.set_margin_bottom(8);
 
-    let queue_header = Label::new(Some("Up Next"));
-    queue_header.add_css_class("queue-header");
-    queue_header.set_halign(Align::Start);
-    queue_header.set_hexpand(true);
-    queue_header_row.append(&queue_header);
+    let panel_tabs = GtkBox::new(Orientation::Horizontal, 6);
+    panel_tabs.set_hexpand(true);
+
+    let queue_tab_btn = detail_tab_button("Up Next", true);
+    panel_tabs.append(&queue_tab_btn);
+
+    let lyrics_tab_btn = detail_tab_button("Lyrics", false);
+    panel_tabs.append(&lyrics_tab_btn);
+
+    queue_header_row.append(&panel_tabs);
 
     let dismiss_queue_btn = Button::with_label("Dismiss Queue");
     dismiss_queue_btn.add_css_class("settings-secondary-btn");
@@ -1895,6 +2128,15 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     queue_header_row.append(&dismiss_queue_btn);
 
     queue_panel.append(&queue_header_row);
+
+    let detail_panel_stack = Stack::new();
+    detail_panel_stack.set_vexpand(true);
+    detail_panel_stack.set_transition_type(StackTransitionType::Crossfade);
+    detail_panel_stack.set_hexpand(true);
+    detail_panel_stack.set_vhomogeneous(false);
+    detail_panel_stack.set_hhomogeneous(false);
+
+    let queue_page = GtkBox::new(Orientation::Vertical, 0);
 
     // Chip filter bar (horizontal scrollable)
     let chip_scroll = ScrolledWindow::builder()
@@ -1907,7 +2149,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
     chip_bar.set_margin_start(16);
     chip_bar.set_margin_end(16);
     chip_scroll.set_child(Some(&chip_bar));
-    queue_panel.append(&chip_scroll);
+    queue_page.append(&chip_scroll);
 
     // Scrollable queue list
     let queue_scroll = ScrolledWindow::builder()
@@ -1966,7 +2208,52 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
 
     queue_overlay.set_child(Some(&queue_scroll));
     queue_overlay.add_overlay(&queue_drop_indicator);
-    queue_panel.append(&queue_overlay);
+    queue_page.append(&queue_overlay);
+
+    detail_panel_stack.add_named(&queue_page, Some(DetailPanelView::Queue.stack_name()));
+
+    let lyrics_page = GtkBox::new(Orientation::Vertical, 0);
+    lyrics_page.add_css_class("lyrics-panel");
+
+    let lyrics_meta_label = Label::new(None);
+    lyrics_meta_label.add_css_class("lyrics-meta");
+    lyrics_meta_label.set_halign(Align::Start);
+    lyrics_meta_label.set_margin_start(16);
+    lyrics_meta_label.set_margin_end(16);
+    lyrics_meta_label.set_margin_top(14);
+    lyrics_meta_label.set_margin_bottom(8);
+    lyrics_meta_label.set_wrap(true);
+    lyrics_meta_label.set_visible(false);
+    lyrics_page.append(&lyrics_meta_label);
+
+    let lyrics_status_label = Label::new(Some(
+        "Play something to see synced lyrics when YouTube exposes timed text.",
+    ));
+    lyrics_status_label.add_css_class("lyrics-status");
+    lyrics_status_label.set_halign(Align::Start);
+    lyrics_status_label.set_margin_start(16);
+    lyrics_status_label.set_margin_end(16);
+    lyrics_status_label.set_margin_top(14);
+    lyrics_status_label.set_wrap(true);
+    lyrics_page.append(&lyrics_status_label);
+
+    let lyrics_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    lyrics_scroll.set_visible(false);
+
+    let lyrics_list_box = GtkBox::new(Orientation::Vertical, 8);
+    lyrics_list_box.add_css_class("lyrics-list");
+    lyrics_list_box.set_margin_start(16);
+    lyrics_list_box.set_margin_end(18);
+    lyrics_list_box.set_margin_top(14);
+    lyrics_list_box.set_margin_bottom(18);
+    lyrics_scroll.set_child(Some(&lyrics_list_box));
+    lyrics_page.append(&lyrics_scroll);
+
+    detail_panel_stack.add_named(&lyrics_page, Some(DetailPanelView::Lyrics.stack_name()));
+    queue_panel.append(&detail_panel_stack);
 
     hbox.append(&queue_panel);
     paned.set_end_child(Some(&hbox));
@@ -2020,15 +2307,43 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         chip_bar: chip_bar.clone(),
         queue_panel: queue_panel.clone(),
         queue_dismiss_btn: dismiss_queue_btn.clone(),
+        detail_panel_stack: detail_panel_stack.clone(),
+        detail_queue_tab_btn: queue_tab_btn.clone(),
+        detail_lyrics_tab_btn: lyrics_tab_btn.clone(),
+        detail_panel_mode: Cell::new(DetailPanelView::Queue),
+        lyrics_status_label: lyrics_status_label.clone(),
+        lyrics_meta_label: lyrics_meta_label.clone(),
+        lyrics_scroll: lyrics_scroll.clone(),
+        lyrics_list_box: lyrics_list_box.clone(),
+        lyrics_lines: RefCell::new(Vec::new()),
+        lyrics_line_widgets: RefCell::new(Vec::new()),
+        lyrics_active_line: Cell::new(None),
+        lyrics_request_serial: Cell::new(0),
         now_playing_track: RefCell::new(None),
         playback_session_id: Cell::new(0),
     });
+
+    set_detail_panel_view(&ps, DetailPanelView::Queue);
 
     {
         let ps = ps.clone();
         let state = state.clone();
         dismiss_queue_btn.connect_clicked(move |_| {
             dismiss_queue_after_current(&ps, &state);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        queue_tab_btn.connect_clicked(move |_| {
+            set_detail_panel_view(&ps, DetailPanelView::Queue);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        lyrics_tab_btn.connect_clicked(move |_| {
+            set_detail_panel_view(&ps, DetailPanelView::Lyrics);
         });
     }
 
@@ -2092,6 +2407,17 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                 set_button_icon(btn, if paused { ICON_PLAY } else { ICON_PAUSE }, 28);
             }
             sync_mpris_transport(&ps, &state);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        menu_btn.connect_clicked(move |_| {
+            let next_view = match ps.detail_panel_mode.get() {
+                DetailPanelView::Queue => DetailPanelView::Lyrics,
+                DetailPanelView::Lyrics => DetailPanelView::Queue,
+            };
+            set_detail_panel_view(&ps, next_view);
         });
     }
 
@@ -2267,7 +2593,9 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                 }
 
                 if let (Some(pos), Some(dur)) = (pos, dur) {
-                    note_playback_position(&ps_for_ui, pos.nseconds() / 1_000_000);
+                    let position_millis = pos.nseconds() / 1_000_000;
+                    note_playback_position(&ps_for_ui, position_millis);
+                    update_active_lyric_line(&ps_for_ui, Some(position_millis));
                     maybe_apply_sponsorblock_skip(&state_for_ui, &ps_for_ui, pos);
                     maybe_extend_radio_queue(&state_for_ui, &ps_for_ui);
                     let dur_ns = dur.nseconds();
@@ -4034,6 +4362,9 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     let _ = ps.player.stop();
     clear_sponsorblock_state(ps);
     ps.last_mpris_length_micros.set(None);
+    ps.lyrics_request_serial
+        .set(ps.lyrics_request_serial.get().wrapping_add(1));
+    show_lyrics_idle(ps);
     ps.np_title.set_text("Nothing playing");
     ps.np_artist.set_text("");
     ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
@@ -4082,6 +4413,7 @@ fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime, state: &Arc<Mute
     }
 
     ps.is_seeking.set(false);
+    update_active_lyric_line(ps, Some(clamped_target.nseconds() / 1_000_000));
     maybe_apply_sponsorblock_skip(state, ps, clamped_target);
 }
 
@@ -4180,6 +4512,71 @@ fn spawn_song_rating_sync(
                 eprintln!("[RATING] failed to fetch rating for {video_id}: {err}")
             }
             _ => {}
+        }
+    });
+}
+
+fn spawn_synced_lyrics_sync(
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    video_id: &str,
+    session_id: u64,
+) {
+    let request_serial = ps.lyrics_request_serial.get().wrapping_add(1);
+    ps.lyrics_request_serial.set(request_serial);
+    show_lyrics_loading(ps);
+
+    let state = state.clone();
+    let ps = ps.clone();
+    let video_id = video_id.to_string();
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let video_id_bg = video_id.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_synced_lyrics(&video_id_bg))
+        })
+        .await;
+
+        if !lyrics_request_is_current(&ps, session_id, request_serial, &video_id) {
+            return;
+        }
+
+        match result {
+            Ok(Some(Ok(Some(lyrics)))) => {
+                let position_millis = ps
+                    .player
+                    .position()
+                    .map(|position| position.nseconds() / 1_000_000)
+                    .or_else(|| ps.player.snapshot().position_millis);
+                render_synced_lyrics(&ps, &lyrics, position_millis);
+            }
+            Ok(Some(Ok(None))) => show_lyrics_status(
+                &ps,
+                Some("Synced lyrics unavailable"),
+                "This track did not expose timed text, so there isn’t anything to sync yet.",
+            ),
+            Ok(Some(Err(err))) => {
+                eprintln!("[LYRICS] failed to fetch synced lyrics for {video_id}: {err}");
+                show_lyrics_status(
+                    &ps,
+                    Some("Lyrics fetch failed"),
+                    "Timed lyrics could not be loaded for this track.",
+                );
+            }
+            Ok(None) => show_lyrics_status(
+                &ps,
+                Some("Not connected"),
+                "Connect YouTube Music to load synced lyrics.",
+            ),
+            Err(err) => {
+                eprintln!("[LYRICS] timed lyric worker failed for {video_id}: {err:?}");
+                show_lyrics_status(
+                    &ps,
+                    Some("Lyrics fetch failed"),
+                    "Timed lyrics could not be loaded for this track.",
+                );
+            }
         }
     });
 }
@@ -7842,6 +8239,9 @@ fn play_track(
     sync_mpris_transport(ps, state);
 
     clear_sponsorblock_state(ps);
+    ps.lyrics_request_serial
+        .set(ps.lyrics_request_serial.get().wrapping_add(1));
+    show_lyrics_loading(ps);
     ps.np_title.set_text(title);
     ps.np_artist.set_text(artist);
     ps.time_label.set_text("0:00 / 0:00");
@@ -8098,6 +8498,9 @@ fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>, index: us
     drop(queue);
 
     clear_sponsorblock_state(ps);
+    ps.lyrics_request_serial
+        .set(ps.lyrics_request_serial.get().wrapping_add(1));
+    show_lyrics_loading(ps);
 
     // Flush UI
     ps.np_title.set_text(&title);
@@ -9217,7 +9620,7 @@ fn parse_queue_drag_payload(value: &glib::Value) -> Option<QueueDragPayload> {
 }
 
 fn queue_accepts_external_dnd(ps: &PlayerState) -> bool {
-    ps.queue_panel.is_visible()
+    ps.queue_panel.is_visible() && ps.detail_panel_mode.get() == DetailPanelView::Queue
 }
 
 fn attach_queue_drag_source(

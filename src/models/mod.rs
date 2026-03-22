@@ -111,3 +111,24 @@ pub struct RadioVirtualPlaylist {
     pub touched_len: usize,
     pub chips: Vec<RadioChip>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedLyricLine {
+    pub start_millis: u64,
+    pub end_millis: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SyncedLyricsSource {
+    Captions,
+    AutoCaptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncedLyrics {
+    pub source: SyncedLyricsSource,
+    pub language_code: Option<String>,
+    pub track_name: Option<String>,
+    pub lines: Vec<SyncedLyricLine>,
+}

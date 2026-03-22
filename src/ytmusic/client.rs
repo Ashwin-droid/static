@@ -19,7 +19,6 @@ use crate::models::{
     BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult, Track,
 };
 
-use super::cipher::Cipher;
 use super::parsers;
 
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
@@ -488,8 +487,6 @@ pub struct YtMusicClient {
     rt: tokio::runtime::Runtime,
     sapisid: Option<String>,
     visitor_data: std::sync::Mutex<Option<String>>,
-    #[allow(dead_code)]
-    cipher: std::sync::Mutex<Option<Cipher>>,
     /// OAuth refresh token for Android VR (premium content)
     vr_refresh_token: std::sync::Mutex<Option<String>>,
     /// Cached VR access token + expiry (epoch secs)
@@ -572,7 +569,6 @@ impl YtMusicClient {
             rt,
             sapisid,
             visitor_data: std::sync::Mutex::new(None),
-            cipher: std::sync::Mutex::new(None),
             vr_refresh_token: std::sync::Mutex::new(None),
             vr_access_token: std::sync::Mutex::new(None),
         })
@@ -610,24 +606,6 @@ impl YtMusicClient {
                 }
             }
         })
-    }
-
-    /// Get or fetch the cipher (cached per session).
-    #[allow(dead_code)]
-    async fn ensure_cipher(&self) -> Result<Cipher> {
-        {
-            let guard = self.cipher.lock().unwrap();
-            if let Some(c) = guard.as_ref() {
-                return Ok(c.clone());
-            }
-        }
-
-        eprintln!("[CIPHER] fetching and extracting cipher...");
-        let c = Cipher::from_player(&self.http).await?;
-
-        let mut guard = self.cipher.lock().unwrap();
-        *guard = Some(c.clone());
-        Ok(c)
     }
 
     pub fn get_home_page(&self, continuation: Option<&str>) -> Result<HomePage> {
@@ -876,7 +854,7 @@ impl YtMusicClient {
     /// Use this for cache downloads and other non-playback fetches.
     pub fn get_audio_url_no_track(&self, video_id: &str) -> Result<String> {
         self.rt.block_on(async {
-            // Try Android VR client first — returns direct URLs (no cipher needed)
+            // Try Android VR client first — this is the primary path for playable URLs.
             eprintln!("[PLAYER] trying Android VR client for {video_id}...");
             let vr_err = match self.try_android_vr_audio(video_id).await {
                 Ok(url) => {
@@ -894,16 +872,15 @@ impl YtMusicClient {
             body["videoId"] = json!(video_id);
 
             let json = self.player_request(&body).await?;
-
-            if let Ok(audio) = Self::best_audio_format(&json) {
-                if let Some(url) = audio.get("url").and_then(|u| u.as_str()) {
+            let formats = Self::sorted_audio_formats(&json)?;
+            for audio in &formats {
+                if let Some(url) = Self::format_direct_url(audio) {
                     eprintln!("[PLAYER] got direct URL via web client");
                     return Ok(url.to_string());
                 }
             }
 
-            // If we get here, neither path gave a direct URL
-            bail!("Could not get audio URL: {vr_err}")
+            bail!("Could not get audio URL: {vr_err}; web client returned no direct audio URL")
         })
     }
 
@@ -1167,10 +1144,10 @@ impl YtMusicClient {
             bail!("Unplayable: {reason}");
         }
 
-        let audio = Self::best_audio_format(&json)?;
-        audio
-            .get("url")
-            .and_then(|u| u.as_str())
+        let formats = Self::sorted_audio_formats(&json)?;
+        formats
+            .into_iter()
+            .find_map(Self::format_direct_url)
             .map(|s| s.to_string())
             .context("Android VR stream has no direct URL")
     }
@@ -1197,19 +1174,47 @@ impl YtMusicClient {
         }
     }
 
-    fn best_audio_format(json: &Value) -> Result<&Value> {
+    fn audio_formats<'a>(json: &'a Value) -> Result<Vec<&'a Value>> {
         let formats = json
             .pointer("/streamingData/adaptiveFormats")
             .and_then(|f| f.as_array())
             .context("No streaming data")?;
 
-        formats
+        let audio_formats = formats
             .iter()
             .filter(|f| {
                 f.get("mimeType")
                     .and_then(|m| m.as_str())
                     .is_some_and(|m| m.starts_with("audio/"))
             })
+            .collect::<Vec<_>>();
+
+        if audio_formats.is_empty() {
+            bail!("No audio streams found");
+        }
+
+        Ok(audio_formats)
+    }
+
+    fn format_direct_url(format: &Value) -> Option<&str> {
+        format.get("url").and_then(|u| u.as_str())
+    }
+
+    fn audio_format_score(format: &Value) -> (u8, u64) {
+        let playability_rank = u8::from(Self::format_direct_url(format).is_some());
+        let bitrate = format.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+        (playability_rank, bitrate)
+    }
+
+    fn sorted_audio_formats<'a>(json: &'a Value) -> Result<Vec<&'a Value>> {
+        let mut formats = Self::audio_formats(json)?;
+        formats.sort_by(|a, b| Self::audio_format_score(b).cmp(&Self::audio_format_score(a)));
+        Ok(formats)
+    }
+
+    fn best_audio_format(json: &Value) -> Result<&Value> {
+        Self::audio_formats(json)?
+            .into_iter()
             .max_by_key(|f| f.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0))
             .context("No audio streams found")
     }
@@ -1401,5 +1406,37 @@ impl YtMusicClient {
 
             Ok(is_authed)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::YtMusicClient;
+    use serde_json::json;
+
+    #[test]
+    fn sorted_audio_formats_prefer_direct_urls_over_non_url_entries() {
+        let json = json!({
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "mimeType": "audio/webm",
+                        "bitrate": 256000,
+                        "contentLength": "12345"
+                    },
+                    {
+                        "mimeType": "audio/webm",
+                        "bitrate": 128000,
+                        "url": "https://example.com/direct"
+                    }
+                ]
+            }
+        });
+
+        let formats = YtMusicClient::sorted_audio_formats(&json).expect("audio formats");
+        assert_eq!(
+            YtMusicClient::format_direct_url(formats[0]),
+            Some("https://example.com/direct")
+        );
     }
 }

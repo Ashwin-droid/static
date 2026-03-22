@@ -91,16 +91,19 @@ pub fn append_log(source: LogSource, message: &str) -> io::Result<()> {
 
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let trimmed = message.trim_end_matches('\n');
+    let mut payload = String::new();
 
     if trimmed.is_empty() {
-        writeln!(file, "[{}]:", source.label())?;
+        payload.push_str(&format!("[{}]:\n", source.label()));
+        file.write_all(payload.as_bytes())?;
         return Ok(());
     }
 
     for line in trimmed.lines() {
-        writeln!(file, "[{}]: {}", source.label(), line)?;
+        payload.push_str(&format!("[{}]: {line}\n", source.label()));
     }
 
+    file.write_all(payload.as_bytes())?;
     Ok(())
 }
 

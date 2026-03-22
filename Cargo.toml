@@ -34,10 +34,8 @@ serde_json = "1"
 # SAPISIDHASH auth
 sha1 = "0.10"
 
-# Cipher extraction
 regex = "1"
 url = "2"
-urlencoding = "2"
 
 # Keyring (GNOME Keyring via Secret Service)
 keyring = { version = "3", features = ["sync-secret-service"] }

@@ -570,8 +570,10 @@ impl DaemonMprisBridge {
 
     fn sync_position(&self, state: &DaemonState) {
         let position_us = state
-            .player
-            .position()
+            .active_track
+            .as_ref()
+            .filter(|track| !track.awaiting_fresh_position)
+            .and_then(|_| state.player.position())
             .map(|position| (position.nseconds() / 1_000) as i64)
             .unwrap_or(0);
         self.player
@@ -930,8 +932,10 @@ fn maintain_playback(state: &mut DaemonState) {
     }
 
     if let Some(active) = state.active_track.as_mut() {
-        if let Some(position) = state.player.position() {
-            active.last_position_millis = position.mseconds();
+        if !active.awaiting_fresh_position {
+            if let Some(position) = state.player.position() {
+                active.last_position_millis = position.mseconds();
+            }
         }
     }
 
@@ -953,12 +957,15 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_run_deferred_action(state);
     maybe_extend_radio_queue(state);
 
-    let reached_track_end = matches!(
-        (state.player.position(), state.player.duration()),
-        (Some(position), Some(duration))
-            if duration > ClockTime::from_seconds(1)
-                && position + ClockTime::from_mseconds(500) >= duration
-    );
+    let reached_track_end = state.active_track.as_ref().is_some_and(|active| {
+        !active.awaiting_fresh_position
+            && matches!(
+                (state.player.position(), state.player.duration()),
+                (Some(position), Some(duration))
+                    if duration > ClockTime::from_seconds(1)
+                        && position + ClockTime::from_mseconds(500) >= duration
+            )
+    });
 
     if reached_track_end {
         let queue_len = effective_queue_len(
@@ -1097,14 +1104,17 @@ fn natural_end_target_index(
     }
 }
 
-fn playback_start_stalled(
-    started_at: Instant,
-    last_position_millis: u64,
-    current_position_millis: Option<u64>,
-) -> bool {
-    started_at.elapsed() >= PLAYBACK_START_TIMEOUT
-        && last_position_millis < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
-        && current_position_millis.unwrap_or_default() < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+fn playback_start_stalled(started_at: Instant, awaiting_fresh_position: bool) -> bool {
+    awaiting_fresh_position && started_at.elapsed() >= PLAYBACK_START_TIMEOUT
+}
+
+fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -> bool {
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
+
+    position_millis <= PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+        || (position_millis <= session_elapsed_millis + 1_500
+            && track.last_position_millis > 0
+            && position_millis >= track.last_position_millis.saturating_add(200))
 }
 
 fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
@@ -1116,12 +1126,7 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
         return false;
     };
 
-    let current_position_millis = state.player.position().map(|position| position.mseconds());
-    if !playback_start_stalled(
-        active.started_at,
-        active.last_position_millis,
-        current_position_millis,
-    ) {
+    if !playback_start_stalled(active.started_at, active.awaiting_fresh_position) {
         return false;
     }
 
@@ -1378,6 +1383,13 @@ fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<(String, 
         .map_err(|err| anyhow!("Playback failed: {err}"))
 }
 
+fn should_retry_after_offline_cache_failure(
+    playback_source: PlaybackSource,
+    awaiting_fresh_position: bool,
+) -> bool {
+    playback_source == PlaybackSource::OfflineCache && awaiting_fresh_position
+}
+
 fn handle_playback_failure(state: &mut DaemonState, error: String) {
     let Some(active) = state.active_track.as_ref() else {
         eprintln!("[DAEMON] playback engine reported an error without an active track: {error}");
@@ -1388,6 +1400,7 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
     let video_id = active.video_id.clone();
     let playback_source = active.playback_source;
     let queue_index = state.queue_index;
+    let awaiting_fresh_position = active.awaiting_fresh_position;
 
     eprintln!("[DAEMON] playback failed for {video_id}: {error}");
 
@@ -1396,6 +1409,20 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
         state.cache.remove_temp_audio(&video_id);
         if let Err(err) = play_index(state, queue_index) {
             eprintln!("[DAEMON] retry after temp-cache eviction failed for {video_id}: {err}");
+        }
+        return;
+    }
+
+    if should_retry_after_offline_cache_failure(playback_source, awaiting_fresh_position) {
+        eprintln!(
+            "[DAEMON] evicting cached offline audio for {video_id} after startup failure and retrying"
+        );
+        if let Err(err) = state.cache.remove_cached(&video_id) {
+            eprintln!("[DAEMON] failed to evict offline cache for {video_id}: {err}");
+        }
+        if let Err(err) = play_index(state, queue_index) {
+            eprintln!("[DAEMON] retry after offline-cache eviction failed for {video_id}: {err}");
+            stop_playback(state, false);
         }
         return;
     }
@@ -1984,10 +2011,7 @@ fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, 
 }
 
 fn current_listened_millis(current_position_millis: Option<u64>, track: &ActiveTrack) -> u64 {
-    if track.awaiting_fresh_position
-        && track.last_position_millis < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
-        && current_position_millis.unwrap_or_default() < PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
-    {
+    if track.awaiting_fresh_position {
         return 0;
     }
 
@@ -2021,17 +2045,22 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
         .player
         .position()
         .map(|pos| pos.nseconds() / 1_000_000);
-    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
-
     if track.awaiting_fresh_position {
         match player_position_millis {
-            Some(position_millis) if position_millis <= session_elapsed_millis + 1_500 => {
+            Some(position_millis) if playback_position_confirms_start(track, position_millis) => {
                 track.awaiting_fresh_position = false;
             }
-            Some(_) | None => return,
+            Some(position_millis) => {
+                if track.last_position_millis == 0 || position_millis < track.last_position_millis {
+                    track.last_position_millis = position_millis;
+                }
+                return;
+            }
+            None => return,
         }
     }
 
+    let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
     let listened = player_position_millis
         .filter(|millis| *millis > 0)
         .unwrap_or(session_elapsed_millis);
@@ -2631,8 +2660,10 @@ fn build_mpris_metadata(state: &DaemonState) -> Metadata {
         .title(track.title.clone())
         .artist(vec![track.artist.clone()]);
 
-    if let Some(duration_millis) = state.player.duration().map(|duration| duration.mseconds()) {
-        builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
+    if !track.awaiting_fresh_position {
+        if let Some(duration_millis) = state.player.duration().map(|duration| duration.mseconds()) {
+            builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
+        }
     }
 
     let art_url = state
@@ -2842,7 +2873,8 @@ mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
         PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
-        natural_end_target_index, playback_start_stalled, previous_action,
+        natural_end_target_index, playback_position_confirms_start, playback_start_stalled,
+        previous_action, should_retry_after_offline_cache_failure,
     };
     use crate::ipc::RepeatMode;
     use crate::ytmusic::client::SongRating;
@@ -2933,14 +2965,54 @@ mod tests {
     #[test]
     fn playback_start_is_marked_stalled_after_timeout_without_progress() {
         let started_at = Instant::now() - (PLAYBACK_START_TIMEOUT + Duration::from_secs(1));
-        assert!(playback_start_stalled(started_at, 0, None));
-        assert!(playback_start_stalled(started_at, 0, Some(0)));
+        assert!(playback_start_stalled(started_at, true));
     }
 
     #[test]
     fn playback_start_is_not_stalled_once_position_moves() {
         let started_at = Instant::now() - (PLAYBACK_START_TIMEOUT + Duration::from_secs(1));
-        assert!(!playback_start_stalled(started_at, 1_500, Some(1_500)));
+        assert!(!playback_start_stalled(started_at, false));
+    }
+
+    #[test]
+    fn flush_keeps_waiting_on_stale_position_samples() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let mut track = test_active_track(started_at);
+
+        let stale_probe = 9_000;
+        if track.awaiting_fresh_position && !playback_position_confirms_start(&track, stale_probe) {
+            track.last_position_millis = stale_probe;
+        }
+
+        assert!(track.awaiting_fresh_position);
+        assert_eq!(track.last_position_millis, stale_probe);
+        assert_eq!(current_listened_millis(Some(stale_probe), &track), 0);
+    }
+
+    #[test]
+    fn advancing_position_clears_startup_wait() {
+        let started_at = Instant::now() - Duration::from_secs(5);
+        let mut track = test_active_track(started_at);
+        track.last_position_millis = 5_000;
+        let next_position = 5_250;
+
+        assert!(playback_position_confirms_start(&track, next_position));
+    }
+
+    #[test]
+    fn offline_cache_failures_retry_only_before_playback_really_starts() {
+        assert!(should_retry_after_offline_cache_failure(
+            PlaybackSource::OfflineCache,
+            true
+        ));
+        assert!(!should_retry_after_offline_cache_failure(
+            PlaybackSource::OfflineCache,
+            false
+        ));
+        assert!(!should_retry_after_offline_cache_failure(
+            PlaybackSource::RemoteStream,
+            true
+        ));
     }
 
     #[test]

@@ -161,7 +161,7 @@ impl SponsorBlockClient {
     pub fn new() -> Result<Self> {
         let http = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("Static/0.1.0")
+            .user_agent(format!("Static/{}", env!("CARGO_PKG_VERSION")))
             .build()
             .context("Failed to build SponsorBlock HTTP client")?;
 

@@ -48,7 +48,10 @@ const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::cache::{AppSettings, MusicCache};
-use crate::ipc::{PlaybackSnapshot, RepeatMode};
+use crate::ipc::{
+    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, RepeatMode,
+    current_unix_millis, load_persisted_playback_state, store_persisted_playback_state,
+};
 use crate::models::{
     Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
     HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, Track,
@@ -182,6 +185,7 @@ struct PlayerState {
     daemon_refresh_in_flight: Cell<bool>,
     daemon_refresh_started_at: Cell<Option<Instant>>,
     daemon_refresh_serial: Cell<u64>,
+    daemon_recovery_in_flight: Cell<bool>,
     play_request_serial: Cell<u64>,
     // Queue panel widgets
     queue_scroll: ScrolledWindow,
@@ -356,6 +360,171 @@ fn next_play_request_serial(ps: &PlayerState) -> u64 {
 
 fn is_current_play_request(ps: &PlayerState, request_serial: u64) -> bool {
     ps.play_request_serial.get() == request_serial
+}
+
+fn active_track_snapshot_from_track(track: &Track) -> ActiveTrackSnapshot {
+    ActiveTrackSnapshot {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artist: artist_string(track),
+        thumb_url: track.thumbnail_url.clone(),
+        rating: SongRating::Indifferent,
+    }
+}
+
+fn playback_snapshot_from_ui_state(ps: &PlayerState) -> PlaybackSnapshot {
+    let mut snapshot = ps.player.snapshot();
+    let use_live_ui_queue = !ps.queue.borrow().is_empty();
+    let queue = if use_live_ui_queue {
+        ps.queue.borrow().clone()
+    } else {
+        snapshot.queue.clone()
+    };
+
+    snapshot.queue = queue;
+    snapshot.queue_index = snapshot
+        .queue_index
+        .min(snapshot.queue.len().saturating_sub(1));
+
+    if use_live_ui_queue && !snapshot.queue.is_empty() {
+        snapshot.queue_index = ps
+            .queue_index
+            .get()
+            .min(snapshot.queue.len().saturating_sub(1));
+    } else {
+        snapshot.queue_index = snapshot
+            .queue_index
+            .min(snapshot.queue.len().saturating_sub(1));
+    }
+
+    let radio_virtual_playlist = if use_live_ui_queue {
+        ps.radio_virtual_playlist.borrow().clone()
+    } else {
+        snapshot.radio_virtual_playlist.clone()
+    };
+    snapshot.radio_virtual_playlist = radio_virtual_playlist;
+    if use_live_ui_queue {
+        snapshot.repeat_mode = ps.repeat_mode.get();
+    }
+    snapshot.volume = ps.volume_slider.value();
+    snapshot.position_millis = ps
+        .now_playing_track
+        .borrow()
+        .as_ref()
+        .map(|track| track.last_observed_position_millis)
+        .filter(|position| *position > 0)
+        .or(snapshot.position_millis);
+
+    if snapshot.current_track.is_none() {
+        snapshot.current_track = snapshot
+            .queue
+            .get(snapshot.queue_index)
+            .map(active_track_snapshot_from_track);
+    }
+
+    snapshot
+}
+
+fn should_show_dropped_resume(ps: &PlayerState) -> bool {
+    let snapshot = playback_snapshot_from_ui_state(ps);
+    snapshot.current_track.is_none() && snapshot.queue.is_empty()
+}
+
+fn restore_playback_snapshot_via_daemon(
+    snapshot: PlaybackSnapshot,
+    resume_playback: bool,
+) -> anyhow::Result<PlaybackSnapshot> {
+    crate::ipc::ensure_daemon_running()?;
+    let client = DaemonClient::new()?;
+    let queue_index = snapshot
+        .queue_index
+        .min(snapshot.queue.len().saturating_sub(1));
+
+    let mut restored = client.set_volume(snapshot.volume)?;
+    if snapshot.queue.is_empty() {
+        return Ok(restored);
+    }
+
+    restored = if resume_playback {
+        client.play_queue_at(
+            snapshot.queue.clone(),
+            queue_index,
+            snapshot.radio_virtual_playlist.clone(),
+            snapshot.repeat_mode,
+        )?
+    } else {
+        client.replace_queue(
+            snapshot.queue.clone(),
+            queue_index,
+            snapshot.radio_virtual_playlist.clone(),
+            snapshot.repeat_mode,
+        )?
+    };
+
+    if resume_playback {
+        if let Some(position_millis) = snapshot.position_millis.filter(|position| *position > 0) {
+            restored = client.seek_to_millis(position_millis)?;
+        }
+        if snapshot.paused {
+            restored = client.pause()?;
+        } else if restored.paused {
+            restored = client.resume()?;
+        }
+    }
+
+    Ok(restored)
+}
+
+fn maybe_restore_daemon_from_ui_state(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    if ps.daemon_recovery_in_flight.get() {
+        return;
+    }
+
+    let snapshot = playback_snapshot_from_ui_state(ps);
+    let has_recoverable_state = snapshot.current_track.is_some() || !snapshot.queue.is_empty();
+    if !has_recoverable_state {
+        return;
+    }
+
+    let resume_playback = snapshot.current_track.is_some();
+    ps.daemon_recovery_in_flight.set(true);
+    let ps_for_ui = ps.clone();
+    let state_for_ui = state.clone();
+
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || {
+            restore_playback_snapshot_via_daemon(snapshot, resume_playback)
+        })
+        .await;
+
+        ps_for_ui.daemon_recovery_in_flight.set(false);
+
+        match result {
+            Ok(Ok(restored)) => {
+                eprintln!("[UI] restarted staticd and restored playback from live UI state");
+                apply_remote_snapshot(&ps_for_ui, &state_for_ui, restored);
+            }
+            Ok(Err(err)) => eprintln!("[UI] failed to restore staticd from live UI state: {err}"),
+            Err(err) => eprintln!("[UI] daemon restore worker failed: {err:?}"),
+        }
+    });
+}
+
+fn persist_resume_snapshot_from_ui_state(ps: &PlayerState) {
+    let snapshot = playback_snapshot_from_ui_state(ps);
+    let has_recoverable_state = snapshot.current_track.is_some() || !snapshot.queue.is_empty();
+    if !has_recoverable_state {
+        return;
+    }
+
+    let persisted = PersistedPlaybackState {
+        snapshot,
+        saved_at_unix_millis: current_unix_millis(),
+    };
+
+    if let Err(err) = store_persisted_playback_state(&persisted) {
+        eprintln!("[UI] failed to persist resume snapshot while closing: {err}");
+    }
 }
 
 fn apply_remote_snapshot(
@@ -947,6 +1116,7 @@ pub fn build_window(app: &Application) {
         let ps = main_widgets.player_state.clone();
         window.connect_close_request(move |_| {
             let snapshot = ps.player.snapshot();
+            persist_resume_snapshot_from_ui_state(&ps);
             if snapshot.paused && snapshot.current_track.is_some() {
                 let client = ps.player.daemon_client();
                 if let Err(err) = client.shutdown() {
@@ -1843,6 +2013,7 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
         daemon_refresh_in_flight: Cell::new(false),
         daemon_refresh_started_at: Cell::new(None),
         daemon_refresh_serial: Cell::new(0),
+        daemon_recovery_in_flight: Cell::new(false),
         play_request_serial: Cell::new(0),
         queue_scroll: queue_scroll.clone(),
         queue_list_box: queue_list_box.clone(),
@@ -2063,9 +2234,23 @@ fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidge
                 ps_for_ui.daemon_refresh_in_flight.set(false);
                 ps_for_ui.daemon_refresh_started_at.set(None);
 
-                let Ok(Ok(snapshot)) = snapshot else {
-                    return;
+                let snapshot = match snapshot {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(err)) => {
+                        eprintln!("[UI] staticd poll failed; attempting recovery: {err}");
+                        maybe_restore_daemon_from_ui_state(&ps_for_ui, &state_for_ui);
+                        return;
+                    }
+                    Err(err) => {
+                        eprintln!("[UI] staticd poll worker failed; attempting recovery: {err:?}");
+                        maybe_restore_daemon_from_ui_state(&ps_for_ui, &state_for_ui);
+                        return;
+                    }
                 };
+
+                if ps_for_ui.daemon_recovery_in_flight.get() {
+                    return;
+                }
 
                 apply_remote_snapshot(&ps_for_ui, &state_for_ui, snapshot.clone());
 
@@ -6116,6 +6301,215 @@ fn load_sidebar_history(state: &Arc<Mutex<AppState>>, recent_list: &GtkBox, ps: 
 // RENDERING
 // ============================================================
 
+fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track> {
+    snapshot
+        .queue
+        .get(
+            snapshot
+                .queue_index
+                .min(snapshot.queue.len().saturating_sub(1)),
+        )
+        .cloned()
+        .or_else(|| {
+            snapshot.current_track.as_ref().map(|track| Track {
+                video_id: track.video_id.clone(),
+                title: track.title.clone(),
+                artists: vec![Artist {
+                    name: track.artist.clone(),
+                    id: None,
+                }],
+                album: None,
+                duration: None,
+                thumbnail_url: track.thumb_url.clone(),
+            })
+        })
+}
+
+fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
+    let queue_label = if snapshot.radio_virtual_playlist.is_some() {
+        "Radio queue"
+    } else if snapshot.queue.len() > 1 {
+        "Queue"
+    } else {
+        "Track"
+    };
+    let queue_copy = if snapshot.queue.len() > 1 {
+        format!("{queue_label} \u{2022} {} songs", snapshot.queue.len())
+    } else {
+        queue_label.to_string()
+    };
+
+    match snapshot.position_millis {
+        Some(position_millis) if position_millis > 0 => {
+            let action = if snapshot.paused {
+                "Paused at"
+            } else {
+                "Resume at"
+            };
+            format!(
+                "{queue_copy} \u{2022} {action} {}",
+                format_clock_time(ClockTime::from_mseconds(position_millis))
+            )
+        }
+        _ => queue_copy,
+    }
+}
+
+fn render_resume_dropped_section(
+    content_box: &GtkBox,
+    state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> bool {
+    if !should_show_dropped_resume(ps) {
+        return false;
+    }
+
+    let persisted = match load_persisted_playback_state() {
+        Ok(Some(persisted)) if !persisted.snapshot.queue.is_empty() => persisted,
+        Ok(_) => return false,
+        Err(err) => {
+            eprintln!("[UI] failed to read dropped playback state: {err}");
+            return false;
+        }
+    };
+
+    let Some(track) = resume_snapshot_track(&persisted.snapshot) else {
+        return false;
+    };
+
+    let header = Label::new(Some("Resume dropped"));
+    header.add_css_class("section-header");
+    header.set_halign(Align::Start);
+    content_box.append(&header);
+
+    let resume_btn = Button::new();
+    resume_btn.add_css_class("track-row");
+    resume_btn.add_css_class("resume-drop-row");
+    resume_btn.set_hexpand(true);
+    resume_btn.set_halign(Align::Fill);
+
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+
+    let art = GtkBox::new(Orientation::Vertical, 0);
+    art.add_css_class("track-art");
+    art.add_css_class("resume-drop-art");
+    art.set_size_request(56, 56);
+    art.set_overflow(gtk::Overflow::Hidden);
+    if let Some(url) = track.thumbnail_url.as_deref() {
+        let picture = Picture::new();
+        picture.set_keep_aspect_ratio(true);
+        picture.set_size_request(56, 56);
+        art.append(&picture);
+        load_thumbnail_into(&picture, url, 112);
+    } else {
+        let initial = track
+            .title
+            .chars()
+            .next()
+            .unwrap_or('\u{266B}')
+            .to_uppercase()
+            .to_string();
+        let letter = Label::new(Some(&initial));
+        letter.add_css_class("track-art-letter");
+        letter.set_halign(Align::Center);
+        letter.set_valign(Align::Center);
+        letter.set_hexpand(true);
+        letter.set_vexpand(true);
+        art.append(&letter);
+    }
+    row.append(&art);
+
+    let info = GtkBox::new(Orientation::Vertical, 2);
+    info.set_hexpand(true);
+    info.set_valign(Align::Center);
+
+    let title = Label::new(Some(&track.title));
+    title.add_css_class("track-title");
+    title.set_halign(Align::Start);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    info.append(&title);
+
+    let subtitle = Label::new(Some(&artist_string(&track)));
+    subtitle.add_css_class("track-artist");
+    subtitle.set_halign(Align::Start);
+    subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    info.append(&subtitle);
+
+    let meta = Label::new(Some(&resume_snapshot_meta(&persisted.snapshot)));
+    meta.add_css_class("resume-drop-meta");
+    meta.set_halign(Align::Start);
+    meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    info.append(&meta);
+
+    row.append(&info);
+
+    let badge = Label::new(Some("Resume"));
+    badge.add_css_class("resume-drop-badge");
+    badge.set_valign(Align::Center);
+    row.append(&badge);
+
+    resume_btn.set_child(Some(&row));
+    content_box.append(&resume_btn);
+
+    {
+        let resume_btn_for_handler = resume_btn.clone();
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let content_scroll = content_scroll.clone();
+        let home_pagination = home_pagination.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let resume_snapshot = persisted.snapshot.clone();
+
+        resume_btn.connect_clicked(move |_| {
+            resume_btn_for_handler.set_sensitive(false);
+            let state = state.clone();
+            let content_box = content_box.clone();
+            let content_scroll = content_scroll.clone();
+            let home_pagination = home_pagination.clone();
+            let ps = ps.clone();
+            let recent_list = recent_list.clone();
+            let resume_btn = resume_btn_for_handler.clone();
+            let resume_snapshot = resume_snapshot.clone();
+
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    restore_playback_snapshot_via_daemon(resume_snapshot, true)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(snapshot)) => {
+                        apply_remote_snapshot(&ps, &state, snapshot);
+                        load_home(
+                            &state,
+                            &content_box,
+                            &content_scroll,
+                            &home_pagination,
+                            &ps,
+                            &recent_list,
+                            false,
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("[UI] failed to resume dropped playback: {err}");
+                        resume_btn.set_sensitive(true);
+                    }
+                    Err(err) => {
+                        eprintln!("[UI] dropped playback resume worker failed: {err:?}");
+                        resume_btn.set_sensitive(true);
+                    }
+                }
+            });
+        });
+    }
+
+    true
+}
+
 fn render_home_view(
     content_box: &GtkBox,
     sections: &[HomeSection],
@@ -6126,6 +6520,19 @@ fn render_home_view(
     recent_list: &GtkBox,
     prepend_separator: bool,
 ) {
+    let rendered_resume_dropped = if prepend_separator {
+        false
+    } else {
+        render_resume_dropped_section(
+            content_box,
+            state,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+        )
+    };
+
     if sections.is_empty() {
         let msg = Label::new(Some(
             "No recommendations returned. Your cookie might be expired.",
@@ -6139,7 +6546,7 @@ fn render_home_view(
     // First section -> horizontal cover art cards
     if let Some(first) = sections.first() {
         let first_tracks = home_section_tracks(first);
-        if prepend_separator && content_box.first_child().is_some() {
+        if rendered_resume_dropped || (prepend_separator && content_box.first_child().is_some()) {
             content_box.append(&Separator::new(Orientation::Horizontal));
         }
         let header = Label::new(Some(&first.title));

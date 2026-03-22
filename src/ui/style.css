@@ -382,6 +382,20 @@ popover > contents {
     border-color: rgba(130, 160, 255, 0.15);
 }
 
+.resume-drop-row {
+    padding: 10px 12px;
+    border-radius: 12px;
+}
+
+.resume-drop-row:hover {
+    background-color: rgba(255, 255, 255, 0.08);
+    border-color: rgba(130, 160, 255, 0.22);
+}
+
+.resume-drop-art {
+    border-radius: 10px;
+}
+
 .track-art {
     background-image: linear-gradient(135deg, rgba(130, 160, 255, 0.1), rgba(160, 100, 255, 0.06));
     border-radius: 8px;
@@ -403,6 +417,22 @@ popover > contents {
 .track-artist {
     color: rgba(255, 255, 255, 0.38);
     font-size: 11px;
+}
+
+.resume-drop-meta {
+    color: rgba(255, 255, 255, 0.28);
+    font-size: 10px;
+    font-weight: 500;
+}
+
+.resume-drop-badge {
+    background-color: rgba(130, 160, 255, 0.16);
+    border: 1px solid rgba(130, 160, 255, 0.26);
+    border-radius: 999px;
+    color: #c6d7ff;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 4px 10px;
 }
 
 .track-duration {

@@ -1,6 +1,6 @@
 [package]
 name = "static"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A YouTube Music client built with Rust and GTK4"
 authors = ["Ashwin Mhaskar"]
@@ -30,6 +30,7 @@ reqwest = { version = "0.12", features = ["json", "cookies", "blocking"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+signal-hook = "0.3"
 
 # SAPISIDHASH auth
 sha1 = "0.10"

@@ -21,6 +21,7 @@ use crate::models::{
 
 use super::parsers;
 
+const STATIC_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
@@ -215,7 +216,7 @@ impl TrackingInfo {
             Self::set_query_param(&mut params, "cbr", "Static");
         }
         if !params.contains_key("cbrver") {
-            Self::set_query_param(&mut params, "cbrver", "0.1.0");
+            Self::set_query_param(&mut params, "cbrver", STATIC_APP_VERSION);
         }
 
         {
@@ -353,13 +354,15 @@ impl TrackingInfo {
             return;
         }
 
-        let client_params = "&cbr=Static&cbrver=0.1.0&c=WEB_REMIX&cver=1.20260304.03.00\
-             &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP";
+        let client_params = format!(
+            "&cbr=Static&cbrver={STATIC_APP_VERSION}&c=WEB_REMIX&cver=1.20260304.03.00\
+             &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP"
+        );
         let full = format!(
             "{}&cpn={}&ver=2&st={}&et={}&cmt={}\
              &fmt=251&afmt=251&muted=0&volume=100&vis=1\
              &rt={}&state=playing&rtn={}\
-             &referrer=https%3A%2F%2Fmusic.youtube.com%2F{client_params}",
+             &referrer=https%3A%2F%2Fmusic.youtube.com%2F{}",
             self.watchtime_url,
             self.cpn,
             format_millis(0),
@@ -367,6 +370,7 @@ impl TrackingInfo {
             format_millis(target),
             format_millis(target),
             (target / 1000) + 5,
+            client_params,
         );
 
         let rt = unsafe { &*self.rt };
@@ -987,11 +991,14 @@ impl YtMusicClient {
 
             // Fire playback URL immediately (start event)
             if let Some(url) = &playback_url {
-                let client_params = "&cbr=Static&cbrver=0.1.0&c=WEB_REMIX&cver=1.20260304.03.00\
-                     &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP";
+                let client_params = format!(
+                    "&cbr=Static&cbrver={STATIC_APP_VERSION}&c=WEB_REMIX&cver=1.20260304.03.00\
+                     &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP"
+                );
                 let full = format!(
                     "{url}&cpn={cpn}&ver=2&cmt=0&fmt=251&afmt=251\
-                     &muted=0&volume=100&vis=1{client_params}"
+                     &muted=0&volume=100&vis=1{}",
+                    client_params
                 );
                 let mut req = http
                     .get(&full)

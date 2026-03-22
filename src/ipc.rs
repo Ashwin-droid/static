@@ -1,5 +1,8 @@
+use std::fs;
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use gstreamer::ClockTime;
@@ -52,6 +55,12 @@ pub struct PlaybackSnapshot {
     pub position_millis: Option<u64>,
     pub duration_millis: Option<u64>,
     pub buffered_fraction: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedPlaybackState {
+    pub snapshot: PlaybackSnapshot,
+    pub saved_at_unix_millis: u64,
 }
 
 impl Default for PlaybackSnapshot {
@@ -147,6 +156,78 @@ fn send_request_raw_with_connection(
 fn send_request_raw(request: &DaemonRequest) -> Result<DaemonResponse> {
     let connection = daemon_connection()?;
     send_request_raw_with_connection(&connection, request)
+}
+
+pub fn playback_state_path() -> PathBuf {
+    crate::logging::static_root().join("playback.json")
+}
+
+pub fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn load_persisted_playback_state() -> Result<Option<PersistedPlaybackState>> {
+    let path = playback_state_path();
+    let payload = match fs::read(&path) {
+        Ok(payload) => payload,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to read persisted playback state at {}",
+                    path.display()
+                )
+            });
+        }
+    };
+
+    serde_json::from_slice(&payload)
+        .with_context(|| {
+            format!(
+                "Failed to parse persisted playback state at {}",
+                path.display()
+            )
+        })
+        .map(Some)
+}
+
+pub fn store_persisted_playback_state(state: &PersistedPlaybackState) -> Result<()> {
+    let path = playback_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create playback state dir {}", parent.display()))?;
+    }
+
+    let payload = serde_json::to_vec_pretty(state)?;
+    let part_path = path.with_file_name(format!(
+        "{}.part",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("playback.json")
+    ));
+
+    fs::write(&part_path, payload)
+        .and_then(|_| fs::rename(&part_path, &path))
+        .with_context(|| format!("Failed to persist playback state to {}", path.display()))?;
+
+    Ok(())
+}
+
+pub fn clear_persisted_playback_state() -> Result<()> {
+    let path = playback_state_path();
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to clear persisted playback state at {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 pub fn ensure_daemon_running() -> Result<()> {
@@ -250,6 +331,14 @@ impl DaemonClient {
 
     pub fn toggle_pause(&self) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::TogglePause)
+    }
+
+    pub fn pause(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::Pause)
+    }
+
+    pub fn resume(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::Resume)
     }
 
     pub fn stop(&self) -> Result<PlaybackSnapshot> {

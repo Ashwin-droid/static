@@ -1,7 +1,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
-use std::sync::{LazyLock, mpsc};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -15,13 +19,16 @@ use mpris_server::{
     Player as MprisPlayer, Time as MprisTime, TrackId,
 };
 use reqwest::blocking::Client as BlockingClient;
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+use signal_hook::flag;
 use zbus::blocking::{Connection, Proxy};
 use zbus::interface;
 
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{
     ActiveTrackSnapshot, DAEMON_BUS_NAME, DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse,
-    PlaybackSnapshot, RepeatMode,
+    PersistedPlaybackState, PlaybackSnapshot, RepeatMode, clear_persisted_playback_state,
+    current_unix_millis, store_persisted_playback_state,
 };
 use crate::models::{RadioVirtualPlaylist, Track};
 use crate::pipewire_monitor::PipeWireMonitor;
@@ -48,7 +55,9 @@ const MIN_LISTEN_SECS: u64 = 10;
 const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
 const PLAYBACK_START_RETRY_LIMIT: u8 = 1;
+const PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS: u64 = 250;
 const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
+const PLAYBACK_STATE_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -141,6 +150,8 @@ struct DaemonState {
     pipewire_pause_active: bool,
     pre_duck_volume: f64,
     volume_ramp: Option<VolumeRamp>,
+    last_persisted_playback_json: Option<String>,
+    last_persisted_playback_at: Option<Instant>,
     shutting_down: Cell<bool>,
 }
 
@@ -644,6 +655,8 @@ pub fn run() -> Result<()> {
         pipewire_pause_active: false,
         pre_duck_volume: initial_volume,
         volume_ramp: None,
+        last_persisted_playback_json: None,
+        last_persisted_playback_at: None,
         shutting_down: Cell::new(false),
     }));
 
@@ -679,9 +692,25 @@ pub fn run() -> Result<()> {
         .build()
         .context("Failed to start staticd D-Bus service")?;
 
+    let termination_requested = Arc::new(AtomicBool::new(false));
+    flag::register(SIGTERM, termination_requested.clone())
+        .context("Failed to register SIGTERM handler")?;
+    flag::register(SIGINT, termination_requested.clone())
+        .context("Failed to register SIGINT handler")?;
+
     let main_loop = glib::MainLoop::new(None, false);
     let main_loop_handle = main_loop.clone();
+    let termination_requested_for_loop = termination_requested.clone();
     glib::timeout_add_local(Duration::from_millis(40), move || {
+        if termination_requested_for_loop.swap(false, Ordering::SeqCst) {
+            eprintln!(
+                "[STATICD] received termination signal; persisting playback state before exit"
+            );
+            request_daemon_shutdown(&mut state.borrow_mut(), true);
+            main_loop_handle.quit();
+            return glib::ControlFlow::Break;
+        }
+
         while let Ok(envelope) = command_rx.try_recv() {
             let response = {
                 let mut state = state.borrow_mut();
@@ -712,6 +741,11 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn request_daemon_shutdown(state: &mut DaemonState, exiting: bool) {
+    stop_playback(state, exiting);
+    state.shutting_down.set(true);
+}
+
 fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
@@ -726,7 +760,10 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 pause_other_mpris_players(state);
             }
             match play_queue_at(state, queue, index, radio_virtual_playlist, repeat_mode) {
-                Ok(()) => DaemonResponse::State(state_snapshot(state)),
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
                 Err(err) => DaemonResponse::Error(err.to_string()),
             }
         }
@@ -744,20 +781,24 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.repeat_mode = repeat_mode;
             prefetch_upcoming(state);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::TogglePause => {
             toggle_pause_for_user_action(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Pause => {
             state.peer_mpris.clear_waiting();
             state.player.pause();
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Resume => {
             resume_for_user_action(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Stop => {
@@ -766,11 +807,17 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Next => match advance_queue_for_user_action(state, true) {
-            Ok(()) => DaemonResponse::State(state_snapshot(state)),
+            Ok(()) => {
+                maybe_persist_playback_state(state, true);
+                DaemonResponse::State(state_snapshot(state))
+            }
             Err(err) => DaemonResponse::Error(err.to_string()),
         },
         DaemonRequest::Previous => match handle_previous_for_user_action(state) {
-            Ok(()) => DaemonResponse::State(state_snapshot(state)),
+            Ok(()) => {
+                maybe_persist_playback_state(state, true);
+                DaemonResponse::State(state_snapshot(state))
+            }
             Err(err) => DaemonResponse::Error(err.to_string()),
         },
         DaemonRequest::SeekToMillis { position_millis } => {
@@ -778,16 +825,19 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.player.seek(target);
             signal_mpris_seeked(state, target);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::SetVolume { volume } => {
             set_logical_volume(state, volume);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::SetRepeatMode { repeat_mode } => {
             state.repeat_mode = repeat_mode;
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::LogMessage { source, message } => {
@@ -799,11 +849,11 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         DaemonRequest::ReloadSettings => {
             reload_settings(state);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::Shutdown => {
-            stop_playback(state, true);
-            state.shutting_down.set(true);
+            request_daemon_shutdown(state, true);
             DaemonResponse::Ok
         }
     }
@@ -884,6 +934,7 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
 
             if added > 0 {
                 sync_mpris(state);
+                maybe_persist_playback_state(state, true);
             }
         }
         BackgroundEvent::OfflineSyncFinished => {
@@ -956,6 +1007,7 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_apply_sponsorblock_skip(state);
     maybe_run_deferred_action(state);
     maybe_extend_radio_queue(state);
+    maybe_persist_playback_state(state, false);
 
     let reached_track_end = state.active_track.as_ref().is_some_and(|active| {
         !active.awaiting_fresh_position
@@ -1111,7 +1163,8 @@ fn playback_start_stalled(started_at: Instant, awaiting_fresh_position: bool) ->
 fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -> bool {
     let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
 
-    (position_millis > 0 && position_millis <= PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS)
+    (position_millis >= PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS
+        && position_millis <= PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS)
         || (position_millis <= session_elapsed_millis + 1_500
             && track.last_position_millis > 0
             && position_millis >= track.last_position_millis.saturating_add(200))
@@ -1335,6 +1388,7 @@ fn play_index_with_startup_retries(
     maybe_duck_for_pipewire(state);
     signal_mpris_seeked(state, ClockTime::ZERO);
     sync_mpris(state);
+    maybe_persist_playback_state(state, true);
     Ok(())
 }
 
@@ -1345,6 +1399,7 @@ fn mark_radio_touched_through(state: &mut DaemonState, index: usize) {
 }
 
 fn stop_playback(state: &mut DaemonState, exiting: bool) {
+    maybe_persist_playback_state(state, true);
     if let Some(track) = state.active_track.take() {
         let current_position_millis = state
             .player
@@ -2048,10 +2103,11 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
     if track.awaiting_fresh_position {
         match player_position_millis {
             Some(position_millis) if playback_position_confirms_start(track, position_millis) => {
+                let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
                 track.awaiting_fresh_position = false;
                 eprintln!(
-                    "[DAEMON] confirmed playback start for {} at {} ms",
-                    track.video_id, position_millis
+                    "[DAEMON] confirmed playback start for {} at {} ms after {} ms",
+                    track.video_id, position_millis, session_elapsed_millis
                 );
             }
             Some(position_millis) => {
@@ -2324,6 +2380,124 @@ fn prefetch_upcoming(state: &mut DaemonState) {
 
 fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
     url.filter(|value| !value.starts_with("file://"))
+}
+
+fn persisted_playback_track_snapshot(state: &DaemonState) -> Option<ActiveTrackSnapshot> {
+    state
+        .active_track
+        .as_ref()
+        .map(|track| ActiveTrackSnapshot {
+            video_id: track.video_id.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            thumb_url: track.thumb_url.clone(),
+            rating: track.rating,
+        })
+        .or_else(|| {
+            state
+                .queue
+                .get(state.queue_index)
+                .map(|track| ActiveTrackSnapshot {
+                    video_id: track.video_id.clone(),
+                    title: track.title.clone(),
+                    artist: artist_string(track),
+                    thumb_url: track.thumbnail_url.clone(),
+                    rating: SongRating::Indifferent,
+                })
+        })
+}
+
+fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> {
+    if state.queue.is_empty() {
+        return None;
+    }
+
+    let position_millis = state.active_track.as_ref().map(|track| {
+        current_listened_millis(
+            state
+                .player
+                .position()
+                .map(|position| position.nseconds() / 1_000_000),
+            track,
+        )
+    });
+    let hide_timing = state
+        .active_track
+        .as_ref()
+        .is_some_and(|track| track.awaiting_fresh_position);
+
+    Some(PlaybackSnapshot {
+        current_track: persisted_playback_track_snapshot(state),
+        queue: state.queue.clone(),
+        queue_index: state.queue_index.min(state.queue.len().saturating_sub(1)),
+        radio_virtual_playlist: state.radio_virtual_playlist.clone(),
+        repeat_mode: state.repeat_mode,
+        paused: state.active_track.is_some() && state.player.is_paused(),
+        volume: logical_volume(state),
+        position_millis,
+        duration_millis: (!hide_timing)
+            .then(|| state.player.duration().map(|duration| duration.mseconds()))
+            .flatten(),
+        buffered_fraction: state
+            .active_track
+            .as_ref()
+            .map(|_| state.player.buffered_fraction())
+            .unwrap_or(0.0),
+    })
+}
+
+fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
+    let Some(snapshot) = persisted_playback_snapshot(state) else {
+        if force || state.last_persisted_playback_json.is_some() {
+            if let Err(err) = clear_persisted_playback_state() {
+                eprintln!("[STATICD] failed to clear persisted playback state: {err}");
+            } else {
+                state.last_persisted_playback_json = None;
+                state.last_persisted_playback_at = Some(Instant::now());
+            }
+        }
+        return;
+    };
+
+    if !force
+        && state.active_track.is_some()
+        && !state.player.is_paused()
+        && state
+            .last_persisted_playback_at
+            .is_some_and(|saved_at| saved_at.elapsed() < PLAYBACK_STATE_PERSIST_INTERVAL)
+    {
+        return;
+    }
+
+    let snapshot_json = match serde_json::to_string(&snapshot) {
+        Ok(snapshot_json) => snapshot_json,
+        Err(err) => {
+            eprintln!("[STATICD] failed to serialize persisted playback state: {err}");
+            return;
+        }
+    };
+
+    if !force
+        && state
+            .last_persisted_playback_json
+            .as_deref()
+            .is_some_and(|saved| saved == snapshot_json)
+    {
+        return;
+    }
+
+    let payload = PersistedPlaybackState {
+        snapshot,
+        saved_at_unix_millis: current_unix_millis(),
+    };
+
+    match store_persisted_playback_state(&payload) {
+        Ok(()) => {
+            state.last_persisted_playback_json = Some(snapshot_json);
+            state.last_persisted_playback_at = Some(Instant::now());
+        }
+        Err(err) => eprintln!("[STATICD] failed to persist playback state: {err}"),
+    }
 }
 
 fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
@@ -3012,7 +3186,15 @@ mod tests {
     }
 
     #[test]
-    fn small_positive_position_confirms_start() {
+    fn tiny_positive_position_does_not_confirm_start() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let track = test_active_track(started_at);
+
+        assert!(!playback_position_confirms_start(&track, 2));
+    }
+
+    #[test]
+    fn sufficiently_advanced_position_confirms_start() {
         let started_at = Instant::now() - Duration::from_millis(500);
         let track = test_active_track(started_at);
 

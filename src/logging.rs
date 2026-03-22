@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -79,7 +79,12 @@ pub fn reset_session_log() -> io::Result<PathBuf> {
     let root = static_root();
     std::fs::create_dir_all(&root)?;
     let path = root.join(LOG_FILE_NAME);
-    File::create(&path)?;
+    let existing_len = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    if existing_len > 0 {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(b"[UI]: [LOGGER] starting new UI session\n")?;
     Ok(path)
 }
 

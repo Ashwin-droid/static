@@ -1111,7 +1111,7 @@ fn playback_start_stalled(started_at: Instant, awaiting_fresh_position: bool) ->
 fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -> bool {
     let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
 
-    position_millis <= PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS
+    (position_millis > 0 && position_millis <= PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS)
         || (position_millis <= session_elapsed_millis + 1_500
             && track.last_position_millis > 0
             && position_millis >= track.last_position_millis.saturating_add(200))
@@ -2049,6 +2049,10 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
         match player_position_millis {
             Some(position_millis) if playback_position_confirms_start(track, position_millis) => {
                 track.awaiting_fresh_position = false;
+                eprintln!(
+                    "[DAEMON] confirmed playback start for {} at {} ms",
+                    track.video_id, position_millis
+                );
             }
             Some(position_millis) => {
                 if track.last_position_millis == 0 || position_millis < track.last_position_millis {
@@ -2997,6 +3001,22 @@ mod tests {
         let next_position = 5_250;
 
         assert!(playback_position_confirms_start(&track, next_position));
+    }
+
+    #[test]
+    fn zero_position_does_not_confirm_start() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let track = test_active_track(started_at);
+
+        assert!(!playback_position_confirms_start(&track, 0));
+    }
+
+    #[test]
+    fn small_positive_position_confirms_start() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let track = test_active_track(started_at);
+
+        assert!(playback_position_confirms_start(&track, 250));
     }
 
     #[test]

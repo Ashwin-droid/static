@@ -57,6 +57,7 @@ const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
 const PLAYBACK_START_RETRY_LIMIT: u8 = 1;
 const PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS: u64 = 250;
 const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
+const PLAYBACK_START_SEEK_CONFIRM_LEEWAY_MILLIS: u64 = 5_000;
 const PLAYBACK_STATE_PERSIST_INTERVAL: Duration = Duration::from_secs(1);
 const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -94,6 +95,7 @@ struct ActiveTrack {
     tracking: Option<TrackingInfo>,
     started_at: Instant,
     last_position_millis: u64,
+    startup_seek_millis: Option<u64>,
     startup_retries: u8,
     awaiting_fresh_position: bool,
     bootstrapped_watchtime: bool,
@@ -447,27 +449,23 @@ impl DaemonMprisBridge {
         {
             let state = state.clone();
             player.connect_seek(move |_, offset| {
-                let state = state.borrow();
+                let mut state = state.borrow_mut();
                 let Some(current) = state.player.position() else {
                     return;
                 };
                 let current_us = (current.nseconds() / 1_000) as i64;
                 let target_us = (current_us + offset.as_micros()).max(0) as u64;
                 let target = ClockTime::from_useconds(target_us);
-                state.player.seek(target);
-                signal_mpris_seeked(&state, target);
-                sync_mpris(&state);
+                seek_to_position(&mut state, target);
             });
         }
 
         {
             let state = state.clone();
             player.connect_set_position(move |_, _, position| {
-                let state = state.borrow_mut();
+                let mut state = state.borrow_mut();
                 let target = ClockTime::from_useconds(position.as_micros().max(0) as u64);
-                state.player.seek(target);
-                signal_mpris_seeked(&state, target);
-                sync_mpris(&state);
+                seek_to_position(&mut state, target);
             });
         }
 
@@ -580,12 +578,8 @@ impl DaemonMprisBridge {
     }
 
     fn sync_position(&self, state: &DaemonState) {
-        let position_us = state
-            .active_track
-            .as_ref()
-            .filter(|track| !track.awaiting_fresh_position)
-            .and_then(|_| state.player.position())
-            .map(|position| (position.nseconds() / 1_000) as i64)
+        let position_us = visible_position_millis(state)
+            .map(|position_millis| (position_millis * 1_000) as i64)
             .unwrap_or(0);
         self.player
             .set_position(MprisTime::from_micros(position_us));
@@ -822,9 +816,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         },
         DaemonRequest::SeekToMillis { position_millis } => {
             let target = ClockTime::from_mseconds(position_millis);
-            state.player.seek(target);
-            signal_mpris_seeked(state, target);
-            sync_mpris(state);
+            seek_to_position(state, target);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -1156,11 +1148,70 @@ fn natural_end_target_index(
     }
 }
 
+fn hide_timing_for_track(track: &ActiveTrack) -> bool {
+    track.awaiting_fresh_position && track.startup_seek_millis.is_none()
+}
+
+fn visible_position_millis(state: &DaemonState) -> Option<u64> {
+    let track = state.active_track.as_ref()?;
+    if track.awaiting_fresh_position {
+        track
+            .startup_seek_millis
+            .or_else(|| state.player.position().map(|position| position.mseconds()))
+    } else {
+        state.player.position().map(|position| position.mseconds())
+    }
+}
+
+fn visible_duration_millis(state: &DaemonState) -> Option<u64> {
+    let track = state.active_track.as_ref()?;
+    (!hide_timing_for_track(track))
+        .then(|| state.player.duration().map(|duration| duration.mseconds()))
+        .flatten()
+}
+
+fn note_explicit_seek(state: &mut DaemonState, target_millis: u64) {
+    let Some(track) = state.active_track.as_mut() else {
+        return;
+    };
+
+    if track.awaiting_fresh_position {
+        if target_millis > 0 {
+            if track.startup_seek_millis != Some(target_millis) {
+                eprintln!(
+                    "[DAEMON] tracking explicit startup seek for {} at {} ms",
+                    track.video_id, target_millis
+                );
+            }
+            track.startup_seek_millis = Some(target_millis);
+        } else {
+            track.startup_seek_millis = None;
+        }
+    } else {
+        track.startup_seek_millis = None;
+    }
+
+    track.last_position_millis = target_millis;
+}
+
+fn seek_to_position(state: &mut DaemonState, target: ClockTime) {
+    state.player.seek(target);
+    note_explicit_seek(state, target.mseconds());
+    signal_mpris_seeked(state, target);
+    sync_mpris(state);
+}
+
 fn playback_start_stalled(started_at: Instant, awaiting_fresh_position: bool) -> bool {
     awaiting_fresh_position && started_at.elapsed() >= PLAYBACK_START_TIMEOUT
 }
 
 fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -> bool {
+    if track.startup_seek_millis.is_some_and(|target_millis| {
+        position_millis.saturating_add(PLAYBACK_START_SEEK_CONFIRM_LEEWAY_MILLIS) >= target_millis
+    }) {
+        return true;
+    }
+
     let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
 
     (position_millis >= PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS
@@ -1271,9 +1322,7 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
         state.active_track.is_some(),
     ) {
         PreviousAction::RestartCurrent => {
-            state.player.seek(ClockTime::ZERO);
-            signal_mpris_seeked(state, ClockTime::ZERO);
-            sync_mpris(state);
+            seek_to_position(state, ClockTime::ZERO);
             Ok(())
         }
         PreviousAction::PlayIndex(index) => play_index(state, index),
@@ -1366,6 +1415,7 @@ fn play_index_with_startup_retries(
         tracking: None,
         started_at: Instant::now(),
         last_position_millis: 0,
+        startup_seek_millis: None,
         startup_retries,
         awaiting_fresh_position: true,
         bootstrapped_watchtime: false,
@@ -2105,6 +2155,7 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
             Some(position_millis) if playback_position_confirms_start(track, position_millis) => {
                 let session_elapsed_millis = track.started_at.elapsed().as_millis() as u64;
                 track.awaiting_fresh_position = false;
+                track.startup_seek_millis = None;
                 eprintln!(
                     "[DAEMON] confirmed playback start for {} at {} ms after {} ms",
                     track.video_id, position_millis, session_elapsed_millis
@@ -2255,11 +2306,7 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
         segment.category, video_id, target_seconds
     );
     let target = ClockTime::from_mseconds(target_millis);
-    state.player.seek(target);
-    signal_mpris_seeked(state, target);
-    if let Some(track) = state.active_track.as_mut() {
-        track.last_position_millis = target_millis;
-    }
+    seek_to_position(state, target);
 
     if state.sponsor_segments_reported.insert(segment.uuid.clone()) {
         let uuid = segment.uuid.clone();
@@ -2413,18 +2460,20 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
     }
 
     let position_millis = state.active_track.as_ref().map(|track| {
-        current_listened_millis(
-            state
-                .player
-                .position()
-                .map(|position| position.nseconds() / 1_000_000),
-            track,
-        )
+        track.startup_seek_millis.unwrap_or_else(|| {
+            current_listened_millis(
+                state
+                    .player
+                    .position()
+                    .map(|position| position.nseconds() / 1_000_000),
+                track,
+            )
+        })
     });
     let hide_timing = state
         .active_track
         .as_ref()
-        .is_some_and(|track| track.awaiting_fresh_position);
+        .is_some_and(hide_timing_for_track);
 
     Some(PlaybackSnapshot {
         current_track: persisted_playback_track_snapshot(state),
@@ -2436,7 +2485,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         volume: logical_volume(state),
         position_millis,
         duration_millis: (!hide_timing)
-            .then(|| state.player.duration().map(|duration| duration.mseconds()))
+            .then(|| visible_duration_millis(state))
             .flatten(),
         buffered_fraction: state
             .active_track
@@ -2504,7 +2553,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
     let hide_timing = state
         .active_track
         .as_ref()
-        .is_some_and(|track| track.awaiting_fresh_position);
+        .is_some_and(hide_timing_for_track);
 
     PlaybackSnapshot {
         current_track: state
@@ -2524,10 +2573,10 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         paused: state.player.is_paused(),
         volume: logical_volume(state),
         position_millis: (!hide_timing)
-            .then(|| state.player.position().map(|position| position.mseconds()))
+            .then(|| visible_position_millis(state))
             .flatten(),
         duration_millis: (!hide_timing)
-            .then(|| state.player.duration().map(|duration| duration.mseconds()))
+            .then(|| visible_duration_millis(state))
             .flatten(),
         buffered_fraction: state.player.buffered_fraction(),
     }
@@ -2838,8 +2887,8 @@ fn build_mpris_metadata(state: &DaemonState) -> Metadata {
         .title(track.title.clone())
         .artist(vec![track.artist.clone()]);
 
-    if !track.awaiting_fresh_position {
-        if let Some(duration_millis) = state.player.duration().map(|duration| duration.mseconds()) {
+    if !hide_timing_for_track(track) {
+        if let Some(duration_millis) = visible_duration_millis(state) {
             builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
         }
     }
@@ -3051,8 +3100,8 @@ mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
         PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
-        natural_end_target_index, playback_position_confirms_start, playback_start_stalled,
-        previous_action, should_retry_after_offline_cache_failure,
+        hide_timing_for_track, natural_end_target_index, playback_position_confirms_start,
+        playback_start_stalled, previous_action, should_retry_after_offline_cache_failure,
     };
     use crate::ipc::RepeatMode;
     use crate::ytmusic::client::SongRating;
@@ -3069,6 +3118,7 @@ mod tests {
             tracking: None,
             started_at,
             last_position_millis: 0,
+            startup_seek_millis: None,
             startup_retries: 0,
             awaiting_fresh_position: true,
             bootstrapped_watchtime: false,
@@ -3175,6 +3225,24 @@ mod tests {
         let next_position = 5_250;
 
         assert!(playback_position_confirms_start(&track, next_position));
+    }
+
+    #[test]
+    fn explicit_startup_seek_confirms_resumed_position() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let mut track = test_active_track(started_at);
+        track.startup_seek_millis = Some(180_000);
+
+        assert!(playback_position_confirms_start(&track, 179_500));
+    }
+
+    #[test]
+    fn explicit_startup_seek_keeps_timing_visible() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let mut track = test_active_track(started_at);
+        track.startup_seek_millis = Some(180_000);
+
+        assert!(!hide_timing_for_track(&track));
     }
 
     #[test]

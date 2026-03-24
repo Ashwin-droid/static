@@ -33,6 +33,7 @@ pub(super) fn set_detail_panel_view(ps: &PlayerState, view: DetailPanelView) {
 
 pub(super) fn synced_lyrics_meta_text(lyrics: &SyncedLyrics) -> String {
     let source = match lyrics.source {
+        SyncedLyricsSource::TimedLyrics => "Timed lyrics".to_string(),
         SyncedLyricsSource::Captions => "Synced captions".to_string(),
         SyncedLyricsSource::AutoCaptions => "Auto-synced captions".to_string(),
     };

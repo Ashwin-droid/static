@@ -26,6 +26,8 @@ const STATIC_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
+const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
+const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -121,6 +123,21 @@ impl CaptionTrack {
             SyncedLyricsSource::Captions
         }
     }
+}
+
+fn lyrics_browse_id_from_next_response(value: &Value) -> Option<String> {
+    let tabs = value
+        .pointer(
+            "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer/watchNextTabbedResultsRenderer/tabs",
+        )
+        .and_then(|tabs| tabs.as_array())?;
+    let tab = tabs.get(1)?.get("tabRenderer")?;
+    if tab.get("unselectable").is_some() {
+        return None;
+    }
+    tab.pointer("/endpoint/browseEndpoint/browseId")
+        .and_then(|browse_id| browse_id.as_str())
+        .map(str::to_string)
 }
 
 // TrackingInfo contains a raw pointer to the runtime which lives in YtMusicClient
@@ -559,6 +576,24 @@ fn normalize_synced_lyric_text(raw: &str) -> String {
         .join("\n")
 }
 
+fn finalize_synced_lyric_lines(lines: &mut [SyncedLyricLine]) {
+    if lines.is_empty() {
+        return;
+    }
+
+    lines.sort_by_key(|line| line.start_millis);
+    for index in 0..lines.len() {
+        let next_start = lines.get(index + 1).map(|line| line.start_millis);
+        let computed_end = match (lines[index].end_millis, next_start) {
+            (Some(end_millis), Some(next_start)) => end_millis.max(next_start),
+            (Some(end_millis), None) => end_millis,
+            (None, Some(next_start)) => next_start,
+            (None, None) => lines[index].start_millis.saturating_add(4_000),
+        };
+        lines[index].end_millis = Some(computed_end.max(lines[index].start_millis + 1));
+    }
+}
+
 fn format_millis(millis: u64) -> String {
     let mut rendered = format!("{:.3}", millis as f64 / 1000.0);
     while rendered.contains('.') && rendered.ends_with('0') {
@@ -720,6 +755,20 @@ impl YtMusicClient {
                     "hl": "en",
                     "gl": "US",
                 }
+            }
+        })
+    }
+
+    fn mobile_client_context() -> Value {
+        json!({
+            "context": {
+                "client": {
+                    "clientName": YTM_MOBILE_CLIENT_NAME,
+                    "clientVersion": YTM_MOBILE_CLIENT_VERSION,
+                    "hl": "en",
+                    "gl": "US",
+                },
+                "user": {}
             }
         })
     }
@@ -928,6 +977,12 @@ impl YtMusicClient {
 
     pub fn get_synced_lyrics(&self, video_id: &str) -> Result<Option<SyncedLyrics>> {
         self.rt.block_on(async {
+            if let Some(browse_id) = self.get_lyrics_browse_id(video_id).await? {
+                if let Some(lyrics) = self.get_timed_lyrics_from_browse_id(&browse_id).await? {
+                    return Ok(Some(lyrics));
+                }
+            }
+
             let mut body = Self::client_context();
             body["videoId"] = json!(video_id);
 
@@ -1322,6 +1377,53 @@ impl YtMusicClient {
             .context("Android VR stream has no direct URL")
     }
 
+    async fn get_lyrics_browse_id(&self, video_id: &str) -> Result<Option<String>> {
+        let mut body = Self::client_context();
+        body["enablePersistentPlaylistPanel"] = json!(true);
+        body["videoId"] = json!(video_id);
+        body["playlistId"] = json!(format!("RDAMVM{video_id}"));
+        body["isAudioOnly"] = json!(true);
+        body["tunerSettingValue"] = json!("AUTOMIX_SETTING_NORMAL");
+        body["watchEndpointMusicSupportedConfigs"] = json!({
+            "watchEndpointMusicConfig": {
+                "hasPersistentPlaylistPanel": true,
+                "musicVideoType": "MUSIC_VIDEO_TYPE_ATV"
+            }
+        });
+
+        let response = self
+            .post(&format!("{YTM_BASE_URL}/next?{YTM_PARAMS}"))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch lyrics browse id for {video_id}"))?;
+        let json: Value = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse lyrics browse id response for {video_id}"))?;
+        Ok(lyrics_browse_id_from_next_response(&json))
+    }
+
+    async fn get_timed_lyrics_from_browse_id(
+        &self,
+        browse_id: &str,
+    ) -> Result<Option<SyncedLyrics>> {
+        let mut body = Self::mobile_client_context();
+        body["browseId"] = json!(browse_id);
+
+        let response = self
+            .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch timed lyrics browse page {browse_id}"))?;
+        let json: Value = response
+            .json()
+            .await
+            .with_context(|| format!("Failed to parse timed lyrics browse response for {browse_id}"))?;
+        Ok(Self::parse_timed_lyrics_browse(&json))
+    }
+
     async fn player_request(&self, body: &Value) -> Result<Value> {
         let resp = self
             .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
@@ -1330,6 +1432,56 @@ impl YtMusicClient {
             .await
             .context("Failed to fetch player data")?;
         resp.json().await.context("Failed to parse player response")
+    }
+
+    fn parse_timed_lyric_line(raw_line: &Value) -> Option<SyncedLyricLine> {
+        let text = raw_line
+            .get("lyricLine")
+            .and_then(|text| text.as_str())
+            .map(normalize_synced_lyric_text)
+            .filter(|text| !text.is_empty())?;
+        let cue_range = raw_line.get("cueRange")?;
+        let start_millis = parse_json_u64(cue_range.get("startTimeMilliseconds"))?;
+        let end_millis = parse_json_u64(cue_range.get("endTimeMilliseconds"))
+            .filter(|end_millis| *end_millis > start_millis);
+
+        Some(SyncedLyricLine {
+            start_millis,
+            end_millis,
+            text,
+        })
+    }
+
+    fn parse_timed_lyrics_browse(json: &Value) -> Option<SyncedLyrics> {
+        let lyrics_data = json.pointer(
+            "/contents/elementRenderer/newElement/type/componentType/model/timedLyricsModel/lyricsData",
+        )?;
+        let mut lines = lyrics_data
+            .get("timedLyricsData")
+            .and_then(|lines| lines.as_array())?
+            .iter()
+            .filter_map(Self::parse_timed_lyric_line)
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return None;
+        }
+
+        finalize_synced_lyric_lines(&mut lines);
+        Some(SyncedLyrics {
+            source: SyncedLyricsSource::TimedLyrics,
+            language_code: None,
+            track_name: lyrics_data
+                .get("sourceMessage")
+                .and_then(|message| text_from_navigation_text(Some(message)))
+                .or_else(|| {
+                    lyrics_data
+                        .get("sourceMessage")
+                        .and_then(|message| message.as_str())
+                        .map(str::to_string)
+                })
+                .filter(|message| !message.trim().is_empty()),
+            lines,
+        })
     }
 
     fn best_caption_track(json: &Value) -> Option<CaptionTrack> {
@@ -1425,17 +1577,7 @@ impl YtMusicClient {
         if lines.is_empty() {
             return None;
         }
-
-        for index in 0..lines.len() {
-            let next_start = lines.get(index + 1).map(|line| line.start_millis);
-            let computed_end = match (lines[index].end_millis, next_start) {
-                (Some(end_millis), Some(next_start)) => end_millis.max(next_start),
-                (Some(end_millis), None) => end_millis,
-                (None, Some(next_start)) => next_start,
-                (None, None) => lines[index].start_millis.saturating_add(4_000),
-            };
-            lines[index].end_millis = Some(computed_end.max(lines[index].start_millis + 1));
-        }
+        finalize_synced_lyric_lines(&mut lines);
 
         Some(SyncedLyrics {
             source: track.source(),
@@ -1696,7 +1838,11 @@ impl YtMusicClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptionTrack, YtMusicClient, prepare_cookie_for_sapisid_auth};
+    use super::{
+        CaptionTrack, YtMusicClient, lyrics_browse_id_from_next_response,
+        prepare_cookie_for_sapisid_auth,
+    };
+    use crate::models::SyncedLyricsSource;
     use serde_json::json;
 
     #[test]
@@ -1759,6 +1905,87 @@ mod tests {
         assert_eq!(lyrics.lines[0].end_millis, Some(3500));
         assert_eq!(lyrics.lines[1].text, "Next & final");
         assert_eq!(lyrics.lines[1].end_millis, Some(7500));
+    }
+
+    #[test]
+    fn lyrics_browse_id_is_extracted_from_watch_next_tabs() {
+        let json = json!({
+            "contents": {
+                "singleColumnMusicWatchNextResultsRenderer": {
+                    "tabbedRenderer": {
+                        "watchNextTabbedResultsRenderer": {
+                            "tabs": [
+                                { "tabRenderer": {} },
+                                {
+                                    "tabRenderer": {
+                                        "endpoint": {
+                                            "browseEndpoint": {
+                                                "browseId": "MPLYt_test_browse"
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            lyrics_browse_id_from_next_response(&json).as_deref(),
+            Some("MPLYt_test_browse")
+        );
+    }
+
+    #[test]
+    fn parse_timed_lyrics_browse_extracts_mobile_lyrics_model() {
+        let json = json!({
+            "contents": {
+                "elementRenderer": {
+                    "newElement": {
+                        "type": {
+                            "componentType": {
+                                "model": {
+                                    "timedLyricsModel": {
+                                        "lyricsData": {
+                                            "sourceMessage": { "simpleText": "Source: LyricFind" },
+                                            "timedLyricsData": [
+                                                {
+                                                    "lyricLine": "I was a liar",
+                                                    "cueRange": {
+                                                        "startTimeMilliseconds": "9200",
+                                                        "endTimeMilliseconds": "10630",
+                                                        "metadata": { "id": "1" }
+                                                    }
+                                                },
+                                                {
+                                                    "lyricLine": "I gave in to the fire",
+                                                    "cueRange": {
+                                                        "startTimeMilliseconds": "10680",
+                                                        "endTimeMilliseconds": "12540",
+                                                        "metadata": { "id": "2" }
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let lyrics = YtMusicClient::parse_timed_lyrics_browse(&json).expect("timed lyrics");
+        assert_eq!(lyrics.source, SyncedLyricsSource::TimedLyrics);
+        assert_eq!(lyrics.track_name.as_deref(), Some("Source: LyricFind"));
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "I was a liar");
+        assert_eq!(lyrics.lines[0].start_millis, 9200);
+        assert_eq!(lyrics.lines[0].end_millis, Some(10680));
+        assert_eq!(lyrics.lines[1].end_millis, Some(12540));
     }
 
     #[test]

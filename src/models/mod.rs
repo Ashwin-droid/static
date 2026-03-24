@@ -122,6 +122,7 @@ pub struct SyncedLyricLine {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncedLyricsSource {
+    TimedLyrics,
     Captions,
     AutoCaptions,
 }

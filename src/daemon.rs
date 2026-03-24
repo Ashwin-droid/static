@@ -54,7 +54,7 @@ const UI_APP_OBJECT_PATH: &str = "/com/static/music";
 const MIN_LISTEN_SECS: u64 = 10;
 const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
-const PLAYBACK_START_RETRY_LIMIT: u8 = 1;
+const PLAYBACK_START_RETRY_LIMIT: u8 = 2;
 const PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS: u64 = 250;
 const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
 const PLAYBACK_START_SEEK_CONFIRM_LEEWAY_MILLIS: u64 = 5_000;
@@ -106,6 +106,16 @@ enum PlaybackSource {
     OfflineCache,
     TempPrefetch,
     RemoteStream,
+}
+
+impl PlaybackSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::OfflineCache => "offline-cache",
+            Self::TempPrefetch => "temp-prefetch",
+            Self::RemoteStream => "remote-stream",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,6 +1215,10 @@ fn playback_start_stalled(started_at: Instant, awaiting_fresh_position: bool) ->
     awaiting_fresh_position && started_at.elapsed() >= PLAYBACK_START_TIMEOUT
 }
 
+fn playback_start_attempt_total() -> u8 {
+    PLAYBACK_START_RETRY_LIMIT.saturating_add(1)
+}
+
 fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -> bool {
     if track.startup_seek_millis.is_some_and(|target_millis| {
         position_millis.saturating_add(PLAYBACK_START_SEEK_CONFIRM_LEEWAY_MILLIS) >= target_millis
@@ -1238,19 +1252,26 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
     let playback_source = active.playback_source;
     let queue_index = state.queue_index;
     let startup_retries = active.startup_retries;
+    let startup_attempt = startup_retries.saturating_add(1);
     let elapsed_secs = active.started_at.elapsed().as_secs_f32();
     let buffered_percent = state.player.buffered_fraction() * 100.0;
 
     if startup_retries < PLAYBACK_START_RETRY_LIMIT {
         let next_retry = startup_retries.saturating_add(1);
+        let next_attempt = next_retry.saturating_add(1);
         eprintln!(
-            "[DAEMON] playback start stalled for {video_id} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%); retrying ({next_retry}/{PLAYBACK_START_RETRY_LIMIT})"
+            "[DAEMON] playback start stalled for {video_id} from {} on startup attempt {startup_attempt}/{} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%); retrying ({next_attempt}/{})",
+            playback_source.label(),
+            playback_start_attempt_total(),
+            playback_start_attempt_total(),
         );
 
         if playback_source == PlaybackSource::TempPrefetch {
             eprintln!(
-                "[DAEMON] removing prefetched temp audio for {video_id} before startup retry"
+                "[DAEMON] stopping stalled {} playback and evicting prefetched temp audio for {video_id} before startup retry",
+                playback_source.label()
             );
+            stop_playback(state, false);
             state.cache.remove_temp_audio(&video_id);
         }
 
@@ -1396,8 +1417,15 @@ fn play_index_with_startup_retries(
         .cloned()
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
     let (prepared_uri, playback_source) = prepare_playback(state, &track.video_id)?;
+    let startup_attempt = startup_retries.saturating_add(1);
     state.queue_index = index;
     mark_radio_touched_through(state, index);
+    eprintln!(
+        "[DAEMON] starting playback for {} from {} (startup attempt {startup_attempt}/{})",
+        track.video_id,
+        playback_source.label(),
+        playback_start_attempt_total(),
+    );
     state.player.play_uri(&prepared_uri);
     if state.volume_ramp.is_some() {
         advance_volume_ramp(state);
@@ -1506,11 +1534,24 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
     let playback_source = active.playback_source;
     let queue_index = state.queue_index;
     let awaiting_fresh_position = active.awaiting_fresh_position;
+    let startup_attempt = active.startup_retries.saturating_add(1);
 
-    eprintln!("[DAEMON] playback failed for {video_id}: {error}");
+    if awaiting_fresh_position {
+        eprintln!(
+            "[DAEMON] playback failed for {video_id} from {} before startup was confirmed (attempt {startup_attempt}/{}): {error}",
+            playback_source.label(),
+            playback_start_attempt_total(),
+        );
+    } else {
+        eprintln!(
+            "[DAEMON] playback failed for {video_id} from {} after startup was confirmed: {error}",
+            playback_source.label(),
+        );
+    }
 
     if playback_source == PlaybackSource::TempPrefetch {
         eprintln!("[DAEMON] removing prefetched temp audio for {video_id} and retrying");
+        stop_playback(state, false);
         state.cache.remove_temp_audio(&video_id);
         if let Err(err) = play_index(state, queue_index) {
             eprintln!("[DAEMON] retry after temp-cache eviction failed for {video_id}: {err}");
@@ -1534,7 +1575,17 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
 
     if let Some(target) = queue_target_index(state, true) {
         if target != queue_index {
-            eprintln!("[DAEMON] skipping failed track {video_id}");
+            if awaiting_fresh_position {
+                eprintln!(
+                    "[DAEMON] skipping failed track {video_id} after startup never confirmed from {}",
+                    playback_source.label()
+                );
+            } else {
+                eprintln!(
+                    "[DAEMON] skipping failed track {video_id} after failure from {}",
+                    playback_source.label()
+                );
+            }
             if let Err(err) = play_index(state, target) {
                 eprintln!("[DAEMON] failed to advance after playback failure on {video_id}: {err}");
                 stop_playback(state, false);

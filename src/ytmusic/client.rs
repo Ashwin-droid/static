@@ -511,7 +511,11 @@ fn parse_json_u64(value: Option<&Value>) -> Option<u64> {
     let value = value?;
     value
         .as_u64()
-        .or_else(|| value.as_i64().and_then(|number| (number >= 0).then_some(number as u64)))
+        .or_else(|| {
+            value
+                .as_i64()
+                .and_then(|number| (number >= 0).then_some(number as u64))
+        })
         .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
 }
 
@@ -582,12 +586,34 @@ pub struct YtMusicClient {
 unsafe impl Send for YtMusicClient {}
 unsafe impl Sync for YtMusicClient {}
 
-fn extract_sapisid(cookie: &str) -> Option<String> {
-    cookie
-        .split(';')
-        .map(|s| s.trim())
-        .find(|s| s.starts_with("SAPISID="))
-        .map(|s| s.trim_start_matches("SAPISID=").to_string())
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').map(|s| s.trim()).find_map(|cookie| {
+        let (cookie_name, value) = cookie.split_once('=')?;
+        (cookie_name == name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn prepare_cookie_for_sapisid_auth(cookie: &str) -> (String, Option<String>, Option<&'static str>) {
+    if let Some(sapisid) = cookie_value(cookie, "SAPISID") {
+        return (cookie.to_string(), Some(sapisid), Some("SAPISID"));
+    }
+
+    // Chromium exports sometimes keep only the secure PAPISID cookies.
+    // Mirroring them into a plain SAPISID cookie restores authenticated
+    // youtubei/player responses, while APISID alone is not sufficient.
+    for fallback_name in ["__Secure-3PAPISID", "__Secure-1PAPISID"] {
+        if let Some(sapisid) = cookie_value(cookie, fallback_name) {
+            let mut normalized_cookie = cookie.trim().trim_end_matches(';').to_string();
+            if !normalized_cookie.is_empty() {
+                normalized_cookie.push_str("; ");
+            }
+            normalized_cookie.push_str("SAPISID=");
+            normalized_cookie.push_str(&sapisid);
+            return (normalized_cookie, Some(sapisid), Some(fallback_name));
+        }
+    }
+
+    (cookie.to_string(), None, None)
 }
 
 fn generate_cpn() -> String {
@@ -615,10 +641,10 @@ fn rewrite_tracking_base_url(url: &str) -> String {
 
 impl YtMusicClient {
     pub fn new(cookie: &str) -> Result<Self> {
-        let sapisid = extract_sapisid(cookie);
+        let (normalized_cookie, sapisid, sapisid_source) = prepare_cookie_for_sapisid_auth(cookie);
 
         let mut headers = HeaderMap::new();
-        headers.insert("cookie", HeaderValue::from_str(cookie)?);
+        headers.insert("cookie", HeaderValue::from_str(&normalized_cookie)?);
         headers.insert(
             "user-agent",
             HeaderValue::from_static(
@@ -649,9 +675,13 @@ impl YtMusicClient {
             .build()
             .context("Failed to create tokio runtime")?;
 
+        if let Some(source) = sapisid_source.filter(|source| *source != "SAPISID") {
+            eprintln!("[AUTH] using {source} as a SAPISID fallback for authenticated requests");
+        }
+
         Ok(Self {
             http,
-            cookie: cookie.to_string(),
+            cookie: normalized_cookie,
             rt,
             sapisid,
             visitor_data: std::sync::Mutex::new(None),
@@ -760,6 +790,28 @@ impl YtMusicClient {
                 .await
                 .context("Failed to parse search response")?;
             parsers::parse_search_results(&json)
+        })
+    }
+
+    pub fn get_search_suggestions(&self, query: &str) -> Result<Vec<String>> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["input"] = json!(query);
+
+            let resp = self
+                .post(&format!(
+                    "{YTM_BASE_URL}/music/get_search_suggestions?{YTM_PARAMS}"
+                ))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to fetch search suggestions")?;
+
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse search suggestions response")?;
+            Ok(parsers::parse_search_suggestions(&json))
         })
     }
 
@@ -890,10 +942,9 @@ impl YtMusicClient {
                 .send()
                 .await
                 .with_context(|| format!("Failed to fetch synced lyrics for {video_id}"))?;
-            let captions: Value = response
-                .json()
-                .await
-                .with_context(|| format!("Failed to parse synced lyrics response for {video_id}"))?;
+            let captions: Value = response.json().await.with_context(|| {
+                format!("Failed to parse synced lyrics response for {video_id}")
+            })?;
             Ok(Self::parse_synced_lyrics(track, &captions))
         })
     }
@@ -1004,6 +1055,12 @@ impl YtMusicClient {
         let rt_ptr: *const tokio::runtime::Runtime = &self.rt;
 
         {
+            if auth.is_none() {
+                eprintln!(
+                    "[TRACKING] no SAPISID-derived auth cookie is available for {video_id}; player bootstrap may omit playbackTracking"
+                );
+            }
+
             let mut body = json!({
                 "context": {
                     "client": {
@@ -1016,12 +1073,12 @@ impl YtMusicClient {
             });
             body["videoId"] = json!(&video_id);
 
-            let mut req = http.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"));
-            if let Some(ref auth) = auth {
-                req = req.header("authorization", auth.clone());
-            }
-
-            let Ok(resp) = req.json(&body).send().await else {
+            let Ok(resp) = self
+                .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+            else {
                 eprintln!("[TRACKING] player bootstrap request failed for {video_id}");
                 return None;
             };
@@ -1382,7 +1439,9 @@ impl YtMusicClient {
 
         Some(SyncedLyrics {
             source: track.source(),
-            language_code: track.language_code.filter(|language| !language.trim().is_empty()),
+            language_code: track
+                .language_code
+                .filter(|language| !language.trim().is_empty()),
             track_name: track.name.filter(|name| !name.trim().is_empty()),
             lines,
         })
@@ -1637,7 +1696,7 @@ impl YtMusicClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptionTrack, YtMusicClient};
+    use super::{CaptionTrack, YtMusicClient, prepare_cookie_for_sapisid_auth};
     use serde_json::json;
 
     #[test]
@@ -1700,5 +1759,51 @@ mod tests {
         assert_eq!(lyrics.lines[0].end_millis, Some(3500));
         assert_eq!(lyrics.lines[1].text, "Next & final");
         assert_eq!(lyrics.lines[1].end_millis, Some(7500));
+    }
+
+    #[test]
+    fn prepare_cookie_for_sapisid_auth_keeps_plain_sapisid() {
+        let cookie = "SID=sid; SAPISID=plain-sapisid; __Secure-3PAPISID=secure-3p";
+        let (normalized, sapisid, source) = prepare_cookie_for_sapisid_auth(cookie);
+
+        assert_eq!(normalized, cookie);
+        assert_eq!(sapisid.as_deref(), Some("plain-sapisid"));
+        assert_eq!(source, Some("SAPISID"));
+    }
+
+    #[test]
+    fn prepare_cookie_for_sapisid_auth_uses_secure_3papisid_fallback() {
+        let cookie = "SID=sid; __Secure-3PAPISID=secure-3p";
+        let (normalized, sapisid, source) = prepare_cookie_for_sapisid_auth(cookie);
+
+        assert_eq!(
+            normalized,
+            "SID=sid; __Secure-3PAPISID=secure-3p; SAPISID=secure-3p"
+        );
+        assert_eq!(sapisid.as_deref(), Some("secure-3p"));
+        assert_eq!(source, Some("__Secure-3PAPISID"));
+    }
+
+    #[test]
+    fn prepare_cookie_for_sapisid_auth_uses_secure_1papisid_when_needed() {
+        let cookie = "SID=sid; __Secure-1PAPISID=secure-1p";
+        let (normalized, sapisid, source) = prepare_cookie_for_sapisid_auth(cookie);
+
+        assert_eq!(
+            normalized,
+            "SID=sid; __Secure-1PAPISID=secure-1p; SAPISID=secure-1p"
+        );
+        assert_eq!(sapisid.as_deref(), Some("secure-1p"));
+        assert_eq!(source, Some("__Secure-1PAPISID"));
+    }
+
+    #[test]
+    fn prepare_cookie_for_sapisid_auth_does_not_promote_apisid() {
+        let cookie = "SID=sid; APISID=apisid-only";
+        let (normalized, sapisid, source) = prepare_cookie_for_sapisid_auth(cookie);
+
+        assert_eq!(normalized, cookie);
+        assert_eq!(sapisid, None);
+        assert_eq!(source, None);
     }
 }

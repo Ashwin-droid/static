@@ -57,6 +57,7 @@ pub enum HomeBrowsePageType {
     Album,
     Artist,
     UserChannel,
+    PodcastShow,
 }
 
 #[allow(dead_code)]

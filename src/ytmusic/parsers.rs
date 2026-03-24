@@ -149,7 +149,8 @@ fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
 fn parse_home_item(item: &Value) -> Option<HomeItem> {
     let renderer = item
         .get("musicTwoRowItemRenderer")
-        .or_else(|| item.get("musicResponsiveListItemRenderer"))?;
+        .or_else(|| item.get("musicResponsiveListItemRenderer"))
+        .or_else(|| item.get("musicMultiRowListItemRenderer"))?;
 
     parse_track_from_renderer(renderer)
         .map(HomeItem::Track)
@@ -212,6 +213,10 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
         });
     }
 
+    if let Some(track) = parse_multi_row_track_from_renderer(renderer) {
+        return Some(track);
+    }
+
     // Try two-row item renderer format (carousel items)
     if let Some(video_id) = extract_watch_video_id(renderer) {
         let title = renderer
@@ -236,8 +241,35 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
     None
 }
 
+fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
+    if renderer.get("onTap").is_none() && renderer.get("displayStyle").is_none() {
+        return None;
+    }
+
+    let title = renderer
+        .pointer("/title/runs/0/text")
+        .and_then(|t| t.as_str())?
+        .to_string();
+
+    let video_id = renderer
+        .pointer("/onTap/watchEndpoint/videoId")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| extract_watch_video_id(renderer))?;
+
+    Some(Track {
+        video_id,
+        title,
+        artists: extract_multi_row_artists(renderer),
+        album: None,
+        duration: extract_duration(renderer),
+        thumbnail_url: extract_thumbnail(renderer),
+    })
+}
+
 fn extract_watch_video_id(renderer: &Value) -> Option<String> {
     [
+        "/onTap/watchEndpoint/videoId",
         "/navigationEndpoint/watchEndpoint/videoId",
         "/playNavigationEndpoint/watchEndpoint/videoId",
         "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
@@ -271,6 +303,9 @@ fn extract_browse_id_and_page_type(renderer: &Value) -> Option<(String, HomeBrow
                 "MUSIC_PAGE_TYPE_ALBUM" => Some(HomeBrowsePageType::Album),
                 "MUSIC_PAGE_TYPE_ARTIST" => Some(HomeBrowsePageType::Artist),
                 "MUSIC_PAGE_TYPE_USER_CHANNEL" => Some(HomeBrowsePageType::UserChannel),
+                "MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE" => {
+                    Some(HomeBrowsePageType::PodcastShow)
+                }
                 _ => None,
             })?;
         let browse_id = browse.get("browseId")?.as_str()?.to_string();
@@ -383,6 +418,38 @@ fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
     } else {
         vec![Artist {
             name: artist_name,
+            id: None,
+        }]
+    }
+}
+
+fn extract_multi_row_artists(renderer: &Value) -> Vec<Artist> {
+    let Some(label) = [
+        "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/accessibilityPlayData/accessibilityData/label",
+        "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/accessibilityPlayData/accessibilityData/label",
+    ]
+    .iter()
+    .find_map(|path| renderer.pointer(path).and_then(|value| value.as_str()))
+    else {
+        return vec![];
+    };
+
+    let cleaned = label
+        .strip_prefix("Play ")
+        .or_else(|| label.strip_prefix("Pause "))
+        .unwrap_or(label)
+        .trim();
+
+    let Some((_, artist_name)) = cleaned.rsplit_once(" - ") else {
+        return vec![];
+    };
+
+    let artist_name = artist_name.trim();
+    if artist_name.is_empty() {
+        vec![]
+    } else {
+        vec![Artist {
+            name: artist_name.to_string(),
             id: None,
         }]
     }
@@ -517,6 +584,7 @@ pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
             let Some(renderer) = item
                 .get("musicResponsiveListItemRenderer")
                 .or_else(|| item.get("musicTwoRowItemRenderer"))
+                .or_else(|| item.get("musicMultiRowListItemRenderer"))
             else {
                 continue;
             };
@@ -540,7 +608,7 @@ pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
                             results.artists.push(card);
                         }
                     }
-                    HomeBrowsePageType::Album => {}
+                    HomeBrowsePageType::Album | HomeBrowsePageType::PodcastShow => {}
                 }
             }
         }
@@ -549,13 +617,39 @@ pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
     Ok(results)
 }
 
+pub fn parse_search_suggestions(json: &Value) -> Vec<String> {
+    let Some(contents) = json
+        .pointer("/contents/0/searchSuggestionsSectionRenderer/contents")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    contents
+        .iter()
+        .filter_map(|item| {
+            let renderer = item
+                .get("historySuggestionRenderer")
+                .or_else(|| item.get("searchSuggestionRenderer"))?;
+
+            renderer
+                .pointer("/navigationEndpoint/searchEndpoint/query")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use crate::models::{HomeBrowsePageType, HomeItem};
 
-    use super::{parse_home_item, parse_search_results, parse_track_from_renderer};
+    use super::{
+        parse_home_item, parse_search_results, parse_search_suggestions, parse_track_from_renderer,
+    };
 
     #[test]
     fn responsive_history_items_fall_back_to_user_channel_name() {
@@ -877,6 +971,113 @@ mod tests {
     }
 
     #[test]
+    fn home_items_parse_podcast_show_browse_cards() {
+        let item = json!({
+            "musicTwoRowItemRenderer": {
+                "title": {
+                    "runs": [
+                        {
+                            "text": "English Learning Podcast for Beginners",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "MPSPPLGtHGptrOdBuAJIKVjOfgKm41M7uAjruH",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                },
+                "subtitle": {
+                    "runs": [
+                        { "text": "Show" }
+                    ]
+                }
+            }
+        });
+
+        let parsed = parse_home_item(&item).expect("podcast show card should parse");
+        let HomeItem::BrowseCard(card) = parsed else {
+            panic!("podcast show recommendation should parse as browse card");
+        };
+
+        assert_eq!(card.title, "English Learning Podcast for Beginners");
+        assert_eq!(card.browse_id, "MPSPPLGtHGptrOdBuAJIKVjOfgKm41M7uAjruH");
+        assert_eq!(card.page_type, HomeBrowsePageType::PodcastShow);
+    }
+
+    #[test]
+    fn multi_row_items_parse_podcast_episode_tracks() {
+        let renderer = json!({
+            "title": {
+                "runs": [
+                    {
+                        "text": "Has VW Completely Lost Its Soul? VW LOVE IS DEAD",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {
+                                "browseId": "MPEDf5WkZmhsiEw",
+                                "browseEndpointContextSupportedConfigs": {
+                                    "browseEndpointContextMusicConfig": {
+                                        "pageType": "MUSIC_PAGE_TYPE_NON_MUSIC_AUDIO_TRACK_PAGE"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "subtitle": {
+                "runs": [
+                    { "text": "Mar 16, 2025" }
+                ]
+            },
+            "onTap": {
+                "watchEndpoint": {
+                    "videoId": "f5WkZmhsiEw"
+                }
+            },
+            "thumbnail": {
+                "musicThumbnailRenderer": {
+                    "thumbnail": {
+                        "thumbnails": [
+                            { "url": "https://example.com/thumb.jpg" }
+                        ]
+                    }
+                }
+            },
+            "overlay": {
+                "musicItemThumbnailOverlayRenderer": {
+                    "content": {
+                        "musicPlayButtonRenderer": {
+                            "accessibilityPlayData": {
+                                "accessibilityData": {
+                                    "label": "Play Has VW Completely Lost Its Soul? VW LOVE IS DEAD - HumbleMechanic"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("podcast episode should parse");
+        assert_eq!(track.video_id, "f5WkZmhsiEw");
+        assert_eq!(
+            track.title,
+            "Has VW Completely Lost Its Soul? VW LOVE IS DEAD"
+        );
+        assert_eq!(track.artists.len(), 1);
+        assert_eq!(track.artists[0].name, "HumbleMechanic");
+        assert_eq!(
+            track.thumbnail_url.as_deref(),
+            Some("https://example.com/thumb.jpg")
+        );
+    }
+
+    #[test]
     fn two_row_song_prefix_falls_back_to_following_artist_segment() {
         let renderer = json!({
             "title": {
@@ -1051,6 +1252,39 @@ mod tests {
         assert_eq!(results.artists[0].title, "Lofi Producer");
         assert_eq!(results.artists[0].page_type, HomeBrowsePageType::Artist);
     }
+
+    #[test]
+    fn search_suggestions_include_history_and_regular_items() {
+        let json = json!({
+            "contents": [{
+                "searchSuggestionsSectionRenderer": {
+                    "contents": [
+                        {
+                            "historySuggestionRenderer": {
+                                "navigationEndpoint": {
+                                    "searchEndpoint": {
+                                        "query": "faded"
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "searchSuggestionRenderer": {
+                                "navigationEndpoint": {
+                                    "searchEndpoint": {
+                                        "query": "faded alan walker"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }]
+        });
+
+        let suggestions = parse_search_suggestions(&json);
+        assert_eq!(suggestions, vec!["faded", "faded alan walker"]);
+    }
 }
 
 /// Parse the `/next` response into a RadioQueue with tracks, chips, and continuation token.
@@ -1190,7 +1424,8 @@ pub fn parse_browse_tracks(json: &Value) -> Result<Vec<Track>> {
                 for item in items {
                     let renderer = item
                         .get("musicTwoRowItemRenderer")
-                        .or_else(|| item.get("musicResponsiveListItemRenderer"));
+                        .or_else(|| item.get("musicResponsiveListItemRenderer"))
+                        .or_else(|| item.get("musicMultiRowListItemRenderer"));
                     let Some(renderer) = renderer else {
                         continue;
                     };
@@ -1220,7 +1455,8 @@ pub fn parse_browse_tracks(json: &Value) -> Result<Vec<Track>> {
             for item in items {
                 let renderer = item
                     .get("musicResponsiveListItemRenderer")
-                    .or_else(|| item.get("musicTwoRowItemRenderer"));
+                    .or_else(|| item.get("musicTwoRowItemRenderer"))
+                    .or_else(|| item.get("musicMultiRowListItemRenderer"));
                 let Some(renderer) = renderer else {
                     continue;
                 };

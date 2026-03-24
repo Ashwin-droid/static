@@ -318,6 +318,7 @@ pub(super) fn build_home_browse_row(
             HomeBrowsePageType::Playlist => "Playlist".to_string(),
             HomeBrowsePageType::Artist => "Artist".to_string(),
             HomeBrowsePageType::UserChannel => "Channel".to_string(),
+            HomeBrowsePageType::PodcastShow => "Show".to_string(),
         });
     let subtitle_label = Label::new(Some(&subtitle));
     subtitle_label.set_halign(Align::Start);
@@ -369,15 +370,15 @@ pub(super) fn queue_drag_payload_for_browse_card(
     card: &HomeBrowseCard,
 ) -> Option<QueueDragPayload> {
     match card.page_type {
-        HomeBrowsePageType::Album | HomeBrowsePageType::Playlist => {
-            Some(QueueDragPayload::BrowseCollection {
-                browse_id: card.browse_id.clone(),
-                title: card.title.clone(),
-                thumbnail_url: card.thumbnail_url.clone(),
-                subtitle: card.subtitle.clone(),
-                page_type: card.page_type,
-            })
-        }
+        HomeBrowsePageType::Album
+        | HomeBrowsePageType::Playlist
+        | HomeBrowsePageType::PodcastShow => Some(QueueDragPayload::BrowseCollection {
+            browse_id: card.browse_id.clone(),
+            title: card.title.clone(),
+            thumbnail_url: card.thumbnail_url.clone(),
+            subtitle: card.subtitle.clone(),
+            page_type: card.page_type,
+        }),
         HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => None,
     }
 }
@@ -696,7 +697,9 @@ pub(super) fn load_browse_detail(
                         if let Ok(Some(Some(fallback_tracks))) = gio::spawn_blocking(move || {
                             let client = app_client(&state_bg)?;
                             let tracks = match card.page_type {
-                                HomeBrowsePageType::Playlist | HomeBrowsePageType::Album => {
+                                HomeBrowsePageType::Playlist
+                                | HomeBrowsePageType::Album
+                                | HomeBrowsePageType::PodcastShow => {
                                     client.get_browse_tracks(&card.browse_id).ok()
                                 }
                                 HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => {

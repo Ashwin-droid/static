@@ -257,6 +257,7 @@ struct MainPageWidgets {
     content_scroll: ScrolledWindow,
     player_state: Rc<PlayerState>,
     recent_list: GtkBox,
+    search_entry: Entry,
     home_btn: Button,
     home_pagination: Rc<HomePaginationState>,
 }
@@ -393,15 +394,21 @@ pub fn build_window(app: &Application) {
         let home_pagination = main_widgets.home_pagination.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
+        let search_entry = main_widgets.search_entry.clone();
         let home_btn = main_widgets.home_btn.clone();
         let refresh = gtk::EventControllerKey::new();
         refresh.connect_key_pressed(move |_, key, _, modifiers| {
+            let main_is_visible = stack.visible_child_name().as_deref() == Some("main");
+            let wants_search = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                && (key == gtk::gdk::Key::f || key == gtk::gdk::Key::F);
             let wants_refresh = modifiers.contains(gtk::gdk::ModifierType::CONTROL_MASK)
                 && (key == gtk::gdk::Key::r || key == gtk::gdk::Key::R);
-            if wants_refresh
-                && stack.visible_child_name().as_deref() == Some("main")
-                && home_btn.has_css_class("nav-item-active")
-            {
+            if wants_search && main_is_visible {
+                search_entry.grab_focus();
+                search_entry.select_region(0, -1);
+                return glib::Propagation::Stop;
+            }
+            if wants_refresh && main_is_visible && home_btn.has_css_class("nav-item-active") {
                 invalidate_home_cache(&state);
                 load_home(
                     &state,

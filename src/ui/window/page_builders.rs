@@ -328,6 +328,53 @@ pub(super) fn build_vr_auth_page(stack: &Stack, state: &Arc<Mutex<AppState>>) ->
 // ============================================================
 
 pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> MainPageWidgets {
+    fn next_search_request_id(search_request_serial: &Rc<Cell<u64>>) -> u64 {
+        let next = search_request_serial.get().wrapping_add(1);
+        search_request_serial.set(next);
+        next
+    }
+
+    fn run_sidebar_search(
+        state: &Arc<Mutex<AppState>>,
+        content_box: &GtkBox,
+        content_scroll: &ScrolledWindow,
+        home_pagination: &Rc<HomePaginationState>,
+        query: &str,
+        ps: &Rc<PlayerState>,
+        recent_list: &GtkBox,
+        search_request_serial: &Rc<Cell<u64>>,
+    ) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        let request_id = next_search_request_id(search_request_serial);
+        if let Some(target) = parse_direct_music_url(&query) {
+            autoplay_direct_music_url(
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                &query,
+                target,
+                ps,
+                recent_list,
+            );
+        } else {
+            load_search(
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                &query,
+                ps,
+                recent_list,
+                Some((search_request_serial.clone(), request_id)),
+            );
+        }
+    }
+
     let page = GtkBox::new(Orientation::Vertical, 0);
 
     // Use a Paned so the sidebar has a truly fixed width (not just a minimum)
@@ -348,9 +395,27 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     sidebar.set_overflow(gtk::Overflow::Hidden);
 
     // Search
+    let search_shell = GtkBox::new(Orientation::Vertical, 6);
+    search_shell.set_margin_start(12);
+    search_shell.set_margin_end(12);
+    search_shell.set_margin_top(16);
+    search_shell.set_margin_bottom(12);
+
     let search_entry = Entry::builder().placeholder_text("Search songs...").build();
     search_entry.add_css_class("sidebar-search");
-    sidebar.append(&search_entry);
+    search_shell.append(&search_entry);
+
+    let search_suggestions_panel = GtkBox::new(Orientation::Vertical, 0);
+    search_suggestions_panel.add_css_class("search-suggestions-panel");
+    search_suggestions_panel.set_focusable(false);
+    search_suggestions_panel.set_visible(false);
+
+    let search_suggestions_box = GtkBox::new(Orientation::Vertical, 0);
+    search_suggestions_box.add_css_class("search-suggestions-list");
+    search_suggestions_box.set_focusable(false);
+    search_suggestions_panel.append(&search_suggestions_box);
+    search_shell.append(&search_suggestions_panel);
+    sidebar.append(&search_shell);
 
     // Nav items
     let nav_box = GtkBox::new(Orientation::Vertical, 2);
@@ -1140,6 +1205,10 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         offline_btn.clone(),
         settings_btn.clone(),
     ]);
+    let search_request_serial = Rc::new(Cell::new(0_u64));
+    let search_suggestion_request_serial = Rc::new(Cell::new(0_u64));
+    let search_suggestion_debounce = Rc::new(RefCell::new(None::<glib::SourceId>));
+    let suppress_search_suggestions = Rc::new(Cell::new(false));
 
     {
         let state_for_value = state.clone();
@@ -1270,34 +1339,201 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let home_pagination = home_pagination.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
+        let search_request_serial = search_request_serial.clone();
+        let search_suggestion_request_serial = search_suggestion_request_serial.clone();
+        let search_suggestion_debounce = search_suggestion_debounce.clone();
+        let search_suggestions_panel = search_suggestions_panel.clone();
+        let search_suggestions_box = search_suggestions_box.clone();
 
         search_entry.connect_activate(move |entry| {
-            let query = entry.text().trim().to_string();
-            if query.is_empty() {
+            if let Some(source) = search_suggestion_debounce.borrow_mut().take() {
+                source.remove();
+            }
+            next_search_request_id(&search_suggestion_request_serial);
+            clear_box(&search_suggestions_box);
+            search_suggestions_panel.set_visible(false);
+            run_sidebar_search(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                entry.text().as_ref(),
+                &ps,
+                &recent_list,
+                &search_request_serial,
+            );
+        });
+    }
+
+    {
+        let state = state.clone();
+        let content_box = content_box.clone();
+        let content_scroll = scrolled.clone();
+        let home_pagination = home_pagination.clone();
+        let ps = ps.clone();
+        let recent_list = recent_list.clone();
+        let search_request_serial = search_request_serial.clone();
+        let search_suggestion_request_serial = search_suggestion_request_serial.clone();
+        let search_suggestion_debounce = search_suggestion_debounce.clone();
+        let search_suggestions_panel = search_suggestions_panel.clone();
+        let search_suggestions_box = search_suggestions_box.clone();
+        let search_entry_for_suggestions = search_entry.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
+
+        search_entry.connect_changed(move |entry| {
+            if suppress_search_suggestions.replace(false) {
                 return;
             }
-            if let Some(target) = parse_direct_music_url(&query) {
-                autoplay_direct_music_url(
-                    &state,
-                    &content_box,
-                    &content_scroll,
-                    &home_pagination,
-                    &query,
-                    target,
-                    &ps,
-                    &recent_list,
-                );
-            } else {
-                load_search(
-                    &state,
-                    &content_box,
-                    &content_scroll,
-                    &home_pagination,
-                    &query,
-                    &ps,
-                    &recent_list,
-                );
+
+            if let Some(source) = search_suggestion_debounce.borrow_mut().take() {
+                source.remove();
             }
+
+            let query = entry.text().trim().to_string();
+            let request_id = next_search_request_id(&search_suggestion_request_serial);
+            clear_box(&search_suggestions_box);
+            search_suggestions_panel.set_visible(false);
+
+            if query.is_empty() || parse_direct_music_url(&query).is_some() {
+                return;
+            }
+
+            let state = state.clone();
+            let content_box = content_box.clone();
+            let content_scroll = content_scroll.clone();
+            let home_pagination = home_pagination.clone();
+            let ps = ps.clone();
+            let recent_list = recent_list.clone();
+            let search_request_serial = search_request_serial.clone();
+            let search_suggestion_request_serial = search_suggestion_request_serial.clone();
+            let search_suggestion_debounce_for_timeout = search_suggestion_debounce.clone();
+            let search_suggestions_panel = search_suggestions_panel.clone();
+            let search_suggestions_box = search_suggestions_box.clone();
+            let search_entry = search_entry_for_suggestions.clone();
+            let suppress_search_suggestions = suppress_search_suggestions.clone();
+
+            let source =
+                glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                    let _ = search_suggestion_debounce_for_timeout.borrow_mut().take();
+
+                    let state = state.clone();
+                    let content_box = content_box.clone();
+                    let content_scroll = content_scroll.clone();
+                    let home_pagination = home_pagination.clone();
+                    let ps = ps.clone();
+                    let recent_list = recent_list.clone();
+                    let search_request_serial = search_request_serial.clone();
+                    let search_suggestion_request_serial = search_suggestion_request_serial.clone();
+                    let search_suggestions_panel = search_suggestions_panel.clone();
+                    let search_suggestions_box = search_suggestions_box.clone();
+                    let search_entry = search_entry.clone();
+                    let suppress_search_suggestions = suppress_search_suggestions.clone();
+                    let query = query.clone();
+
+                    glib::spawn_future_local(async move {
+                        let state_bg = state.clone();
+                        let q = query.clone();
+                        let result = gio::spawn_blocking(move || {
+                            app_client(&state_bg).map(|ytm| ytm.get_search_suggestions(&q))
+                        })
+                        .await;
+
+                        if search_suggestion_request_serial.get() != request_id {
+                            return;
+                        }
+
+                        clear_box(&search_suggestions_box);
+
+                        match result {
+                            Ok(Some(Ok(suggestions))) => {
+                                let suggestions: Vec<_> = suggestions.into_iter().take(8).collect();
+                                if suggestions.is_empty() {
+                                    search_suggestions_panel.set_visible(false);
+                                    return;
+                                }
+
+                                for suggestion in suggestions {
+                                    let suggestion_btn = Button::new();
+                                    suggestion_btn.add_css_class("search-suggestion-btn");
+                                    suggestion_btn.set_hexpand(true);
+                                    suggestion_btn.set_focusable(false);
+                                    suggestion_btn.set_focus_on_click(false);
+
+                                    let label = Label::new(Some(&suggestion));
+                                    label.set_halign(Align::Start);
+                                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                                    label.set_max_width_chars(28);
+                                    suggestion_btn.set_child(Some(&label));
+
+                                    let state = state.clone();
+                                    let content_box = content_box.clone();
+                                    let content_scroll = content_scroll.clone();
+                                    let home_pagination = home_pagination.clone();
+                                    let ps = ps.clone();
+                                    let recent_list = recent_list.clone();
+                                    let search_request_serial = search_request_serial.clone();
+                                    let search_suggestion_request_serial =
+                                        search_suggestion_request_serial.clone();
+                                    let search_suggestions_panel = search_suggestions_panel.clone();
+                                    let search_suggestions_box_for_click =
+                                        search_suggestions_box.clone();
+                                    let search_entry = search_entry.clone();
+                                    let suppress_search_suggestions =
+                                        suppress_search_suggestions.clone();
+                                    let suggestion_text = suggestion.clone();
+
+                                    suggestion_btn.connect_clicked(move |_| {
+                                        next_search_request_id(&search_suggestion_request_serial);
+                                        clear_box(&search_suggestions_box_for_click);
+                                        search_suggestions_panel.set_visible(false);
+                                        suppress_search_suggestions.set(true);
+                                        search_entry.set_text(&suggestion_text);
+                                        search_entry.set_position(-1);
+                                        run_sidebar_search(
+                                            &state,
+                                            &content_box,
+                                            &content_scroll,
+                                            &home_pagination,
+                                            &suggestion_text,
+                                            &ps,
+                                            &recent_list,
+                                            &search_request_serial,
+                                        );
+                                    });
+
+                                    search_suggestions_box.append(&suggestion_btn);
+                                }
+
+                                search_suggestions_panel.set_visible(true);
+                            }
+                            Ok(Some(Err(err))) => {
+                                eprintln!("[SEARCH] failed to fetch search suggestions: {err}");
+                                search_suggestions_panel.set_visible(false);
+                            }
+                            Ok(None) => {
+                                search_suggestions_panel.set_visible(false);
+                            }
+                            Err(err) => {
+                                eprintln!("[SEARCH] search suggestions worker failed: {err:?}");
+                                search_suggestions_panel.set_visible(false);
+                            }
+                        }
+                    });
+                    glib::ControlFlow::Break
+                });
+            *search_suggestion_debounce.borrow_mut() = Some(source);
+        });
+    }
+
+    {
+        let search_suggestions_panel = search_suggestions_panel.clone();
+        let search_suggestions_box = search_suggestions_box.clone();
+        search_entry.connect_has_focus_notify(move |entry| {
+            if entry.has_focus() {
+                return;
+            }
+            clear_box(&search_suggestions_box);
+            search_suggestions_panel.set_visible(false);
         });
     }
 
@@ -1307,6 +1543,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         content_scroll: scrolled,
         player_state: ps,
         recent_list,
+        search_entry,
         home_btn,
         home_pagination,
     }

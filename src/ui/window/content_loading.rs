@@ -390,6 +390,7 @@ pub(super) fn load_search(
     query: &str,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
+    request_serial: Option<(Rc<Cell<u64>>, u64)>,
 ) {
     clear_box(content_box);
     let loading = Label::new(Some(&format!("Searching \"{query}\"...")));
@@ -404,12 +405,19 @@ pub(super) fn load_search(
     let query = query.to_string();
     let ps = ps.clone();
     let recent_list = recent_list.clone();
+    let request_serial = request_serial.clone();
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
         let q = query.clone();
         let result =
             gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.search(&q))).await;
+
+        if let Some((serial, request_id)) = request_serial.as_ref() {
+            if serial.get() != *request_id {
+                return;
+            }
+        }
 
         clear_box(&content_box);
 
@@ -568,6 +576,8 @@ pub(super) fn normalize_playlist_browse_id(list_id: &str) -> String {
 pub(super) fn infer_browse_page_type(browse_id: &str) -> HomeBrowsePageType {
     if browse_id.starts_with("MPRE") {
         HomeBrowsePageType::Album
+    } else if browse_id.starts_with("MPSP") {
+        HomeBrowsePageType::PodcastShow
     } else if browse_id.starts_with("UC") {
         HomeBrowsePageType::UserChannel
     } else if browse_id.starts_with("VL")

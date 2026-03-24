@@ -45,6 +45,7 @@ pub(super) fn queue_preview_data_for_payload(
                 HomeBrowsePageType::Playlist => "Playlist".to_string(),
                 HomeBrowsePageType::Artist => "Artist".to_string(),
                 HomeBrowsePageType::UserChannel => "Channel".to_string(),
+                HomeBrowsePageType::PodcastShow => "Show".to_string(),
             }),
             thumbnail_url: thumbnail_url.clone(),
             duration: None,

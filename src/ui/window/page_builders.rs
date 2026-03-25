@@ -860,6 +860,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         repeat_mode: Cell::new(RepeatMode::Off),
         queue: RefCell::new(Vec::new()),
         queue_index: Cell::new(0),
+        playlist_context: RefCell::new(None),
         radio_virtual_playlist: RefCell::new(None),
         radio_append_in_flight: Cell::new(false),
         last_radio_append_anchor: RefCell::new(None),
@@ -1982,139 +1983,23 @@ pub(super) fn load_settings_page(
     offline_section.append(&offline_title);
 
     let offline_copy = Label::new(Some(
-        "Control how opinionated the automatic offline cache should be.",
+        "Control Listen again caching separately from Static's heuristic offline cache.",
     ));
     offline_copy.add_css_class("settings-card-copy");
     offline_copy.set_wrap(true);
     offline_copy.set_halign(Align::Start);
     offline_section.append(&offline_copy);
 
-    let manage_row = GtkBox::new(Orientation::Horizontal, 12);
-    manage_row.add_css_class("settings-row");
-    let manage_copy = GtkBox::new(Orientation::Vertical, 2);
-    manage_copy.set_hexpand(true);
-    let manage_label = Label::new(Some("Auto-manage offline cache"));
-    manage_label.add_css_class("settings-row-title");
-    manage_label.set_halign(Align::Start);
-    manage_copy.append(&manage_label);
-    let manage_hint = Label::new(Some(
-        "Keeps a rolling offline library based on your play history, without touching pinned downloads.",
-    ));
-    manage_hint.add_css_class("settings-row-copy");
-    manage_hint.set_wrap(true);
-    manage_hint.set_halign(Align::Start);
-    manage_copy.append(&manage_hint);
-    manage_row.append(&manage_copy);
-    let manage_switch = settings_switch(settings.auto_manage_offline_cache);
-    {
-        let state = state.clone();
-        let stack = stack.clone();
-        let guard_flag = Rc::new(Cell::new(false));
-        let guard_flag_closure = guard_flag.clone();
-        manage_switch.connect_active_notify(move |sw| {
-            if guard_flag_closure.get() {
-                return;
-            }
-
-            let active = sw.is_active();
-            if active {
-                let state = state.clone();
-                gio::spawn_blocking(move || {
-                    let _ = persist_and_sync_settings(&state, |s| s.auto_manage_offline_cache = true);
-                });
-                return;
-            }
-
-            guard_flag_closure.set(true);
-            sw.set_active(true);
-            guard_flag_closure.set(false);
-
-            let state = state.clone();
-            let sw = sw.clone();
-            let guard_flag = guard_flag.clone();
-            let stack_for_dialog = stack.clone();
-            glib::spawn_future_local(async move {
-                let impact = gio::spawn_blocking({
-                    let state = state.clone();
-                    move || {
-                        let guard = state.lock().unwrap();
-                        let cached = guard.cache.cached_ids().unwrap_or_default();
-                        let pinned = guard.cache.pinned_ids().unwrap_or_default();
-                        cached
-                            .into_iter()
-                            .filter(|video_id| !pinned.contains(video_id))
-                            .count()
-                    }
-                })
-                .await
-                .unwrap_or(0);
-
-                let song_label = if impact == 1 { "song" } else { "songs" };
-                let dialog = build_settings_warning_dialog(
-                    &stack_for_dialog,
-                    "Turn off local cache?",
-                    &format!(
-                        "{impact} auto-downloaded {song_label} will be deleted from Static’s local cache. Manually pinned downloads stay right where they are."
-                    ),
-                    &format!("Delete {impact} auto-downloaded {song_label}"),
-                );
-
-                let response = dialog.run_future().await;
-                dialog.close();
-
-                if response != ResponseType::Accept {
-                    guard_flag.set(true);
-                    sw.set_active(true);
-                    guard_flag.set(false);
-                    return;
-                }
-
-                match gio::spawn_blocking(move || -> anyhow::Result<usize> {
-                    let mut guard = state.lock().unwrap();
-                    let removed = guard.cache.clear_auto_downloads()?;
-                    let mut next_settings = guard.settings.clone();
-                    next_settings.auto_manage_offline_cache = false;
-                    guard.cache.save_settings(&next_settings)?;
-                    guard.settings = next_settings;
-                    Ok(removed)
-                })
-                .await
-                {
-                    Ok(Ok(removed)) => {
-                        eprintln!("[CACHE] removed {removed} auto-downloaded songs after disabling local cache");
-                        guard_flag.set(true);
-                        sw.set_active(false);
-                        guard_flag.set(false);
-                    }
-                    Ok(Err(err)) => {
-                        eprintln!("[SETTINGS] failed to disable local cache: {err}");
-                        guard_flag.set(true);
-                        sw.set_active(true);
-                        guard_flag.set(false);
-                    }
-                    Err(err) => {
-                        eprintln!("[SETTINGS] local cache disable worker failed: {err:?}");
-                        guard_flag.set(true);
-                        sw.set_active(true);
-                        guard_flag.set(false);
-                    }
-                }
-            });
-        });
-    }
-    manage_row.append(&manage_switch);
-    offline_section.append(&manage_row);
-
     let listen_again_row = GtkBox::new(Orientation::Horizontal, 12);
     listen_again_row.add_css_class("settings-row");
     let listen_again_copy = GtkBox::new(Orientation::Vertical, 2);
     listen_again_copy.set_hexpand(true);
-    let listen_again_label = Label::new(Some("Cache Listen again picks"));
+    let listen_again_label = Label::new(Some("Listen again cache"));
     listen_again_label.add_css_class("settings-row-title");
     listen_again_label.set_halign(Align::Start);
     listen_again_copy.append(&listen_again_label);
     let listen_again_hint = Label::new(Some(
-        "Also keep songs from Listen again offline. Static hangs onto them for up to 30 days, and removes older ones once they have not been played in that window.",
+        "Keep songs from Listen again offline separately from Static's heuristic offline cache.",
     ));
     listen_again_hint.add_css_class("settings-row-copy");
     listen_again_hint.set_wrap(true);
@@ -2168,9 +2053,9 @@ pub(super) fn load_settings_page(
                     let song_label = if impact == 1 { "song" } else { "songs" };
                     let dialog = build_settings_warning_dialog(
                         &stack,
-                        "Turn off Listen again auto-cache?",
+                        "Turn off Listen again cache?",
                         &format!(
-                            "{impact} auto-downloaded {song_label} would be evicted immediately because they only qualify through Listen again right now."
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they only qualify through Listen again cache right now."
                         ),
                         &format!("Apply and evict {impact} {song_label}"),
                     );
@@ -2197,16 +2082,201 @@ pub(super) fn load_settings_page(
     listen_again_row.append(&listen_again_switch);
     offline_section.append(&listen_again_row);
 
+    let listen_again_days_row = GtkBox::new(Orientation::Horizontal, 12);
+    listen_again_days_row.add_css_class("settings-row");
+    let listen_again_days_copy = GtkBox::new(Orientation::Vertical, 2);
+    listen_again_days_copy.set_hexpand(true);
+    let listen_again_days_label = Label::new(Some("Listen again cache days"));
+    listen_again_days_label.add_css_class("settings-row-title");
+    listen_again_days_label.set_halign(Align::Start);
+    listen_again_days_copy.append(&listen_again_days_label);
+    let listen_again_days_hint = Label::new(Some(
+        "How many days to keep Listen again songs offline after they were last recommended or played.",
+    ));
+    listen_again_days_hint.add_css_class("settings-row-copy");
+    listen_again_days_hint.set_wrap(true);
+    listen_again_days_hint.set_halign(Align::Start);
+    listen_again_days_copy.append(&listen_again_days_hint);
+    listen_again_days_row.append(&listen_again_days_copy);
+    let listen_again_days_spin = SpinButton::with_range(1.0, 365.0, 1.0);
+    listen_again_days_spin.set_value(settings.listen_again_cache_days as f64);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let listen_again_days_spin_ref = listen_again_days_spin.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        listen_again_days_spin.connect_value_changed(move |spin| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = (spin.value() as u32).clamp(1, 365);
+            let current_value = app_settings(&state).listen_again_cache_days;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let listen_again_days_spin = listen_again_days_spin_ref.clone();
+            let guard_flag = guard_flag.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || {
+                        preview_auto_cache_evictions(&state, |s| {
+                            s.listen_again_cache_days = next_value
+                        })
+                    }
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change =
+                    |guard_flag: &Rc<Cell<bool>>, spin: &SpinButton, value: u32| {
+                        guard_flag.set(true);
+                        spin.set_value(value as f64);
+                        guard_flag.set(false);
+                    };
+
+                if next_value < current_value && impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack,
+                        "Shorten Listen again cache?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they would fall outside the new Listen again cache window."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &listen_again_days_spin, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.listen_again_cache_days = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &listen_again_days_spin, next_value),
+                    _ => apply_change(&guard_flag, &listen_again_days_spin, current_value),
+                }
+            });
+        });
+    }
+    listen_again_days_row.append(&listen_again_days_spin);
+    offline_section.append(&listen_again_days_row);
+
+    let manage_row = GtkBox::new(Orientation::Horizontal, 12);
+    manage_row.add_css_class("settings-row");
+    let manage_copy = GtkBox::new(Orientation::Vertical, 2);
+    manage_copy.set_hexpand(true);
+    let manage_label = Label::new(Some("Offline cache"));
+    manage_label.add_css_class("settings-row-title");
+    manage_label.set_halign(Align::Start);
+    manage_copy.append(&manage_label);
+    let manage_hint = Label::new(Some(
+        "Uses Static's play-history heuristics to keep a rolling offline library, without touching pinned downloads or Listen again picks.",
+    ));
+    manage_hint.add_css_class("settings-row-copy");
+    manage_hint.set_wrap(true);
+    manage_hint.set_halign(Align::Start);
+    manage_copy.append(&manage_hint);
+    manage_row.append(&manage_copy);
+    let manage_switch = settings_switch(settings.auto_manage_offline_cache);
+    {
+        let state = state.clone();
+        let stack = stack.clone();
+        let manage_switch_ref = manage_switch.clone();
+        let guard_flag = Rc::new(Cell::new(false));
+        let guard_flag_closure = guard_flag.clone();
+        manage_switch.connect_active_notify(move |sw| {
+            if guard_flag_closure.get() {
+                return;
+            }
+
+            let next_value = sw.is_active();
+            let current_value = app_settings(&state).auto_manage_offline_cache;
+            if next_value == current_value {
+                return;
+            }
+
+            let state = state.clone();
+            let stack = stack.clone();
+            let manage_switch = manage_switch_ref.clone();
+            let guard_flag = guard_flag.clone();
+            glib::spawn_future_local(async move {
+                let impact = gio::spawn_blocking({
+                    let state = state.clone();
+                    move || {
+                        preview_auto_cache_evictions(&state, |s| {
+                            s.auto_manage_offline_cache = next_value
+                        })
+                    }
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+
+                let apply_change =
+                    |guard_flag: &Rc<Cell<bool>>, manage_switch: &Switch, value: bool| {
+                        guard_flag.set(true);
+                        manage_switch.set_active(value);
+                        guard_flag.set(false);
+                    };
+
+                if !next_value && impact > 0 {
+                    let song_label = if impact == 1 { "song" } else { "songs" };
+                    let dialog = build_settings_warning_dialog(
+                        &stack,
+                        "Turn off offline cache?",
+                        &format!(
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they only qualify through the heuristic offline cache right now."
+                        ),
+                        &format!("Apply and evict {impact} {song_label}"),
+                    );
+                    let response = dialog.run_future().await;
+                    dialog.close();
+                    if response != ResponseType::Accept {
+                        apply_change(&guard_flag, &manage_switch, current_value);
+                        return;
+                    }
+                }
+
+                match gio::spawn_blocking({
+                    let state = state.clone();
+                    move || persist_and_sync_settings(&state, |s| s.auto_manage_offline_cache = next_value)
+                })
+                .await
+                {
+                    Ok(Ok(())) => apply_change(&guard_flag, &manage_switch, next_value),
+                    _ => apply_change(&guard_flag, &manage_switch, current_value),
+                }
+            });
+        });
+    }
+    manage_row.append(&manage_switch);
+    offline_section.append(&manage_row);
+
     let target_row = GtkBox::new(Orientation::Horizontal, 12);
     target_row.add_css_class("settings-row");
     let target_copy = GtkBox::new(Orientation::Vertical, 2);
     target_copy.set_hexpand(true);
-    let target_label = Label::new(Some("Auto-cache target"));
+    let target_label = Label::new(Some("Offline cache target"));
     target_label.add_css_class("settings-row-title");
     target_label.set_halign(Align::Start);
     target_copy.append(&target_label);
     let target_hint = Label::new(Some(
-        "How many frequently played songs Static should keep ready offline.",
+        "How many play-history picks Static should keep ready offline through the heuristic cache.",
     ));
     target_hint.add_css_class("settings-row-copy");
     target_hint.set_wrap(true);
@@ -2256,9 +2326,9 @@ pub(super) fn load_settings_page(
                     let song_label = if impact == 1 { "song" } else { "songs" };
                     let dialog = build_settings_warning_dialog(
                         &stack,
-                        "Lower the auto-cache target?",
+                        "Lower the offline cache target?",
                         &format!(
-                            "{impact} auto-downloaded {song_label} would be evicted immediately to honor the smaller offline library size."
+                            "{impact} auto-downloaded {song_label} would be evicted immediately to honor the smaller heuristic offline library size."
                         ),
                         &format!("Apply and evict {impact} {song_label}"),
                     );
@@ -2294,7 +2364,7 @@ pub(super) fn load_settings_page(
     replay_label.set_halign(Align::Start);
     replay_copy.append(&replay_label);
     let replay_hint = Label::new(Some(
-        "How many rewatches a song needs before it becomes eligible for auto-offline caching.",
+        "How many rewatches a song needs before it becomes eligible for the heuristic offline cache.",
     ));
     replay_hint.add_css_class("settings-row-copy");
     replay_hint.set_wrap(true);
@@ -2347,7 +2417,7 @@ pub(super) fn load_settings_page(
                         &stack_for_dialog,
                         "Raise the offline replay threshold?",
                         &format!(
-                            "{impact} auto-downloaded {song_label} would be evicted immediately because they no longer qualify for offline caching."
+                            "{impact} auto-downloaded {song_label} would be evicted immediately because they no longer qualify for the heuristic offline cache."
                         ),
                         &format!("Apply and evict {impact} {song_label}"),
                     );

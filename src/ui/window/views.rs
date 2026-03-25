@@ -65,6 +65,8 @@ pub(super) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track
 pub(super) fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
     let queue_label = if snapshot.radio_virtual_playlist.is_some() {
         "Radio queue"
+    } else if snapshot.playlist_context.is_some() {
+        "Playlist"
     } else if snapshot.queue.len() > 1 {
         "Queue"
     } else {
@@ -292,7 +294,7 @@ pub(super) fn render_home_view(
         content_box.append(&header);
 
         if should_show_home_play_controls(first, &first_tracks) {
-            content_box.append(&build_play_controls(&first_tracks, state, ps, None));
+            content_box.append(&build_play_controls(&first_tracks, state, ps, None, None));
         }
 
         let cards_scroll = build_horizontal_cards_scroll(content_scroll);
@@ -330,7 +332,7 @@ pub(super) fn render_home_view(
         let tracks = home_section_tracks(section);
         let browse_cards = home_section_browse_cards(section);
         if should_show_home_play_controls(section, &tracks) {
-            content_box.append(&build_play_controls(&tracks, state, ps, None));
+            content_box.append(&build_play_controls(&tracks, state, ps, None, None));
         }
         if tracks.len() == section.contents.len() {
             let grid = gtk::Grid::new();
@@ -345,6 +347,7 @@ pub(super) fn render_home_view(
                     track,
                     i,
                     &section_tracks,
+                    None,
                     state,
                     ps,
                     recent_list,
@@ -480,7 +483,7 @@ pub(super) fn render_artist_view(
     if let Some(top_songs) = top_songs {
         let tracks = home_section_tracks(top_songs);
         if !tracks.is_empty() {
-            meta.append(&build_play_controls(&tracks, state, ps, None));
+            meta.append(&build_play_controls(&tracks, state, ps, None, None));
         }
     }
 
@@ -510,6 +513,7 @@ pub(super) fn render_artist_view(
                     track,
                     i,
                     &section_tracks,
+                    None,
                     state,
                     ps,
                     recent_list,
@@ -534,7 +538,7 @@ pub(super) fn render_artist_view(
         let tracks = home_section_tracks(section);
         let browse_cards = home_section_browse_cards(section);
         if tracks.len() == section.contents.len() && !tracks.is_empty() {
-            content_box.append(&build_play_controls(&tracks, state, ps, None));
+            content_box.append(&build_play_controls(&tracks, state, ps, None, None));
             let grid = gtk::Grid::new();
             grid.set_column_spacing(12);
             grid.set_row_spacing(8);
@@ -547,6 +551,7 @@ pub(super) fn render_artist_view(
                     track,
                     i,
                     &section_tracks,
+                    None,
                     state,
                     ps,
                     recent_list,
@@ -733,7 +738,7 @@ pub(super) fn render_search_view(
         section_header.set_halign(Align::Start);
         section_header.set_margin_top(8);
         content_box.append(&section_header);
-        content_box.append(&build_play_controls(&results.tracks, state, ps, None));
+        content_box.append(&build_play_controls(&results.tracks, state, ps, None, None));
 
         let grid = gtk::Grid::new();
         grid.set_column_spacing(12);
@@ -747,6 +752,7 @@ pub(super) fn render_search_view(
                 track,
                 i,
                 &tracks_rc,
+                None,
                 state,
                 ps,
                 recent_list,
@@ -1029,6 +1035,7 @@ pub(super) fn build_track_row(
     track: &Track,
     index: usize,
     all_tracks: &Rc<Vec<Track>>,
+    playlist_context: Option<PlaylistContext>,
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
@@ -1110,6 +1117,7 @@ pub(super) fn build_track_row(
         let recent_list = recent_list.clone();
         let track = track.clone();
         let all_tracks = all_tracks.clone();
+        let playlist_context = playlist_context.clone();
         let video_id = track.video_id.clone();
         let title = track.title.clone();
         let artist_str = artist_str.clone();
@@ -1118,7 +1126,7 @@ pub(super) fn build_track_row(
         row_btn.connect_clicked(move |_| {
             match click_behavior {
                 TrackRowClickBehavior::PlayFromContext => {
-                    play_from_context(&state, &ps, &all_tracks, index);
+                    play_from_context(&state, &ps, &all_tracks, index, playlist_context.clone());
                 }
                 TrackRowClickBehavior::StartRadio => {
                     play_track(

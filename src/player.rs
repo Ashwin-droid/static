@@ -2,7 +2,9 @@ use std::cell::RefCell;
 
 use gstreamer::ClockTime;
 
-use crate::ipc::{DaemonClient, PlaybackSnapshot, RepeatMode, millis_to_clock_time};
+use crate::ipc::{
+    DaemonClient, PlaybackSnapshot, PlaylistContext, RepeatMode, millis_to_clock_time,
+};
 use crate::models::{RadioVirtualPlaylist, Track};
 
 macro_rules! eprintln {
@@ -34,11 +36,18 @@ impl Player {
         &self,
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     ) -> Result<PlaybackSnapshot, String> {
         self.run_command(|client| {
-            client.replace_queue(queue, index, radio_virtual_playlist, repeat_mode)
+            client.replace_queue(
+                queue,
+                index,
+                playlist_context,
+                radio_virtual_playlist,
+                repeat_mode,
+            )
         })
     }
 
@@ -46,10 +55,17 @@ impl Player {
         &self,
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     ) -> Result<PlaybackSnapshot, String> {
-        self.set_queue(queue, index, radio_virtual_playlist, repeat_mode)
+        self.set_queue(
+            queue,
+            index,
+            playlist_context,
+            radio_virtual_playlist,
+            repeat_mode,
+        )
     }
 
     pub fn toggle_pause(&self) -> Result<PlaybackSnapshot, String> {

@@ -1417,10 +1417,9 @@ impl YtMusicClient {
             .send()
             .await
             .with_context(|| format!("Failed to fetch timed lyrics browse page {browse_id}"))?;
-        let json: Value = response
-            .json()
-            .await
-            .with_context(|| format!("Failed to parse timed lyrics browse response for {browse_id}"))?;
+        let json: Value = response.json().await.with_context(|| {
+            format!("Failed to parse timed lyrics browse response for {browse_id}")
+        })?;
         Ok(Self::parse_timed_lyrics_browse(&json))
     }
 

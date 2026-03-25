@@ -50,6 +50,14 @@ pub(super) fn load_likes(
                 count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
 
+                let playlist_context = playlist_context(
+                    "LM",
+                    "Liked Songs",
+                    None,
+                    None,
+                    PlaylistContextSource::Remote,
+                );
+
                 content_box.append(&build_play_controls(
                     &tracks,
                     &state,
@@ -60,6 +68,7 @@ pub(super) fn load_likes(
                         thumbnail_url: None,
                         subtitle: None,
                     }),
+                    Some(playlist_context.clone()),
                 ));
 
                 let grid = gtk::Grid::new();
@@ -76,6 +85,7 @@ pub(super) fn load_likes(
                         track,
                         i,
                         &tracks_rc,
+                        Some(playlist_context.clone()),
                         &state,
                         &ps,
                         &recent_list,
@@ -500,6 +510,13 @@ pub(super) fn load_playlist_detail(
     let playlist_id = playlist_id.to_string();
     let playlist_title = playlist_title.to_string();
     let playlist_thumb = playlist_thumb.map(|s| s.to_string());
+    let playlist_context = playlist_context(
+        &playlist_id,
+        &playlist_title,
+        playlist_thumb.as_deref(),
+        None,
+        PlaylistContextSource::Remote,
+    );
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
@@ -562,6 +579,7 @@ pub(super) fn load_playlist_detail(
                         thumbnail_url: playlist_thumb.clone(),
                         subtitle: Some(format!("{} tracks", tracks.len())),
                     }),
+                    Some(playlist_context.clone()),
                 ));
 
                 let grid = gtk::Grid::new();
@@ -578,6 +596,7 @@ pub(super) fn load_playlist_detail(
                         track,
                         i,
                         &tracks_rc,
+                        Some(playlist_context.clone()),
                         &state,
                         &ps,
                         &recent_list,
@@ -689,22 +708,23 @@ pub(super) fn load_browse_detail(
                 if autoplay {
                     let tracks = flatten_section_tracks(&sections);
                     if let Some(first_track) = tracks.first() {
-                        play_from_context(&state, &ps, &tracks, 0);
+                        play_from_context(&state, &ps, &tracks, 0, None);
                         add_to_recent(&recent_list, first_track, &state, &ps);
                     } else if let Some(card) = first_playable_browse_card(&sections) {
                         let state_bg = state.clone();
-                        let card = card.clone();
+                        let card_for_fetch = card.clone();
+                        let card_for_context = card.clone();
                         if let Ok(Some(Some(fallback_tracks))) = gio::spawn_blocking(move || {
                             let client = app_client(&state_bg)?;
-                            let tracks = match card.page_type {
+                            let tracks = match card_for_fetch.page_type {
                                 HomeBrowsePageType::Playlist
                                 | HomeBrowsePageType::Album
                                 | HomeBrowsePageType::PodcastShow => {
-                                    client.get_browse_tracks(&card.browse_id).ok()
+                                    client.get_browse_tracks(&card_for_fetch.browse_id).ok()
                                 }
                                 HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => {
                                     client
-                                        .get_channel_page(&card.browse_id)
+                                        .get_channel_page(&card_for_fetch.browse_id)
                                         .ok()
                                         .map(|page| flatten_section_tracks(&page.sections))
                                 }
@@ -714,7 +734,24 @@ pub(super) fn load_browse_detail(
                         .await
                         {
                             if let Some(first_track) = fallback_tracks.first() {
-                                play_from_context(&state, &ps, &fallback_tracks, 0);
+                                let fallback_playlist_context = (card_for_context.page_type
+                                    == HomeBrowsePageType::Playlist)
+                                    .then(|| {
+                                        playlist_context(
+                                            &card_for_context.browse_id,
+                                            &card_for_context.title,
+                                            card_for_context.thumbnail_url.as_deref(),
+                                            card_for_context.subtitle.as_deref(),
+                                            PlaylistContextSource::Browse,
+                                        )
+                                    });
+                                play_from_context(
+                                    &state,
+                                    &ps,
+                                    &fallback_tracks,
+                                    0,
+                                    fallback_playlist_context,
+                                );
                                 add_to_recent(&recent_list, first_track, &state, &ps);
                             }
                         }
@@ -785,7 +822,18 @@ pub(super) fn load_browse_detail(
                 }
 
                 if autoplay {
-                    play_from_context(&state, &ps, &tracks, 0);
+                    let browse_subtitle = format!("{} tracks", tracks.len());
+                    let autoplay_playlist_context = (page_type == HomeBrowsePageType::Playlist)
+                        .then(|| {
+                            playlist_context(
+                                &browse_id,
+                                &browse_title,
+                                browse_thumb.as_deref(),
+                                Some(&browse_subtitle),
+                                PlaylistContextSource::Browse,
+                            )
+                        });
+                    play_from_context(&state, &ps, &tracks, 0, autoplay_playlist_context);
                     if let Some(first_track) = tracks.first() {
                         add_to_recent(&recent_list, first_track, &state, &ps);
                     }
@@ -808,8 +856,25 @@ pub(super) fn load_browse_detail(
                     thumbnail_url: browse_thumb.clone(),
                     subtitle: Some(format!("{} tracks", tracks.len())),
                 });
+                let browse_subtitle = format!("{} tracks", tracks.len());
+                let browse_playlist_context =
+                    (page_type == HomeBrowsePageType::Playlist).then(|| {
+                        playlist_context(
+                            &browse_id,
+                            &browse_title,
+                            browse_thumb.as_deref(),
+                            Some(&browse_subtitle),
+                            PlaylistContextSource::Browse,
+                        )
+                    });
 
-                content_box.append(&build_play_controls(&tracks, &state, &ps, download_meta));
+                content_box.append(&build_play_controls(
+                    &tracks,
+                    &state,
+                    &ps,
+                    download_meta,
+                    browse_playlist_context.clone(),
+                ));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -825,6 +890,7 @@ pub(super) fn load_browse_detail(
                         track,
                         i,
                         &tracks_rc,
+                        browse_playlist_context.clone(),
                         &state,
                         &ps,
                         &recent_list,
@@ -954,6 +1020,13 @@ pub(super) fn load_offline_playlist_detail(
     let recent_list = recent_list.clone();
     let playlist_id = playlist_id.to_string();
     let playlist_title = playlist_title.to_string();
+    let playlist_context = playlist_context(
+        &playlist_id,
+        &playlist_title,
+        None,
+        None,
+        PlaylistContextSource::Offline,
+    );
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
@@ -1005,7 +1078,13 @@ pub(super) fn load_offline_playlist_detail(
                 count_label.set_margin_bottom(4);
                 content_box.append(&count_label);
 
-                content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+                content_box.append(&build_play_controls(
+                    &tracks,
+                    &state,
+                    &ps,
+                    None,
+                    Some(playlist_context.clone()),
+                ));
 
                 let grid = gtk::Grid::new();
                 grid.set_column_spacing(12);
@@ -1021,6 +1100,7 @@ pub(super) fn load_offline_playlist_detail(
                         track,
                         i,
                         &tracks_rc,
+                        Some(playlist_context.clone()),
                         &state,
                         &ps,
                         &recent_list,

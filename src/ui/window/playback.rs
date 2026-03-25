@@ -4,6 +4,7 @@ pub(super) fn sync_mpris_transport(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppSt
     if let Ok(snapshot) = ps.player.replace_queue(
         ps.queue.borrow().clone(),
         ps.queue_index.get(),
+        ps.playlist_context.borrow().clone(),
         ps.radio_virtual_playlist.borrow().clone(),
         ps.repeat_mode.get(),
     ) {
@@ -23,6 +24,7 @@ pub(super) fn sync_remote_queue(ps: &Rc<PlayerState>) {
     let _ = ps.player.replace_queue(
         ps.queue.borrow().clone(),
         ps.queue_index.get(),
+        ps.playlist_context.borrow().clone(),
         ps.radio_virtual_playlist.borrow().clone(),
         ps.repeat_mode.get(),
     );
@@ -78,6 +80,12 @@ pub(super) fn playback_snapshot_from_ui_state(ps: &PlayerState) -> PlaybackSnaps
     } else {
         snapshot.radio_virtual_playlist.clone()
     };
+    let playlist_context = if use_live_ui_queue {
+        ps.playlist_context.borrow().clone()
+    } else {
+        snapshot.playlist_context.clone()
+    };
+    snapshot.playlist_context = playlist_context;
     snapshot.radio_virtual_playlist = radio_virtual_playlist;
     if use_live_ui_queue {
         snapshot.repeat_mode = ps.repeat_mode.get();
@@ -125,6 +133,7 @@ pub(super) fn restore_playback_snapshot_via_daemon(
         client.play_queue_at(
             snapshot.queue.clone(),
             queue_index,
+            snapshot.playlist_context.clone(),
             snapshot.radio_virtual_playlist.clone(),
             snapshot.repeat_mode,
         )?
@@ -132,6 +141,7 @@ pub(super) fn restore_playback_snapshot_via_daemon(
         client.replace_queue(
             snapshot.queue.clone(),
             queue_index,
+            snapshot.playlist_context.clone(),
             snapshot.radio_virtual_playlist.clone(),
             snapshot.repeat_mode,
         )?
@@ -204,6 +214,14 @@ pub(super) fn persist_resume_snapshot_from_ui_state(ps: &PlayerState) {
     if let Err(err) = store_persisted_playback_state(&persisted) {
         eprintln!("[UI] failed to persist resume snapshot while closing: {err}");
     }
+    if let Some(playlist_context) = persisted.snapshot.playlist_context.as_ref() {
+        if let Err(err) = store_persisted_playlist_state(playlist_context, &persisted) {
+            eprintln!(
+                "[UI] failed to persist playlist resume state for {}: {err}",
+                playlist_context.playlist_id
+            );
+        }
+    }
 }
 
 pub(super) fn apply_remote_snapshot(
@@ -229,6 +247,10 @@ pub(super) fn apply_remote_snapshot(
             ps.radio_append_in_flight.set(false);
             *ps.last_radio_append_anchor.borrow_mut() = None;
         }
+    }
+
+    if *ps.playlist_context.borrow() != snapshot.playlist_context {
+        *ps.playlist_context.borrow_mut() = snapshot.playlist_context.clone();
     }
 
     if ps.repeat_mode.get() != snapshot.repeat_mode {

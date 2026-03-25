@@ -24,6 +24,7 @@ pub(super) fn play_track(
     ps.queue_index.set(0);
     set_queue_context(
         ps,
+        None,
         Some(RadioVirtualPlaylist {
             source_video_id: seed_track.video_id.clone(),
             touched_len: 1,
@@ -66,7 +67,7 @@ pub(super) fn play_track(
 
     glib::spawn_future_local(async move {
         let playback_result = gio::spawn_blocking(move || {
-            client.play_queue_at(queue, 0, radio_virtual_playlist, repeat_mode)
+            client.play_queue_at(queue, 0, None, radio_virtual_playlist, repeat_mode)
         })
         .await;
 
@@ -122,6 +123,7 @@ pub(super) fn play_track(
             ps.queue_index.set(0);
             set_queue_context(
                 &ps,
+                None,
                 Some(RadioVirtualPlaylist {
                     source_video_id: video_id.clone(),
                     touched_len: 1,
@@ -321,12 +323,19 @@ pub(super) fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>
     let request_serial = next_play_request_serial(&ps);
     let client = ps.player.daemon_client();
     let queue = ps.queue.borrow().clone();
+    let playlist_context = ps.playlist_context.borrow().clone();
     let radio_virtual_playlist = ps.radio_virtual_playlist.borrow().clone();
     let repeat_mode = ps.repeat_mode.get();
 
     glib::spawn_future_local(async move {
         let playback_result = gio::spawn_blocking(move || {
-            client.play_queue_at(queue, index, radio_virtual_playlist, repeat_mode)
+            client.play_queue_at(
+                queue,
+                index,
+                playlist_context,
+                radio_virtual_playlist,
+                repeat_mode,
+            )
         })
         .await;
 
@@ -356,6 +365,7 @@ pub(super) fn play_all(
     shuffle: bool,
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
+    playlist_context: Option<PlaylistContext>,
 ) {
     if tracks.is_empty() {
         return;
@@ -370,7 +380,7 @@ pub(super) fn play_all(
 
     *ps.queue.borrow_mut() = queue;
     ps.queue_index.set(0);
-    set_queue_context(ps, None);
+    set_queue_context(ps, playlist_context, None);
 
     play_from_queue(state, ps, 0);
 }
@@ -382,10 +392,83 @@ pub(super) fn build_play_controls(
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
     download_meta: Option<DownloadPlaylistMeta>,
+    playlist_context: Option<PlaylistContext>,
 ) -> GtkBox {
     let row = GtkBox::new(Orientation::Horizontal, 8);
     row.set_margin_start(28);
     row.set_margin_bottom(12);
+
+    let has_saved_resume =
+        playlist_context.as_ref().is_some_and(
+            |playlist_context| match load_persisted_playlist_state(playlist_context) {
+                Ok(Some(persisted)) => !persisted.snapshot.queue.is_empty(),
+                Ok(None) => false,
+                Err(err) => {
+                    eprintln!(
+                        "[UI] failed to load persisted playlist state for {}: {err}",
+                        playlist_context.playlist_id
+                    );
+                    false
+                }
+            },
+        );
+
+    if has_saved_resume {
+        let resume_btn = Button::new();
+        let resume_content = GtkBox::new(Orientation::Horizontal, 6);
+        resume_content.append(&svg_image(ICON_PLAY, 14));
+        resume_content.append(&Label::new(Some("Resume")));
+        resume_btn.set_child(Some(&resume_content));
+        resume_btn.add_css_class("nav-item");
+        {
+            let state = state.clone();
+            let ps = ps.clone();
+            let playlist_context = playlist_context.clone().unwrap();
+            let resume_btn_for_handler = resume_btn.clone();
+            resume_btn.connect_clicked(move |btn| {
+                btn.set_sensitive(false);
+                let state = state.clone();
+                let ps = ps.clone();
+                let resume_btn = resume_btn_for_handler.clone();
+                let playlist_context = playlist_context.clone();
+                glib::spawn_future_local(async move {
+                    let playlist_context_for_load = playlist_context.clone();
+                    let result =
+                        gio::spawn_blocking(move || -> anyhow::Result<PlaybackSnapshot> {
+                            let persisted =
+                                load_persisted_playlist_state(&playlist_context_for_load)?
+                                    .and_then(|persisted| {
+                                        (!persisted.snapshot.queue.is_empty()).then_some(persisted)
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("No saved state for this playlist")
+                                    })?;
+                            restore_playback_snapshot_via_daemon(persisted.snapshot, true)
+                        })
+                        .await;
+
+                    match result {
+                        Ok(Ok(snapshot)) => apply_remote_snapshot(&ps, &state, snapshot),
+                        Ok(Err(err)) => {
+                            eprintln!(
+                                "[UI] failed to resume playlist {}: {err}",
+                                playlist_context.playlist_id
+                            );
+                            resume_btn.set_sensitive(true);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[UI] playlist resume worker failed for {}: {err:?}",
+                                playlist_context.playlist_id
+                            );
+                            resume_btn.set_sensitive(true);
+                        }
+                    }
+                });
+            });
+        }
+        row.append(&resume_btn);
+    }
 
     let play_all_btn = Button::new();
     let play_all_content = GtkBox::new(Orientation::Horizontal, 6);
@@ -397,8 +480,9 @@ pub(super) fn build_play_controls(
         let tracks = tracks.to_vec();
         let state = state.clone();
         let ps = ps.clone();
+        let playlist_context = playlist_context.clone();
         play_all_btn.connect_clicked(move |_| {
-            play_all(&tracks, false, &state, &ps);
+            play_all(&tracks, false, &state, &ps, playlist_context.clone());
         });
     }
     row.append(&play_all_btn);
@@ -413,8 +497,9 @@ pub(super) fn build_play_controls(
         let tracks = tracks.to_vec();
         let state = state.clone();
         let ps = ps.clone();
+        let playlist_context = playlist_context.clone();
         shuffle_btn.connect_clicked(move |_| {
-            play_all(&tracks, true, &state, &ps);
+            play_all(&tracks, true, &state, &ps, playlist_context.clone());
         });
     }
     row.append(&shuffle_btn);

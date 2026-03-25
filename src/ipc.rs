@@ -1,11 +1,11 @@
 use std::fs;
-use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use gstreamer::ClockTime;
+use rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
 
@@ -16,6 +16,11 @@ use crate::ytmusic::client::SongRating;
 pub const DAEMON_BUS_NAME: &str = "com.static.music.staticd";
 pub const DAEMON_OBJECT_PATH: &str = "/com/static/music/Staticd";
 pub const DAEMON_INTERFACE: &str = "com.static.music.Staticd1";
+const PLAYBACK_STATE_DB_FILE_NAME: &str = "data.db";
+const PLAYBACK_STATE_TABLE: &str = "playback_state";
+const PLAYBACK_STATE_ROW_KEY: &str = "resume";
+const PLAYLIST_STATE_ROW_KEY_PREFIX: &str = "playlist";
+const PLAYBACK_STATE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepeatMode {
@@ -48,6 +53,7 @@ pub struct PlaybackSnapshot {
     pub current_track: Option<ActiveTrackSnapshot>,
     pub queue: Vec<Track>,
     pub queue_index: usize,
+    pub playlist_context: Option<PlaylistContext>,
     pub radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     pub repeat_mode: RepeatMode,
     pub paused: bool,
@@ -63,12 +69,49 @@ pub struct PersistedPlaybackState {
     pub saved_at_unix_millis: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaylistContextSource {
+    Remote,
+    Offline,
+    Browse,
+}
+
+impl PlaylistContextSource {
+    fn storage_key_segment(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Offline => "offline",
+            Self::Browse => "browse",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaylistContext {
+    pub playlist_id: String,
+    pub title: String,
+    pub thumbnail_url: Option<String>,
+    pub subtitle: Option<String>,
+    pub source: PlaylistContextSource,
+}
+
+impl PlaylistContext {
+    fn storage_key(&self) -> String {
+        format!(
+            "{PLAYLIST_STATE_ROW_KEY_PREFIX}:{}:{}",
+            self.source.storage_key_segment(),
+            self.playlist_id
+        )
+    }
+}
+
 impl Default for PlaybackSnapshot {
     fn default() -> Self {
         Self {
             current_track: None,
             queue: Vec::new(),
             queue_index: 0,
+            playlist_context: None,
             radio_virtual_playlist: None,
             repeat_mode: RepeatMode::Off,
             paused: false,
@@ -87,12 +130,14 @@ pub enum DaemonRequest {
     PlayQueueAt {
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     },
     ReplaceQueue {
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     },
@@ -158,8 +203,114 @@ fn send_request_raw(request: &DaemonRequest) -> Result<DaemonResponse> {
     send_request_raw_with_connection(&connection, request)
 }
 
-pub fn playback_state_path() -> PathBuf {
-    crate::logging::static_root().join("playback.json")
+fn playback_state_database_path() -> PathBuf {
+    crate::logging::static_root().join(PLAYBACK_STATE_DB_FILE_NAME)
+}
+
+fn open_playback_state_database(path: &Path) -> Result<SqliteConnection> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create playback state dir {}", parent.display()))?;
+    }
+
+    let db = SqliteConnection::open(path).with_context(|| {
+        format!(
+            "Failed to open playback state database at {}",
+            path.display()
+        )
+    })?;
+    db.busy_timeout(PLAYBACK_STATE_DB_BUSY_TIMEOUT)
+        .with_context(|| {
+            format!(
+                "Failed to configure playback state database at {}",
+                path.display()
+            )
+        })?;
+    db.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {PLAYBACK_STATE_TABLE} (
+            key     TEXT PRIMARY KEY,
+            payload TEXT NOT NULL
+        );"
+    ))
+    .with_context(|| {
+        format!(
+            "Failed to initialize playback state database at {}",
+            path.display()
+        )
+    })?;
+
+    Ok(db)
+}
+
+fn load_persisted_state_at_path(path: &Path, key: &str) -> Result<Option<PersistedPlaybackState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let db = open_playback_state_database(path)?;
+    let payload = db
+        .query_row(
+            &format!("SELECT payload FROM {PLAYBACK_STATE_TABLE} WHERE key = ?1"),
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .with_context(|| {
+            format!(
+                "Failed to read persisted playback state from {}",
+                path.display()
+            )
+        })?;
+
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+
+    serde_json::from_str(&payload)
+        .with_context(|| {
+            format!(
+                "Failed to parse persisted playback state from {}",
+                path.display()
+            )
+        })
+        .map(Some)
+}
+
+fn store_persisted_state_at_path(
+    path: &Path,
+    key: &str,
+    state: &PersistedPlaybackState,
+) -> Result<()> {
+    let db = open_playback_state_database(path)?;
+    let payload = serde_json::to_string(state)?;
+    db.execute(
+        &format!(
+            "INSERT INTO {PLAYBACK_STATE_TABLE} (key, payload) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET payload = excluded.payload"
+        ),
+        (key, payload),
+    )
+    .with_context(|| format!("Failed to persist playback state in {}", path.display()))?;
+    Ok(())
+}
+
+fn clear_persisted_state_at_path(path: &Path, key: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let db = open_playback_state_database(path)?;
+    db.execute(
+        &format!("DELETE FROM {PLAYBACK_STATE_TABLE} WHERE key = ?1"),
+        [key],
+    )
+    .with_context(|| {
+        format!(
+            "Failed to clear persisted playback state from {}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub fn current_unix_millis() -> u64 {
@@ -170,64 +321,39 @@ pub fn current_unix_millis() -> u64 {
 }
 
 pub fn load_persisted_playback_state() -> Result<Option<PersistedPlaybackState>> {
-    let path = playback_state_path();
-    let payload = match fs::read(&path) {
-        Ok(payload) => payload,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to read persisted playback state at {}",
-                    path.display()
-                )
-            });
-        }
-    };
-
-    serde_json::from_slice(&payload)
-        .with_context(|| {
-            format!(
-                "Failed to parse persisted playback state at {}",
-                path.display()
-            )
-        })
-        .map(Some)
+    load_persisted_state_at_path(&playback_state_database_path(), PLAYBACK_STATE_ROW_KEY)
 }
 
 pub fn store_persisted_playback_state(state: &PersistedPlaybackState) -> Result<()> {
-    let path = playback_state_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create playback state dir {}", parent.display()))?;
-    }
-
-    let payload = serde_json::to_vec_pretty(state)?;
-    let part_path = path.with_file_name(format!(
-        "{}.part",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("playback.json")
-    ));
-
-    fs::write(&part_path, payload)
-        .and_then(|_| fs::rename(&part_path, &path))
-        .with_context(|| format!("Failed to persist playback state to {}", path.display()))?;
-
-    Ok(())
+    store_persisted_state_at_path(
+        &playback_state_database_path(),
+        PLAYBACK_STATE_ROW_KEY,
+        state,
+    )
 }
 
 pub fn clear_persisted_playback_state() -> Result<()> {
-    let path = playback_state_path();
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| {
-            format!(
-                "Failed to clear persisted playback state at {}",
-                path.display()
-            )
-        }),
-    }
+    clear_persisted_state_at_path(&playback_state_database_path(), PLAYBACK_STATE_ROW_KEY)
+}
+
+pub fn load_persisted_playlist_state(
+    playlist_context: &PlaylistContext,
+) -> Result<Option<PersistedPlaybackState>> {
+    load_persisted_state_at_path(
+        &playback_state_database_path(),
+        &playlist_context.storage_key(),
+    )
+}
+
+pub fn store_persisted_playlist_state(
+    playlist_context: &PlaylistContext,
+    state: &PersistedPlaybackState,
+) -> Result<()> {
+    store_persisted_state_at_path(
+        &playback_state_database_path(),
+        &playlist_context.storage_key(),
+        state,
+    )
 }
 
 pub fn ensure_daemon_running() -> Result<()> {
@@ -295,12 +421,14 @@ impl DaemonClient {
         &self,
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     ) -> Result<PlaybackSnapshot> {
         match self.request(&DaemonRequest::PlayQueueAt {
             queue,
             index,
+            playlist_context,
             radio_virtual_playlist,
             repeat_mode,
         })? {
@@ -314,12 +442,14 @@ impl DaemonClient {
         &self,
         queue: Vec<Track>,
         index: usize,
+        playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     ) -> Result<PlaybackSnapshot> {
         match self.request(&DaemonRequest::ReplaceQueue {
             queue,
             index,
+            playlist_context,
             radio_virtual_playlist,
             repeat_mode,
         })? {
@@ -388,4 +518,188 @@ impl DaemonClient {
 
 pub fn millis_to_clock_time(value: Option<u64>) -> Option<ClockTime> {
     value.map(ClockTime::from_mseconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ActiveTrackSnapshot, PLAYBACK_STATE_ROW_KEY, PersistedPlaybackState, PlaybackSnapshot,
+        PlaylistContext, PlaylistContextSource, clear_persisted_state_at_path, current_unix_millis,
+        load_persisted_state_at_path, store_persisted_state_at_path,
+    };
+    use crate::ipc::RepeatMode;
+    use crate::models::Track;
+    use crate::ytmusic::client::SongRating;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_db_path() -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("static-ipc-test-{suffix}"))
+            .join("data.db")
+    }
+
+    #[test]
+    fn persisted_playback_state_round_trips_through_database() {
+        let path = unique_temp_db_path();
+        let snapshot = PlaybackSnapshot {
+            current_track: Some(ActiveTrackSnapshot {
+                video_id: "video-123".to_string(),
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                thumb_url: Some("https://example.com/thumb.jpg".to_string()),
+                rating: SongRating::Like,
+            }),
+            queue: Vec::new(),
+            queue_index: 0,
+            playlist_context: Some(PlaylistContext {
+                playlist_id: "PL123".to_string(),
+                title: "Coding Mix".to_string(),
+                thumbnail_url: Some("https://example.com/playlist.jpg".to_string()),
+                subtitle: Some("42 songs".to_string()),
+                source: PlaylistContextSource::Remote,
+            }),
+            radio_virtual_playlist: None,
+            repeat_mode: RepeatMode::All,
+            paused: true,
+            volume: 0.75,
+            position_millis: Some(12_345),
+            duration_millis: Some(67_890),
+            buffered_fraction: 0.5,
+        };
+        let persisted = PersistedPlaybackState {
+            snapshot,
+            saved_at_unix_millis: current_unix_millis(),
+        };
+
+        store_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY, &persisted).unwrap();
+        let loaded = load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY).unwrap();
+
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.saved_at_unix_millis, persisted.saved_at_unix_millis);
+        assert_eq!(loaded.snapshot.queue, persisted.snapshot.queue);
+        assert_eq!(loaded.snapshot.queue_index, persisted.snapshot.queue_index);
+        assert_eq!(
+            loaded
+                .snapshot
+                .playlist_context
+                .as_ref()
+                .map(|context| context.playlist_id.as_str()),
+            persisted
+                .snapshot
+                .playlist_context
+                .as_ref()
+                .map(|context| context.playlist_id.as_str())
+        );
+        assert_eq!(loaded.snapshot.repeat_mode, persisted.snapshot.repeat_mode);
+        assert_eq!(loaded.snapshot.paused, persisted.snapshot.paused);
+        assert_eq!(loaded.snapshot.volume, persisted.snapshot.volume);
+        assert_eq!(
+            loaded.snapshot.position_millis,
+            persisted.snapshot.position_millis
+        );
+        assert_eq!(
+            loaded.snapshot.duration_millis,
+            persisted.snapshot.duration_millis
+        );
+        assert_eq!(
+            loaded.snapshot.buffered_fraction,
+            persisted.snapshot.buffered_fraction
+        );
+        assert_eq!(
+            loaded
+                .snapshot
+                .current_track
+                .as_ref()
+                .map(|track| &track.video_id),
+            persisted
+                .snapshot
+                .current_track
+                .as_ref()
+                .map(|track| &track.video_id)
+        );
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn clearing_persisted_playback_state_removes_database_row() {
+        let path = unique_temp_db_path();
+        let persisted = PersistedPlaybackState {
+            snapshot: PlaybackSnapshot::default(),
+            saved_at_unix_millis: current_unix_millis(),
+        };
+
+        store_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY, &persisted).unwrap();
+        clear_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY).unwrap();
+
+        assert!(
+            load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn playlist_state_rows_do_not_clobber_global_resume_row() {
+        let path = unique_temp_db_path();
+        let global = PersistedPlaybackState {
+            snapshot: PlaybackSnapshot::default(),
+            saved_at_unix_millis: current_unix_millis(),
+        };
+        let playlist_context = PlaylistContext {
+            playlist_id: "PL456".to_string(),
+            title: "Late Night".to_string(),
+            thumbnail_url: None,
+            subtitle: Some("19 songs".to_string()),
+            source: PlaylistContextSource::Offline,
+        };
+        let playlist = PersistedPlaybackState {
+            snapshot: PlaybackSnapshot {
+                queue: vec![Track {
+                    video_id: "track-1".to_string(),
+                    title: "One".to_string(),
+                    artists: Vec::new(),
+                    album: None,
+                    duration: None,
+                    thumbnail_url: None,
+                }],
+                queue_index: 0,
+                playlist_context: Some(playlist_context.clone()),
+                ..PlaybackSnapshot::default()
+            },
+            saved_at_unix_millis: current_unix_millis(),
+        };
+
+        store_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY, &global).unwrap();
+        store_persisted_state_at_path(&path, &playlist_context.storage_key(), &playlist).unwrap();
+
+        let loaded_global = load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY).unwrap();
+        let loaded_playlist =
+            load_persisted_state_at_path(&path, &playlist_context.storage_key()).unwrap();
+
+        assert!(loaded_global.is_some());
+        assert!(loaded_playlist.is_some());
+        assert_eq!(loaded_global.unwrap().snapshot.queue.len(), 0);
+        assert_eq!(loaded_playlist.unwrap().snapshot.queue.len(), 1);
+
+        let _ = fs::remove_file(&path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
 }

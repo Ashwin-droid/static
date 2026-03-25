@@ -20,6 +20,7 @@ pub struct AppSettings {
     pub chromium_cookie_path: String,
     pub auto_manage_offline_cache: bool,
     pub auto_cache_listen_again: bool,
+    pub listen_again_cache_days: u32,
     pub offline_cache_target: u32,
     pub offline_rewatch_threshold: u32,
     pub score_decay_window_days: u32,
@@ -43,6 +44,7 @@ impl Default for AppSettings {
             chromium_cookie_path: String::new(),
             auto_manage_offline_cache: true,
             auto_cache_listen_again: true,
+            listen_again_cache_days: 30,
             offline_cache_target: 100,
             offline_rewatch_threshold: 1,
             score_decay_window_days: 30,
@@ -75,7 +77,7 @@ pub struct MusicCache {
     temp_dir: PathBuf,
 }
 
-const LISTEN_AGAIN_RETENTION_SECS: i64 = 30 * 24 * 60 * 60;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 impl MusicCache {
     fn default_base_dir() -> PathBuf {
@@ -349,6 +351,14 @@ impl MusicCache {
                     settings.auto_cache_listen_again =
                         parse_bool_setting(&row.1, settings.auto_cache_listen_again);
                 }
+                "listen_again_cache_days" => {
+                    settings.listen_again_cache_days = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.listen_again_cache_days)
+                        .clamp(1, 365);
+                }
                 "offline_cache_target" => {
                     settings.offline_cache_target = row
                         .1
@@ -463,6 +473,10 @@ impl MusicCache {
                 bool_setting(settings.auto_cache_listen_again),
             ),
             (
+                "listen_again_cache_days",
+                settings.listen_again_cache_days.to_string(),
+            ),
+            (
                 "offline_cache_target",
                 settings.offline_cache_target.to_string(),
             ),
@@ -571,7 +585,8 @@ impl MusicCache {
         settings: &AppSettings,
         limit: usize,
     ) -> Result<Vec<String>> {
-        if limit == 0 {
+        if !settings.auto_cache_listen_again && (!settings.auto_manage_offline_cache || limit == 0)
+        {
             return Ok(Vec::new());
         }
 
@@ -583,11 +598,15 @@ impl MusicCache {
         let mut seen_ids = std::collections::HashSet::new();
 
         if settings.auto_cache_listen_again {
-            for video_id in self.listen_again_candidate_ids()? {
+            for video_id in self.listen_again_candidate_ids(settings)? {
                 if seen_ids.insert(video_id.clone()) {
                     candidate_ids.push(video_id);
                 }
             }
+        }
+
+        if !settings.auto_manage_offline_cache || limit == 0 {
+            return Ok(candidate_ids);
         }
 
         let mut stmt = self.db.prepare(
@@ -615,12 +634,14 @@ impl MusicCache {
             right.partial_cmp(left).unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        let mut heuristic_count = 0usize;
         for (video_id, _) in ranked {
-            if candidate_ids.len() >= limit {
+            if heuristic_count >= limit {
                 break;
             }
             if seen_ids.insert(video_id.clone()) {
                 candidate_ids.push(video_id);
+                heuristic_count += 1;
             }
         }
 
@@ -799,7 +820,11 @@ impl MusicCache {
         Ok(())
     }
 
-    pub fn store_listen_again_snapshot(&self, video_ids: &[String]) -> Result<()> {
+    pub fn store_listen_again_snapshot(
+        &self,
+        video_ids: &[String],
+        settings: &AppSettings,
+    ) -> Result<()> {
         let now = epoch_secs();
         let tx = self.db.unchecked_transaction()?;
         for video_id in video_ids {
@@ -811,7 +836,7 @@ impl MusicCache {
             )?;
         }
         tx.commit()?;
-        self.prune_stale_listen_again_candidates()?;
+        self.prune_stale_listen_again_candidates(settings)?;
         Ok(())
     }
 
@@ -996,8 +1021,8 @@ impl MusicCache {
             .is_some())
     }
 
-    pub fn offline_listen_again_track_ids(&self) -> Result<Vec<String>> {
-        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+    pub fn offline_listen_again_track_ids(&self, settings: &AppSettings) -> Result<Vec<String>> {
+        let cutoff = self.listen_again_cutoff(settings);
         let mut stmt = self.db.prepare(
             "SELECT lac.video_id
              FROM listen_again_candidates lac
@@ -1077,25 +1102,8 @@ impl MusicCache {
         }
     }
 
-    pub fn clear_auto_downloads(&self) -> Result<usize> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT video_id FROM offline WHERE pinned = 0")?;
-        let ids: Vec<String> = stmt
-            .query_map([], |row| row.get(0))?
-            .filter_map(|row| row.ok())
-            .collect();
-
-        let removed = ids.len();
-        for video_id in ids {
-            let _ = self.remove_cached(&video_id);
-        }
-
-        Ok(removed)
-    }
-
-    fn listen_again_candidate_ids(&self) -> Result<Vec<String>> {
-        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+    fn listen_again_candidate_ids(&self, settings: &AppSettings) -> Result<Vec<String>> {
+        let cutoff = self.listen_again_cutoff(settings);
         let mut stmt = self.db.prepare(
             "SELECT lac.video_id
              FROM listen_again_candidates lac
@@ -1115,8 +1123,8 @@ impl MusicCache {
         Ok(ids)
     }
 
-    fn prune_stale_listen_again_candidates(&self) -> Result<()> {
-        let cutoff = epoch_secs() - LISTEN_AGAIN_RETENTION_SECS;
+    fn prune_stale_listen_again_candidates(&self, settings: &AppSettings) -> Result<()> {
+        let cutoff = self.listen_again_cutoff(settings);
         self.db.execute(
             "DELETE FROM listen_again_candidates
              WHERE video_id IN (
@@ -1129,6 +1137,10 @@ impl MusicCache {
             [cutoff],
         )?;
         Ok(())
+    }
+
+    fn listen_again_cutoff(&self, settings: &AppSettings) -> i64 {
+        epoch_secs() - (settings.listen_again_cache_days.max(1) as i64 * SECONDS_PER_DAY)
     }
 }
 

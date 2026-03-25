@@ -49,8 +49,9 @@ const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{
-    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, RepeatMode,
-    current_unix_millis, load_persisted_playback_state, store_persisted_playback_state,
+    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
+    PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playback_state,
+    load_persisted_playlist_state, store_persisted_playback_state, store_persisted_playlist_state,
 };
 use crate::models::{
     Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
@@ -207,6 +208,7 @@ struct PlayerState {
     // Queue / Radio
     queue: RefCell<Vec<Track>>,
     queue_index: Cell<usize>,
+    playlist_context: RefCell<Option<PlaylistContext>>,
     radio_virtual_playlist: RefCell<Option<RadioVirtualPlaylist>>,
     radio_append_in_flight: Cell<bool>,
     last_radio_append_anchor: RefCell<Option<String>>,
@@ -540,7 +542,28 @@ fn radio_source_video_id(ps: &PlayerState) -> Option<String> {
         .map(|radio| radio.source_video_id.clone())
 }
 
-fn set_queue_context(ps: &PlayerState, radio: Option<RadioVirtualPlaylist>) {
+fn playlist_context(
+    playlist_id: &str,
+    title: &str,
+    thumbnail_url: Option<&str>,
+    subtitle: Option<&str>,
+    source: PlaylistContextSource,
+) -> PlaylistContext {
+    PlaylistContext {
+        playlist_id: playlist_id.to_string(),
+        title: title.to_string(),
+        thumbnail_url: thumbnail_url.map(str::to_string),
+        subtitle: subtitle.map(str::to_string),
+        source,
+    }
+}
+
+fn set_queue_context(
+    ps: &PlayerState,
+    playlist_context: Option<PlaylistContext>,
+    radio: Option<RadioVirtualPlaylist>,
+) {
+    *ps.playlist_context.borrow_mut() = playlist_context;
     *ps.radio_virtual_playlist.borrow_mut() = radio;
     ps.radio_append_in_flight.set(false);
     *ps.last_radio_append_anchor.borrow_mut() = None;
@@ -726,10 +749,11 @@ fn play_from_context(
     ps: &Rc<PlayerState>,
     tracks: &[Track],
     index: usize,
+    playlist_context: Option<PlaylistContext>,
 ) {
     *ps.queue.borrow_mut() = tracks.to_vec();
     ps.queue_index.set(index);
-    set_queue_context(ps, None);
+    set_queue_context(ps, playlist_context, None);
     play_from_queue(state, ps, index);
 }
 

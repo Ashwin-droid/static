@@ -27,8 +27,9 @@ use zbus::interface;
 use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{
     ActiveTrackSnapshot, DAEMON_BUS_NAME, DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse,
-    PersistedPlaybackState, PlaybackSnapshot, RepeatMode, clear_persisted_playback_state,
-    current_unix_millis, store_persisted_playback_state,
+    PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, RepeatMode,
+    clear_persisted_playback_state, current_unix_millis, store_persisted_playback_state,
+    store_persisted_playlist_state,
 };
 use crate::models::{RadioVirtualPlaylist, Track};
 use crate::pipewire_monitor::PipeWireMonitor;
@@ -139,6 +140,7 @@ struct DaemonState {
     client: Option<Rc<YtMusicClient>>,
     queue: Vec<Track>,
     queue_index: usize,
+    playlist_context: Option<PlaylistContext>,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
     active_track: Option<ActiveTrack>,
@@ -636,6 +638,7 @@ pub fn run() -> Result<()> {
         client: None,
         queue: Vec::new(),
         queue_index: 0,
+        playlist_context: None,
         radio_virtual_playlist: None,
         repeat_mode: RepeatMode::Off,
         active_track: None,
@@ -757,13 +760,21 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         DaemonRequest::PlayQueueAt {
             queue,
             index,
+            playlist_context,
             radio_virtual_playlist,
             repeat_mode,
         } => {
             if !queue.is_empty() {
                 pause_other_mpris_players(state);
             }
-            match play_queue_at(state, queue, index, radio_virtual_playlist, repeat_mode) {
+            match play_queue_at(
+                state,
+                queue,
+                index,
+                playlist_context,
+                radio_virtual_playlist,
+                repeat_mode,
+            ) {
                 Ok(()) => {
                     maybe_persist_playback_state(state, true);
                     DaemonResponse::State(state_snapshot(state))
@@ -774,11 +785,13 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         DaemonRequest::ReplaceQueue {
             queue,
             index,
+            playlist_context,
             radio_virtual_playlist,
             repeat_mode,
         } => {
             state.queue = queue;
             state.queue_index = index.min(state.queue.len().saturating_sub(1));
+            state.playlist_context = playlist_context;
             state.radio_virtual_playlist = radio_virtual_playlist;
             state.radio_append_in_flight = false;
             state.last_radio_append_anchor = None;
@@ -1045,6 +1058,7 @@ fn play_queue_at(
     state: &mut DaemonState,
     queue: Vec<Track>,
     index: usize,
+    playlist_context: Option<PlaylistContext>,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
 ) -> Result<()> {
@@ -1054,6 +1068,7 @@ fn play_queue_at(
     }
     state.queue = queue;
     state.queue_index = index.min(state.queue.len().saturating_sub(1));
+    state.playlist_context = playlist_context;
     state.radio_virtual_playlist = radio_virtual_playlist;
     state.radio_append_in_flight = false;
     state.last_radio_append_anchor = None;
@@ -1762,16 +1777,16 @@ fn sync_auto_offline_cache(
     settings: &AppSettings,
     client: Option<&YtMusicClient>,
 ) {
-    if !settings.auto_manage_offline_cache {
-        return;
-    }
-
     let cache_target = settings.offline_cache_target as usize;
-    let top = match cache.auto_offline_candidates(settings, cache_target) {
-        Ok(candidates) => candidates,
-        Err(err) => {
-            eprintln!("[CACHE] failed to compute offline candidates: {err}");
-            return;
+    let top = if !settings.auto_manage_offline_cache && !settings.auto_cache_listen_again {
+        Vec::new()
+    } else {
+        match cache.auto_offline_candidates(settings, cache_target) {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                eprintln!("[CACHE] failed to compute offline candidates: {err}");
+                return;
+            }
         }
     };
     let cached = cache.cached_ids().unwrap_or_default();
@@ -1783,11 +1798,7 @@ fn sync_auto_offline_cache(
         }
     }
 
-    let to_download: Vec<String> = top
-        .into_iter()
-        .take(cache_target)
-        .filter(|id| !cached.contains(id))
-        .collect();
+    let to_download: Vec<String> = top.into_iter().filter(|id| !cached.contains(id)).collect();
 
     if to_download.is_empty() {
         return;
@@ -2530,6 +2541,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         current_track: persisted_playback_track_snapshot(state),
         queue: state.queue.clone(),
         queue_index: state.queue_index.min(state.queue.len().saturating_sub(1)),
+        playlist_context: state.playlist_context.clone(),
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         paused: state.active_track.is_some() && state.player.is_paused(),
@@ -2590,11 +2602,20 @@ fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
         snapshot,
         saved_at_unix_millis: current_unix_millis(),
     };
+    let playlist_context = payload.snapshot.playlist_context.clone();
 
     match store_persisted_playback_state(&payload) {
         Ok(()) => {
             state.last_persisted_playback_json = Some(snapshot_json);
             state.last_persisted_playback_at = Some(Instant::now());
+            if let Some(playlist_context) = playlist_context {
+                if let Err(err) = store_persisted_playlist_state(&playlist_context, &payload) {
+                    eprintln!(
+                        "[STATICD] failed to persist playlist state for {}: {err}",
+                        playlist_context.playlist_id
+                    );
+                }
+            }
         }
         Err(err) => eprintln!("[STATICD] failed to persist playback state: {err}"),
     }
@@ -2619,6 +2640,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             }),
         queue: state.queue.clone(),
         queue_index: state.queue_index,
+        playlist_context: state.playlist_context.clone(),
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         paused: state.player.is_paused(),

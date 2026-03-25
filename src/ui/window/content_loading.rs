@@ -93,7 +93,9 @@ pub(super) fn load_home(
                             history_thumbnail_candidate(track.thumbnail_url.as_deref()),
                         );
                     }
-                    guard.cache.store_listen_again_snapshot(&listen_again_ids)
+                    guard
+                        .cache
+                        .store_listen_again_snapshot(&listen_again_ids, &guard.settings)
                 })
                 .await;
                 render_home_view(
@@ -715,7 +717,7 @@ pub(super) fn load_offline_page_data(
 
     let listen_again_track_ids = guard
         .cache
-        .offline_listen_again_track_ids()
+        .offline_listen_again_track_ids(&guard.settings)
         .unwrap_or_default();
     if let Some(first_video_id) = listen_again_track_ids.first() {
         offline_playlists.insert(
@@ -845,7 +847,7 @@ pub(super) fn load_offline_playlist_tracks(
     let video_ids = if playlist_id == OFFLINE_LISTEN_AGAIN_PLAYLIST_ID {
         guard
             .cache
-            .offline_listen_again_track_ids()
+            .offline_listen_again_track_ids(&guard.settings)
             .unwrap_or_default()
     } else {
         guard
@@ -978,7 +980,7 @@ pub(super) fn load_offline(
                     count_label.set_margin_bottom(4);
                     content_box.append(&count_label);
 
-                    content_box.append(&build_play_controls(&tracks, &state, &ps, None));
+                    content_box.append(&build_play_controls(&tracks, &state, &ps, None, None));
 
                     let grid = GtkBox::new(Orientation::Vertical, 6);
                     grid.set_margin_start(20);
@@ -990,6 +992,7 @@ pub(super) fn load_offline(
                             track,
                             i,
                             &tracks_rc,
+                            None,
                             &state,
                             &ps,
                             &recent_list,

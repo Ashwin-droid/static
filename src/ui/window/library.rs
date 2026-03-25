@@ -338,9 +338,11 @@ pub(super) fn build_home_browse_row(
 
     let title_label = Label::new(Some(&card.title));
     title_label.set_halign(Align::Start);
-    title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title_label.add_css_class("track-title");
-    info.append(&title_label);
+    let title_sw = label_scroller(&title_label, 20);
+    title_sw.set_hexpand(true);
+    attach_hover_marquee(&row_btn, &title_sw, Some(&title_label));
+    info.append(&title_sw);
 
     let subtitle = card
         .subtitle
@@ -490,11 +492,12 @@ pub(super) fn build_browse_summary_card(
 
     let name = Label::new(Some(title));
     name.add_css_class("cover-card-title");
-    name.set_width_request(150);
     name.set_halign(Align::Start);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    name.set_max_width_chars(18);
-    card.append(&name);
+    let name_sw = label_scroller(&name, 20);
+    name_sw.set_width_request(150);
+    name_sw.set_max_content_width(150);
+    attach_hover_marquee(&card_btn, &name_sw, Some(&name));
+    card.append(&name_sw);
 
     if let Some(subtitle) = subtitle {
         let subtitle_label = Label::new(Some(subtitle));

@@ -616,12 +616,14 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     np_title.add_css_class("np-track-title");
     np_title.set_halign(Align::Start);
     let np_title_sw = label_scroller(&np_title, 22);
+    attach_hover_marquee(&text_box, &np_title_sw, Some(&np_title));
     text_box.append(&np_title_sw);
 
     let np_artist = Label::new(None);
     np_artist.add_css_class("np-track-artist");
     np_artist.set_halign(Align::Start);
     let np_artist_sw = label_scroller(&np_artist, 18);
+    attach_hover_marquee(&text_box, &np_artist_sw, Some(&np_artist));
     text_box.append(&np_artist_sw);
 
     track_info_box.append(&text_box);

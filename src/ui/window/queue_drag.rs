@@ -112,6 +112,7 @@ pub(super) fn build_queue_row_visual(
         let title_sw = label_scroller(&title_lbl, 18);
         title_sw.set_hexpand(true);
         title_sw.set_max_content_width(reserved_width);
+        attach_hover_marquee(&row, &title_sw, Some(&title_lbl));
         info.append(&title_sw);
 
         let artist_lbl = Label::new(Some(&preview.subtitle));
@@ -120,6 +121,7 @@ pub(super) fn build_queue_row_visual(
         let artist_sw = label_scroller(&artist_lbl, 16);
         artist_sw.set_hexpand(true);
         artist_sw.set_max_content_width(reserved_width);
+        attach_hover_marquee(&row, &artist_sw, Some(&artist_lbl));
         info.append(&artist_sw);
     } else {
         let title_lbl = Label::new(Some(&preview.title));

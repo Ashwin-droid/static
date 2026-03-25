@@ -58,6 +58,8 @@ pub(super) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track
                 album: None,
                 duration: None,
                 thumbnail_url: track.thumb_url.clone(),
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
             })
         })
 }
@@ -998,6 +1000,7 @@ pub(super) fn build_cover_card(
     }
     pop_box.append(&add_queue_btn);
 
+    append_track_feedback_actions(&pop_box, track, state);
     append_download_action(&pop_box, track, state, &popover);
 
     popover.set_child(Some(&pop_box));
@@ -1181,6 +1184,7 @@ pub(super) fn build_track_row(
     }
     pop_box.append(&add_queue_btn);
 
+    append_track_feedback_actions(&pop_box, track, state);
     append_download_action(&pop_box, track, state, &popover);
 
     popover.set_child(Some(&pop_box));

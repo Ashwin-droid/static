@@ -152,9 +152,9 @@ fn parse_home_item(item: &Value) -> Option<HomeItem> {
         .or_else(|| item.get("musicResponsiveListItemRenderer"))
         .or_else(|| item.get("musicMultiRowListItemRenderer"))?;
 
-    parse_track_from_renderer(renderer)
-        .map(HomeItem::Track)
-        .or_else(|| parse_home_browse_card(renderer).map(HomeItem::BrowseCard))
+    parse_home_browse_card(renderer)
+        .map(HomeItem::BrowseCard)
+        .or_else(|| parse_track_from_renderer(renderer).map(HomeItem::Track))
 }
 
 fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
@@ -172,6 +172,9 @@ fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
 }
 
 fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
+    let (not_interested_feedback_token, undo_feedback_token) =
+        extract_track_feedback_tokens(renderer);
+
     // Try responsive list item renderer format (shelf items)
     if let Some(flex_columns) = renderer.pointer("/flexColumns").and_then(|f| f.as_array()) {
         let title = flex_columns
@@ -210,6 +213,8 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             album: None,
             duration,
             thumbnail_url,
+            not_interested_feedback_token,
+            undo_feedback_token,
         });
     }
 
@@ -235,6 +240,8 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             album: None,
             duration: extract_duration(renderer),
             thumbnail_url,
+            not_interested_feedback_token,
+            undo_feedback_token,
         });
     }
 
@@ -256,6 +263,8 @@ fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .or_else(|| extract_watch_video_id(renderer))?;
+    let (not_interested_feedback_token, undo_feedback_token) =
+        extract_track_feedback_tokens(renderer);
 
     Some(Track {
         video_id,
@@ -264,7 +273,58 @@ fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
         album: None,
         duration: extract_duration(renderer),
         thumbnail_url: extract_thumbnail(renderer),
+        not_interested_feedback_token,
+        undo_feedback_token,
     })
+}
+
+fn extract_track_feedback_tokens(renderer: &Value) -> (Option<String>, Option<String>) {
+    let Some(items) = renderer
+        .pointer("/menu/menuRenderer/items")
+        .and_then(|value| value.as_array())
+    else {
+        return (None, None);
+    };
+
+    items.iter()
+        .find_map(|item| {
+            let renderer = item.get("menuServiceItemRenderer")?;
+            let text = renderer
+                .pointer("/text/runs")
+                .and_then(|runs| runs.as_array())
+                .map(|runs| join_runs(runs))
+                .or_else(|| {
+                    renderer
+                        .pointer("/text/simpleText")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })?;
+            if text != "Not interested" {
+                return None;
+            }
+
+            let endpoint = renderer.pointer("/serviceEndpoint/feedbackEndpoint")?;
+            let feedback_token = endpoint
+                .get("feedbackToken")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)?;
+            let undo_feedback_token = endpoint
+                .get("actions")
+                .and_then(|value| value.as_array())
+                .and_then(|actions| {
+                    actions.iter().find_map(|action| {
+                        action
+                            .pointer(
+                                "/openPopupAction/popup/notificationActionRenderer/actionButton/buttonRenderer/command/feedbackEndpoint/feedbackToken",
+                            )
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                });
+
+            Some((Some(feedback_token), undo_feedback_token))
+        })
+        .unwrap_or((None, None))
 }
 
 fn extract_watch_video_id(renderer: &Value) -> Option<String> {
@@ -971,6 +1031,85 @@ mod tests {
     }
 
     #[test]
+    fn home_items_prefer_browse_for_album_cards_with_play_overlay() {
+        let item = json!({
+            "musicTwoRowItemRenderer": {
+                "title": {
+                    "runs": [
+                        {
+                            "text": "Nostalgic Rock Covers, Vol. 1",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "MPREb_EGkJ2704KUj",
+                                    "params": "album-browse-params",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                },
+                "subtitle": {
+                    "runs": [
+                        { "text": "EP" },
+                        { "text": " • " },
+                        {
+                            "text": "The Nostal Days",
+                            "navigationEndpoint": {
+                                "browseEndpoint": {
+                                    "browseId": "UC6KUWbHoIgWKsjCBRuTsZwg",
+                                    "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                            "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                },
+                "navigationEndpoint": {
+                    "browseEndpoint": {
+                        "browseId": "MPREb_EGkJ2704KUj",
+                        "params": "album-browse-params",
+                        "browseEndpointContextSupportedConfigs": {
+                            "browseEndpointContextMusicConfig": {
+                                "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                            }
+                        }
+                    }
+                },
+                "thumbnailOverlay": {
+                    "musicItemThumbnailOverlayRenderer": {
+                        "content": {
+                            "musicPlayButtonRenderer": {
+                                "playNavigationEndpoint": {
+                                    "watchEndpoint": {
+                                        "videoId": "Vnqb4RqRm0g",
+                                        "playlistId": "OLAK5uy_n3HtnESc5n2OgMdDcqZ05nkKr36EXNc9s"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let parsed = parse_home_item(&item).expect("album card should parse");
+        let HomeItem::BrowseCard(card) = parsed else {
+            panic!("album card should stay a browse card even with a play overlay");
+        };
+
+        assert_eq!(card.browse_id, "MPREb_EGkJ2704KUj");
+        assert_eq!(card.title, "Nostalgic Rock Covers, Vol. 1");
+        assert_eq!(card.page_type, HomeBrowsePageType::Album);
+    }
+
+    #[test]
     fn home_items_parse_podcast_show_browse_cards() {
         let item = json!({
             "musicTwoRowItemRenderer": {
@@ -1107,6 +1246,91 @@ mod tests {
             track.artists[0].name,
             "Wuthering Waves, jixwang, & markmilian"
         );
+    }
+
+    #[test]
+    fn track_parser_extracts_not_interested_and_undo_tokens_from_menu() {
+        let renderer = json!({
+            "title": {
+                "runs": [
+                    {
+                        "text": "Quiet Focus",
+                        "navigationEndpoint": {
+                            "watchEndpoint": {
+                                "videoId": "focus123"
+                            }
+                        }
+                    }
+                ]
+            },
+            "subtitle": {
+                "runs": [
+                    {
+                        "text": "Calm Artist",
+                        "navigationEndpoint": {
+                            "browseEndpoint": {
+                                "browseId": "artist-focus",
+                                "browseEndpointContextSupportedConfigs": {
+                                    "browseEndpointContextMusicConfig": {
+                                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "menu": {
+                "menuRenderer": {
+                    "items": [
+                        {
+                            "menuServiceItemRenderer": {
+                                "text": {
+                                    "runs": [
+                                        { "text": "Not interested" }
+                                    ]
+                                },
+                                "serviceEndpoint": {
+                                    "feedbackEndpoint": {
+                                        "feedbackToken": "not-token-123",
+                                        "actions": [
+                                            { "signalServiceEndpoint": {} },
+                                            {
+                                                "openPopupAction": {
+                                                    "popup": {
+                                                        "notificationActionRenderer": {
+                                                            "actionButton": {
+                                                                "buttonRenderer": {
+                                                                    "text": {
+                                                                        "simpleText": "Undo"
+                                                                    },
+                                                                    "command": {
+                                                                        "feedbackEndpoint": {
+                                                                            "feedbackToken": "undo-token-456"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("track should parse");
+        assert_eq!(
+            track.not_interested_feedback_token.as_deref(),
+            Some("not-token-123")
+        );
+        assert_eq!(track.undo_feedback_token.as_deref(), Some("undo-token-456"));
     }
 
     #[test]
@@ -1348,6 +1572,8 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                         album: None,
                         duration,
                         thumbnail_url,
+                        not_interested_feedback_token: None,
+                        undo_feedback_token: None,
                     })
                 })
                 .collect()

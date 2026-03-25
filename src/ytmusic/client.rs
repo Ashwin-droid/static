@@ -1024,6 +1024,23 @@ impl YtMusicClient {
         })
     }
 
+    pub fn submit_feedback_token(&self, feedback_token: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            body["feedbackTokens"] = json!([feedback_token]);
+
+            self.post(&format!("{YTM_BASE_URL}/feedback?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .context("Failed to submit feedback")?
+                .error_for_status()
+                .context("YouTube Music rejected feedback request")?;
+
+            Ok(())
+        })
+    }
+
     /// Start a radio from a video, or switch to a different radio filter.
     ///
     /// - To start the default radio: `get_radio("VIDEO_ID", None, None)`

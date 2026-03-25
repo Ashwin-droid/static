@@ -8,6 +8,10 @@ pub struct Track {
     pub album: Option<String>,
     pub duration: Option<String>,
     pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_interested_feedback_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_feedback_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

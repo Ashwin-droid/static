@@ -656,6 +656,8 @@ pub(super) fn autoplay_video_url(
             album: None,
             duration: None,
             thumbnail_url: None,
+            not_interested_feedback_token: None,
+            undo_feedback_token: None,
         };
 
         let track = match result {
@@ -754,6 +756,8 @@ pub(super) fn load_offline_page_data(
                 album: None,
                 duration: None,
                 thumbnail_url,
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
             }
         })
         .collect();
@@ -880,6 +884,8 @@ pub(super) fn load_offline_playlist_tracks(
                 album: None,
                 duration: None,
                 thumbnail_url,
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
             }
         })
         .collect()

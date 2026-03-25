@@ -1,5 +1,27 @@
 use super::*;
 
+fn browse_collection_context(
+    page_type: HomeBrowsePageType,
+    browse_id: &str,
+    title: &str,
+    thumbnail_url: Option<&str>,
+    subtitle: Option<&str>,
+) -> Option<PlaylistContext> {
+    matches!(
+        page_type,
+        HomeBrowsePageType::Playlist | HomeBrowsePageType::Album
+    )
+    .then(|| {
+        playlist_context(
+            browse_id,
+            title,
+            thumbnail_url,
+            subtitle,
+            PlaylistContextSource::Browse,
+        )
+    })
+}
+
 pub(super) fn load_likes(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -734,17 +756,13 @@ pub(super) fn load_browse_detail(
                         .await
                         {
                             if let Some(first_track) = fallback_tracks.first() {
-                                let fallback_playlist_context = (card_for_context.page_type
-                                    == HomeBrowsePageType::Playlist)
-                                    .then(|| {
-                                        playlist_context(
-                                            &card_for_context.browse_id,
-                                            &card_for_context.title,
-                                            card_for_context.thumbnail_url.as_deref(),
-                                            card_for_context.subtitle.as_deref(),
-                                            PlaylistContextSource::Browse,
-                                        )
-                                    });
+                                let fallback_playlist_context = browse_collection_context(
+                                    card_for_context.page_type,
+                                    &card_for_context.browse_id,
+                                    &card_for_context.title,
+                                    card_for_context.thumbnail_url.as_deref(),
+                                    card_for_context.subtitle.as_deref(),
+                                );
                                 play_from_context(
                                     &state,
                                     &ps,
@@ -823,16 +841,13 @@ pub(super) fn load_browse_detail(
 
                 if autoplay {
                     let browse_subtitle = format!("{} tracks", tracks.len());
-                    let autoplay_playlist_context = (page_type == HomeBrowsePageType::Playlist)
-                        .then(|| {
-                            playlist_context(
-                                &browse_id,
-                                &browse_title,
-                                browse_thumb.as_deref(),
-                                Some(&browse_subtitle),
-                                PlaylistContextSource::Browse,
-                            )
-                        });
+                    let autoplay_playlist_context = browse_collection_context(
+                        page_type,
+                        &browse_id,
+                        &browse_title,
+                        browse_thumb.as_deref(),
+                        Some(&browse_subtitle),
+                    );
                     play_from_context(&state, &ps, &tracks, 0, autoplay_playlist_context);
                     if let Some(first_track) = tracks.first() {
                         add_to_recent(&recent_list, first_track, &state, &ps);
@@ -857,16 +872,13 @@ pub(super) fn load_browse_detail(
                     subtitle: Some(format!("{} tracks", tracks.len())),
                 });
                 let browse_subtitle = format!("{} tracks", tracks.len());
-                let browse_playlist_context =
-                    (page_type == HomeBrowsePageType::Playlist).then(|| {
-                        playlist_context(
-                            &browse_id,
-                            &browse_title,
-                            browse_thumb.as_deref(),
-                            Some(&browse_subtitle),
-                            PlaylistContextSource::Browse,
-                        )
-                    });
+                let browse_playlist_context = browse_collection_context(
+                    page_type,
+                    &browse_id,
+                    &browse_title,
+                    browse_thumb.as_deref(),
+                    Some(&browse_subtitle),
+                );
 
                 content_box.append(&build_play_controls(
                     &tracks,

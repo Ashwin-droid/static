@@ -18,6 +18,8 @@ pub(super) fn play_track(
         album: None,
         duration: None,
         thumbnail_url: thumb_url.map(String::from),
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
     };
 
     *ps.queue.borrow_mut() = vec![seed_track.clone()];
@@ -279,6 +281,135 @@ pub(super) fn append_download_action(
     });
 
     pop_box.append(&button);
+}
+
+pub(super) fn append_track_feedback_actions(
+    pop_box: &GtkBox,
+    track: &Track,
+    state: &Arc<Mutex<AppState>>,
+) {
+    let Some(not_interested_token) = track.not_interested_feedback_token.clone() else {
+        return;
+    };
+
+    let not_interested_btn = Button::with_label("Not interested");
+    not_interested_btn.add_css_class("popover-action-btn");
+    pop_box.append(&not_interested_btn);
+
+    let undo_btn = Button::with_label("Undo");
+    undo_btn.add_css_class("popover-action-btn");
+    undo_btn.set_visible(false);
+    pop_box.append(&undo_btn);
+
+    let in_flight = Rc::new(Cell::new(false));
+
+    {
+        let state = state.clone();
+        let not_interested_btn = not_interested_btn.clone();
+        let undo_btn = undo_btn.clone();
+        let undo_token = track.undo_feedback_token.clone();
+        let in_flight = in_flight.clone();
+        let not_interested_click_btn = not_interested_btn.clone();
+
+        not_interested_click_btn.connect_clicked(move |_| {
+            if in_flight.replace(true) {
+                return;
+            }
+
+            not_interested_btn.set_sensitive(false);
+            undo_btn.set_sensitive(false);
+
+            let state_bg = state.clone();
+            let feedback_token = not_interested_token.clone();
+            let not_interested_btn_done = not_interested_btn.clone();
+            let undo_btn_done = undo_btn.clone();
+            let undo_token_done = undo_token.clone();
+            let in_flight_done = in_flight.clone();
+
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    app_client(&state_bg).map_or_else(
+                        || Err(anyhow::anyhow!("YouTube Music is not connected")),
+                        |ytm| ytm.submit_feedback_token(&feedback_token),
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        not_interested_btn_done.set_visible(false);
+                        if undo_token_done.is_some() {
+                            undo_btn_done.set_visible(true);
+                            undo_btn_done.set_sensitive(true);
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("[FEEDBACK] failed to mark track as not interested: {err}");
+                        not_interested_btn_done.set_sensitive(true);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[FEEDBACK] failed to run not interested request worker: {err:?}"
+                        );
+                        not_interested_btn_done.set_sensitive(true);
+                    }
+                }
+
+                in_flight_done.set(false);
+            });
+        });
+    }
+
+    if let Some(undo_token) = track.undo_feedback_token.clone() {
+        let state = state.clone();
+        let not_interested_btn = not_interested_btn.clone();
+        let undo_btn = undo_btn.clone();
+        let in_flight = in_flight.clone();
+        let undo_click_btn = undo_btn.clone();
+
+        undo_click_btn.connect_clicked(move |_| {
+            if in_flight.replace(true) {
+                return;
+            }
+
+            not_interested_btn.set_sensitive(false);
+            undo_btn.set_sensitive(false);
+
+            let state_bg = state.clone();
+            let feedback_token = undo_token.clone();
+            let not_interested_btn_done = not_interested_btn.clone();
+            let undo_btn_done = undo_btn.clone();
+            let in_flight_done = in_flight.clone();
+
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || {
+                    app_client(&state_bg).map_or_else(
+                        || Err(anyhow::anyhow!("YouTube Music is not connected")),
+                        |ytm| ytm.submit_feedback_token(&feedback_token),
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        undo_btn_done.set_visible(false);
+                        not_interested_btn_done.set_visible(true);
+                        not_interested_btn_done.set_sensitive(true);
+                    }
+                    Ok(Err(err)) => {
+                        eprintln!("[FEEDBACK] failed to undo not interested: {err}");
+                        undo_btn_done.set_sensitive(true);
+                    }
+                    Err(err) => {
+                        eprintln!("[FEEDBACK] failed to run undo feedback worker: {err:?}");
+                        undo_btn_done.set_sensitive(true);
+                    }
+                }
+
+                in_flight_done.set(false);
+            });
+        });
+    }
 }
 
 /// Play a track from the queue by index (no radio re-fetch).
@@ -778,6 +909,7 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
 
             let pop_box = GtkBox::new(Orientation::Vertical, 0);
 
+            append_track_feedback_actions(&pop_box, track, state);
             append_download_action(&pop_box, track, state, &popover);
 
             let remove_btn = Button::with_label("Remove from queue");

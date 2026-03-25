@@ -677,6 +677,8 @@ mod tests {
                     album: None,
                     duration: None,
                     thumbnail_url: None,
+                    not_interested_feedback_token: None,
+                    undo_feedback_token: None,
                 }],
                 queue_index: 0,
                 playlist_context: Some(playlist_context.clone()),

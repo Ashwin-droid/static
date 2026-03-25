@@ -150,13 +150,6 @@ impl MusicCache {
 
     fn open_at_base(base: PathBuf) -> Result<Self> {
         let (offline_dir, art_dir, temp_dir) = Self::ensure_storage_layout(&base)?;
-        // Clean stale prefetch files on startup
-        if let Ok(entries) = std::fs::read_dir(&temp_dir) {
-            for entry in entries.flatten() {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-
         let db = Self::open_database(&base)?;
 
         Ok(Self {
@@ -1083,7 +1076,6 @@ impl MusicCache {
     }
 
     /// Clear all temp prefetch files.
-    #[allow(dead_code)]
     pub fn clear_temp(&self) {
         if let Ok(entries) = std::fs::read_dir(&self.temp_dir) {
             for entry in entries.flatten() {
@@ -1209,4 +1201,26 @@ fn copy_file_contents(from: &Path, to: &Path) -> Result<()> {
 
     std::fs::copy(from, to)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MusicCache;
+    use std::fs;
+    use uuid::Uuid;
+
+    #[test]
+    fn clear_temp_removes_prefetched_audio() {
+        let base = std::env::temp_dir().join(format!("static-cache-test-{}", Uuid::new_v4()));
+        let raw_root = base.to_string_lossy().to_string();
+
+        let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+        cache.store_temp_audio("video123", b"hello world");
+        assert!(cache.get_temp_audio("video123").is_some());
+
+        cache.clear_temp();
+        assert!(cache.get_temp_audio("video123").is_none());
+
+        let _ = fs::remove_dir_all(base);
+    }
 }

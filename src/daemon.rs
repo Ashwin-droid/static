@@ -626,6 +626,7 @@ pub fn run() -> Result<()> {
     let storage_root = get_storage_root();
     let cache = MusicCache::new_with_storage_root(storage_root.as_deref())
         .context("Failed to initialise music cache")?;
+    cache.clear_temp();
     let settings = cache.load_settings().unwrap_or_default();
     let player = PlaybackEngine::new();
     let initial_volume = player.volume();

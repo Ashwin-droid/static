@@ -141,6 +141,10 @@ impl PlaybackEngine {
         (self.buf_percent.get() as f64 / 100.0).clamp(0.0, 1.0)
     }
 
+    pub fn pipeline_state(&self) -> gst::State {
+        self.inner.pipeline().current_state()
+    }
+
     pub fn take_error(&self) -> Option<String> {
         self.last_error.borrow_mut().take()
     }

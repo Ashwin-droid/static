@@ -1271,12 +1271,13 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
     let startup_attempt = startup_retries.saturating_add(1);
     let elapsed_secs = active.started_at.elapsed().as_secs_f32();
     let buffered_percent = state.player.buffered_fraction() * 100.0;
+    let pipeline_state = state.player.pipeline_state();
 
     if startup_retries < PLAYBACK_START_RETRY_LIMIT {
         let next_retry = startup_retries.saturating_add(1);
         let next_attempt = next_retry.saturating_add(1);
         eprintln!(
-            "[DAEMON] playback start stalled for {video_id} from {} on startup attempt {startup_attempt}/{} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%); retrying ({next_attempt}/{})",
+            "[DAEMON] playback start stalled for {video_id} from {} on startup attempt {startup_attempt}/{} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%, pipeline {pipeline_state:?}); retrying ({next_attempt}/{})",
             playback_source.label(),
             playback_start_attempt_total(),
             playback_start_attempt_total(),
@@ -1426,6 +1427,7 @@ fn play_index_with_startup_retries(
     startup_retries: u8,
 ) -> Result<()> {
     stop_playback(state, false);
+    state.player = PlaybackEngine::new();
 
     let track = state
         .queue

@@ -98,14 +98,6 @@ impl PlaybackEngine {
         self.paused.set(false);
     }
 
-    pub fn toggle_pause(&self) {
-        if self.paused.get() {
-            self.resume();
-        } else {
-            self.pause();
-        }
-    }
-
     pub fn is_paused(&self) -> bool {
         self.paused.get()
     }

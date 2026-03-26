@@ -97,6 +97,8 @@ struct ActiveTrack {
     tracking: Option<TrackingInfo>,
     started_at: Instant,
     last_position_millis: u64,
+    previous_threshold_played_millis: u64,
+    previous_threshold_resumed_at: Option<Instant>,
     startup_seek_millis: Option<u64>,
     startup_retries: u8,
     awaiting_fresh_position: bool,
@@ -433,7 +435,7 @@ impl DaemonMprisBridge {
                 let mut state = state.borrow_mut();
                 if state.active_track.is_some() && !state.player.is_paused() {
                     state.peer_mpris.clear_waiting();
-                    state.player.pause();
+                    pause_local_playback(&mut state);
                     sync_mpris(&state);
                 }
             });
@@ -814,7 +816,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         }
         DaemonRequest::Pause => {
             state.peer_mpris.clear_waiting();
-            state.player.pause();
+            pause_local_playback(state);
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
@@ -1217,15 +1219,28 @@ fn should_sync_live_mpris_position(
             .unwrap_or(true)
 }
 
+fn should_emit_live_mpris_seeked_hint(
+    last_position_millis: Option<u64>,
+    next_position_millis: Option<u64>,
+) -> bool {
+    matches!(
+        (last_position_millis, next_position_millis),
+        (Some(last_position_millis), Some(next_position_millis))
+            if next_position_millis > last_position_millis
+                && next_position_millis / 1_000 > last_position_millis / 1_000
+    )
+}
+
 fn maybe_sync_live_mpris_position(state: &DaemonState) {
     if state.active_track.is_none() || state.player.is_paused() {
         return;
     }
 
+    let last_position_millis = state.last_mpris_position_millis.get();
     let next_position_millis = visible_position_millis(state);
     let now = Instant::now();
     if !should_sync_live_mpris_position(
-        state.last_mpris_position_millis.get(),
+        last_position_millis,
         next_position_millis,
         state.last_mpris_position_sync_at.get(),
         now,
@@ -1238,31 +1253,43 @@ fn maybe_sync_live_mpris_position(state: &DaemonState) {
         return;
     };
     bridge.sync_position(state);
+    if should_emit_live_mpris_seeked_hint(last_position_millis, next_position_millis) {
+        if let Some(position_millis) = next_position_millis {
+            bridge.emit_seeked((position_millis * 1_000) as i64);
+        }
+    }
     note_mpris_position_sync(state, next_position_millis, now);
 }
 
 fn note_explicit_seek(state: &mut DaemonState, target_millis: u64) {
-    let Some(track) = state.active_track.as_mut() else {
-        return;
-    };
+    let should_reset_previous_threshold = target_millis == 0;
+    {
+        let Some(track) = state.active_track.as_mut() else {
+            return;
+        };
 
-    if track.awaiting_fresh_position {
-        if target_millis > 0 {
-            if track.startup_seek_millis != Some(target_millis) {
-                eprintln!(
-                    "[DAEMON] tracking explicit startup seek for {} at {} ms",
-                    track.video_id, target_millis
-                );
+        if track.awaiting_fresh_position {
+            if target_millis > 0 {
+                if track.startup_seek_millis != Some(target_millis) {
+                    eprintln!(
+                        "[DAEMON] tracking explicit startup seek for {} at {} ms",
+                        track.video_id, target_millis
+                    );
+                }
+                track.startup_seek_millis = Some(target_millis);
+            } else {
+                track.startup_seek_millis = None;
             }
-            track.startup_seek_millis = Some(target_millis);
         } else {
             track.startup_seek_millis = None;
         }
-    } else {
-        track.startup_seek_millis = None;
+
+        track.last_position_millis = target_millis;
     }
 
-    track.last_position_millis = target_millis;
+    if should_reset_previous_threshold {
+        reset_previous_threshold_clock(state);
+    }
 }
 
 fn seek_to_position(state: &mut DaemonState, target: ClockTime) {
@@ -1297,9 +1324,60 @@ fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -
 }
 
 fn previous_threshold_millis(track: &ActiveTrack) -> u64 {
-    // Keep quick-back tied to real elapsed playback time so SponsorBlock seeks
-    // do not make a fresh track behave like it is already several seconds in.
-    track.started_at.elapsed().as_millis() as u64
+    let live_played_millis = track
+        .previous_threshold_resumed_at
+        .map(|resumed_at| resumed_at.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    track
+        .previous_threshold_played_millis
+        .saturating_add(live_played_millis)
+}
+
+fn pause_previous_threshold_clock_for_track(track: &mut ActiveTrack) {
+    let Some(resumed_at) = track.previous_threshold_resumed_at.take() else {
+        return;
+    };
+    track.previous_threshold_played_millis = track
+        .previous_threshold_played_millis
+        .saturating_add(resumed_at.elapsed().as_millis() as u64);
+}
+
+fn resume_previous_threshold_clock_for_track(track: &mut ActiveTrack) {
+    if track.previous_threshold_resumed_at.is_none() {
+        track.previous_threshold_resumed_at = Some(Instant::now());
+    }
+}
+
+fn reset_previous_threshold_clock_for_track(track: &mut ActiveTrack, playing: bool) {
+    track.previous_threshold_played_millis = 0;
+    track.previous_threshold_resumed_at = playing.then_some(Instant::now());
+}
+
+fn pause_local_playback(state: &mut DaemonState) {
+    if state.player.is_paused() {
+        return;
+    }
+    if let Some(track) = state.active_track.as_mut() {
+        pause_previous_threshold_clock_for_track(track);
+    }
+    state.player.pause();
+}
+
+fn resume_local_playback(state: &mut DaemonState) {
+    if !state.player.is_paused() {
+        return;
+    }
+    state.player.resume();
+    if let Some(track) = state.active_track.as_mut() {
+        resume_previous_threshold_clock_for_track(track);
+    }
+}
+
+fn reset_previous_threshold_clock(state: &mut DaemonState) {
+    let playing = !state.player.is_paused();
+    if let Some(track) = state.active_track.as_mut() {
+        reset_previous_threshold_clock_for_track(track, playing);
+    }
 }
 
 fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
@@ -1390,10 +1468,7 @@ fn previous_action(
 }
 
 fn handle_previous(state: &mut DaemonState) -> Result<()> {
-    let position_millis = state
-        .active_track
-        .as_ref()
-        .map(previous_threshold_millis);
+    let position_millis = state.active_track.as_ref().map(previous_threshold_millis);
     let queue_len = effective_queue_len(
         state.queue.len(),
         state.repeat_mode,
@@ -1420,10 +1495,7 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
 }
 
 fn handle_previous_for_user_action(state: &mut DaemonState) -> Result<()> {
-    let position_millis = state
-        .active_track
-        .as_ref()
-        .map(previous_threshold_millis);
+    let position_millis = state.active_track.as_ref().map(previous_threshold_millis);
     let queue_len = effective_queue_len(
         state.queue.len(),
         state.repeat_mode,
@@ -1455,7 +1527,11 @@ fn toggle_pause_for_user_action(state: &mut DaemonState) {
     } else {
         state.peer_mpris.clear_waiting();
     }
-    state.player.toggle_pause();
+    if state.player.is_paused() {
+        resume_local_playback(state);
+    } else {
+        pause_local_playback(state);
+    }
     sync_mpris(state);
 }
 
@@ -1464,7 +1540,7 @@ fn resume_for_user_action(state: &mut DaemonState) {
     if state.active_track.is_some() {
         pause_other_mpris_players(state);
     }
-    state.player.resume();
+    resume_local_playback(state);
     sync_mpris(state);
 }
 
@@ -1502,6 +1578,7 @@ fn play_index_with_startup_retries(
         state.player.set_volume(current_output_volume(state));
     }
     state.last_duration_micros.set(None);
+    let now = Instant::now();
     state.active_track = Some(ActiveTrack {
         video_id: track.video_id.clone(),
         title: track.title.clone(),
@@ -1510,8 +1587,10 @@ fn play_index_with_startup_retries(
         playback_source,
         rating: SongRating::Indifferent,
         tracking: None,
-        started_at: Instant::now(),
+        started_at: now,
         last_position_millis: 0,
+        previous_threshold_played_millis: 0,
+        previous_threshold_resumed_at: Some(now),
         startup_seek_millis: None,
         startup_retries,
         awaiting_fresh_position: true,
@@ -2865,7 +2944,7 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
             && !state.peer_mpris.is_waiting_for_peer_pause();
         state.pipewire_pause_active = false;
         if should_resume {
-            state.player.resume();
+            resume_local_playback(state);
             sync_mpris(state);
         }
     }
@@ -2892,7 +2971,7 @@ fn maybe_duck_for_pipewire(state: &mut DaemonState) {
                 state.pipewire_pause_active = true;
             }
             if !state.player.is_paused() {
-                state.player.pause();
+                pause_local_playback(state);
                 sync_mpris(state);
             }
         }
@@ -2920,7 +2999,7 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
         playing_services.join(", ")
     );
     state.peer_mpris.set_waiting_for_services(&playing_services);
-    state.player.pause();
+    pause_local_playback(state);
     sync_mpris(state);
 }
 
@@ -2965,7 +3044,7 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
     eprintln!(
         "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
     );
-    state.player.resume();
+    resume_local_playback(state);
     sync_mpris(state);
 }
 
@@ -3233,9 +3312,11 @@ mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
         PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
-        hide_timing_for_track, natural_end_target_index, playback_position_confirms_start,
-        playback_start_stalled, previous_action, previous_threshold_millis,
-        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+        hide_timing_for_track, natural_end_target_index, pause_previous_threshold_clock_for_track,
+        playback_position_confirms_start, playback_start_stalled, previous_action,
+        previous_threshold_millis, reset_previous_threshold_clock_for_track,
+        should_emit_live_mpris_seeked_hint, should_retry_after_offline_cache_failure,
+        should_sync_live_mpris_position,
     };
     use crate::ipc::RepeatMode;
     use crate::ytmusic::client::SongRating;
@@ -3252,6 +3333,8 @@ mod tests {
             tracking: None,
             started_at,
             last_position_millis: 0,
+            previous_threshold_played_millis: 0,
+            previous_threshold_resumed_at: Some(started_at),
             startup_seek_millis: None,
             startup_retries: 0,
             awaiting_fresh_position: true,
@@ -3309,6 +3392,18 @@ mod tests {
         let mut track = test_active_track(started_at);
         track.awaiting_fresh_position = false;
         track.last_position_millis = 75_000;
+
+        assert!(previous_threshold_millis(&track) < PREVIOUS_TRACK_THRESHOLD_MILLIS);
+    }
+
+    #[test]
+    fn previous_threshold_resets_after_restarting_current_track() {
+        let started_at = Instant::now() - Duration::from_secs(10);
+        let mut track = test_active_track(started_at);
+        track.awaiting_fresh_position = false;
+
+        pause_previous_threshold_clock_for_track(&mut track);
+        reset_previous_threshold_clock_for_track(&mut track, true);
 
         assert!(previous_threshold_millis(&track) < PREVIOUS_TRACK_THRESHOLD_MILLIS);
     }
@@ -3456,6 +3551,19 @@ mod tests {
             Some(1_250),
             Some(now - Duration::from_millis(300)),
             now
+        ));
+    }
+
+    #[test]
+    fn live_mpris_seeked_hint_emits_when_crossing_second_boundary() {
+        assert!(should_emit_live_mpris_seeked_hint(Some(950), Some(1_120)));
+    }
+
+    #[test]
+    fn live_mpris_seeked_hint_skips_intra_second_updates() {
+        assert!(!should_emit_live_mpris_seeked_hint(
+            Some(1_050),
+            Some(1_240)
         ));
     }
 }

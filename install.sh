@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE_FILE="${TMPDIR:-/tmp}/static-force-fix-state-$(date +%Y%m%d-%H%M%S).json"
 LOCAL_DESKTOP="${XDG_DATA_HOME:-$HOME/.local/share}/applications/com.static.music.desktop"
 SYSTEM_BIN="/usr/bin/static"
+CLEAN_BUILD=0
 
 log() {
   printf '[force-fix] %s\n' "$*"
@@ -15,6 +16,17 @@ require_cmd() {
     log "missing required command: $1"
     exit 1
   fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [--clean] [--no-clean] [--help]
+
+Options:
+  --clean     Run `cargo clean` before rebuilding the package.
+  --no-clean  Rebuild/install from the current target dir (default).
+  --help      Show this help text.
+EOF
 }
 
 python_dbus() {
@@ -138,6 +150,27 @@ for cmd in cargo gdbus pkexec python3 pgrep; do
   require_cmd "$cmd"
 done
 
+while (($#)); do
+  case "$1" in
+    --clean)
+      CLEAN_BUILD=1
+      ;;
+    --no-clean)
+      CLEAN_BUILD=0
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      log "unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 log "root dir: $ROOT_DIR"
 log "state file: $STATE_FILE"
 
@@ -159,8 +192,13 @@ else
   log "no local desktop override found"
 fi
 
-log "building fresh package"
-(cd "$ROOT_DIR" && cargo clean && cargo deb)
+if (( CLEAN_BUILD )); then
+  log "building fresh package with cargo clean && cargo deb"
+  (cd "$ROOT_DIR" && cargo clean && cargo deb)
+else
+  log "building fresh package with cargo deb --no-clean mode (default)"
+  (cd "$ROOT_DIR" && cargo deb)
+fi
 
 DEB_PATH="$(
   find "$ROOT_DIR/target/debian" -maxdepth 1 -type f -name 'static_*.deb' -printf '%T@ %p\n' \

@@ -595,7 +595,7 @@ impl DaemonMprisBridge {
     }
 
     fn sync_position(&self, state: &DaemonState) {
-        let position_us = visible_position_millis(state)
+        let position_us = mpris_position_millis(state)
             .map(|position_millis| (position_millis * 1_000) as i64)
             .unwrap_or(0);
         self.player
@@ -1204,6 +1204,43 @@ fn visible_duration_millis(state: &DaemonState) -> Option<u64> {
         .flatten()
 }
 
+fn mpris_position_millis_for_track(
+    track: &ActiveTrack,
+    player_position_millis: Option<u64>,
+    paused: bool,
+) -> Option<u64> {
+    if track.awaiting_fresh_position {
+        track
+            .startup_seek_millis
+            .or_else(|| player_position_millis.filter(|millis| *millis > 0))
+            .or_else(|| (!paused).then(|| track.started_at.elapsed().as_millis() as u64))
+            .or(Some(0))
+    } else {
+        player_position_millis
+    }
+}
+
+fn mpris_position_millis(state: &DaemonState) -> Option<u64> {
+    let track = state.active_track.as_ref()?;
+    let player_position_millis = state.player.position().map(|position| position.mseconds());
+    let duration_millis = state.player.duration().map(|duration| duration.mseconds());
+    let position_millis =
+        mpris_position_millis_for_track(track, player_position_millis, state.player.is_paused());
+
+    match (position_millis, duration_millis) {
+        (Some(position_millis), Some(duration_millis)) => {
+            Some(position_millis.min(duration_millis))
+        }
+        (position_millis, None) => position_millis,
+        (None, Some(_)) => None,
+    }
+}
+
+fn mpris_duration_millis(state: &DaemonState) -> Option<u64> {
+    state.active_track.as_ref()?;
+    state.player.duration().map(|duration| duration.mseconds())
+}
+
 fn should_sync_live_mpris_position(
     last_position_millis: Option<u64>,
     next_position_millis: Option<u64>,
@@ -1237,7 +1274,7 @@ fn maybe_sync_live_mpris_position(state: &DaemonState) {
     }
 
     let last_position_millis = state.last_mpris_position_millis.get();
-    let next_position_millis = visible_position_millis(state);
+    let next_position_millis = mpris_position_millis(state);
     let now = Instant::now();
     if !should_sync_live_mpris_position(
         last_position_millis,
@@ -2791,7 +2828,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
 fn sync_mpris(state: &DaemonState) {
     if let Some(bridge) = state.mpris.borrow().as_ref() {
         bridge.sync_all(state);
-        note_mpris_position_sync(state, visible_position_millis(state), Instant::now());
+        note_mpris_position_sync(state, mpris_position_millis(state), Instant::now());
     }
 }
 
@@ -3099,10 +3136,8 @@ fn build_mpris_metadata(state: &DaemonState) -> Metadata {
         .title(track.title.clone())
         .artist(vec![track.artist.clone()]);
 
-    if !hide_timing_for_track(track) {
-        if let Some(duration_millis) = visible_duration_millis(state) {
-            builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
-        }
+    if let Some(duration_millis) = mpris_duration_millis(state) {
+        builder = builder.length(MprisTime::from_micros((duration_millis * 1_000) as i64));
     }
 
     let art_url = state
@@ -3312,11 +3347,11 @@ mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
         PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
-        hide_timing_for_track, natural_end_target_index, pause_previous_threshold_clock_for_track,
-        playback_position_confirms_start, playback_start_stalled, previous_action,
-        previous_threshold_millis, reset_previous_threshold_clock_for_track,
-        should_emit_live_mpris_seeked_hint, should_retry_after_offline_cache_failure,
-        should_sync_live_mpris_position,
+        hide_timing_for_track, mpris_position_millis_for_track, natural_end_target_index,
+        pause_previous_threshold_clock_for_track, playback_position_confirms_start,
+        playback_start_stalled, previous_action, previous_threshold_millis,
+        reset_previous_threshold_clock_for_track, should_emit_live_mpris_seeked_hint,
+        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
     };
     use crate::ipc::RepeatMode;
     use crate::ytmusic::client::SongRating;
@@ -3530,6 +3565,27 @@ mod tests {
         let track = test_active_track(started_at);
         assert_eq!(current_listened_millis(None, &track), 0);
         assert_eq!(current_listened_millis(Some(0), &track), 0);
+    }
+
+    #[test]
+    fn mpris_position_uses_elapsed_time_while_waiting_for_first_real_sample() {
+        let started_at = Instant::now() - Duration::from_millis(1_200);
+        let track = test_active_track(started_at);
+
+        let visible = mpris_position_millis_for_track(&track, None, false).unwrap();
+        assert!((1_000..=2_000).contains(&visible));
+    }
+
+    #[test]
+    fn mpris_position_keeps_explicit_startup_seek_visible() {
+        let started_at = Instant::now() - Duration::from_millis(500);
+        let mut track = test_active_track(started_at);
+        track.startup_seek_millis = Some(180_000);
+
+        assert_eq!(
+            mpris_position_millis_for_track(&track, Some(250), false),
+            Some(180_000)
+        );
     }
 
     #[test]

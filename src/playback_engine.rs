@@ -1,5 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use gstreamer as gst;
 use gstreamer::ClockTime;
@@ -18,6 +22,9 @@ pub struct PlaybackEngine {
     paused: Cell<bool>,
     buf_percent: Rc<Cell<u32>>,
     last_error: Rc<RefCell<Option<String>>>,
+    cached_position_nanos: Arc<AtomicU64>,
+    cached_duration_nanos: Arc<AtomicU64>,
+    _signal_adapter: gst_play::PlaySignalAdapter,
     _bus_watch: gst::bus::BusWatchGuard,
 }
 
@@ -31,6 +38,41 @@ impl PlaybackEngine {
         let bp = buf_percent.clone();
         let last_error = Rc::new(RefCell::new(None));
         let last_error_for_watch = last_error.clone();
+        let cached_position_nanos = Arc::new(AtomicU64::new(u64::MAX));
+        let cached_duration_nanos = Arc::new(AtomicU64::new(u64::MAX));
+        let signal_adapter = gst_play::PlaySignalAdapter::new_sync_emit(&inner);
+
+        {
+            let cached_position_nanos = cached_position_nanos.clone();
+            signal_adapter.connect_position_updated(move |_, position| {
+                cached_position_nanos.store(
+                    position
+                        .map(|position| position.nseconds())
+                        .unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            });
+        }
+
+        {
+            let cached_position_nanos = cached_position_nanos.clone();
+            signal_adapter.connect_seek_done(move |_, position| {
+                cached_position_nanos.store(position.nseconds(), Ordering::Relaxed);
+            });
+        }
+
+        {
+            let cached_duration_nanos = cached_duration_nanos.clone();
+            signal_adapter.connect_duration_changed(move |_, duration| {
+                cached_duration_nanos.store(
+                    duration
+                        .map(|duration| duration.nseconds())
+                        .unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            });
+        }
+
         let bus = inner.message_bus();
         let bus_watch = bus
             .add_watch_local(move |_, msg| {
@@ -75,6 +117,9 @@ impl PlaybackEngine {
             paused: Cell::new(false),
             buf_percent,
             last_error,
+            cached_position_nanos,
+            cached_duration_nanos,
+            _signal_adapter: signal_adapter,
             _bus_watch: bus_watch,
         }
     }
@@ -83,6 +128,10 @@ impl PlaybackEngine {
         self.inner.stop();
         self.buf_percent.set(0);
         self.last_error.borrow_mut().take();
+        self.cached_position_nanos
+            .store(u64::MAX, Ordering::Relaxed);
+        self.cached_duration_nanos
+            .store(u64::MAX, Ordering::Relaxed);
         self.inner.set_uri(Some(uri));
         self.inner.play();
         self.paused.set(false);
@@ -107,9 +156,15 @@ impl PlaybackEngine {
         self.paused.set(false);
         self.buf_percent.set(0);
         self.last_error.borrow_mut().take();
+        self.cached_position_nanos
+            .store(u64::MAX, Ordering::Relaxed);
+        self.cached_duration_nanos
+            .store(u64::MAX, Ordering::Relaxed);
     }
 
     pub fn seek(&self, position: ClockTime) {
+        self.cached_position_nanos
+            .store(position.nseconds(), Ordering::Relaxed);
         self.inner.seek(position);
     }
 
@@ -122,11 +177,11 @@ impl PlaybackEngine {
     }
 
     pub fn position(&self) -> Option<ClockTime> {
-        self.inner.position()
+        atomic_nanos_to_clock_time(&self.cached_position_nanos).or_else(|| self.inner.position())
     }
 
     pub fn duration(&self) -> Option<ClockTime> {
-        self.inner.duration()
+        atomic_nanos_to_clock_time(&self.cached_duration_nanos).or_else(|| self.inner.duration())
     }
 
     pub fn buffered_fraction(&self) -> f64 {
@@ -140,4 +195,9 @@ impl PlaybackEngine {
     pub fn take_error(&self) -> Option<String> {
         self.last_error.borrow_mut().take()
     }
+}
+
+fn atomic_nanos_to_clock_time(nanos: &AtomicU64) -> Option<ClockTime> {
+    let nanos = nanos.load(Ordering::Relaxed);
+    (nanos != u64::MAX).then(|| ClockTime::from_nseconds(nanos))
 }

@@ -185,28 +185,13 @@ pub(super) fn probe_track(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<
     });
 }
 
-pub(super) fn jump_to_radio_seed(
-    index: usize,
+fn spawn_jump_to_radio_seed_tail_refresh(
+    expected_index: usize,
+    prefix_len: usize,
+    seed_track: Track,
     ps: &Rc<PlayerState>,
     state: &Arc<Mutex<AppState>>,
 ) {
-    if !is_radio_queue(ps) {
-        return;
-    }
-
-    let Some(seed_track) = ps.queue.borrow().get(index).cloned() else {
-        return;
-    };
-    let prefix_len = index.saturating_add(1);
-
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.source_video_id = seed_track.video_id.clone();
-    }
-    replace_radio_tail(ps, prefix_len, Vec::new(), Vec::new());
-    ps.radio_append_in_flight.set(true);
-
-    play_from_queue(state, ps, index);
-
     let state = state.clone();
     let ps = ps.clone();
     let seed_video_id = seed_track.video_id.clone();
@@ -221,7 +206,11 @@ pub(super) fn jump_to_radio_seed(
 
         let still_current_seed = is_radio_queue(&ps)
             && radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str())
-            && ps.queue_index.get() == index;
+            && ps
+                .queue
+                .borrow()
+                .get(expected_index)
+                .is_some_and(|track| track.video_id == seed_video_id);
         if !still_current_seed {
             if radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str()) {
                 ps.radio_append_in_flight.set(false);
@@ -251,6 +240,59 @@ pub(super) fn jump_to_radio_seed(
 
         ps.radio_append_in_flight.set(false);
     });
+}
+
+pub(super) fn jump_to_radio_seed(
+    index: usize,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    if !is_radio_queue(ps) {
+        return;
+    }
+
+    let Some(seed_track) = ps.queue.borrow().get(index).cloned() else {
+        return;
+    };
+
+    mark_radio_touched_through(ps, index);
+    let prefix_len = radio_touched_len(ps).unwrap_or_else(|| index.saturating_add(1));
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        radio.source_video_id = seed_track.video_id.clone();
+        radio.chips.clear();
+    }
+    ps.radio_append_in_flight.set(true);
+    *ps.last_radio_append_anchor.borrow_mut() = None;
+    render_queue_panel(ps, state);
+    sync_remote_queue(ps);
+    sync_mpris_transport(ps, state);
+    spawn_jump_to_radio_seed_tail_refresh(index, prefix_len, seed_track, ps, state);
+}
+
+pub(super) fn jump_to_radio_seed_from_track(
+    track: Track,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    if !is_radio_queue(ps) {
+        return;
+    }
+
+    let queue_len = ps.queue.borrow().len();
+    let insert_at = radio_touched_len(ps).unwrap_or(queue_len).min(queue_len);
+    ps.queue.borrow_mut().insert(insert_at, track.clone());
+    extend_radio_touched_for_insert(ps, insert_at, 1);
+    let prefix_len = radio_touched_len(ps).unwrap_or_else(|| insert_at.saturating_add(1));
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        radio.source_video_id = track.video_id.clone();
+        radio.chips.clear();
+    }
+    ps.radio_append_in_flight.set(true);
+    *ps.last_radio_append_anchor.borrow_mut() = None;
+    render_queue_panel(ps, state);
+    sync_remote_queue(ps);
+    sync_mpris_transport(ps, state);
+    spawn_jump_to_radio_seed_tail_refresh(insert_at, prefix_len, track, ps, state);
 }
 
 /// Insert a track right after the currently-playing position.
@@ -1014,46 +1056,46 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
         row_wrapper.add_controller(click);
 
         // Right-click context menu
-        if i != current_idx {
-            let popover = Popover::new();
-            popover.add_css_class("context-menu");
-            popover.set_has_arrow(false);
-            popover.set_position(gtk::PositionType::Bottom);
+        let popover = Popover::new();
+        popover.add_css_class("context-menu");
+        popover.set_has_arrow(false);
+        popover.set_position(gtk::PositionType::Bottom);
 
-            let pop_box = GtkBox::new(Orientation::Vertical, 0);
+        let pop_box = GtkBox::new(Orientation::Vertical, 0);
 
-            if is_radio_queue(ps) {
-                let jump_btn = Button::with_label("Jump to");
-                jump_btn.add_css_class("popover-action-btn");
-                {
-                    let ps = ps.clone();
-                    let state = state.clone();
-                    let popover = popover.clone();
-                    jump_btn.connect_clicked(move |_| {
-                        popover.popdown();
-                        jump_to_radio_seed(i, &ps, &state);
-                    });
-                }
-                pop_box.append(&jump_btn);
-            }
-
-            let probe_btn = Button::with_label("Probe");
-            probe_btn.add_css_class("popover-action-btn");
+        if is_radio_queue(ps) {
+            let jump_btn = Button::with_label("Jump to");
+            jump_btn.add_css_class("popover-action-btn");
             {
-                let track = track.clone();
                 let ps = ps.clone();
                 let state = state.clone();
                 let popover = popover.clone();
-                probe_btn.connect_clicked(move |_| {
+                jump_btn.connect_clicked(move |_| {
                     popover.popdown();
-                    probe_track(track.clone(), &ps, &state);
+                    jump_to_radio_seed(i, &ps, &state);
                 });
             }
-            pop_box.append(&probe_btn);
+            pop_box.append(&jump_btn);
+        }
 
-            append_track_feedback_actions(&pop_box, track, state);
-            append_download_action(&pop_box, track, state, &popover);
+        let probe_btn = Button::with_label("Probe");
+        probe_btn.add_css_class("popover-action-btn");
+        {
+            let track = track.clone();
+            let ps = ps.clone();
+            let state = state.clone();
+            let popover = popover.clone();
+            probe_btn.connect_clicked(move |_| {
+                popover.popdown();
+                probe_track(track.clone(), &ps, &state);
+            });
+        }
+        pop_box.append(&probe_btn);
 
+        append_track_feedback_actions(&pop_box, track, state);
+        append_download_action(&pop_box, track, state, &popover);
+
+        if i != current_idx {
             let remove_btn = Button::with_label("Remove from queue");
             remove_btn.add_css_class("popover-action-btn");
             {
@@ -1066,35 +1108,35 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
                 });
             }
             pop_box.append(&remove_btn);
-
-            popover.set_child(Some(&pop_box));
-            popover.set_parent(&row_wrapper);
-
-            // On open: dim all siblings, highlight this row
-            {
-                let queue_list = ps.queue_list_box.clone();
-                let row_wrapper_ref = row_wrapper.clone();
-                popover.connect_notify_local(Some("visible"), move |pop, _| {
-                    if pop.is_visible() {
-                        queue_list.add_css_class("queue-ctx-active");
-                        row_wrapper_ref.add_css_class("queue-row-focused");
-                    } else {
-                        queue_list.remove_css_class("queue-ctx-active");
-                        row_wrapper_ref.remove_css_class("queue-row-focused");
-                    }
-                });
-            }
-
-            let rc_gesture = GestureClick::new();
-            rc_gesture.set_button(3);
-            {
-                let popover = popover.clone();
-                rc_gesture.connect_pressed(move |_, _, _, _| {
-                    popover.popup();
-                });
-            }
-            row_wrapper.add_controller(rc_gesture);
         }
+
+        popover.set_child(Some(&pop_box));
+        popover.set_parent(&row_wrapper);
+
+        // On open: dim all siblings, highlight this row
+        {
+            let queue_list = ps.queue_list_box.clone();
+            let row_wrapper_ref = row_wrapper.clone();
+            popover.connect_notify_local(Some("visible"), move |pop, _| {
+                if pop.is_visible() {
+                    queue_list.add_css_class("queue-ctx-active");
+                    row_wrapper_ref.add_css_class("queue-row-focused");
+                } else {
+                    queue_list.remove_css_class("queue-ctx-active");
+                    row_wrapper_ref.remove_css_class("queue-row-focused");
+                }
+            });
+        }
+
+        let rc_gesture = GestureClick::new();
+        rc_gesture.set_button(3);
+        {
+            let popover = popover.clone();
+            rc_gesture.connect_pressed(move |_, _, _, _| {
+                popover.popup();
+            });
+        }
+        row_wrapper.add_controller(rc_gesture);
 
         // Drag source
         let drag_source = DragSource::new();

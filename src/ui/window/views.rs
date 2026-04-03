@@ -1133,6 +1133,22 @@ pub(super) fn build_cover_card(
     }
     pop_box.append(&add_queue_btn);
 
+    if is_radio_queue(ps) {
+        let jump_btn = Button::with_label("Jump to");
+        jump_btn.add_css_class("popover-action-btn");
+        {
+            let track = track.clone();
+            let ps = ps.clone();
+            let state = state.clone();
+            let popover = popover.clone();
+            jump_btn.connect_clicked(move |_| {
+                popover.popdown();
+                jump_to_radio_seed_from_track(track.clone(), &ps, &state);
+            });
+        }
+        pop_box.append(&jump_btn);
+    }
+
     let probe_btn = Button::with_label("Probe");
     probe_btn.add_css_class("popover-action-btn");
     {
@@ -1332,6 +1348,36 @@ pub(super) fn build_track_row(
         });
     }
     pop_box.append(&add_queue_btn);
+
+    if is_radio_queue(ps) {
+        let jump_btn = Button::with_label("Jump to");
+        jump_btn.add_css_class("popover-action-btn");
+        {
+            let track = track.clone();
+            let ps = ps.clone();
+            let state = state.clone();
+            let popover = popover.clone();
+            jump_btn.connect_clicked(move |_| {
+                popover.popdown();
+                jump_to_radio_seed_from_track(track.clone(), &ps, &state);
+            });
+        }
+        pop_box.append(&jump_btn);
+    }
+
+    let probe_btn = Button::with_label("Probe");
+    probe_btn.add_css_class("popover-action-btn");
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        probe_btn.connect_clicked(move |_| {
+            popover.popdown();
+            probe_track(track.clone(), &ps, &state);
+        });
+    }
+    pop_box.append(&probe_btn);
 
     append_track_feedback_actions(&pop_box, track, state);
     append_download_action(&pop_box, track, state, &popover);

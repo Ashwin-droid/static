@@ -91,13 +91,26 @@ pub(super) fn playback_snapshot_from_ui_state(ps: &PlayerState) -> PlaybackSnaps
         snapshot.repeat_mode = ps.repeat_mode.get();
     }
     snapshot.volume = ps.volume_slider.value();
-    snapshot.position_millis = ps
-        .now_playing_track
-        .borrow()
-        .as_ref()
-        .map(|track| track.last_observed_position_millis)
-        .filter(|position| *position > 0)
-        .or(snapshot.position_millis);
+    if snapshot.probe_active {
+        snapshot.current_track = snapshot
+            .queue
+            .get(snapshot.queue_index)
+            .map(active_track_snapshot_from_track);
+        snapshot.position_millis = snapshot.probe_restore_position_millis;
+        snapshot.duration_millis = None;
+        snapshot.buffered_fraction = 0.0;
+        snapshot.paused = true;
+        snapshot.probe_active = false;
+        snapshot.probe_restore_position_millis = None;
+    } else {
+        snapshot.position_millis = ps
+            .now_playing_track
+            .borrow()
+            .as_ref()
+            .map(|track| track.last_observed_position_millis)
+            .filter(|position| *position > 0)
+            .or(snapshot.position_millis);
+    }
 
     if snapshot.current_track.is_none() {
         snapshot.current_track = snapshot

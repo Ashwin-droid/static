@@ -61,6 +61,10 @@ pub struct PlaybackSnapshot {
     pub position_millis: Option<u64>,
     pub duration_millis: Option<u64>,
     pub buffered_fraction: f64,
+    #[serde(default)]
+    pub probe_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_restore_position_millis: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +123,8 @@ impl Default for PlaybackSnapshot {
             position_millis: None,
             duration_millis: None,
             buffered_fraction: 0.0,
+            probe_active: false,
+            probe_restore_position_millis: None,
         }
     }
 }
@@ -140,6 +146,9 @@ pub enum DaemonRequest {
         playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
+    },
+    ProbeTrack {
+        track: Track,
     },
     TogglePause,
     Pause,
@@ -459,6 +468,14 @@ impl DaemonClient {
         }
     }
 
+    pub fn probe_track(&self, track: Track) -> Result<PlaybackSnapshot> {
+        match self.request(&DaemonRequest::ProbeTrack { track })? {
+            DaemonResponse::State(state) => Ok(state),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
+    }
+
     pub fn toggle_pause(&self) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::TogglePause)
     }
@@ -571,6 +588,8 @@ mod tests {
             position_millis: Some(12_345),
             duration_millis: Some(67_890),
             buffered_fraction: 0.5,
+            probe_active: false,
+            probe_restore_position_millis: None,
         };
         let persisted = PersistedPlaybackState {
             snapshot,

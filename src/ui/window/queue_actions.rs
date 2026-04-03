@@ -135,6 +135,124 @@ pub(super) fn play_track(
     });
 }
 
+pub(super) fn probe_track(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    let title = track.title.clone();
+    let artist = artist_string(&track);
+    let thumb_url = track.thumbnail_url.clone();
+
+    clear_sponsorblock_state(ps);
+    ps.lyrics_request_serial
+        .set(ps.lyrics_request_serial.get().wrapping_add(1));
+    show_lyrics_loading(ps);
+    ps.np_title.set_text(&title);
+    ps.np_artist.set_text(&artist);
+    ps.time_label.set_text("0:00 / 0:00");
+    ps.progress_slider.set_value(0.0);
+    ps.progress_slider.set_fill_level(0.0);
+    set_button_icon(&ps.play_pause_btn, ICON_PLAY, 28);
+    ps.play_pause_btn.set_sensitive(false);
+
+    if let Some(url) = &thumb_url {
+        load_thumbnail_into(&ps.np_thumb, url, 80);
+    } else {
+        ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
+    }
+
+    let state = state.clone();
+    let ps = ps.clone();
+    let request_serial = next_play_request_serial(&ps);
+    let client = ps.player.daemon_client();
+
+    glib::spawn_future_local(async move {
+        let playback_result = gio::spawn_blocking(move || client.probe_track(track)).await;
+
+        if !is_current_play_request(&ps, request_serial) {
+            return;
+        }
+
+        match playback_result {
+            Ok(Ok(snapshot)) => apply_remote_snapshot(&ps, &state, snapshot),
+            Ok(Err(err)) => {
+                ps.np_title.set_text(&err.to_string());
+                ps.np_artist.set_text("");
+            }
+            Err(err) => {
+                ps.np_title
+                    .set_text(&format!("Probe playback failed: {err:?}"));
+                ps.np_artist.set_text("");
+            }
+        }
+    });
+}
+
+pub(super) fn jump_to_radio_seed(
+    index: usize,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    if !is_radio_queue(ps) {
+        return;
+    }
+
+    let Some(seed_track) = ps.queue.borrow().get(index).cloned() else {
+        return;
+    };
+    let prefix_len = index.saturating_add(1);
+
+    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
+        radio.source_video_id = seed_track.video_id.clone();
+    }
+    replace_radio_tail(ps, prefix_len, Vec::new(), Vec::new());
+    ps.radio_append_in_flight.set(true);
+
+    play_from_queue(state, ps, index);
+
+    let state = state.clone();
+    let ps = ps.clone();
+    let seed_video_id = seed_track.video_id.clone();
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let seed_track = seed_track.clone();
+        let seed_video_id_for_request = seed_video_id.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_radio(&seed_video_id_for_request, None, None))
+        })
+        .await;
+
+        let still_current_seed = is_radio_queue(&ps)
+            && radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str())
+            && ps.queue_index.get() == index;
+        if !still_current_seed {
+            if radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str()) {
+                ps.radio_append_in_flight.set(false);
+            }
+            return;
+        }
+
+        if let Ok(Some(Ok(mut radio))) = result {
+            let idx = radio
+                .tracks
+                .iter()
+                .position(|track| track.video_id == seed_video_id);
+            if let Some(i) = idx {
+                if i > 0 {
+                    let track = radio.tracks.remove(i);
+                    radio.tracks.insert(0, track);
+                }
+            } else {
+                radio.tracks.insert(0, seed_track);
+            }
+
+            replace_radio_tail(&ps, prefix_len, radio.tracks, radio.chips);
+            render_queue_panel(&ps, &state);
+            sync_remote_queue(&ps);
+            sync_mpris_transport(&ps, &state);
+        }
+
+        ps.radio_append_in_flight.set(false);
+    });
+}
+
 /// Insert a track right after the currently-playing position.
 pub(super) fn queue_play_next(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     let insert_at = ps.queue_index.get() + 1;
@@ -903,6 +1021,35 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
             popover.set_position(gtk::PositionType::Bottom);
 
             let pop_box = GtkBox::new(Orientation::Vertical, 0);
+
+            if is_radio_queue(ps) {
+                let jump_btn = Button::with_label("Jump to");
+                jump_btn.add_css_class("popover-action-btn");
+                {
+                    let ps = ps.clone();
+                    let state = state.clone();
+                    let popover = popover.clone();
+                    jump_btn.connect_clicked(move |_| {
+                        popover.popdown();
+                        jump_to_radio_seed(i, &ps, &state);
+                    });
+                }
+                pop_box.append(&jump_btn);
+            }
+
+            let probe_btn = Button::with_label("Probe");
+            probe_btn.add_css_class("popover-action-btn");
+            {
+                let track = track.clone();
+                let ps = ps.clone();
+                let state = state.clone();
+                let popover = popover.clone();
+                probe_btn.connect_clicked(move |_| {
+                    popover.popdown();
+                    probe_track(track.clone(), &ps, &state);
+                });
+            }
+            pop_box.append(&probe_btn);
 
             append_track_feedback_actions(&pop_box, track, state);
             append_download_action(&pop_box, track, state, &popover);

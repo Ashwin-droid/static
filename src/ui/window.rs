@@ -749,9 +749,7 @@ fn replace_radio_tail(
 
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
         radio.touched_len = radio.touched_len.min(prefix_len);
-        if !chips.is_empty() {
-            radio.chips = chips;
-        }
+        radio.chips = chips;
     }
     *ps.last_radio_append_anchor.borrow_mut() = None;
 }

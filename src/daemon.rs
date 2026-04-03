@@ -93,6 +93,7 @@ struct ActiveTrack {
     artist: String,
     thumb_url: Option<String>,
     playback_source: PlaybackSource,
+    reporting_enabled: bool,
     rating: SongRating,
     tracking: Option<TrackingInfo>,
     started_at: Instant,
@@ -136,6 +137,14 @@ struct VolumeRamp {
     target_volume: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ProbeRestoreState {
+    queue_index: usize,
+    queue_video_id: Option<String>,
+    position_millis: Option<u64>,
+    resume_playback: bool,
+}
+
 struct DaemonState {
     player: PlaybackEngine,
     cache: MusicCache,
@@ -147,6 +156,7 @@ struct DaemonState {
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
     active_track: Option<ActiveTrack>,
+    probe_context: Option<ProbeRestoreState>,
     sponsor_segments: Vec<SponsorSegment>,
     sponsor_segments_reported: HashSet<String>,
     prefetch_in_flight: HashSet<String>,
@@ -648,6 +658,7 @@ pub fn run() -> Result<()> {
         radio_virtual_playlist: None,
         repeat_mode: RepeatMode::Off,
         active_track: None,
+        probe_context: None,
         sponsor_segments: Vec::new(),
         sponsor_segments_reported: HashSet::new(),
         prefetch_in_flight: HashSet::new(),
@@ -809,17 +820,49 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
+        DaemonRequest::ProbeTrack { track } => {
+            if state.probe_context.is_none() && state.active_track.is_some() {
+                pause_other_mpris_players(state);
+            }
+            match probe_track(state, track) {
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
         DaemonRequest::TogglePause => {
-            toggle_pause_for_user_action(state);
-            maybe_persist_playback_state(state, true);
-            DaemonResponse::State(state_snapshot(state))
+            let result = if state.probe_context.is_some() {
+                restore_after_probe(state, false)
+            } else {
+                toggle_pause_for_user_action(state);
+                Ok(())
+            };
+            match result {
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
         }
         DaemonRequest::Pause => {
-            state.peer_mpris.clear_waiting();
-            pause_local_playback(state);
-            sync_mpris(state);
-            maybe_persist_playback_state(state, true);
-            DaemonResponse::State(state_snapshot(state))
+            let result = if state.probe_context.is_some() {
+                restore_after_probe(state, false)
+            } else {
+                state.peer_mpris.clear_waiting();
+                pause_local_playback(state);
+                sync_mpris(state);
+                Ok(())
+            };
+            match result {
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
         }
         DaemonRequest::Resume => {
             resume_for_user_action(state);
@@ -828,6 +871,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         }
         DaemonRequest::Stop => {
             stop_playback(state, false);
+            state.probe_context = None;
             sync_mpris(state);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -1044,6 +1088,16 @@ fn maintain_playback(state: &mut DaemonState) {
     });
 
     if reached_track_end {
+        if let Some(resume_playback) = state.probe_context.as_ref().map(|probe| probe.resume_playback)
+        {
+            if let Err(err) = restore_after_probe(state, resume_playback) {
+                eprintln!("[DAEMON] failed to restore queue after probe playback completed: {err}");
+                state.probe_context = None;
+                stop_playback(state, false);
+            }
+            return;
+        }
+
         let queue_len = effective_queue_len(
             state.queue.len(),
             state.repeat_mode,
@@ -1083,6 +1137,161 @@ fn play_queue_at(
     state.last_radio_append_anchor = None;
     state.repeat_mode = repeat_mode;
     play_index(state, state.queue_index)
+}
+
+fn capture_probe_restore_state(state: &DaemonState) -> ProbeRestoreState {
+    let queue_index = state.queue_index.min(state.queue.len().saturating_sub(1));
+    let queue_video_id = state.queue.get(queue_index).map(|track| track.video_id.clone());
+    let position_millis = state.active_track.as_ref().map(|track| {
+        track.startup_seek_millis.unwrap_or_else(|| {
+            current_listened_millis(
+                state
+                    .player
+                    .position()
+                    .map(|position| position.nseconds() / 1_000_000),
+                track,
+            )
+        })
+    });
+
+    ProbeRestoreState {
+        queue_index,
+        queue_video_id,
+        position_millis,
+        resume_playback: state.active_track.is_some() && !state.player.is_paused(),
+    }
+}
+
+fn resolve_probe_restore_index(state: &DaemonState, probe: &ProbeRestoreState) -> Option<usize> {
+    if state.queue.is_empty() {
+        return None;
+    }
+
+    let fallback_index = probe.queue_index.min(state.queue.len().saturating_sub(1));
+    if state
+        .queue
+        .get(fallback_index)
+        .is_some_and(|track| Some(track.video_id.as_str()) == probe.queue_video_id.as_deref())
+    {
+        return Some(fallback_index);
+    }
+
+    probe
+        .queue_video_id
+        .as_ref()
+        .and_then(|video_id| {
+            state
+                .queue
+                .iter()
+                .position(|track| track.video_id == *video_id)
+        })
+        .or(Some(fallback_index))
+}
+
+fn suspend_playback_for_probe(state: &mut DaemonState) {
+    state.player.stop();
+    state.player = PlaybackEngine::new();
+    state.active_track.take();
+    state.sponsor_segments.clear();
+    state.sponsor_segments_reported.clear();
+    state.paused_since = None;
+    state.deferred_actions.clear();
+    state.last_duration_micros.set(None);
+    state.last_pipewire_poll_at = None;
+    state.peer_mpris.clear_waiting();
+}
+
+fn start_probe_playback(
+    state: &mut DaemonState,
+    track: Track,
+    prepared_uri: String,
+    playback_source: PlaybackSource,
+) -> Result<()> {
+    eprintln!(
+        "[DAEMON] starting probe playback for {} from {}",
+        track.video_id,
+        playback_source.label(),
+    );
+    state.player.play_uri(&prepared_uri);
+    if state.volume_ramp.is_some() {
+        advance_volume_ramp(state);
+    } else {
+        state.player.set_volume(current_output_volume(state));
+    }
+    state.last_duration_micros.set(None);
+    let now = Instant::now();
+    state.active_track = Some(ActiveTrack {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artist: artist_string(&track),
+        thumb_url: track.thumbnail_url.clone(),
+        playback_source,
+        reporting_enabled: false,
+        rating: SongRating::Indifferent,
+        tracking: None,
+        started_at: now,
+        last_position_millis: 0,
+        previous_threshold_played_millis: 0,
+        previous_threshold_resumed_at: Some(now),
+        startup_seek_millis: None,
+        startup_retries: 0,
+        awaiting_fresh_position: true,
+        bootstrapped_watchtime: false,
+    });
+    state.sponsor_segments.clear();
+    state.sponsor_segments_reported.clear();
+    state.paused_since = None;
+    refresh_sponsorblock_for_current_track(state);
+    prefetch_upcoming(state);
+    state.last_pipewire_poll_at = None;
+    poll_pipewire_streams(state);
+    maybe_unduck_for_pipewire(state);
+    maybe_duck_for_pipewire(state);
+    signal_mpris_seeked(state, ClockTime::ZERO);
+    sync_mpris(state);
+    maybe_persist_playback_state(state, true);
+    Ok(())
+}
+
+fn probe_track(state: &mut DaemonState, track: Track) -> Result<()> {
+    let (prepared_uri, playback_source) = prepare_playback(state, &track.video_id)?;
+    if state.probe_context.is_none() {
+        let probe_restore = capture_probe_restore_state(state);
+        maybe_persist_playback_state(state, true);
+        state.probe_context = Some(probe_restore);
+    }
+
+    suspend_playback_for_probe(state);
+    start_probe_playback(state, track, prepared_uri, playback_source)
+}
+
+fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result<()> {
+    let Some(probe) = state.probe_context.clone() else {
+        return Ok(());
+    };
+
+    stop_playback(state, false);
+    state.probe_context = None;
+
+    let Some(index) = resolve_probe_restore_index(state, &probe) else {
+        maybe_persist_playback_state(state, true);
+        sync_mpris(state);
+        return Ok(());
+    };
+
+    play_index(state, index)?;
+
+    if let Some(position_millis) = probe.position_millis.filter(|position| *position > 0) {
+        seek_to_position(state, ClockTime::from_mseconds(position_millis));
+    }
+
+    if !resume_playback {
+        pause_local_playback(state);
+        sync_mpris(state);
+    }
+
+    maybe_persist_playback_state(state, true);
+    Ok(())
 }
 
 fn advance_queue(state: &mut DaemonState, forward: bool) -> Result<()> {
@@ -1439,6 +1648,21 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
     let buffered_percent = state.player.buffered_fraction() * 100.0;
     let pipeline_state = state.player.pipeline_state();
 
+    if let Some(resume_playback) = state.probe_context.as_ref().map(|probe| probe.resume_playback)
+    {
+        eprintln!(
+            "[DAEMON] probe playback start stalled for {video_id} from {} on startup attempt {startup_attempt}/{} after {elapsed_secs:.1}s (buffered {buffered_percent:.0}%, pipeline {pipeline_state:?}); restoring queued track",
+            playback_source.label(),
+            playback_start_attempt_total(),
+        );
+        if let Err(err) = restore_after_probe(state, resume_playback) {
+            eprintln!("[DAEMON] failed to restore queue after stalled probe playback: {err}");
+            state.probe_context = None;
+            stop_playback(state, false);
+        }
+        return true;
+    }
+
     if startup_retries < PLAYBACK_START_RETRY_LIMIT {
         let next_retry = startup_retries.saturating_add(1);
         let next_attempt = next_retry.saturating_add(1);
@@ -1592,6 +1816,7 @@ fn play_index_with_startup_retries(
 ) -> Result<()> {
     stop_playback(state, false);
     state.player = PlaybackEngine::new();
+    state.probe_context = None;
 
     let track = state
         .queue
@@ -1622,6 +1847,7 @@ fn play_index_with_startup_retries(
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
         playback_source,
+        reporting_enabled: true,
         rating: SongRating::Indifferent,
         tracking: None,
         started_at: now,
@@ -1720,6 +1946,21 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
     let queue_index = state.queue_index;
     let awaiting_fresh_position = active.awaiting_fresh_position;
     let startup_attempt = active.startup_retries.saturating_add(1);
+
+    if let Some(resume_playback) = state.probe_context.as_ref().map(|probe| probe.resume_playback)
+    {
+        eprintln!(
+            "[DAEMON] probe playback failed for {video_id} from {} (attempt {startup_attempt}/{}): {error}; restoring queued track",
+            playback_source.label(),
+            playback_start_attempt_total(),
+        );
+        if let Err(err) = restore_after_probe(state, resume_playback) {
+            eprintln!("[DAEMON] failed to restore queue after probe playback error: {err}");
+            state.probe_context = None;
+            stop_playback(state, false);
+        }
+        return;
+    }
 
     if awaiting_fresh_position {
         eprintln!(
@@ -2303,6 +2544,10 @@ fn maybe_extend_radio_queue(state: &mut DaemonState) {
 }
 
 fn flush_active_track(track: ActiveTrack, current_position_millis: Option<u64>, exiting: bool) {
+    if !track.reporting_enabled {
+        return;
+    }
+
     let listened_millis = current_listened_millis(current_position_millis, &track);
     std::thread::spawn(move || {
         if let Some(tracking) = track.tracking {
@@ -2377,6 +2622,9 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
     let Some(track) = state.active_track.as_mut() else {
         return;
     };
+    if !track.reporting_enabled {
+        return;
+    }
 
     let player_position_millis = state
         .player
@@ -2540,7 +2788,12 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
     let target = ClockTime::from_mseconds(target_millis);
     seek_to_position(state, target);
 
-    if state.sponsor_segments_reported.insert(segment.uuid.clone()) {
+    if state
+        .active_track
+        .as_ref()
+        .is_some_and(|track| track.reporting_enabled)
+        && state.sponsor_segments_reported.insert(segment.uuid.clone())
+    {
         let uuid = segment.uuid.clone();
         let video_id_for_report = video_id.clone();
         std::thread::spawn(move || {
@@ -2661,29 +2914,32 @@ fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
     url.filter(|value| !value.starts_with("file://"))
 }
 
-fn persisted_playback_track_snapshot(state: &DaemonState) -> Option<ActiveTrackSnapshot> {
+fn queued_track_snapshot(state: &DaemonState) -> Option<ActiveTrackSnapshot> {
     state
-        .active_track
-        .as_ref()
+        .queue
+        .get(state.queue_index)
         .map(|track| ActiveTrackSnapshot {
             video_id: track.video_id.clone(),
             title: track.title.clone(),
-            artist: track.artist.clone(),
-            thumb_url: track.thumb_url.clone(),
-            rating: track.rating,
+            artist: artist_string(track),
+            thumb_url: track.thumbnail_url.clone(),
+            rating: SongRating::Indifferent,
         })
-        .or_else(|| {
-            state
-                .queue
-                .get(state.queue_index)
-                .map(|track| ActiveTrackSnapshot {
-                    video_id: track.video_id.clone(),
-                    title: track.title.clone(),
-                    artist: artist_string(track),
-                    thumb_url: track.thumbnail_url.clone(),
-                    rating: SongRating::Indifferent,
-                })
-        })
+}
+
+fn persisted_playback_track_snapshot(state: &DaemonState) -> Option<ActiveTrackSnapshot> {
+    if state.probe_context.is_some() {
+        return queued_track_snapshot(state);
+    }
+
+    state.active_track.as_ref().map(|track| ActiveTrackSnapshot {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artist: track.artist.clone(),
+        thumb_url: track.thumb_url.clone(),
+        rating: track.rating,
+    })
+    .or_else(|| queued_track_snapshot(state))
 }
 
 fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> {
@@ -2691,18 +2947,21 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         return None;
     }
 
-    let position_millis = state.active_track.as_ref().map(|track| {
-        track.startup_seek_millis.unwrap_or_else(|| {
-            current_listened_millis(
-                state
-                    .player
-                    .position()
-                    .map(|position| position.nseconds() / 1_000_000),
-                track,
-            )
+    let position_millis = state.probe_context.as_ref().and_then(|probe| probe.position_millis).or_else(|| {
+        state.active_track.as_ref().map(|track| {
+            track.startup_seek_millis.unwrap_or_else(|| {
+                current_listened_millis(
+                    state
+                        .player
+                        .position()
+                        .map(|position| position.nseconds() / 1_000_000),
+                    track,
+                )
+            })
         })
     });
-    let hide_timing = state
+    let hide_timing = state.probe_context.is_none()
+        && state
         .active_track
         .as_ref()
         .is_some_and(hide_timing_for_track);
@@ -2714,18 +2973,68 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         playlist_context: state.playlist_context.clone(),
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
-        paused: state.active_track.is_some() && state.player.is_paused(),
+        paused: state.probe_context.is_some()
+            || (state.active_track.is_some() && state.player.is_paused()),
         volume: logical_volume(state),
         position_millis,
-        duration_millis: (!hide_timing)
+        duration_millis: (state.probe_context.is_none() && !hide_timing)
             .then(|| visible_duration_millis(state))
             .flatten(),
         buffered_fraction: state
+            .probe_context
+            .is_none()
+            .then_some(
+                state
+                    .active_track
+                    .as_ref()
+                    .map(|_| state.player.buffered_fraction())
+                    .unwrap_or(0.0),
+            )
+            .unwrap_or(0.0),
+        probe_active: false,
+        probe_restore_position_millis: None,
+    })
+}
+
+fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
+    let probe_active = state.probe_context.is_some();
+    let hide_timing = !probe_active
+        && state
             .active_track
             .as_ref()
-            .map(|_| state.player.buffered_fraction())
-            .unwrap_or(0.0),
-    })
+            .is_some_and(hide_timing_for_track);
+
+    PlaybackSnapshot {
+        current_track: state
+            .active_track
+            .as_ref()
+            .map(|track| ActiveTrackSnapshot {
+                video_id: track.video_id.clone(),
+                title: track.title.clone(),
+                artist: track.artist.clone(),
+                thumb_url: track.thumb_url.clone(),
+                rating: track.rating,
+            }),
+        queue: state.queue.clone(),
+        queue_index: state.queue_index,
+        playlist_context: state.playlist_context.clone(),
+        radio_virtual_playlist: state.radio_virtual_playlist.clone(),
+        repeat_mode: state.repeat_mode,
+        paused: state.player.is_paused(),
+        volume: logical_volume(state),
+        position_millis: (!hide_timing)
+            .then(|| visible_position_millis(state))
+            .flatten(),
+        duration_millis: (!hide_timing)
+            .then(|| visible_duration_millis(state))
+            .flatten(),
+        buffered_fraction: state.player.buffered_fraction(),
+        probe_active,
+        probe_restore_position_millis: state
+            .probe_context
+            .as_ref()
+            .and_then(|probe| probe.position_millis),
+    }
 }
 
 fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
@@ -2788,40 +3097,6 @@ fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
             }
         }
         Err(err) => eprintln!("[STATICD] failed to persist playback state: {err}"),
-    }
-}
-
-fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
-    let hide_timing = state
-        .active_track
-        .as_ref()
-        .is_some_and(hide_timing_for_track);
-
-    PlaybackSnapshot {
-        current_track: state
-            .active_track
-            .as_ref()
-            .map(|track| ActiveTrackSnapshot {
-                video_id: track.video_id.clone(),
-                title: track.title.clone(),
-                artist: track.artist.clone(),
-                thumb_url: track.thumb_url.clone(),
-                rating: track.rating,
-            }),
-        queue: state.queue.clone(),
-        queue_index: state.queue_index,
-        playlist_context: state.playlist_context.clone(),
-        radio_virtual_playlist: state.radio_virtual_playlist.clone(),
-        repeat_mode: state.repeat_mode,
-        paused: state.player.is_paused(),
-        volume: logical_volume(state),
-        position_millis: (!hide_timing)
-            .then(|| visible_position_millis(state))
-            .flatten(),
-        duration_millis: (!hide_timing)
-            .then(|| visible_duration_millis(state))
-            .flatten(),
-        buffered_fraction: state.player.buffered_fraction(),
     }
 }
 
@@ -3364,6 +3639,7 @@ mod tests {
             artist: "Test Artist".to_string(),
             thumb_url: None,
             playback_source: PlaybackSource::RemoteStream,
+            reporting_enabled: true,
             rating: SongRating::Indifferent,
             tracking: None,
             started_at,

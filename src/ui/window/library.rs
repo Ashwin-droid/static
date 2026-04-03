@@ -22,6 +22,147 @@ fn browse_collection_context(
     })
 }
 
+fn should_play_album_as_track(page_type: HomeBrowsePageType, track_count: usize) -> bool {
+    matches!(page_type, HomeBrowsePageType::Album) && track_count == 1
+}
+
+fn build_browse_back_button(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) -> Button {
+    let back_target = current_browse_back_target(state);
+    let label = match &back_target {
+        BrowseBackTarget::Search(_) => "\u{2190} Back to Search",
+        BrowseBackTarget::Home => "\u{2190} Back to Home",
+    };
+
+    let back_btn = Button::with_label(label);
+    back_btn.add_css_class("nav-item");
+    back_btn.set_halign(Align::Start);
+    back_btn.set_margin_start(24);
+    back_btn.set_margin_top(12);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    back_btn.connect_clicked(move |_| match back_target.clone() {
+        BrowseBackTarget::Search(cache) => {
+            render_cached_search_page(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                &cache,
+                &ps,
+                &recent_list,
+            );
+        }
+        BrowseBackTarget::Home => {
+            load_home(
+                &state,
+                &content_box,
+                &content_scroll,
+                &home_pagination,
+                &ps,
+                &recent_list,
+                false,
+            );
+        }
+    });
+
+    back_btn
+}
+
+pub(super) fn activate_browse_target(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    browse_id: &str,
+    browse_title: &str,
+    browse_thumb: Option<&str>,
+    page_type: HomeBrowsePageType,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+    autoplay: bool,
+) {
+    if page_type != HomeBrowsePageType::Album {
+        prepare_browse_back_target(state, content_scroll);
+        load_browse_detail(
+            state,
+            content_box,
+            content_scroll,
+            home_pagination,
+            browse_id,
+            browse_title,
+            browse_thumb,
+            page_type,
+            ps,
+            recent_list,
+            autoplay,
+        );
+        return;
+    }
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let browse_id = browse_id.to_string();
+    let browse_title = browse_title.to_string();
+    let browse_thumb = browse_thumb.map(str::to_string);
+
+    glib::spawn_future_local(async move {
+        let state_bg = state.clone();
+        let bid = browse_id.clone();
+        let result = gio::spawn_blocking(move || {
+            app_client(&state_bg).map(|ytm| ytm.get_browse_tracks(&bid))
+        })
+        .await;
+
+        if let Ok(Some(Ok(tracks))) = result {
+            if should_play_album_as_track(page_type, tracks.len()) {
+                if let Some(track) = tracks.first() {
+                    play_track(
+                        &state,
+                        &track.video_id,
+                        &track.title,
+                        &artist_string(track),
+                        track.thumbnail_url.as_deref(),
+                        &ps,
+                    );
+                    add_to_recent(&recent_list, track, &state, &ps);
+                    return;
+                }
+            }
+        }
+
+        prepare_browse_back_target(&state, &content_scroll);
+        load_browse_detail(
+            &state,
+            &content_box,
+            &content_scroll,
+            &home_pagination,
+            &browse_id,
+            &browse_title,
+            browse_thumb.as_deref(),
+            page_type,
+            &ps,
+            &recent_list,
+            autoplay,
+        );
+    });
+}
+
 pub(super) fn load_likes(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -266,7 +407,7 @@ pub(super) fn build_home_browse_card(
         let page_type = card.page_type;
 
         button.connect_clicked(move |_| {
-            load_browse_detail(
+            activate_browse_target(
                 &state,
                 &content_box,
                 &content_scroll,
@@ -380,7 +521,7 @@ pub(super) fn build_home_browse_row(
         let page_type = card.page_type;
 
         row_btn.connect_clicked(move |_| {
-            load_browse_detail(
+            activate_browse_target(
                 &state,
                 &content_box,
                 &content_scroll,
@@ -398,6 +539,31 @@ pub(super) fn build_home_browse_row(
 
     wrapper.append(&row_btn);
     wrapper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_play_album_as_track;
+    use crate::models::HomeBrowsePageType;
+
+    #[test]
+    fn single_track_albums_play_like_tracks() {
+        assert!(should_play_album_as_track(HomeBrowsePageType::Album, 1));
+    }
+
+    #[test]
+    fn multi_track_albums_still_open_album_pages() {
+        assert!(!should_play_album_as_track(HomeBrowsePageType::Album, 2));
+    }
+
+    #[test]
+    fn non_album_singletons_keep_their_existing_behavior() {
+        assert!(!should_play_album_as_track(HomeBrowsePageType::Playlist, 1));
+        assert!(!should_play_album_as_track(
+            HomeBrowsePageType::PodcastShow,
+            1
+        ));
+    }
 }
 
 pub(super) fn queue_drag_payload_for_browse_card(
@@ -696,30 +862,14 @@ pub(super) fn load_browse_detail(
                 let display_thumb = page.thumbnail_url.clone().or_else(|| browse_thumb.clone());
                 let artist_like = page.artist_like;
                 let sections = page.sections;
-                let back_btn = Button::with_label("\u{2190} Back to Home");
-                back_btn.add_css_class("nav-item");
-                back_btn.set_halign(Align::Start);
-                back_btn.set_margin_start(24);
-                back_btn.set_margin_top(12);
-                {
-                    let state = state.clone();
-                    let content_box = content_box.clone();
-                    let content_scroll = content_scroll.clone();
-                    let home_pagination = home_pagination.clone();
-                    let ps = ps.clone();
-                    let recent_list = recent_list.clone();
-                    back_btn.connect_clicked(move |_| {
-                        load_home(
-                            &state,
-                            &content_box,
-                            &content_scroll,
-                            &home_pagination,
-                            &ps,
-                            &recent_list,
-                            false,
-                        );
-                    });
-                }
+                let back_btn = build_browse_back_button(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                );
                 content_box.append(&back_btn);
 
                 if sections.is_empty() {
@@ -800,30 +950,14 @@ pub(super) fn load_browse_detail(
                 );
             }
             Ok(Some(Ok(BrowseDetailData::Tracks(tracks)))) => {
-                let back_btn = Button::with_label("\u{2190} Back to Home");
-                back_btn.add_css_class("nav-item");
-                back_btn.set_halign(Align::Start);
-                back_btn.set_margin_start(24);
-                back_btn.set_margin_top(12);
-                {
-                    let state = state.clone();
-                    let content_box = content_box.clone();
-                    let content_scroll = content_scroll.clone();
-                    let home_pagination = home_pagination.clone();
-                    let ps = ps.clone();
-                    let recent_list = recent_list.clone();
-                    back_btn.connect_clicked(move |_| {
-                        load_home(
-                            &state,
-                            &content_box,
-                            &content_scroll,
-                            &home_pagination,
-                            &ps,
-                            &recent_list,
-                            false,
-                        );
-                    });
-                }
+                let back_btn = build_browse_back_button(
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                );
                 content_box.append(&back_btn);
 
                 let header = Label::new(Some(&browse_title));

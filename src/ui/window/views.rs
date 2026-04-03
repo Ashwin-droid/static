@@ -704,7 +704,11 @@ pub(super) fn render_search_view(
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
 ) {
-    let total_results = results.tracks.len() + results.playlists.len() + results.artists.len();
+    let total_results: usize = results
+        .sections
+        .iter()
+        .map(|section| section.contents.len())
+        .sum();
     let header = Label::new(Some(&format!(
         "Results for \"{}\" \u{2014} {} results",
         query, total_results
@@ -721,62 +725,29 @@ pub(super) fn render_search_view(
         return;
     }
 
-    let summary = Label::new(Some(&format!(
-        "{} tracks  •  {} playlists  •  {} artists",
-        results.tracks.len(),
-        results.playlists.len(),
-        results.artists.len()
-    )));
-    summary.add_css_class("dim-label");
-    summary.set_halign(Align::Start);
-    summary.set_margin_bottom(4);
-    content_box.append(&summary);
+    if let Some(summary_text) = search_results_summary(results) {
+        let summary = Label::new(Some(&summary_text));
+        summary.add_css_class("dim-label");
+        summary.set_halign(Align::Start);
+        summary.set_margin_bottom(4);
+        content_box.append(&summary);
+    }
 
     let mut rendered_sections = 0;
 
-    if !results.tracks.is_empty() {
-        let section_header = Label::new(Some("Tracks"));
-        section_header.add_css_class("section-header");
-        section_header.set_halign(Align::Start);
-        section_header.set_margin_top(8);
-        content_box.append(&section_header);
-        content_box.append(&build_play_controls(&results.tracks, state, ps, None, None));
-
-        let grid = gtk::Grid::new();
-        grid.set_column_spacing(12);
-        grid.set_row_spacing(8);
-        grid.set_column_homogeneous(true);
-        grid.set_margin_top(4);
-
-        let tracks_rc = Rc::new(results.tracks.clone());
-        for (i, track) in tracks_rc.iter().enumerate() {
-            let row = build_track_row(
-                track,
-                i,
-                &tracks_rc,
-                None,
-                state,
-                ps,
-                recent_list,
-                TrackRowClickBehavior::PlayFromContext,
-            );
-            grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+    for section in &results.sections {
+        if section.contents.is_empty() {
+            continue;
         }
 
-        content_box.append(&grid);
-        rendered_sections += 1;
-    }
-
-    if !results.playlists.is_empty() {
-        render_search_browse_section(
+        render_search_section(
             content_box,
             if rendered_sections > 0 {
                 Some(Separator::new(Orientation::Horizontal))
             } else {
                 None
             },
-            "Playlists",
-            &results.playlists,
+            section,
             state,
             content_scroll,
             home_pagination,
@@ -784,32 +755,59 @@ pub(super) fn render_search_view(
             recent_list,
         );
         rendered_sections += 1;
-    }
-
-    if !results.artists.is_empty() {
-        render_search_browse_section(
-            content_box,
-            if rendered_sections > 0 {
-                Some(Separator::new(Orientation::Horizontal))
-            } else {
-                None
-            },
-            "Artists",
-            &results.artists,
-            state,
-            content_scroll,
-            home_pagination,
-            ps,
-            recent_list,
-        );
     }
 }
 
-pub(super) fn render_search_browse_section(
+fn search_results_summary(results: &SearchResult) -> Option<String> {
+    let mut tracks = 0;
+    let mut playlists = 0;
+    let mut artists = 0;
+    let mut albums = 0;
+    let mut shows = 0;
+    let mut channels = 0;
+
+    for section in &results.sections {
+        for item in &section.contents {
+            match item {
+                HomeItem::Track(_) => tracks += 1,
+                HomeItem::BrowseCard(card) => match card.page_type {
+                    HomeBrowsePageType::Playlist => playlists += 1,
+                    HomeBrowsePageType::Album => albums += 1,
+                    HomeBrowsePageType::Artist => artists += 1,
+                    HomeBrowsePageType::UserChannel => channels += 1,
+                    HomeBrowsePageType::PodcastShow => shows += 1,
+                },
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if tracks > 0 {
+        parts.push(format!("{tracks} tracks"));
+    }
+    if playlists > 0 {
+        parts.push(format!("{playlists} playlists"));
+    }
+    if artists > 0 {
+        parts.push(format!("{artists} artists"));
+    }
+    if albums > 0 {
+        parts.push(format!("{albums} albums"));
+    }
+    if channels > 0 {
+        parts.push(format!("{channels} channels"));
+    }
+    if shows > 0 {
+        parts.push(format!("{shows} shows"));
+    }
+
+    (!parts.is_empty()).then(|| parts.join("  •  "))
+}
+
+pub(super) fn render_search_section(
     content_box: &GtkBox,
     separator: Option<Separator>,
-    title: &str,
-    items: &[HomeBrowseCard],
+    section: &HomeSection,
     state: &Arc<Mutex<AppState>>,
     content_scroll: &ScrolledWindow,
     home_pagination: &Rc<HomePaginationState>,
@@ -820,12 +818,91 @@ pub(super) fn render_search_browse_section(
         content_box.append(&separator);
     }
 
-    let section_header = Label::new(Some(title));
-    section_header.add_css_class("section-header");
-    section_header.set_halign(Align::Start);
-    section_header.set_margin_top(8);
-    content_box.append(&section_header);
+    if !section.title.trim().is_empty() {
+        let section_header = Label::new(Some(&section.title));
+        section_header.add_css_class("section-header");
+        section_header.set_halign(Align::Start);
+        section_header.set_margin_top(8);
+        content_box.append(&section_header);
+    }
 
+    let tracks = home_section_tracks(section);
+    let browse_cards = home_section_browse_cards(section);
+
+    if tracks.len() == section.contents.len() && !tracks.is_empty() {
+        render_search_track_grid(content_box, &tracks, state, ps, recent_list);
+        return;
+    }
+
+    if browse_cards.len() == section.contents.len() && !browse_cards.is_empty() {
+        render_search_browse_grid(
+            content_box,
+            &browse_cards,
+            state,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+        );
+        return;
+    }
+
+    render_search_mixed_grid(
+        content_box,
+        section,
+        &tracks,
+        state,
+        content_scroll,
+        home_pagination,
+        ps,
+        recent_list,
+    );
+}
+
+fn render_search_track_grid(
+    content_box: &GtkBox,
+    tracks: &[Track],
+    state: &Arc<Mutex<AppState>>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    if tracks.len() > 1 {
+        content_box.append(&build_play_controls(tracks, state, ps, None, None));
+    }
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(12);
+    grid.set_row_spacing(8);
+    grid.set_column_homogeneous(true);
+    grid.set_margin_top(4);
+
+    let tracks_rc = Rc::new(tracks.to_vec());
+    for (i, track) in tracks_rc.iter().enumerate() {
+        let row = build_track_row(
+            track,
+            i,
+            &tracks_rc,
+            None,
+            state,
+            ps,
+            recent_list,
+            TrackRowClickBehavior::PlayFromContext,
+        );
+        grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+    }
+
+    content_box.append(&grid);
+}
+
+fn render_search_browse_grid(
+    content_box: &GtkBox,
+    items: &[HomeBrowseCard],
+    state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
     let grid = gtk::Grid::new();
     grid.set_column_spacing(12);
     grid.set_row_spacing(8);
@@ -842,6 +919,61 @@ pub(super) fn render_search_browse_section(
             ps,
             recent_list,
         );
+        grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
+    }
+
+    content_box.append(&grid);
+}
+
+fn render_search_mixed_grid(
+    content_box: &GtkBox,
+    section: &HomeSection,
+    tracks: &[Track],
+    state: &Arc<Mutex<AppState>>,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    if tracks.len() > 1 {
+        content_box.append(&build_play_controls(tracks, state, ps, None, None));
+    }
+
+    let grid = gtk::Grid::new();
+    grid.set_column_spacing(12);
+    grid.set_row_spacing(8);
+    grid.set_column_homogeneous(true);
+    grid.set_margin_top(4);
+
+    let playable_tracks = Rc::new(tracks.to_vec());
+    let mut track_index = 0;
+
+    for (i, item) in section.contents.iter().enumerate() {
+        let row = match item {
+            HomeItem::Track(track) => {
+                let row = build_track_row(
+                    track,
+                    track_index,
+                    &playable_tracks,
+                    None,
+                    state,
+                    ps,
+                    recent_list,
+                    TrackRowClickBehavior::PlayFromContext,
+                );
+                track_index += 1;
+                row
+            }
+            HomeItem::BrowseCard(card) => build_home_browse_row(
+                card,
+                state,
+                content_box,
+                content_scroll,
+                home_pagination,
+                ps,
+                recent_list,
+            ),
+        };
         grid.attach(&row, (i % 2) as i32, (i / 2) as i32, 1, 1);
     }
 

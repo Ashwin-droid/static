@@ -105,23 +105,18 @@ pub(super) fn play_track(
         }
 
         if let Ok(Some(Ok(mut radio))) = radio_result {
-            // Ensure the seed track is always first in the queue
-            let idx = radio.tracks.iter().position(|t| t.video_id == video_id);
-            if let Some(i) = idx {
-                // Move it to front if not already there
-                if i > 0 {
-                    let seed_track = radio.tracks.remove(i);
-                    radio.tracks.insert(0, seed_track);
-                }
-            } else {
-                // Not in queue at all — prepend it
-                radio.tracks.insert(0, seed_track);
-            }
+            // Keep the touched prefix authoritative and silently drop any
+            // recommended tracks that duplicate the seed or each other.
+            let queue_seed = radio
+                .tracks
+                .iter()
+                .position(|track| track.video_id == video_id)
+                .map(|index| radio.tracks.remove(index))
+                .unwrap_or(seed_track);
+            let mut queue = vec![queue_seed.clone()];
+            queue.extend(dedupe_radio_recommendations(&queue, radio.tracks));
 
-            {
-                let mut queue = ps.queue.borrow_mut();
-                *queue = radio.tracks;
-            }
+            *ps.queue.borrow_mut() = queue;
             ps.queue_index.set(0);
             set_queue_context(
                 &ps,

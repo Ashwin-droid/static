@@ -129,6 +129,29 @@ struct AppState {
     settings: AppSettings,
     home_cache: Option<HomePage>,
     home_scroll_position: f64,
+    search_cache: Option<SearchPageCache>,
+    content_view: ContentViewKind,
+    browse_back_target: BrowseBackTarget,
+}
+
+#[derive(Debug, Clone)]
+struct SearchPageCache {
+    query: String,
+    results: SearchResult,
+    scroll_position: f64,
+}
+
+#[derive(Debug, Clone)]
+enum BrowseBackTarget {
+    Home,
+    Search(SearchPageCache),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentViewKind {
+    Home,
+    Search,
+    BrowseDetail,
 }
 
 /// Tracks the currently playing song so we can record listen time when navigating away.
@@ -176,6 +199,67 @@ fn cached_home_scroll_position(state: &Arc<Mutex<AppState>>) -> f64 {
 
 fn store_home_scroll_position(state: &Arc<Mutex<AppState>>, position: f64) {
     state.lock().unwrap().home_scroll_position = position.max(0.0);
+}
+
+fn store_search_cache(
+    state: &Arc<Mutex<AppState>>,
+    query: &str,
+    results: &SearchResult,
+    scroll_position: f64,
+) {
+    let mut guard = state.lock().unwrap();
+    guard.search_cache = Some(SearchPageCache {
+        query: query.to_string(),
+        results: results.clone(),
+        scroll_position: scroll_position.max(0.0),
+    });
+    guard.content_view = ContentViewKind::Search;
+}
+
+fn set_content_view(state: &Arc<Mutex<AppState>>, view: ContentViewKind) {
+    state.lock().unwrap().content_view = view;
+}
+
+fn selected_browse_back_target_kind(
+    current_view: ContentViewKind,
+    existing_target: &BrowseBackTarget,
+    has_search_cache: bool,
+) -> ContentViewKind {
+    match current_view {
+        ContentViewKind::Search if has_search_cache => ContentViewKind::Search,
+        ContentViewKind::BrowseDetail => match existing_target {
+            BrowseBackTarget::Search(_) => ContentViewKind::Search,
+            BrowseBackTarget::Home => ContentViewKind::Home,
+        },
+        _ => ContentViewKind::Home,
+    }
+}
+
+fn prepare_browse_back_target(state: &Arc<Mutex<AppState>>, content_scroll: &ScrolledWindow) {
+    let scroll_position = content_scroll.vadjustment().value().max(0.0);
+    let mut guard = state.lock().unwrap();
+    let next_kind = selected_browse_back_target_kind(
+        guard.content_view,
+        &guard.browse_back_target,
+        guard.search_cache.is_some(),
+    );
+
+    guard.browse_back_target = match next_kind {
+        ContentViewKind::Search => {
+            if let Some(cache) = guard.search_cache.as_mut() {
+                cache.scroll_position = scroll_position;
+                BrowseBackTarget::Search(cache.clone())
+            } else {
+                BrowseBackTarget::Home
+            }
+        }
+        _ => BrowseBackTarget::Home,
+    };
+    guard.content_view = ContentViewKind::BrowseDetail;
+}
+
+fn current_browse_back_target(state: &Arc<Mutex<AppState>>) -> BrowseBackTarget {
+    state.lock().unwrap().browse_back_target.clone()
 }
 
 #[allow(dead_code)]
@@ -360,6 +444,9 @@ pub fn build_window(app: &Application) {
         settings,
         home_cache: None,
         home_scroll_position: 0.0,
+        search_cache: None,
+        content_view: ContentViewKind::Home,
+        browse_back_target: BrowseBackTarget::Home,
     }));
 
     let onboarding = build_onboarding_page(&stack, &state);
@@ -630,6 +717,22 @@ fn radio_touched_len(ps: &PlayerState) -> Option<usize> {
         .map(|radio| radio.touched_len)
 }
 
+fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen_ids = prefix
+        .iter()
+        .map(|track| track.video_id.clone())
+        .collect::<HashSet<_>>();
+    let mut deduped = Vec::with_capacity(tracks.len());
+
+    for track in tracks {
+        if seen_ids.insert(track.video_id.clone()) {
+            deduped.push(track);
+        }
+    }
+
+    deduped
+}
+
 fn replace_radio_tail(
     ps: &PlayerState,
     prefix_len: usize,
@@ -640,17 +743,8 @@ fn replace_radio_tail(
     {
         let mut queue = ps.queue.borrow_mut();
         queue.truncate(prefix_len);
-
-        let existing_ids = queue
-            .iter()
-            .map(|track| track.video_id.clone())
-            .collect::<HashSet<_>>();
-        let mut seen_ids = existing_ids;
-        for track in tracks {
-            if seen_ids.insert(track.video_id.clone()) {
-                queue.push(track);
-            }
-        }
+        let deduped_tracks = dedupe_radio_recommendations(queue.as_slice(), tracks);
+        queue.extend(deduped_tracks);
     }
 
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
@@ -663,18 +757,10 @@ fn replace_radio_tail(
 }
 
 fn append_radio_recommendations(ps: &PlayerState, tracks: Vec<Track>) -> usize {
-    let mut added = 0usize;
     let mut queue = ps.queue.borrow_mut();
-    let mut seen_ids = queue
-        .iter()
-        .map(|track| track.video_id.clone())
-        .collect::<HashSet<_>>();
-    for track in tracks {
-        if seen_ids.insert(track.video_id.clone()) {
-            queue.push(track);
-            added += 1;
-        }
-    }
+    let deduped_tracks = dedupe_radio_recommendations(queue.as_slice(), tracks);
+    let added = deduped_tracks.len();
+    queue.extend(deduped_tracks);
     added
 }
 
@@ -1059,7 +1145,27 @@ fn clear_box(container: &GtkBox) {
 
 #[cfg(test)]
 mod tests {
-    use super::radio_touched_len_after_reorder;
+    use super::{
+        BrowseBackTarget, ContentViewKind, dedupe_radio_recommendations,
+        radio_touched_len_after_reorder, selected_browse_back_target_kind,
+    };
+    use crate::models::{Artist, Track};
+
+    fn test_track(video_id: &str) -> Track {
+        Track {
+            video_id: video_id.to_string(),
+            title: video_id.to_string(),
+            artists: vec![Artist {
+                name: "Artist".to_string(),
+                id: None,
+            }],
+            album: None,
+            duration: None,
+            thumbnail_url: None,
+            not_interested_feedback_token: None,
+            undo_feedback_token: None,
+        }
+    }
 
     #[test]
     fn reordering_generated_track_into_touched_prefix_extends_boundary() {
@@ -1074,5 +1180,64 @@ mod tests {
     #[test]
     fn reordering_within_touched_prefix_preserves_boundary_width() {
         assert_eq!(radio_touched_len_after_reorder(4, 1, 2), 4);
+    }
+
+    #[test]
+    fn radio_recommendations_drop_tracks_already_in_virtual_prefix() {
+        let prefix = vec![test_track("seed"), test_track("already-touched")];
+        let deduped = dedupe_radio_recommendations(
+            &prefix,
+            vec![
+                test_track("already-touched"),
+                test_track("fresh"),
+                test_track("fresh"),
+            ],
+        );
+
+        assert_eq!(deduped, vec![test_track("fresh")]);
+    }
+
+    #[test]
+    fn search_pages_capture_search_as_browse_back_target() {
+        assert_eq!(
+            selected_browse_back_target_kind(
+                ContentViewKind::Search,
+                &BrowseBackTarget::Home,
+                true,
+            ),
+            ContentViewKind::Search
+        );
+    }
+
+    #[test]
+    fn nested_browse_pages_keep_existing_search_return_target() {
+        assert_eq!(
+            selected_browse_back_target_kind(
+                ContentViewKind::BrowseDetail,
+                &BrowseBackTarget::Search(super::SearchPageCache {
+                    query: "rain by face".to_string(),
+                    results: super::SearchResult::default(),
+                    scroll_position: 320.0,
+                }),
+                true,
+            ),
+            ContentViewKind::Search
+        );
+    }
+
+    #[test]
+    fn non_search_pages_fall_back_to_home_back_target() {
+        assert_eq!(
+            selected_browse_back_target_kind(
+                ContentViewKind::Home,
+                &BrowseBackTarget::Search(super::SearchPageCache {
+                    query: "rain by face".to_string(),
+                    results: super::SearchResult::default(),
+                    scroll_position: 320.0,
+                }),
+                true,
+            ),
+            ContentViewKind::Home
+        );
     }
 }

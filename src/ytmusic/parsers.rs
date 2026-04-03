@@ -146,6 +146,182 @@ fn parse_music_shelf(shelf: &Value) -> Option<HomeSection> {
     Some(HomeSection { title, contents })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSectionBucket {
+    Songs,
+    Videos,
+    Artists,
+    Channels,
+    AlbumsAndEps,
+    Playlists,
+    Shows,
+    Episodes,
+    Other,
+}
+
+impl SearchSectionBucket {
+    fn title(self) -> &'static str {
+        match self {
+            SearchSectionBucket::Songs => "Songs",
+            SearchSectionBucket::Videos => "Videos",
+            SearchSectionBucket::Artists => "Artists",
+            SearchSectionBucket::Channels => "Channels",
+            SearchSectionBucket::AlbumsAndEps => "Albums & EPs",
+            SearchSectionBucket::Playlists => "Playlists",
+            SearchSectionBucket::Shows => "Shows",
+            SearchSectionBucket::Episodes => "Episodes",
+            SearchSectionBucket::Other => "More results",
+        }
+    }
+}
+
+fn parse_search_sections(section: &Value) -> Vec<HomeSection> {
+    if let Some(card_shelf) = section.get("musicCardShelfRenderer") {
+        return parse_search_card_shelf(card_shelf).into_iter().collect();
+    }
+
+    section
+        .get("musicShelfRenderer")
+        .map(parse_search_music_shelf)
+        .unwrap_or_default()
+}
+
+fn parse_search_card_shelf(shelf: &Value) -> Option<HomeSection> {
+    let item = parse_search_card_shelf_item(shelf)?;
+    Some(HomeSection {
+        title: "Top result".to_string(),
+        contents: vec![item],
+    })
+}
+
+fn parse_search_music_shelf(shelf: &Value) -> Vec<HomeSection> {
+    let title = shelf
+        .pointer("/title/runs/0/text")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            shelf
+                .pointer("/title/simpleText")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default()
+        .to_string();
+
+    let Some(items) = shelf
+        .pointer("/contents")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+
+    if !title.trim().is_empty() {
+        let contents: Vec<HomeItem> = items.iter().filter_map(parse_search_item).collect();
+        return (!contents.is_empty())
+            .then_some(HomeSection { title, contents })
+            .into_iter()
+            .collect();
+    }
+
+    let mut grouped: Vec<(SearchSectionBucket, Vec<HomeItem>)> = Vec::new();
+    for (item, bucket) in items.iter().filter_map(parse_search_item_with_bucket) {
+        if let Some((_, contents)) = grouped.iter_mut().find(|(existing, _)| *existing == bucket) {
+            contents.push(item);
+        } else {
+            grouped.push((bucket, vec![item]));
+        }
+    }
+
+    let order = [
+        SearchSectionBucket::Songs,
+        SearchSectionBucket::Videos,
+        SearchSectionBucket::Artists,
+        SearchSectionBucket::Channels,
+        SearchSectionBucket::AlbumsAndEps,
+        SearchSectionBucket::Playlists,
+        SearchSectionBucket::Shows,
+        SearchSectionBucket::Episodes,
+        SearchSectionBucket::Other,
+    ];
+
+    let mut sections = Vec::new();
+    for bucket in order {
+        if let Some(index) = grouped.iter().position(|(existing, _)| *existing == bucket) {
+            let (_, contents) = grouped.remove(index);
+            if !contents.is_empty() {
+                sections.push(HomeSection {
+                    title: bucket.title().to_string(),
+                    contents,
+                });
+            }
+        }
+    }
+
+    sections
+}
+
+fn parse_search_card_shelf_item(renderer: &Value) -> Option<HomeItem> {
+    parse_home_browse_card(renderer)
+        .map(HomeItem::BrowseCard)
+        .or_else(|| parse_track_from_renderer(renderer).map(HomeItem::Track))
+}
+
+fn parse_search_item(item: &Value) -> Option<HomeItem> {
+    parse_search_item_with_bucket(item).map(|(item, _)| item)
+}
+
+fn parse_search_item_with_bucket(item: &Value) -> Option<(HomeItem, SearchSectionBucket)> {
+    let renderer = item
+        .get("musicResponsiveListItemRenderer")
+        .or_else(|| item.get("musicTwoRowItemRenderer"))
+        .or_else(|| item.get("musicMultiRowListItemRenderer"))?;
+
+    if let Some(track) = parse_track_from_renderer(renderer) {
+        return Some((
+            HomeItem::Track(track),
+            classify_search_track_bucket(renderer),
+        ));
+    }
+
+    parse_home_browse_card(renderer).map(|card| {
+        let bucket = classify_search_browse_bucket(renderer, card.page_type);
+        (HomeItem::BrowseCard(card), bucket)
+    })
+}
+
+fn classify_search_track_bucket(renderer: &Value) -> SearchSectionBucket {
+    match search_result_type_label(renderer).as_deref() {
+        Some("video") => SearchSectionBucket::Videos,
+        Some("episode") => SearchSectionBucket::Episodes,
+        Some("song") | Some("single") => SearchSectionBucket::Songs,
+        _ => SearchSectionBucket::Songs,
+    }
+}
+
+fn classify_search_browse_bucket(
+    renderer: &Value,
+    page_type: HomeBrowsePageType,
+) -> SearchSectionBucket {
+    match page_type {
+        HomeBrowsePageType::Playlist => SearchSectionBucket::Playlists,
+        HomeBrowsePageType::Artist => SearchSectionBucket::Artists,
+        HomeBrowsePageType::UserChannel => SearchSectionBucket::Channels,
+        HomeBrowsePageType::PodcastShow => SearchSectionBucket::Shows,
+        HomeBrowsePageType::Album => match search_result_type_label(renderer).as_deref() {
+            Some("show") => SearchSectionBucket::Shows,
+            _ => SearchSectionBucket::AlbumsAndEps,
+        },
+    }
+}
+
+fn search_result_type_label(renderer: &Value) -> Option<String> {
+    extract_browse_subtitle(renderer).and_then(|subtitle| {
+        subtitle
+            .split('\u{2022}')
+            .map(str::trim)
+            .find(|segment| !segment.is_empty())
+            .map(|segment| segment.to_ascii_lowercase())
+    })
+}
+
 fn parse_home_item(item: &Value) -> Option<HomeItem> {
     let renderer = item
         .get("musicTwoRowItemRenderer")
@@ -568,6 +744,18 @@ fn extract_duration(renderer: &Value) -> Option<String> {
                 "/overlay/musicItemThumbnailOverlayRenderer/content/thumbnailOverlayTimeStatusRenderer/text",
             )
         })
+        .or_else(|| {
+            renderer
+                .pointer("/subtitle/runs")
+                .and_then(|runs| runs.as_array())
+                .and_then(|runs| extract_duration_from_subtitle_runs(runs))
+        })
+        .or_else(|| {
+            renderer
+                .pointer("/subtitle/simpleText")
+                .and_then(|text| text.as_str())
+                .and_then(extract_duration_from_bulleted_text)
+        })
 }
 
 fn extract_duration_from_fixed_column(column: &Value) -> Option<String> {
@@ -600,6 +788,19 @@ fn extract_duration_from_runs(runs: &[Value]) -> Option<String> {
     normalize_duration_text(&join_runs(runs))
 }
 
+fn extract_duration_from_subtitle_runs(runs: &[Value]) -> Option<String> {
+    runs.iter()
+        .filter_map(|run| run.get("text").and_then(|value| value.as_str()))
+        .find_map(normalize_duration_text)
+        .or_else(|| extract_duration_from_bulleted_text(&join_runs(runs)))
+}
+
+fn extract_duration_from_bulleted_text(text: &str) -> Option<String> {
+    text.split('\u{2022}')
+        .map(str::trim)
+        .find_map(normalize_duration_text)
+}
+
 fn normalize_duration_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     looks_like_duration(trimmed).then(|| trimmed.to_string())
@@ -619,62 +820,18 @@ fn looks_like_duration(text: &str) -> bool {
 }
 
 pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
-    let mut results = SearchResult::default();
-    let mut seen_tracks = HashSet::new();
-    let mut seen_playlists = HashSet::new();
-    let mut seen_artists = HashSet::new();
-
     let contents = json
         .pointer("/contents/tabbedSearchResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents")
         .and_then(|c| c.as_array());
 
     let Some(sections) = contents else {
         tracing::warn!("No search results found");
-        return Ok(results);
+        return Ok(SearchResult::default());
     };
 
-    for section in sections {
-        let items = section
-            .pointer("/musicShelfRenderer/contents")
-            .and_then(|c| c.as_array());
-
-        let Some(items) = items else { continue };
-
-        for item in items {
-            let Some(renderer) = item
-                .get("musicResponsiveListItemRenderer")
-                .or_else(|| item.get("musicTwoRowItemRenderer"))
-                .or_else(|| item.get("musicMultiRowListItemRenderer"))
-            else {
-                continue;
-            };
-
-            if let Some(track) = parse_track_from_renderer(renderer) {
-                if seen_tracks.insert(track.video_id.clone()) {
-                    results.tracks.push(track);
-                }
-                continue;
-            }
-
-            if let Some(card) = parse_home_browse_card(renderer) {
-                match card.page_type {
-                    HomeBrowsePageType::Playlist => {
-                        if seen_playlists.insert(card.browse_id.clone()) {
-                            results.playlists.push(card);
-                        }
-                    }
-                    HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => {
-                        if seen_artists.insert(card.browse_id.clone()) {
-                            results.artists.push(card);
-                        }
-                    }
-                    HomeBrowsePageType::Album | HomeBrowsePageType::PodcastShow => {}
-                }
-            }
-        }
-    }
-
-    Ok(results)
+    Ok(SearchResult {
+        sections: sections.iter().flat_map(parse_search_sections).collect(),
+    })
 }
 
 pub fn parse_search_suggestions(json: &Value) -> Vec<String> {
@@ -1467,14 +1624,103 @@ mod tests {
         });
 
         let results = parse_search_results(&json).expect("search results should parse");
-        assert_eq!(results.tracks.len(), 1);
-        assert_eq!(results.playlists.len(), 1);
-        assert_eq!(results.artists.len(), 1);
-        assert_eq!(results.tracks[0].video_id, "track123");
-        assert_eq!(results.playlists[0].title, "Coding Mix");
-        assert_eq!(results.playlists[0].page_type, HomeBrowsePageType::Playlist);
-        assert_eq!(results.artists[0].title, "Lofi Producer");
-        assert_eq!(results.artists[0].page_type, HomeBrowsePageType::Artist);
+        assert_eq!(results.sections.len(), 3);
+        assert_eq!(results.sections[0].title, "Songs");
+        assert_eq!(results.sections[1].title, "Artists");
+        assert_eq!(results.sections[2].title, "Playlists");
+        assert_eq!(results.sections[0].contents.len(), 1);
+        assert_eq!(results.sections[1].contents.len(), 1);
+        assert_eq!(results.sections[2].contents.len(), 1);
+
+        let HomeItem::Track(track) = &results.sections[0].contents[0] else {
+            panic!("first search item should stay playable");
+        };
+        assert_eq!(track.video_id, "track123");
+
+        let HomeItem::BrowseCard(artist) = &results.sections[1].contents[0] else {
+            panic!("artist search item should parse as a browse card");
+        };
+        assert_eq!(artist.title, "Lofi Producer");
+        assert_eq!(artist.page_type, HomeBrowsePageType::Artist);
+
+        let HomeItem::BrowseCard(playlist) = &results.sections[2].contents[0] else {
+            panic!("playlist search item should parse as a browse card");
+        };
+        assert_eq!(playlist.title, "Coding Mix");
+        assert_eq!(playlist.page_type, HomeBrowsePageType::Playlist);
+    }
+
+    #[test]
+    fn search_results_include_top_result_card_sections() {
+        let json = json!({
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicCardShelfRenderer": {
+                                            "title": {
+                                                "runs": [{
+                                                    "text": "RAIN",
+                                                    "navigationEndpoint": {
+                                                        "watchEndpoint": {
+                                                            "videoId": "rwC4f83gnNA"
+                                                        }
+                                                    }
+                                                }]
+                                            },
+                                            "subtitle": {
+                                                "runs": [
+                                                    { "text": "Song" },
+                                                    { "text": " • " },
+                                                    {
+                                                        "text": "F/ACE",
+                                                        "navigationEndpoint": {
+                                                            "browseEndpoint": {
+                                                                "browseId": "UCecgaN_eMxdiC-nTDRtWpXw",
+                                                                "browseEndpointContextSupportedConfigs": {
+                                                                    "browseEndpointContextMusicConfig": {
+                                                                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    { "text": " • " },
+                                                    { "text": "3:36" }
+                                                ]
+                                            },
+                                            "thumbnail": {
+                                                "musicThumbnailRenderer": {
+                                                    "thumbnail": {
+                                                        "thumbnails": [{ "url": "https://example.com/rain.jpg" }]
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        });
+
+        let results = parse_search_results(&json).expect("search results should parse");
+        assert_eq!(results.sections.len(), 1);
+        assert_eq!(results.sections[0].title, "Top result");
+        assert_eq!(results.sections[0].contents.len(), 1);
+
+        let HomeItem::Track(track) = &results.sections[0].contents[0] else {
+            panic!("top-result card should parse as a playable track");
+        };
+        assert_eq!(track.video_id, "rwC4f83gnNA");
+        assert_eq!(track.title, "RAIN");
+        assert_eq!(track.duration.as_deref(), Some("3:36"));
+        assert_eq!(track.artists[0].name, "F/ACE");
     }
 
     #[test]

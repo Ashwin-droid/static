@@ -9,6 +9,8 @@ pub(super) fn load_home(
     recent_list: &GtkBox,
     force_refresh: bool,
 ) {
+    set_content_view(state, ContentViewKind::Home);
+
     if force_refresh {
         store_home_scroll_position(state, 0.0);
         content_scroll.vadjustment().set_value(0.0);
@@ -150,6 +152,41 @@ pub(super) fn restore_home_scroll_position_later(
         let target = cached_home_scroll_position(&state).min(max_value);
         adjustment.set_value(target);
     });
+}
+
+fn restore_search_scroll_position_later(content_scroll: &ScrolledWindow, scroll_position: f64) {
+    let content_scroll = content_scroll.clone();
+    glib::idle_add_local_once(move || {
+        let adjustment = content_scroll.vadjustment();
+        let max_value = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        adjustment.set_value(scroll_position.min(max_value).max(0.0));
+    });
+}
+
+pub(super) fn render_cached_search_page(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    cache: &SearchPageCache,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+) {
+    clear_box(content_box);
+    home_pagination.continuation.replace(None);
+    home_pagination.loading.set(false);
+    store_search_cache(state, &cache.query, &cache.results, cache.scroll_position);
+    render_search_view(
+        content_box,
+        &cache.query,
+        &cache.results,
+        state,
+        content_scroll,
+        home_pagination,
+        ps,
+        recent_list,
+    );
+    restore_search_scroll_position_later(content_scroll, cache.scroll_position);
 }
 
 pub(super) fn queue_home_lazy_load_check(
@@ -425,13 +462,17 @@ pub(super) fn load_search(
 
         match result {
             Ok(Some(Ok(results))) => {
-                render_search_view(
-                    &content_box,
-                    &query,
-                    &results,
+                let cache = SearchPageCache {
+                    query: query.clone(),
+                    results,
+                    scroll_position: 0.0,
+                };
+                render_cached_search_page(
                     &state,
+                    &content_box,
                     &content_scroll,
                     &home_pagination,
+                    &cache,
                     &ps,
                     &recent_list,
                 );
@@ -609,7 +650,7 @@ pub(super) fn autoplay_direct_music_url(
         DirectMusicUrlTarget::Browse {
             browse_id,
             page_type,
-        } => load_browse_detail(
+        } => activate_browse_target(
             state,
             content_box,
             content_scroll,

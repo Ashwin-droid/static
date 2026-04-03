@@ -76,9 +76,7 @@ pub struct Playlist {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub tracks: Vec<Track>,
-    pub playlists: Vec<HomeBrowseCard>,
-    pub artists: Vec<HomeBrowseCard>,
+    pub sections: Vec<HomeSection>,
 }
 
 /// Lightweight summary for a playlist in the user's library listing (no embedded tracks).

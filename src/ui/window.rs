@@ -345,6 +345,7 @@ struct MainPageWidgets {
     recent_list: GtkBox,
     search_entry: Entry,
     home_btn: Button,
+    offline_btn: Button,
     home_pagination: Rc<HomePaginationState>,
 }
 
@@ -452,11 +453,30 @@ pub fn build_window(app: &Application) {
     let onboarding = build_onboarding_page(&stack, &state);
     let vr_auth = build_vr_auth_page(&stack, &state);
     let main_widgets = build_main_page(&stack, &state);
+    let startup_saved_cookie = get_cookie().filter(|cookie| !cookie.trim().is_empty());
+    let has_cached_offline_library = {
+        let guard = state.lock().unwrap();
+        !guard.cache.cached_ids().unwrap_or_default().is_empty()
+            || !guard
+                .cache
+                .offline_playlists()
+                .unwrap_or_default()
+                .is_empty()
+    };
+    let has_storage_root_evidence = storage_root
+        .as_deref()
+        .is_some_and(|root| !root.trim().is_empty())
+        || has_cached_offline_library;
+    let should_skip_onboarding = startup_saved_cookie.is_some() || has_storage_root_evidence;
 
     stack.add_named(&onboarding, Some("onboarding"));
     stack.add_named(&vr_auth, Some("vr_auth"));
     stack.add_named(&main_widgets.page, Some("main"));
-    stack.set_visible_child_name("onboarding");
+    stack.set_visible_child_name(if should_skip_onboarding {
+        "main"
+    } else {
+        "onboarding"
+    });
 
     {
         let ps = main_widgets.player_state.clone();
@@ -474,6 +494,10 @@ pub fn build_window(app: &Application) {
     }
 
     window.set_child(Some(&stack));
+
+    if should_skip_onboarding {
+        show_offline_startup_shell(&state, &main_widgets);
+    }
 
     {
         let state = state.clone();
@@ -565,15 +589,38 @@ pub fn build_window(app: &Application) {
     {
         let stack = stack.clone();
         let state = state.clone();
+        let content_box = main_widgets.content_box.clone();
+        let content_scroll = main_widgets.content_scroll.clone();
+        let home_pagination = main_widgets.home_pagination.clone();
+        let ps = main_widgets.player_state.clone();
+        let recent_list = main_widgets.recent_list.clone();
+        let home_btn = main_widgets.home_btn.clone();
+        let startup_saved_cookie = startup_saved_cookie.clone();
         glib::spawn_future_local(async move {
-            if let Ok(Some(cookie)) = gio::spawn_blocking(get_cookie).await {
-                if let Some(client) =
-                    validate_cookie_and_build_client(cookie, "keyring cookie").await
-                {
-                    activate_authenticated_client(client, &state, &stack).await;
-                    return;
+            if let Some(cookie) = startup_saved_cookie {
+                match validate_cookie_and_build_client(cookie, "keyring cookie").await {
+                    CookieValidationOutcome::Authenticated(client) => {
+                        let main_was_visible =
+                            stack.visible_child_name().as_deref() == Some("main");
+                        activate_authenticated_client(client, &state, &stack).await;
+                        if main_was_visible {
+                            refresh_main_after_client_restore(
+                                &state,
+                                &content_box,
+                                &content_scroll,
+                                &home_pagination,
+                                &ps,
+                                &recent_list,
+                                &home_btn,
+                            );
+                        }
+                        return;
+                    }
+                    CookieValidationOutcome::Rejected => {
+                        let _ = gio::spawn_blocking(delete_cookie).await;
+                    }
+                    CookieValidationOutcome::Deferred => {}
                 }
-                let _ = gio::spawn_blocking(delete_cookie).await;
             }
 
             let settings = app_settings(&state);
@@ -583,15 +630,33 @@ pub fn build_window(app: &Application) {
 
             match gio::spawn_blocking(move || load_cookie_from_chromium_profile(&settings)).await {
                 Ok(Ok(Some(edge_cookie))) => {
-                    if let Some(client) = validate_cookie_and_build_client(
+                    match validate_cookie_and_build_client(
                         edge_cookie.clone(),
                         "Chromium cookie auto-sync",
                     )
                     .await
                     {
-                        let cookie_to_store = edge_cookie.clone();
-                        let _ = gio::spawn_blocking(move || store_cookie(&cookie_to_store)).await;
-                        activate_authenticated_client(client, &state, &stack).await;
+                        CookieValidationOutcome::Authenticated(client) => {
+                            let cookie_to_store = edge_cookie.clone();
+                            let _ =
+                                gio::spawn_blocking(move || store_cookie(&cookie_to_store)).await;
+                            let main_was_visible =
+                                stack.visible_child_name().as_deref() == Some("main");
+                            activate_authenticated_client(client, &state, &stack).await;
+                            if main_was_visible {
+                                refresh_main_after_client_restore(
+                                    &state,
+                                    &content_box,
+                                    &content_scroll,
+                                    &home_pagination,
+                                    &ps,
+                                    &recent_list,
+                                    &home_btn,
+                                );
+                            }
+                        }
+                        CookieValidationOutcome::Rejected => {}
+                        CookieValidationOutcome::Deferred => {}
                     }
                 }
                 Ok(Ok(None)) => {}
@@ -603,6 +668,50 @@ pub fn build_window(app: &Application) {
                 }
             }
         });
+    }
+}
+
+fn set_recent_list_status(recent_list: &GtkBox, message: &str) {
+    clear_box(recent_list);
+    let label = Label::new(Some(message));
+    label.add_css_class("sidebar-dim");
+    label.set_margin_top(8);
+    recent_list.append(&label);
+}
+
+fn show_offline_startup_shell(state: &Arc<Mutex<AppState>>, widgets: &MainPageWidgets) {
+    widgets.home_btn.remove_css_class("nav-item-active");
+    widgets.offline_btn.add_css_class("nav-item-active");
+    set_recent_list_status(&widgets.recent_list, "History will load after reconnect.");
+    load_offline(
+        state,
+        &widgets.content_box,
+        &widgets.content_scroll,
+        &widgets.player_state,
+        &widgets.recent_list,
+    );
+}
+
+fn refresh_main_after_client_restore(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+    home_btn: &Button,
+) {
+    load_sidebar_history(state, recent_list, ps);
+    if home_btn.has_css_class("nav-item-active") {
+        load_home(
+            state,
+            content_box,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+            false,
+        );
     }
 }
 

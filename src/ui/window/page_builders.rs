@@ -96,8 +96,6 @@ pub(super) fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>)
                     }
                     let state = state.clone();
                     let stack = stack.clone();
-                    let status_label = status_label.clone();
-                    let connect_btn = connect_btn_inner.clone();
                     let cookie_text = cookie_text.clone();
 
                     glib::spawn_future_local(async move {
@@ -110,25 +108,27 @@ pub(super) fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>)
                         })
                         .await;
 
+                        let cookie_for_save = cookie_text.clone();
+                        let _ = gio::spawn_blocking(move || {
+                            let _ = store_cookie(&cookie_for_save);
+                        })
+                        .await;
+
                         match result {
                             Ok(Ok(true)) | Ok(Ok(false)) => {
-                                let cookie_for_save = cookie_text.clone();
-                                let _ = gio::spawn_blocking(move || {
-                                    let _ = store_cookie(&cookie_for_save);
-                                })
-                                .await;
-                                // Show VR auth step
                                 stack.set_visible_child_name("vr_auth");
                             }
                             Ok(Err(e)) => {
-                                status_label.set_text(&format!("Auth check failed: {e}"));
-                                connect_btn.set_sensitive(true);
-                                connect_btn.set_label("Connect");
+                                eprintln!(
+                                    "[AUTH] onboarding cookie auth check failed, continuing offline-first: {e}"
+                                );
+                                stack.set_visible_child_name("vr_auth");
                             }
                             Err(e) => {
-                                status_label.set_text(&format!("Error: {e:?}"));
-                                connect_btn.set_sensitive(true);
-                                connect_btn.set_label("Connect");
+                                eprintln!(
+                                    "[AUTH] onboarding cookie auth worker failed, continuing offline-first: {e:?}"
+                                );
+                                stack.set_visible_child_name("vr_auth");
                             }
                         }
                     });
@@ -1548,6 +1548,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         recent_list,
         search_entry,
         home_btn,
+        offline_btn,
         home_pagination,
     }
 }

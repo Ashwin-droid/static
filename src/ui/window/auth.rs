@@ -1,5 +1,11 @@
 use super::*;
 
+pub(super) enum CookieValidationOutcome {
+    Authenticated(Arc<YtMusicClient>),
+    Rejected,
+    Deferred,
+}
+
 pub(super) fn store_cookie(cookie: &str) -> Result<(), keyring::Error> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)?;
     entry.set_password(cookie)
@@ -280,30 +286,30 @@ pub(super) fn load_cookie_from_chromium_profile(
 pub(super) async fn validate_cookie_and_build_client(
     cookie: String,
     source_label: &str,
-) -> Option<Arc<YtMusicClient>> {
+) -> CookieValidationOutcome {
     let client = match YtMusicClient::new(&cookie) {
         Ok(client) => Arc::new(client),
         Err(err) => {
             eprintln!("[AUTH] {source_label}: invalid cookie: {err}");
-            return None;
+            return CookieValidationOutcome::Rejected;
         }
     };
 
     let check_client = client.clone();
     let auth_result = gio::spawn_blocking(move || check_client.check_auth()).await;
     match auth_result {
-        Ok(Ok(true)) => Some(client),
+        Ok(Ok(true)) => CookieValidationOutcome::Authenticated(client),
         Ok(Ok(false)) => {
             eprintln!("[AUTH] {source_label}: cookie is not authenticated");
-            None
+            CookieValidationOutcome::Rejected
         }
         Ok(Err(err)) => {
             eprintln!("[AUTH] {source_label}: auth check failed: {err}");
-            None
+            CookieValidationOutcome::Deferred
         }
         Err(err) => {
             eprintln!("[AUTH] {source_label}: auth worker failed: {err:?}");
-            None
+            CookieValidationOutcome::Deferred
         }
     }
 }

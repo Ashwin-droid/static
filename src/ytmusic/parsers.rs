@@ -350,6 +350,8 @@ fn parse_home_browse_card(renderer: &Value) -> Option<HomeBrowseCard> {
 fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
     let (not_interested_feedback_token, undo_feedback_token) =
         extract_track_feedback_tokens(renderer);
+    let playback_playlist_id = extract_watch_playlist_id(renderer);
+    let playback_params = extract_watch_params(renderer);
 
     // Try responsive list item renderer format (shelf items)
     if let Some(flex_columns) = renderer.pointer("/flexColumns").and_then(|f| f.as_array()) {
@@ -389,6 +391,8 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             album: None,
             duration,
             thumbnail_url,
+            playback_playlist_id: playback_playlist_id.clone(),
+            playback_params: playback_params.clone(),
             not_interested_feedback_token,
             undo_feedback_token,
         });
@@ -416,6 +420,8 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             album: None,
             duration: extract_duration(renderer),
             thumbnail_url,
+            playback_playlist_id,
+            playback_params,
             not_interested_feedback_token,
             undo_feedback_token,
         });
@@ -439,6 +445,8 @@ fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .or_else(|| extract_watch_video_id(renderer))?;
+    let playback_playlist_id = extract_watch_playlist_id(renderer);
+    let playback_params = extract_watch_params(renderer);
     let (not_interested_feedback_token, undo_feedback_token) =
         extract_track_feedback_tokens(renderer);
 
@@ -449,6 +457,8 @@ fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
         album: None,
         duration: extract_duration(renderer),
         thumbnail_url: extract_thumbnail(renderer),
+        playback_playlist_id,
+        playback_params,
         not_interested_feedback_token,
         undo_feedback_token,
     })
@@ -504,19 +514,32 @@ fn extract_track_feedback_tokens(renderer: &Value) -> (Option<String>, Option<St
 }
 
 fn extract_watch_video_id(renderer: &Value) -> Option<String> {
+    extract_watch_endpoint_field(renderer, "videoId")
+}
+
+fn extract_watch_playlist_id(renderer: &Value) -> Option<String> {
+    extract_watch_endpoint_field(renderer, "playlistId")
+}
+
+fn extract_watch_params(renderer: &Value) -> Option<String> {
+    extract_watch_endpoint_field(renderer, "params")
+}
+
+fn extract_watch_endpoint_field(renderer: &Value, field: &str) -> Option<String> {
     [
-        "/onTap/watchEndpoint/videoId",
-        "/navigationEndpoint/watchEndpoint/videoId",
-        "/playNavigationEndpoint/watchEndpoint/videoId",
-        "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
-        "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
-        "/thumbnailOverlay/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint/videoId",
-        "/title/runs/0/navigationEndpoint/watchEndpoint/videoId",
+        "/onTap/watchEndpoint",
+        "/navigationEndpoint/watchEndpoint",
+        "/playNavigationEndpoint/watchEndpoint",
+        "/overlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint",
+        "/thumbnailOverlay/musicItemThumbnailOverlayRenderer/content/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint",
+        "/thumbnailOverlay/musicPlayButtonRenderer/playNavigationEndpoint/watchEndpoint",
+        "/title/runs/0/navigationEndpoint/watchEndpoint",
+        "/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint/watchEndpoint",
     ]
     .iter()
     .find_map(|path| {
         renderer
-            .pointer(path)
+            .pointer(&format!("{path}/{field}"))
             .and_then(|value| value.as_str())
             .map(str::to_string)
     })
@@ -1109,6 +1132,45 @@ mod tests {
 
         let track = parse_track_from_renderer(&renderer).expect("track should parse");
         assert_eq!(track.duration.as_deref(), Some("10:02"));
+    }
+
+    #[test]
+    fn parsed_tracks_keep_watch_endpoint_playlist_context() {
+        let renderer = json!({
+            "flexColumns": [
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                {
+                                    "text": "Playlist Song",
+                                    "navigationEndpoint": {
+                                        "watchEndpoint": {
+                                            "videoId": "track123",
+                                            "playlistId": "PLcanon123",
+                                            "params": "opaque-item-token"
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                            "runs": [
+                                { "text": "Artist" }
+                            ]
+                        }
+                    }
+                }
+            ]
+        });
+
+        let track = parse_track_from_renderer(&renderer).expect("playlist track should parse");
+        assert_eq!(track.playback_playlist_id.as_deref(), Some("PLcanon123"));
+        assert_eq!(track.playback_params.as_deref(), Some("opaque-item-token"));
     }
 
     #[test]
@@ -1818,6 +1880,8 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                         album: None,
                         duration,
                         thumbnail_url,
+                        playback_playlist_id: None,
+                        playback_params: None,
                         not_interested_feedback_token: None,
                         undo_feedback_token: None,
                     })

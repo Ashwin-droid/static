@@ -58,6 +58,8 @@ pub(super) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track
                 album: None,
                 duration: None,
                 thumbnail_url: track.thumb_url.clone(),
+                playback_playlist_id: None,
+                playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
             })

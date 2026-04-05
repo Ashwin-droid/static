@@ -2581,11 +2581,29 @@ fn start_playback_tracking_with_retry(
         }
     }
 
-    if let Some(tracking) = state
-        .client
-        .as_ref()
-        .and_then(|client| client.start_playback_tracking(video_id, session_started_at))
-    {
+    let queued_track = state
+        .queue
+        .get(state.queue_index)
+        .filter(|track| track.video_id == video_id)
+        .or_else(|| state.queue.iter().find(|track| track.video_id == video_id));
+    let playback_playlist_id = queued_track
+        .and_then(|track| track.playback_playlist_id.clone())
+        .or_else(|| {
+            state
+                .playlist_context
+                .as_ref()
+                .map(|context| context.playlist_id.clone())
+        });
+    let playback_params = queued_track.and_then(|track| track.playback_params.clone());
+
+    if let Some(tracking) = state.client.as_ref().and_then(|client| {
+        client.start_playback_tracking(
+            video_id,
+            session_started_at,
+            playback_playlist_id.as_deref(),
+            playback_params.as_deref(),
+        )
+    }) {
         if current_attempt > 1 {
             eprintln!(
                 "[TRACKING] recovered telemetry bootstrap for {video_id} on attempt {current_attempt}"
@@ -2609,7 +2627,12 @@ fn start_playback_tracking_with_retry(
         }
     };
 
-    let tracking = refreshed_client.start_playback_tracking(video_id, session_started_at);
+    let tracking = refreshed_client.start_playback_tracking(
+        video_id,
+        session_started_at,
+        playback_playlist_id.as_deref(),
+        playback_params.as_deref(),
+    );
     if tracking.is_none() {
         eprintln!(
             "[TRACKING] attempt {current_attempt} for {video_id} still produced no watchtime tracker after client refresh"

@@ -900,6 +900,40 @@ impl YtMusicClient {
         })
     }
 
+    fn tracking_player_body(
+        video_id: &str,
+        client_name: &str,
+        client_version: &str,
+        cpn: &str,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
+    ) -> Value {
+        let mut body = Self::client_context_with(client_name, client_version);
+        body["videoId"] = json!(video_id);
+        body["cpn"] = json!(cpn);
+        body["playbackContext"] = json!({
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "lactMilliseconds": "0",
+                "referer": format!("{YTM_ORIGIN}/"),
+                "autonavState": "STATE_OFF",
+                "autoCaptionsDefaultOn": false,
+                "vis": 1
+            },
+            "devicePlaybackCapabilities": {
+                "supportXhr": true
+            }
+        });
+        body["captionParams"] = json!({});
+        if let Some(playlist_id) = playlist_id {
+            body["playlistId"] = json!(playlist_id);
+        }
+        if let Some(params) = params {
+            body["params"] = json!(params);
+        }
+        body
+    }
+
     fn mobile_client_context() -> Value {
         json!({
             "context": {
@@ -1223,9 +1257,15 @@ impl YtMusicClient {
         &self,
         video_id: &str,
         session_started_at: Instant,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
     ) -> Option<TrackingInfo> {
-        self.rt
-            .block_on(self.start_playback_tracking_async(video_id, session_started_at))
+        self.rt.block_on(self.start_playback_tracking_async(
+            video_id,
+            session_started_at,
+            playlist_id,
+            params,
+        ))
     }
 
     /// Get just the streaming URL without reporting anything to YouTube.
@@ -1269,10 +1309,13 @@ impl YtMusicClient {
         &self,
         video_id: &str,
         session_started_at: Instant,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
     ) -> Option<TrackingInfo> {
         let video_id = video_id.to_string();
         let rt_ptr: *const tokio::runtime::Runtime = &self.rt;
         let auth = self.auth_header();
+        let cpn = generate_cpn();
 
         {
             if auth.is_none() {
@@ -1299,8 +1342,14 @@ impl YtMusicClient {
                     YTM_WEB_FALLBACK_CLIENT_VERSION,
                 ),
             ] {
-                let mut body = Self::client_context_with(client_name, client_version);
-                body["videoId"] = json!(&video_id);
+                let body = Self::tracking_player_body(
+                    &video_id,
+                    client_name,
+                    client_version,
+                    &cpn,
+                    playlist_id,
+                    params,
+                );
 
                 let resp = match self
                     .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
@@ -1428,8 +1477,6 @@ impl YtMusicClient {
                     )
                 })
                 .unwrap_or(300_000);
-
-            let cpn = generate_cpn();
 
             let tracking_info = TrackingInfo {
                 http: self.http.clone(),
@@ -2359,6 +2406,29 @@ mod tests {
         assert!(
             cpn.chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        );
+    }
+
+    #[test]
+    fn tracking_player_body_carries_playlist_identity_and_cpn() {
+        let body = YtMusicClient::tracking_player_body(
+            "Dx69Ut6Wyuk",
+            "WEB_REMIX",
+            "1.20260331.01.00",
+            "_Z3q2CnOA6jEC31l",
+            Some("PLSeq4utvoqwBO9ZHP3ZN-JyGU9wbmphgv"),
+            Some("opaque-item-token"),
+        );
+
+        assert_eq!(body["videoId"], "Dx69Ut6Wyuk");
+        assert_eq!(body["cpn"], "_Z3q2CnOA6jEC31l");
+        assert_eq!(body["playlistId"], "PLSeq4utvoqwBO9ZHP3ZN-JyGU9wbmphgv");
+        assert_eq!(body["params"], "opaque-item-token");
+        assert_eq!(body["captionParams"], json!({}));
+        assert_eq!(
+            body.pointer("/playbackContext/contentPlaybackContext/referer")
+                .and_then(|value| value.as_str()),
+            Some("https://music.youtube.com/")
         );
     }
 }

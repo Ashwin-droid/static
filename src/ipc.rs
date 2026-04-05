@@ -704,6 +704,8 @@ mod tests {
                     album: None,
                     duration: None,
                     thumbnail_url: None,
+                    playback_playlist_id: None,
+                    playback_params: None,
                     not_interested_feedback_token: None,
                     undo_feedback_token: None,
                 }],

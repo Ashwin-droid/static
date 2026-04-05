@@ -855,6 +855,8 @@ pub(super) fn autoplay_video_url(
             album: None,
             duration: None,
             thumbnail_url: None,
+            playback_playlist_id: None,
+            playback_params: None,
             not_interested_feedback_token: None,
             undo_feedback_token: None,
         };
@@ -955,6 +957,8 @@ pub(super) fn load_offline_page_data(
                 album: None,
                 duration: None,
                 thumbnail_url,
+                playback_playlist_id: None,
+                playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
             }
@@ -1083,6 +1087,8 @@ pub(super) fn load_offline_playlist_tracks(
                 album: None,
                 duration: None,
                 thumbnail_url,
+                playback_playlist_id: None,
+                playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
             }

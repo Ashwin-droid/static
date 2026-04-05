@@ -18,6 +18,8 @@ pub(super) fn play_track(
         album: None,
         duration: None,
         thumbnail_url: thumb_url.map(String::from),
+        playback_playlist_id: None,
+        playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
     };

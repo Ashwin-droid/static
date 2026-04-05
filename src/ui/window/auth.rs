@@ -3,7 +3,7 @@ use super::*;
 pub(super) enum CookieValidationOutcome {
     Authenticated(Arc<YtMusicClient>),
     Rejected,
-    Deferred,
+    Deferred(Arc<YtMusicClient>),
 }
 
 pub(super) fn store_cookie(cookie: &str) -> Result<(), keyring::Error> {
@@ -305,19 +305,18 @@ pub(super) async fn validate_cookie_and_build_client(
         }
         Ok(Err(err)) => {
             eprintln!("[AUTH] {source_label}: auth check failed: {err}");
-            CookieValidationOutcome::Deferred
+            CookieValidationOutcome::Deferred(client)
         }
         Err(err) => {
             eprintln!("[AUTH] {source_label}: auth worker failed: {err:?}");
-            CookieValidationOutcome::Deferred
+            CookieValidationOutcome::Deferred(client)
         }
     }
 }
 
-pub(super) async fn activate_authenticated_client(
+pub(super) async fn stage_restored_client(
     client: Arc<YtMusicClient>,
     state: &Arc<Mutex<AppState>>,
-    stack: &Stack,
 ) {
     if let Ok(Some(vr_token)) = gio::spawn_blocking(get_vr_refresh_token).await {
         client.set_vr_refresh_token(&vr_token);
@@ -327,5 +326,13 @@ pub(super) async fn activate_authenticated_client(
         guard.client = Some(client);
         guard.home_cache = None;
     }
+}
+
+pub(super) async fn activate_authenticated_client(
+    client: Arc<YtMusicClient>,
+    state: &Arc<Mutex<AppState>>,
+    stack: &Stack,
+) {
+    stage_restored_client(client, state).await;
     stack.set_visible_child_name("main");
 }

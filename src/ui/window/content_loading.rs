@@ -1,5 +1,67 @@
 use super::*;
 
+const HOME_BOOTSTRAP_BACKOFF_SECONDS: [u32; 3] = [1, 2, 4];
+
+async fn apply_loaded_home_page(
+    page: HomePage,
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+    force_refresh: bool,
+) {
+    store_home_cache(state, &page);
+    home_pagination
+        .continuation
+        .replace(page.continuation.clone());
+    let listen_again_tracks = extract_listen_again_tracks(&page.sections);
+    let state_bg = state.clone();
+    let _ = gio::spawn_blocking(move || {
+        let guard = state_bg.lock().unwrap();
+        let listen_again_ids = listen_again_tracks
+            .iter()
+            .map(|track| track.video_id.clone())
+            .collect::<Vec<_>>();
+        for track in &listen_again_tracks {
+            let _ = guard.cache.upsert_track_metadata(
+                &track.video_id,
+                &track.title,
+                &artist_string(track),
+                history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+            );
+        }
+        guard
+            .cache
+            .store_listen_again_snapshot(&listen_again_ids, &guard.settings)
+    })
+    .await;
+    render_home_view(
+        content_box,
+        &page.sections,
+        state,
+        content_scroll,
+        home_pagination,
+        ps,
+        recent_list,
+        false,
+    );
+    if force_refresh {
+        content_scroll.vadjustment().set_value(0.0);
+    } else {
+        restore_home_scroll_position_later(state, content_scroll);
+    }
+    queue_home_lazy_load_check(
+        state,
+        content_box,
+        content_scroll,
+        home_pagination,
+        ps,
+        recent_list,
+    );
+}
+
 pub(super) fn load_home(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -75,54 +137,17 @@ pub(super) fn load_home(
 
         match result {
             Ok(Some(Ok(page))) => {
-                store_home_cache(&state, &page);
-                home_pagination
-                    .continuation
-                    .replace(page.continuation.clone());
-                let listen_again_tracks = extract_listen_again_tracks(&page.sections);
-                let state_bg = state.clone();
-                let _ = gio::spawn_blocking(move || {
-                    let guard = state_bg.lock().unwrap();
-                    let listen_again_ids = listen_again_tracks
-                        .iter()
-                        .map(|track| track.video_id.clone())
-                        .collect::<Vec<_>>();
-                    for track in &listen_again_tracks {
-                        let _ = guard.cache.upsert_track_metadata(
-                            &track.video_id,
-                            &track.title,
-                            &artist_string(track),
-                            history_thumbnail_candidate(track.thumbnail_url.as_deref()),
-                        );
-                    }
-                    guard
-                        .cache
-                        .store_listen_again_snapshot(&listen_again_ids, &guard.settings)
-                })
+                apply_loaded_home_page(
+                    page,
+                    &state,
+                    &content_box,
+                    &content_scroll,
+                    &home_pagination,
+                    &ps,
+                    &recent_list,
+                    force_refresh,
+                )
                 .await;
-                render_home_view(
-                    &content_box,
-                    &page.sections,
-                    &state,
-                    &content_scroll,
-                    &home_pagination,
-                    &ps,
-                    &recent_list,
-                    false,
-                );
-                if force_refresh {
-                    content_scroll.vadjustment().set_value(0.0);
-                } else {
-                    restore_home_scroll_position_later(&state, &content_scroll);
-                }
-                queue_home_lazy_load_check(
-                    &state,
-                    &content_box,
-                    &content_scroll,
-                    &home_pagination,
-                    &ps,
-                    &recent_list,
-                );
             }
             Ok(Some(Err(e))) => {
                 home_pagination.continuation.replace(None);
@@ -137,6 +162,139 @@ pub(super) fn load_home(
                 content_box.append(&Label::new(Some(&format!("Error: {e:?}"))));
             }
         }
+    });
+}
+
+pub(super) fn load_home_with_offline_fallback(
+    state: &Arc<Mutex<AppState>>,
+    content_box: &GtkBox,
+    content_scroll: &ScrolledWindow,
+    home_pagination: &Rc<HomePaginationState>,
+    ps: &Rc<PlayerState>,
+    recent_list: &GtkBox,
+    home_btn: &Button,
+    offline_btn: &Button,
+) {
+    set_content_view(state, ContentViewKind::Home);
+
+    if let Some(page) = cached_home_page(state) {
+        clear_box(content_box);
+        content_box.add_css_class("home-view-active");
+        home_pagination
+            .continuation
+            .replace(page.continuation.clone());
+        home_pagination.loading.set(false);
+        render_home_view(
+            content_box,
+            &page.sections,
+            state,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+            false,
+        );
+        restore_home_scroll_position_later(state, content_scroll);
+        queue_home_lazy_load_check(
+            state,
+            content_box,
+            content_scroll,
+            home_pagination,
+            ps,
+            recent_list,
+        );
+        return;
+    }
+
+    clear_box(content_box);
+    content_box.add_css_class("home-view-active");
+    home_pagination.continuation.replace(None);
+    home_pagination.loading.set(true);
+    let loading = Label::new(Some("Loading recommendations..."));
+    loading.add_css_class("dim-label");
+    loading.set_margin_top(60);
+    content_box.append(&loading);
+
+    let state = state.clone();
+    let content_box = content_box.clone();
+    let content_scroll = content_scroll.clone();
+    let home_pagination = home_pagination.clone();
+    let ps = ps.clone();
+    let recent_list = recent_list.clone();
+    let home_btn = home_btn.clone();
+    let offline_btn = offline_btn.clone();
+    let loading_label = loading.clone();
+
+    glib::spawn_future_local(async move {
+        let total_attempts = HOME_BOOTSTRAP_BACKOFF_SECONDS.len() + 1;
+        let mut last_error = String::from("not connected");
+
+        for attempt in 0..total_attempts {
+            if !home_btn.has_css_class("nav-item-active") {
+                home_pagination.loading.set(false);
+                return;
+            }
+
+            let state_bg = state.clone();
+            let result = gio::spawn_blocking(move || {
+                app_client(&state_bg).map(|ytm| ytm.get_home_page(None))
+            })
+            .await;
+
+            match result {
+                Ok(Some(Ok(page))) => {
+                    home_pagination.loading.set(false);
+                    clear_box(&content_box);
+                    content_box.add_css_class("home-view-active");
+                    apply_loaded_home_page(
+                        page,
+                        &state,
+                        &content_box,
+                        &content_scroll,
+                        &home_pagination,
+                        &ps,
+                        &recent_list,
+                        false,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(Some(Err(err))) => {
+                    last_error = err.to_string();
+                }
+                Ok(None) => {
+                    last_error = "session still restoring".to_string();
+                }
+                Err(err) => {
+                    last_error = format!("worker failed: {err:?}");
+                }
+            }
+
+            if attempt + 1 == total_attempts {
+                break;
+            }
+
+            let delay = HOME_BOOTSTRAP_BACKOFF_SECONDS[attempt];
+            loading_label.set_text(&format!(
+                "Loading recommendations... Retry {}/3 in {}s",
+                attempt + 1,
+                delay
+            ));
+            glib::timeout_future_seconds(delay).await;
+        }
+
+        home_pagination.loading.set(false);
+        if !home_btn.has_css_class("nav-item-active") {
+            return;
+        }
+
+        eprintln!(
+            "[HOME] failed to load after {} attempts, falling back offline: {}",
+            total_attempts, last_error
+        );
+        home_btn.remove_css_class("nav-item-active");
+        offline_btn.add_css_class("nav-item-active");
+        load_offline(&state, &content_box, &content_scroll, &ps, &recent_list);
     });
 }
 

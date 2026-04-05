@@ -496,7 +496,7 @@ pub fn build_window(app: &Application) {
     window.set_child(Some(&stack));
 
     if should_skip_onboarding {
-        show_offline_startup_shell(&state, &main_widgets);
+        bootstrap_home_startup_shell(&state, &main_widgets);
     }
 
     {
@@ -549,21 +549,27 @@ pub fn build_window(app: &Application) {
         let home_pagination = main_widgets.home_pagination.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
+        let home_btn = main_widgets.home_btn.clone();
+        let offline_btn = main_widgets.offline_btn.clone();
 
         stack.connect_notify_local(Some("visible-child-name"), move |stack, _| {
-            if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
-            {
+            if stack.visible_child_name().as_deref() == Some("main") {
                 clear_box(&content_box);
-                load_home(
+                load_home_with_offline_fallback(
                     &state,
                     &content_box,
                     &content_scroll,
                     &home_pagination,
                     &ps,
                     &recent_list,
-                    false,
+                    &home_btn,
+                    &offline_btn,
                 );
-                load_sidebar_history(&state, &recent_list, &ps);
+                if app_client(&state).is_some() {
+                    load_sidebar_history(&state, &recent_list, &ps);
+                } else {
+                    set_recent_list_status(&recent_list, "Restoring history...");
+                }
             }
         });
     }
@@ -589,12 +595,8 @@ pub fn build_window(app: &Application) {
     {
         let stack = stack.clone();
         let state = state.clone();
-        let content_box = main_widgets.content_box.clone();
-        let content_scroll = main_widgets.content_scroll.clone();
-        let home_pagination = main_widgets.home_pagination.clone();
         let ps = main_widgets.player_state.clone();
         let recent_list = main_widgets.recent_list.clone();
-        let home_btn = main_widgets.home_btn.clone();
         let startup_saved_cookie = startup_saved_cookie.clone();
         glib::spawn_future_local(async move {
             if let Some(cookie) = startup_saved_cookie {
@@ -604,22 +606,19 @@ pub fn build_window(app: &Application) {
                             stack.visible_child_name().as_deref() == Some("main");
                         activate_authenticated_client(client, &state, &stack).await;
                         if main_was_visible {
-                            refresh_main_after_client_restore(
-                                &state,
-                                &content_box,
-                                &content_scroll,
-                                &home_pagination,
-                                &ps,
-                                &recent_list,
-                                &home_btn,
-                            );
+                            refresh_main_after_client_restore(&state, &recent_list, &ps);
                         }
                         return;
                     }
                     CookieValidationOutcome::Rejected => {
                         let _ = gio::spawn_blocking(delete_cookie).await;
                     }
-                    CookieValidationOutcome::Deferred => {}
+                    CookieValidationOutcome::Deferred(client) => {
+                        stage_restored_client(client, &state).await;
+                        if stack.visible_child_name().as_deref() == Some("main") {
+                            refresh_main_after_client_restore(&state, &recent_list, &ps);
+                        }
+                    }
                 }
             }
 
@@ -644,19 +643,16 @@ pub fn build_window(app: &Application) {
                                 stack.visible_child_name().as_deref() == Some("main");
                             activate_authenticated_client(client, &state, &stack).await;
                             if main_was_visible {
-                                refresh_main_after_client_restore(
-                                    &state,
-                                    &content_box,
-                                    &content_scroll,
-                                    &home_pagination,
-                                    &ps,
-                                    &recent_list,
-                                    &home_btn,
-                                );
+                                refresh_main_after_client_restore(&state, &recent_list, &ps);
                             }
                         }
                         CookieValidationOutcome::Rejected => {}
-                        CookieValidationOutcome::Deferred => {}
+                        CookieValidationOutcome::Deferred(client) => {
+                            stage_restored_client(client, &state).await;
+                            if stack.visible_child_name().as_deref() == Some("main") {
+                                refresh_main_after_client_restore(&state, &recent_list, &ps);
+                            }
+                        }
                     }
                 }
                 Ok(Ok(None)) => {}
@@ -679,40 +675,28 @@ fn set_recent_list_status(recent_list: &GtkBox, message: &str) {
     recent_list.append(&label);
 }
 
-fn show_offline_startup_shell(state: &Arc<Mutex<AppState>>, widgets: &MainPageWidgets) {
-    widgets.home_btn.remove_css_class("nav-item-active");
-    widgets.offline_btn.add_css_class("nav-item-active");
-    set_recent_list_status(&widgets.recent_list, "History will load after reconnect.");
-    load_offline(
+fn bootstrap_home_startup_shell(state: &Arc<Mutex<AppState>>, widgets: &MainPageWidgets) {
+    widgets.offline_btn.remove_css_class("nav-item-active");
+    widgets.home_btn.add_css_class("nav-item-active");
+    set_recent_list_status(&widgets.recent_list, "Restoring history...");
+    load_home_with_offline_fallback(
         state,
         &widgets.content_box,
         &widgets.content_scroll,
+        &widgets.home_pagination,
         &widgets.player_state,
         &widgets.recent_list,
+        &widgets.home_btn,
+        &widgets.offline_btn,
     );
 }
 
 fn refresh_main_after_client_restore(
     state: &Arc<Mutex<AppState>>,
-    content_box: &GtkBox,
-    content_scroll: &ScrolledWindow,
-    home_pagination: &Rc<HomePaginationState>,
-    ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
-    home_btn: &Button,
+    ps: &Rc<PlayerState>,
 ) {
     load_sidebar_history(state, recent_list, ps);
-    if home_btn.has_css_class("nav-item-active") {
-        load_home(
-            state,
-            content_box,
-            content_scroll,
-            home_pagination,
-            ps,
-            recent_list,
-            false,
-        );
-    }
 }
 
 // ============================================================

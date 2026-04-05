@@ -103,7 +103,6 @@ struct ActiveTrack {
     startup_seek_millis: Option<u64>,
     startup_retries: u8,
     awaiting_fresh_position: bool,
-    bootstrapped_watchtime: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1348,7 +1347,6 @@ fn start_probe_playback(
         startup_seek_millis: None,
         startup_retries: 0,
         awaiting_fresh_position: true,
-        bootstrapped_watchtime: false,
     });
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
@@ -1987,7 +1985,6 @@ fn play_index_with_startup_retries(
         startup_seek_millis: None,
         startup_retries,
         awaiting_fresh_position: true,
-        bootstrapped_watchtime: false,
     });
     match budget_mode {
         TrackRepeatBudgetMode::ResetForCurrentTrack => {
@@ -2565,6 +2562,12 @@ fn start_playback_tracking_with_retry(
     attempt: u8,
 ) -> Option<TrackingInfo> {
     let current_attempt = attempt + 1;
+    let session_started_at = state
+        .active_track
+        .as_ref()
+        .filter(|track| track.video_id == video_id)
+        .map(|track| track.started_at)
+        .unwrap_or_else(Instant::now);
 
     if state.client.is_none() {
         match ensure_client_loaded(state) {
@@ -2581,7 +2584,7 @@ fn start_playback_tracking_with_retry(
     if let Some(tracking) = state
         .client
         .as_ref()
-        .and_then(|client| client.start_playback_tracking(video_id))
+        .and_then(|client| client.start_playback_tracking(video_id, session_started_at))
     {
         if current_attempt > 1 {
             eprintln!(
@@ -2606,7 +2609,7 @@ fn start_playback_tracking_with_retry(
         }
     };
 
-    let tracking = refreshed_client.start_playback_tracking(video_id);
+    let tracking = refreshed_client.start_playback_tracking(video_id, session_started_at);
     if tracking.is_none() {
         eprintln!(
             "[TRACKING] attempt {current_attempt} for {video_id} still produced no watchtime tracker after client refresh"
@@ -2799,12 +2802,8 @@ fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
 
     if track.reporting_enabled {
         if let Some(tracking) = track.tracking.as_ref() {
+            tracking.maybe_report_atr(listened);
             tracking.maybe_report_watchtime(listened);
-            if !track.bootstrapped_watchtime && track.started_at.elapsed() >= Duration::from_secs(3)
-            {
-                tracking.maybe_bootstrap_watchtime();
-                track.bootstrapped_watchtime = true;
-            }
         }
     }
 }
@@ -3805,7 +3804,6 @@ mod tests {
             startup_seek_millis: None,
             startup_retries: 0,
             awaiting_fresh_position: true,
-            bootstrapped_watchtime: false,
         }
     }
 

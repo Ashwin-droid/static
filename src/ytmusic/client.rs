@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
@@ -22,18 +22,22 @@ use crate::models::{
 
 use super::parsers;
 
-const STATIC_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const YTM_WEB_REMIX_HEADER_CLIENT_NAME: &str = "67";
 const YTM_WEB_REMIX_CLIENT_NAME: &str = "WEB_REMIX";
-const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20240101.01.00";
+const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20260331.01.00";
 const YTM_WEB_FALLBACK_HEADER_CLIENT_NAME: &str = "1";
 const YTM_WEB_FALLBACK_CLIENT_NAME: &str = "WEB";
 const YTM_WEB_FALLBACK_CLIENT_VERSION: &str = "2.20260403.01.00";
 const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
 const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
+const YTM_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0";
+const TRACKING_BROWSER_BRAND: &str = "Firefox";
+const TRACKING_BROWSER_VERSION: &str = "136.0";
+const ATR_REPORT_DELAY: Duration = Duration::from_secs(4);
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -72,7 +76,8 @@ impl SongRating {
 pub struct TrackingInfo {
     http: reqwest::Client,
     auth: Option<String>,
-    watchtime_url: String,
+    watchtime_url: Option<String>,
+    atr_url: Option<String>,
     cpn: String,
     referer_url: String,
     visitor_id: Option<String>,
@@ -83,6 +88,7 @@ pub struct TrackingInfo {
     default_flush_interval_millis: u64,
     last_reported_millis: AtomicU64,
     last_activity_millis: AtomicU64,
+    atr_reported: AtomicBool,
     session_started_at: Instant,
     rt: *const tokio::runtime::Runtime,
 }
@@ -96,6 +102,14 @@ struct PendingWatchtimeRequest {
     watched_millis: u64,
     state: String,
     final_ping: bool,
+}
+
+struct PendingTrackingRequest {
+    kind: &'static str,
+    url: String,
+    referer: String,
+    event_time: String,
+    request_time: String,
 }
 
 #[derive(Debug, Clone)]
@@ -153,10 +167,6 @@ unsafe impl Send for TrackingInfo {}
 unsafe impl Sync for TrackingInfo {}
 
 impl TrackingInfo {
-    fn startup_bootstrap_target(&self) -> u64 {
-        self.length_millis.min(30_000)
-    }
-
     fn next_flush_after(&self, last_reported_millis: u64) -> Option<u64> {
         if let Some(next) = self
             .flush_points_millis
@@ -191,6 +201,74 @@ impl TrackingInfo {
         Some((parsed, params))
     }
 
+    fn default_visibility(&self) -> &'static str {
+        if self.video_fmt == "0" { "1" } else { "10" }
+    }
+
+    fn apply_default_client_params(&self, params: &mut HashMap<String, String>) {
+        if !params.contains_key("c") {
+            Self::set_query_param(params, "c", YTM_WEB_REMIX_CLIENT_NAME);
+        }
+        if !params.contains_key("cver") {
+            Self::set_query_param(params, "cver", YTM_WEB_REMIX_CLIENT_VERSION);
+        }
+        if !params.contains_key("cplayer") {
+            Self::set_query_param(params, "cplayer", "UNIPLAYER");
+        }
+        if !params.contains_key("cos") {
+            Self::set_query_param(params, "cos", "X11");
+        }
+        if !params.contains_key("cplatform") {
+            Self::set_query_param(params, "cplatform", "DESKTOP");
+        }
+        if !params.contains_key("cbr") {
+            Self::set_query_param(params, "cbr", TRACKING_BROWSER_BRAND);
+        }
+        if !params.contains_key("cbrver") {
+            Self::set_query_param(params, "cbrver", TRACKING_BROWSER_VERSION);
+        }
+    }
+
+    fn finalize_tracking_url(url: Url, params: HashMap<String, String>) -> String {
+        let mut url = url;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in params {
+                pairs.append_pair(&key, &value);
+            }
+        }
+        url.into()
+    }
+
+    fn next_request_metadata(&self) -> (String, String, u64, u64) {
+        let now_unix_millis = unix_epoch_millis();
+        let wall_elapsed_millis = self.session_started_at.elapsed().as_millis() as u64;
+        let previous_activity = self
+            .last_activity_millis
+            .swap(wall_elapsed_millis, Ordering::Relaxed);
+        let lact_millis = wall_elapsed_millis.saturating_sub(previous_activity);
+        (
+            now_unix_millis.to_string(),
+            now_unix_millis.to_string(),
+            wall_elapsed_millis,
+            lact_millis,
+        )
+    }
+
+    fn next_report_deadline_seconds(
+        &self,
+        wall_elapsed_millis: u64,
+        watched_millis: u64,
+    ) -> Option<String> {
+        if watched_millis >= self.length_millis {
+            return None;
+        }
+
+        let next_flush_millis = self.next_flush_after(watched_millis)?;
+        let wall_lag_millis = wall_elapsed_millis.saturating_sub(watched_millis);
+        Some((((next_flush_millis + wall_lag_millis + 999) / 1000) + 1).to_string())
+    }
+
     fn build_watchtime_request(
         &self,
         start_millis: u64,
@@ -198,18 +276,15 @@ impl TrackingInfo {
         state: &str,
         final_ping: bool,
     ) -> Option<PendingWatchtimeRequest> {
+        let watchtime_url = self.watchtime_url.as_deref()?;
         let watched = listened_millis.min(self.length_millis);
-        if watched == 0 || watched <= start_millis {
+        if watched == 0 || (!final_ping && watched <= start_millis) {
             return None;
         }
 
-        let (mut url, mut params) = Self::build_query_map(&self.watchtime_url)?;
-        let now_unix_millis = unix_epoch_millis();
-        let wall_elapsed_millis = self.session_started_at.elapsed().as_millis() as u64;
-        let previous_activity = self
-            .last_activity_millis
-            .swap(wall_elapsed_millis, Ordering::Relaxed);
-        let lact_millis = wall_elapsed_millis.saturating_sub(previous_activity);
+        let (url, mut params) = Self::build_query_map(watchtime_url)?;
+        let (event_time, request_time, wall_elapsed_millis, lact_millis) =
+            self.next_request_metadata();
 
         Self::set_query_param(&mut params, "cpn", self.cpn.clone());
         Self::set_query_param(&mut params, "ver", "2");
@@ -223,7 +298,7 @@ impl TrackingInfo {
         let vis = params
             .get("vis")
             .cloned()
-            .unwrap_or_else(|| "10".to_string());
+            .unwrap_or_else(|| self.default_visibility().to_string());
         Self::set_query_param(&mut params, "vis", vis);
         Self::set_query_param(&mut params, "state", state);
         Self::set_query_param(&mut params, "rt", format_millis(wall_elapsed_millis));
@@ -231,21 +306,20 @@ impl TrackingInfo {
         Self::set_query_param(&mut params, "lact", lact_millis.to_string());
 
         if state == "playing" && !final_ping {
-            Self::set_query_param(
-                &mut params,
-                "rtn",
-                ((wall_elapsed_millis / 1000) + 10).to_string(),
-            );
+            if let Some(next_deadline) =
+                self.next_report_deadline_seconds(wall_elapsed_millis, watched)
+            {
+                Self::set_query_param(&mut params, "rtn", next_deadline);
+            } else {
+                params.remove("rtn");
+            }
             params.remove("final");
-            params.remove("pe");
         } else if final_ping {
             Self::set_query_param(&mut params, "final", "1");
-            Self::set_query_param(&mut params, "pe", "1");
             params.remove("rtn");
         } else {
             params.remove("rtn");
             params.remove("final");
-            params.remove("pe");
         }
 
         if !params.contains_key("referrer") {
@@ -254,45 +328,121 @@ impl TrackingInfo {
         if !params.contains_key("len") {
             Self::set_query_param(&mut params, "len", format_millis(self.length_millis));
         }
-        if !params.contains_key("c") {
-            Self::set_query_param(&mut params, "c", "WEB_REMIX");
-        }
-        if !params.contains_key("cver") {
-            Self::set_query_param(&mut params, "cver", "1.20260304.03.00");
-        }
-        if !params.contains_key("cplayer") {
-            Self::set_query_param(&mut params, "cplayer", "UNIPLAYER");
-        }
-        if !params.contains_key("cos") {
-            Self::set_query_param(&mut params, "cos", "X11");
-        }
-        if !params.contains_key("cplatform") {
-            Self::set_query_param(&mut params, "cplatform", "DESKTOP");
-        }
-        if !params.contains_key("cbr") {
-            Self::set_query_param(&mut params, "cbr", "Static");
-        }
-        if !params.contains_key("cbrver") {
-            Self::set_query_param(&mut params, "cbrver", STATIC_APP_VERSION);
-        }
-
-        {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in params {
-                pairs.append_pair(&key, &value);
-            }
-        }
+        self.apply_default_client_params(&mut params);
 
         Some(PendingWatchtimeRequest {
-            url: url.into(),
+            url: Self::finalize_tracking_url(url, params),
             referer: self.referer_url.clone(),
-            event_time: now_unix_millis.to_string(),
-            request_time: now_unix_millis.to_string(),
+            event_time,
+            request_time,
             start_millis,
             watched_millis: watched,
             state: state.to_string(),
             final_ping,
         })
+    }
+
+    fn build_playback_request(&self, playback_url: &str) -> Option<PendingTrackingRequest> {
+        let watched =
+            (self.session_started_at.elapsed().as_millis() as u64).min(self.length_millis);
+        let (url, mut params) = Self::build_query_map(playback_url)?;
+        let (event_time, request_time, wall_elapsed_millis, lact_millis) =
+            self.next_request_metadata();
+
+        Self::set_query_param(&mut params, "cpn", self.cpn.clone());
+        Self::set_query_param(&mut params, "ver", "2");
+        Self::set_query_param(&mut params, "cmt", format_millis(watched));
+        Self::set_query_param(&mut params, "fmt", self.video_fmt.clone());
+        Self::set_query_param(&mut params, "afmt", self.audio_fmt.clone());
+        Self::set_query_param(&mut params, "muted", "0");
+        Self::set_query_param(&mut params, "volume", "100");
+        Self::set_query_param(&mut params, "vis", self.default_visibility());
+        Self::set_query_param(&mut params, "rt", format_millis(wall_elapsed_millis));
+        Self::set_query_param(&mut params, "lact", lact_millis.to_string());
+        if let Some(next_deadline) = self.next_report_deadline_seconds(wall_elapsed_millis, watched)
+        {
+            Self::set_query_param(&mut params, "rtn", next_deadline);
+        }
+        if !params.contains_key("referrer") {
+            Self::set_query_param(&mut params, "referrer", self.referer_url.clone());
+        }
+        if !params.contains_key("len") {
+            Self::set_query_param(&mut params, "len", format_millis(self.length_millis));
+        }
+        if !params.contains_key("mos") {
+            Self::set_query_param(&mut params, "mos", "0");
+        }
+        self.apply_default_client_params(&mut params);
+
+        Some(PendingTrackingRequest {
+            kind: "playback",
+            url: Self::finalize_tracking_url(url, params),
+            referer: self.referer_url.clone(),
+            event_time,
+            request_time,
+        })
+    }
+
+    fn build_atr_request(&self, listened_millis: u64) -> Option<PendingTrackingRequest> {
+        let atr_url = self.atr_url.as_deref()?;
+        let watched = listened_millis.min(self.length_millis);
+        if watched == 0 {
+            return None;
+        }
+
+        let (url, mut params) = Self::build_query_map(atr_url)?;
+        let (event_time, request_time, wall_elapsed_millis, lact_millis) =
+            self.next_request_metadata();
+
+        Self::set_query_param(&mut params, "cpn", self.cpn.clone());
+        Self::set_query_param(&mut params, "ver", "2");
+        Self::set_query_param(&mut params, "cmt", format_millis(watched));
+        Self::set_query_param(&mut params, "fmt", self.video_fmt.clone());
+        Self::set_query_param(&mut params, "afmt", self.audio_fmt.clone());
+        Self::set_query_param(&mut params, "muted", "0");
+        Self::set_query_param(&mut params, "volume", "100");
+        Self::set_query_param(&mut params, "vis", self.default_visibility());
+        Self::set_query_param(&mut params, "rt", format_millis(wall_elapsed_millis));
+        Self::set_query_param(&mut params, "lact", lact_millis.to_string());
+        if !params.contains_key("len") {
+            Self::set_query_param(&mut params, "len", format_millis(self.length_millis));
+        }
+        if !params.contains_key("mos") {
+            Self::set_query_param(&mut params, "mos", "0");
+        }
+        self.apply_default_client_params(&mut params);
+
+        Some(PendingTrackingRequest {
+            kind: "atr",
+            url: Self::finalize_tracking_url(url, params),
+            referer: self.referer_url.clone(),
+            event_time,
+            request_time,
+        })
+    }
+
+    fn build_request(
+        http: &reqwest::Client,
+        auth: Option<&String>,
+        visitor_id: Option<&String>,
+        request_url: &str,
+        referer: &str,
+        event_time: &str,
+        request_time: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut req = http
+            .get(request_url)
+            .header("referer", referer)
+            .header("x-goog-authuser", "0")
+            .header("x-goog-event-time", event_time)
+            .header("x-goog-request-time", request_time);
+        if let Some(auth) = auth {
+            req = req.header("authorization", auth.clone());
+        }
+        if let Some(visitor_id) = visitor_id {
+            req = req.header("x-goog-visitor-id", visitor_id);
+        }
+        req
     }
 
     fn dispatch_watchtime_request(&self, request: PendingWatchtimeRequest) {
@@ -301,18 +451,15 @@ impl TrackingInfo {
         let auth = self.auth.clone();
         let visitor_id = self.visitor_id.clone();
         rt.spawn(async move {
-            let mut req = http
-                .get(&request.url)
-                .header("referer", request.referer)
-                .header("x-goog-authuser", "0")
-                .header("x-goog-event-time", request.event_time)
-                .header("x-goog-request-time", request.request_time);
-            if let Some(auth) = &auth {
-                req = req.header("authorization", auth.clone());
-            }
-            if let Some(visitor_id) = &visitor_id {
-                req = req.header("x-goog-visitor-id", visitor_id);
-            }
+            let req = Self::build_request(
+                &http,
+                auth.as_ref(),
+                visitor_id.as_ref(),
+                &request.url,
+                &request.referer,
+                &request.event_time,
+                &request.request_time,
+            );
             match req.send().await {
                 Ok(r) => eprintln!(
                     "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
@@ -333,18 +480,15 @@ impl TrackingInfo {
         let auth = self.auth.clone();
         let visitor_id = self.visitor_id.clone();
         rt.block_on(async move {
-            let mut req = http
-                .get(&request.url)
-                .header("referer", request.referer)
-                .header("x-goog-authuser", "0")
-                .header("x-goog-event-time", request.event_time)
-                .header("x-goog-request-time", request.request_time);
-            if let Some(auth) = &auth {
-                req = req.header("authorization", auth.clone());
-            }
-            if let Some(visitor_id) = &visitor_id {
-                req = req.header("x-goog-visitor-id", visitor_id);
-            }
+            let req = Self::build_request(
+                &http,
+                auth.as_ref(),
+                visitor_id.as_ref(),
+                &request.url,
+                &request.referer,
+                &request.event_time,
+                &request.request_time,
+            );
             match req.send().await {
                 Ok(r) => eprintln!(
                     "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
@@ -355,6 +499,28 @@ impl TrackingInfo {
                     r.status()
                 ),
                 Err(e) => eprintln!("[TRACKING] watchtime failed: {e}"),
+            }
+        });
+    }
+
+    fn dispatch_tracking_request(&self, request: PendingTrackingRequest) {
+        let rt = unsafe { &*self.rt };
+        let http = self.http.clone();
+        let auth = self.auth.clone();
+        let visitor_id = self.visitor_id.clone();
+        rt.spawn(async move {
+            let req = Self::build_request(
+                &http,
+                auth.as_ref(),
+                visitor_id.as_ref(),
+                &request.url,
+                &request.referer,
+                &request.event_time,
+                &request.request_time,
+            );
+            match req.send().await {
+                Ok(r) => eprintln!("[TRACKING] {} reported ({})", request.kind, r.status()),
+                Err(e) => eprintln!("[TRACKING] {} failed: {e}", request.kind),
             }
         });
     }
@@ -397,58 +563,28 @@ impl TrackingInfo {
         self.send_watchtime_range(last_reported_millis, watched, "playing", false);
     }
 
-    pub fn maybe_bootstrap_watchtime(&self) {
-        let target = self.startup_bootstrap_target();
-        if target == 0 {
+    pub fn maybe_report_atr(&self, listened_millis: u64) {
+        if self.atr_url.is_none()
+            || listened_millis == 0
+            || self.session_started_at.elapsed() < ATR_REPORT_DELAY
+        {
             return;
         }
 
         if self
-            .last_reported_millis
-            .compare_exchange(0, target, Ordering::Relaxed, Ordering::Relaxed)
+            .atr_reported
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
         {
             return;
         }
 
-        let client_params = format!(
-            "&cbr=Static&cbrver={STATIC_APP_VERSION}&c=WEB_REMIX&cver=1.20260304.03.00\
-             &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP"
-        );
-        let full = format!(
-            "{}&cpn={}&ver=2&st={}&et={}&cmt={}\
-             &fmt=251&afmt=251&muted=0&volume=100&vis=1\
-             &rt={}&state=playing&rtn={}\
-             &referrer=https%3A%2F%2Fmusic.youtube.com%2F{}",
-            self.watchtime_url,
-            self.cpn,
-            format_millis(0),
-            format_millis(target),
-            format_millis(target),
-            format_millis(target),
-            (target / 1000) + 5,
-            client_params,
-        );
+        let Some(request) = self.build_atr_request(listened_millis) else {
+            self.atr_reported.store(false, Ordering::Relaxed);
+            return;
+        };
 
-        let rt = unsafe { &*self.rt };
-        let http = self.http.clone();
-        let auth = self.auth.clone();
-        rt.spawn(async move {
-            let mut req = http
-                .get(&full)
-                .header("referer", "https://music.youtube.com/");
-            if let Some(auth) = &auth {
-                req = req.header("authorization", auth.clone());
-            }
-            match req.send().await {
-                Ok(r) => eprintln!(
-                    "[TRACKING] startup watchtime reported: 0..{} ms ({})",
-                    target,
-                    r.status()
-                ),
-                Err(e) => eprintln!("[TRACKING] startup watchtime failed: {e}"),
-            }
-        });
+        self.dispatch_tracking_request(request);
     }
 
     /// Fire the watchtime URL with real listened time. Call this on song change/stop.
@@ -461,9 +597,7 @@ impl TrackingInfo {
             self.last_reported_millis.store(watched, Ordering::Relaxed);
         }
 
-        let final_start = watched.saturating_sub(7);
-        let final_end = watched.max(final_start + 1);
-        let final_request = self.build_watchtime_request(final_start, final_end, "paused", true);
+        let final_request = self.build_watchtime_request(watched, watched, "paused", true);
 
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
@@ -471,18 +605,15 @@ impl TrackingInfo {
         let visitor_id = self.visitor_id.clone();
         rt.spawn(async move {
             for request in [paused_request, final_request].into_iter().flatten() {
-                let mut req = http
-                    .get(&request.url)
-                    .header("referer", request.referer)
-                    .header("x-goog-authuser", "0")
-                    .header("x-goog-event-time", request.event_time)
-                    .header("x-goog-request-time", request.request_time);
-                if let Some(auth) = &auth {
-                    req = req.header("authorization", auth.clone());
-                }
-                if let Some(visitor_id) = &visitor_id {
-                    req = req.header("x-goog-visitor-id", visitor_id);
-                }
+                let req = Self::build_request(
+                    &http,
+                    auth.as_ref(),
+                    visitor_id.as_ref(),
+                    &request.url,
+                    &request.referer,
+                    &request.event_time,
+                    &request.request_time,
+                );
                 match req.send().await {
                     Ok(r) => eprintln!(
                         "[TRACKING] watchtime reported: {}..{} ms state={} final={} ({})",
@@ -507,9 +638,7 @@ impl TrackingInfo {
             self.last_reported_millis.store(watched, Ordering::Relaxed);
         }
 
-        let final_start = watched.saturating_sub(7);
-        let final_end = watched.max(final_start + 1);
-        let final_request = self.build_watchtime_request(final_start, final_end, "paused", true);
+        let final_request = self.build_watchtime_request(watched, watched, "paused", true);
 
         for request in [paused_request, final_request].into_iter().flatten() {
             self.dispatch_watchtime_request_blocking(request);
@@ -663,7 +792,11 @@ fn generate_cpn() -> String {
         .unwrap()
         .as_nanos();
     let hash = Sha1::digest(nanos.to_le_bytes());
-    format!("{:x}", hash)[..16].to_string()
+    const ALPHABET: &[u8; 64] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+    hash.iter()
+        .take(16)
+        .map(|byte| ALPHABET[(byte & 0x3f) as usize] as char)
+        .collect()
 }
 
 fn generate_sapisidhash(sapisid: &str, origin: &str) -> String {
@@ -686,12 +819,7 @@ impl YtMusicClient {
 
         let mut headers = HeaderMap::new();
         headers.insert("cookie", HeaderValue::from_str(&normalized_cookie)?);
-        headers.insert(
-            "user-agent",
-            HeaderValue::from_static(
-                "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
-            ),
-        );
+        headers.insert("user-agent", HeaderValue::from_static(YTM_USER_AGENT));
         headers.insert("accept", HeaderValue::from_static("*/*"));
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         headers.insert("origin", HeaderValue::from_static(YTM_ORIGIN));
@@ -1091,9 +1219,13 @@ impl YtMusicClient {
 
     /// Report playback start to YouTube and return tracking info.
     /// Call this off the playback-critical path so local files can start instantly.
-    pub fn start_playback_tracking(&self, video_id: &str) -> Option<TrackingInfo> {
+    pub fn start_playback_tracking(
+        &self,
+        video_id: &str,
+        session_started_at: Instant,
+    ) -> Option<TrackingInfo> {
         self.rt
-            .block_on(self.start_playback_tracking_async(video_id))
+            .block_on(self.start_playback_tracking_async(video_id, session_started_at))
     }
 
     /// Get just the streaming URL without reporting anything to YouTube.
@@ -1133,11 +1265,14 @@ impl YtMusicClient {
     /// Report playback start to YouTube and return a TrackingInfo for deferred watchtime reporting.
     /// Fires the playback URL immediately; the caller fires watchtime later via TrackingInfo.
     /// NOTE: Must be called from an async context running on self.rt (e.g. inside block_on).
-    async fn start_playback_tracking_async(&self, video_id: &str) -> Option<TrackingInfo> {
-        let http = self.http.clone();
-        let auth = self.auth_header();
+    async fn start_playback_tracking_async(
+        &self,
+        video_id: &str,
+        session_started_at: Instant,
+    ) -> Option<TrackingInfo> {
         let video_id = video_id.to_string();
         let rt_ptr: *const tokio::runtime::Runtime = &self.rt;
+        let auth = self.auth_header();
 
         {
             if auth.is_none() {
@@ -1204,14 +1339,19 @@ impl YtMusicClient {
                     .and_then(|url| url.get("baseUrl"))
                     .and_then(|url| url.as_str())
                     .map(rewrite_tracking_base_url);
+                let atr_url = tracking
+                    .get("atrUrl")
+                    .and_then(|url| url.get("baseUrl"))
+                    .and_then(|url| url.as_str())
+                    .map(rewrite_tracking_base_url);
 
-                if playback_url.is_some() || watchtime_url.is_some() {
+                if playback_url.is_some() || watchtime_url.is_some() || atr_url.is_some() {
                     if profile_name == YTM_WEB_FALLBACK_CLIENT_NAME {
                         eprintln!(
                             "[TRACKING] recovered playbackTracking for {video_id} via WEB on music.youtube.com"
                         );
                     }
-                    tracking_bootstrap = Some((json, playback_url, watchtime_url));
+                    tracking_bootstrap = Some((json, playback_url, watchtime_url, atr_url));
                     break;
                 }
 
@@ -1222,7 +1362,7 @@ impl YtMusicClient {
                 }
             }
 
-            let Some((json, playback_url, watchtime_url)) = tracking_bootstrap else {
+            let Some((json, playback_url, watchtime_url, atr_url)) = tracking_bootstrap else {
                 eprintln!("[TRACKING] playbackTracking block missing for {video_id}");
                 eprintln!("[TRACKING] playback bootstrap URL missing for {video_id}");
                 eprintln!("[TRACKING] watchtime URL missing for {video_id}");
@@ -1256,8 +1396,8 @@ impl YtMusicClient {
                 .unwrap_or(40)
                 * 1000;
 
-            let audio_fmt = Self::best_audio_format(&json)
-                .ok()
+            let best_audio_format = Self::best_audio_format(&json).ok();
+            let audio_fmt = best_audio_format
                 .and_then(|format| format.get("itag").and_then(|v| v.as_u64()))
                 .unwrap_or(141)
                 .to_string();
@@ -1271,10 +1411,16 @@ impl YtMusicClient {
                 .and_then(|url| TrackingInfo::build_query_map(url))
                 .and_then(|(_, params)| params.get("referrer").cloned())
                 .unwrap_or_else(|| format!("{YTM_ORIGIN}/watch?v={video_id}"));
-            let length_millis = watchtime_url
-                .as_deref()
-                .and_then(|url| TrackingInfo::build_query_map(url))
-                .and_then(|(_, params)| parse_secs_to_millis(params.get("len").map(|s| s.as_str())))
+            let length_millis = best_audio_format
+                .and_then(|format| parse_json_u64(format.get("approxDurationMs")))
+                .or_else(|| {
+                    watchtime_url
+                        .as_deref()
+                        .and_then(|url| TrackingInfo::build_query_map(url))
+                        .and_then(|(_, params)| {
+                            parse_secs_to_millis(params.get("len").map(|s| s.as_str()))
+                        })
+                })
                 .or_else(|| {
                     parse_secs_to_millis(
                         json.pointer("/videoDetails/lengthSeconds")
@@ -1285,34 +1431,11 @@ impl YtMusicClient {
 
             let cpn = generate_cpn();
 
-            // Fire playback URL immediately (start event)
-            if let Some(url) = &playback_url {
-                let client_params = format!(
-                    "&cbr=Static&cbrver={STATIC_APP_VERSION}&c=WEB_REMIX&cver=1.20260304.03.00\
-                     &cplayer=UNIPLAYER&cos=X11&cplatform=DESKTOP"
-                );
-                let full = format!(
-                    "{url}&cpn={cpn}&ver=2&cmt=0&fmt=251&afmt=251\
-                     &muted=0&volume=100&vis=1{}",
-                    client_params
-                );
-                let mut req = http
-                    .get(&full)
-                    .header("referer", "https://music.youtube.com/");
-                if let Some(ref auth) = auth {
-                    req = req.header("authorization", auth.clone());
-                }
-                match req.send().await {
-                    Ok(r) => eprintln!("[TRACKING] playback reported ({})", r.status()),
-                    Err(e) => eprintln!("[TRACKING] playback failed: {e}"),
-                }
-            }
-
-            // Return watchtime info for deferred reporting
-            watchtime_url.map(|wt_url| TrackingInfo {
-                http: http.clone(),
-                auth: auth.clone(),
-                watchtime_url: wt_url,
+            let tracking_info = TrackingInfo {
+                http: self.http.clone(),
+                auth,
+                watchtime_url,
+                atr_url,
                 cpn,
                 referer_url,
                 visitor_id,
@@ -1323,9 +1446,18 @@ impl YtMusicClient {
                 default_flush_interval_millis,
                 last_reported_millis: AtomicU64::new(0),
                 last_activity_millis: AtomicU64::new(0),
-                session_started_at: Instant::now(),
+                atr_reported: AtomicBool::new(false),
+                session_started_at,
                 rt: rt_ptr,
-            })
+            };
+
+            if let Some(url) = playback_url.as_deref() {
+                if let Some(request) = tracking_info.build_playback_request(url) {
+                    tracking_info.dispatch_tracking_request(request);
+                }
+            }
+
+            Some(tracking_info)
         }
     }
 
@@ -1916,11 +2048,42 @@ impl YtMusicClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptionTrack, YtMusicClient, lyrics_browse_id_from_next_response,
-        prepare_cookie_for_sapisid_auth,
+        CaptionTrack, TrackingInfo, YtMusicClient, generate_cpn,
+        lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
     };
     use crate::models::SyncedLyricsSource;
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::time::{Duration, Instant};
+
+    fn test_tracking_info(
+        watchtime_url: Option<&str>,
+        atr_url: Option<&str>,
+        video_fmt: &str,
+        audio_fmt: &str,
+        length_millis: u64,
+        elapsed: Duration,
+    ) -> TrackingInfo {
+        TrackingInfo {
+            http: reqwest::Client::new(),
+            auth: None,
+            watchtime_url: watchtime_url.map(str::to_string),
+            atr_url: atr_url.map(str::to_string),
+            cpn: "_Z3q2CnOA6jEC31l".to_string(),
+            referer_url: "https://music.youtube.com/".to_string(),
+            visitor_id: None,
+            audio_fmt: audio_fmt.to_string(),
+            video_fmt: video_fmt.to_string(),
+            length_millis,
+            flush_points_millis: vec![10_000, 20_000, 30_000],
+            default_flush_interval_millis: 40_000,
+            last_reported_millis: AtomicU64::new(0),
+            last_activity_millis: AtomicU64::new(0),
+            atr_reported: AtomicBool::new(false),
+            session_started_at: Instant::now() - elapsed,
+            rt: std::ptr::null(),
+        }
+    }
 
     #[test]
     fn sorted_audio_formats_prefer_direct_urls_over_non_url_entries() {
@@ -2109,5 +2272,93 @@ mod tests {
         assert_eq!(normalized, cookie);
         assert_eq!(sapisid, None);
         assert_eq!(source, None);
+    }
+
+    #[test]
+    fn final_watchtime_request_matches_current_ytm_shape() {
+        let tracking = test_tracking_info(
+            Some("https://music.youtube.com/api/stats/watchtime?ns=yt&docid=abc123"),
+            None,
+            "0",
+            "141",
+            188_000,
+            Duration::from_secs(96),
+        );
+
+        let request = tracking
+            .build_watchtime_request(94_518, 94_518, "paused", true)
+            .expect("final watchtime request");
+        let (_, params) = TrackingInfo::build_query_map(&request.url).expect("query params");
+
+        assert_eq!(params.get("state").map(String::as_str), Some("paused"));
+        assert_eq!(params.get("st").map(String::as_str), Some("94.518"));
+        assert_eq!(params.get("et").map(String::as_str), Some("94.518"));
+        assert_eq!(params.get("cmt").map(String::as_str), Some("94.518"));
+        assert_eq!(params.get("final").map(String::as_str), Some("1"));
+        assert_eq!(params.get("vis").map(String::as_str), Some("1"));
+        assert!(!params.contains_key("pe"));
+        assert!(!params.contains_key("rtn"));
+    }
+
+    #[test]
+    fn playback_request_uses_selected_formats_and_browser_identity() {
+        let tracking = test_tracking_info(
+            Some("https://music.youtube.com/api/stats/watchtime?ns=yt&docid=abc123"),
+            Some("https://music.youtube.com/api/stats/atr?ns=yt&docid=abc123&ver=2"),
+            "134",
+            "140",
+            179_839,
+            Duration::from_millis(1_116),
+        );
+
+        let request = tracking
+            .build_playback_request(
+                "https://music.youtube.com/api/stats/playback?ns=yt&docid=abc123",
+            )
+            .expect("playback request");
+        let (_, params) = TrackingInfo::build_query_map(&request.url).expect("query params");
+
+        assert_eq!(params.get("fmt").map(String::as_str), Some("134"));
+        assert_eq!(params.get("afmt").map(String::as_str), Some("140"));
+        assert_eq!(params.get("vis").map(String::as_str), Some("10"));
+        assert_eq!(params.get("mos").map(String::as_str), Some("0"));
+        assert_eq!(params.get("cbr").map(String::as_str), Some("Firefox"));
+        assert_eq!(params.get("cbrver").map(String::as_str), Some("136.0"));
+        assert_eq!(
+            params.get("cver").map(String::as_str),
+            Some("1.20260331.01.00")
+        );
+    }
+
+    #[test]
+    fn atr_request_keeps_to_its_own_surface() {
+        let tracking = test_tracking_info(
+            None,
+            Some("https://music.youtube.com/api/stats/atr?ns=yt&docid=abc123&ver=2"),
+            "134",
+            "140",
+            179_839,
+            Duration::from_secs(4),
+        );
+
+        let request = tracking.build_atr_request(2_764).expect("atr request");
+        let (_, params) = TrackingInfo::build_query_map(&request.url).expect("query params");
+
+        assert_eq!(params.get("cmt").map(String::as_str), Some("2.764"));
+        assert_eq!(params.get("fmt").map(String::as_str), Some("134"));
+        assert_eq!(params.get("afmt").map(String::as_str), Some("140"));
+        assert_eq!(params.get("mos").map(String::as_str), Some("0"));
+        assert!(!params.contains_key("referrer"));
+        assert!(!params.contains_key("state"));
+    }
+
+    #[test]
+    fn generated_cpn_matches_youtube_style_charset() {
+        let cpn = generate_cpn();
+        assert_eq!(cpn.len(), 16);
+        assert!(
+            cpn.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        );
     }
 }

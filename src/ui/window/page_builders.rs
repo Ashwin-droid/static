@@ -612,12 +612,25 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     text_box.set_valign(Align::Center);
     text_box.set_size_request(-1, 58);
 
+    let title_row = GtkBox::new(Orientation::Horizontal, 8);
+    title_row.set_hexpand(true);
+    title_row.set_valign(Align::Center);
+
     let np_title = Label::new(Some("Nothing playing"));
     np_title.add_css_class("np-track-title");
     np_title.set_halign(Align::Start);
     let np_title_sw = label_scroller(&np_title, 22);
     attach_hover_marquee(&text_box, &np_title_sw, Some(&np_title));
-    text_box.append(&np_title_sw);
+    title_row.append(&np_title_sw);
+
+    let np_repeat_loops_left = Label::new(None);
+    np_repeat_loops_left.add_css_class("np-track-repeat-count");
+    np_repeat_loops_left.set_halign(Align::Start);
+    np_repeat_loops_left.set_valign(Align::Center);
+    np_repeat_loops_left.set_visible(false);
+    title_row.append(&np_repeat_loops_left);
+
+    text_box.append(&title_row);
 
     let np_artist = Label::new(None);
     np_artist.add_css_class("np-track-artist");
@@ -853,6 +866,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         time_label: time_label.clone(),
         np_thumb: np_thumb.clone(),
         np_title: np_title.clone(),
+        np_repeat_loops_left: np_repeat_loops_left.clone(),
         np_artist: np_artist.clone(),
         dislike_btn: dislike_btn.clone(),
         like_btn: like_btn.clone(),
@@ -1663,6 +1677,72 @@ pub(super) fn load_settings_page(
     }
     local_row.append(&local_switch);
     playback_section.append(&local_row);
+
+    let auto_release_row = GtkBox::new(Orientation::Horizontal, 12);
+    auto_release_row.add_css_class("settings-row");
+    let auto_release_copy = GtkBox::new(Orientation::Vertical, 2);
+    auto_release_copy.set_hexpand(true);
+    let auto_release_label = Label::new(Some("Auto-release Track loops"));
+    auto_release_label.add_css_class("settings-row-title");
+    auto_release_label.set_halign(Align::Start);
+    auto_release_copy.append(&auto_release_label);
+    let auto_release_hint = Label::new(Some(
+        "When Track repeat is active, release it back to Off after the current song loops itself a set number of times.",
+    ));
+    auto_release_hint.add_css_class("settings-row-copy");
+    auto_release_hint.set_wrap(true);
+    auto_release_hint.set_halign(Align::Start);
+    auto_release_copy.append(&auto_release_hint);
+    auto_release_row.append(&auto_release_copy);
+    let auto_release_switch = settings_switch(settings.auto_release_track_loops);
+    auto_release_row.append(&auto_release_switch);
+    playback_section.append(&auto_release_row);
+
+    let auto_release_after_row = GtkBox::new(Orientation::Horizontal, 12);
+    auto_release_after_row.add_css_class("settings-row");
+    let auto_release_after_copy = GtkBox::new(Orientation::Vertical, 2);
+    auto_release_after_copy.set_hexpand(true);
+    let auto_release_after_label = Label::new(Some("Auto-release Track loops after"));
+    auto_release_after_label.add_css_class("settings-row-title");
+    auto_release_after_label.set_halign(Align::Start);
+    auto_release_after_copy.append(&auto_release_after_label);
+    let auto_release_after_hint = Label::new(Some(
+        "Counts only natural self-repeats of the current track, not seeks, replay clicks, or manual skips.",
+    ));
+    auto_release_after_hint.add_css_class("settings-row-copy");
+    auto_release_after_hint.set_wrap(true);
+    auto_release_after_hint.set_halign(Align::Start);
+    auto_release_after_copy.append(&auto_release_after_hint);
+    auto_release_after_row.append(&auto_release_after_copy);
+    let auto_release_after_spin = SpinButton::with_range(1.0, 100.0, 1.0);
+    auto_release_after_spin.set_value(settings.auto_release_track_loops_after as f64);
+    auto_release_after_spin.set_sensitive(settings.auto_release_track_loops);
+    auto_release_after_row.append(&auto_release_after_spin);
+    playback_section.append(&auto_release_after_row);
+
+    {
+        let state = state.clone();
+        let auto_release_after_spin = auto_release_after_spin.clone();
+        auto_release_switch.connect_active_notify(move |sw| {
+            let active = sw.is_active();
+            auto_release_after_spin.set_sensitive(active);
+            if active == app_settings(&state).auto_release_track_loops {
+                return;
+            }
+            update_app_settings(&state, |s| s.auto_release_track_loops = active);
+        });
+    }
+
+    {
+        let state = state.clone();
+        auto_release_after_spin.connect_value_changed(move |spin| {
+            let next_value = (spin.value() as u32).clamp(1, 100);
+            if next_value == app_settings(&state).auto_release_track_loops_after {
+                return;
+            }
+            update_app_settings(&state, |s| s.auto_release_track_loops_after = next_value);
+        });
+    }
 
     let mpris_row = GtkBox::new(Orientation::Horizontal, 12);
     mpris_row.add_css_class("settings-row");

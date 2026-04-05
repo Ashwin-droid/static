@@ -18,6 +18,8 @@ macro_rules! eprintln {
 pub struct AppSettings {
     pub auto_sync_chromium_cookies: bool,
     pub chromium_cookie_path: String,
+    pub auto_release_track_loops: bool,
+    pub auto_release_track_loops_after: u32,
     pub auto_manage_offline_cache: bool,
     pub auto_cache_listen_again: bool,
     pub listen_again_cache_days: u32,
@@ -42,6 +44,8 @@ impl Default for AppSettings {
         Self {
             auto_sync_chromium_cookies: true,
             chromium_cookie_path: String::new(),
+            auto_release_track_loops: false,
+            auto_release_track_loops_after: 1,
             auto_manage_offline_cache: true,
             auto_cache_listen_again: true,
             listen_again_cache_days: 30,
@@ -336,6 +340,18 @@ impl MusicCache {
                 "chromium_cookie_path" => {
                     settings.chromium_cookie_path = row.1;
                 }
+                "auto_release_track_loops" => {
+                    settings.auto_release_track_loops =
+                        parse_bool_setting(&row.1, settings.auto_release_track_loops);
+                }
+                "auto_release_track_loops_after" => {
+                    settings.auto_release_track_loops_after = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.auto_release_track_loops_after)
+                        .clamp(1, 100);
+                }
                 "auto_manage_offline_cache" => {
                     settings.auto_manage_offline_cache =
                         parse_bool_setting(&row.1, settings.auto_manage_offline_cache);
@@ -456,6 +472,14 @@ impl MusicCache {
             (
                 "chromium_cookie_path",
                 settings.chromium_cookie_path.clone(),
+            ),
+            (
+                "auto_release_track_loops",
+                bool_setting(settings.auto_release_track_loops),
+            ),
+            (
+                "auto_release_track_loops_after",
+                settings.auto_release_track_loops_after.to_string(),
             ),
             (
                 "auto_manage_offline_cache",

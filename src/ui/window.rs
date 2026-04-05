@@ -279,6 +279,7 @@ struct PlayerState {
     // Track info
     np_thumb: Picture,
     np_title: Label,
+    np_repeat_loops_left: Label,
     np_artist: Label,
     // Actions
     dislike_btn: Button,
@@ -480,9 +481,10 @@ pub fn build_window(app: &Application) {
 
     {
         let ps = main_widgets.player_state.clone();
+        let state = state.clone();
         window.connect_close_request(move |_| {
             let snapshot = ps.player.snapshot();
-            persist_resume_snapshot_from_ui_state(&ps);
+            persist_resume_snapshot_from_ui_state(&ps, &state);
             if snapshot.paused && snapshot.current_track.is_some() {
                 let client = ps.player.daemon_client();
                 if let Err(err) = client.shutdown() {

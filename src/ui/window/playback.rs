@@ -89,6 +89,9 @@ pub(super) fn playback_snapshot_from_ui_state(ps: &PlayerState) -> PlaybackSnaps
     snapshot.radio_virtual_playlist = radio_virtual_playlist;
     if use_live_ui_queue {
         snapshot.repeat_mode = ps.repeat_mode.get();
+        if snapshot.repeat_mode != RepeatMode::One {
+            snapshot.track_repeat_loops_left = None;
+        }
     }
     snapshot.volume = ps.volume_slider.value();
     if snapshot.probe_active {
@@ -212,12 +215,25 @@ pub(super) fn maybe_restore_daemon_from_ui_state(
     });
 }
 
-pub(super) fn persist_resume_snapshot_from_ui_state(ps: &PlayerState) {
-    let snapshot = playback_snapshot_from_ui_state(ps);
+pub(super) fn persist_resume_snapshot_from_ui_state(
+    ps: &PlayerState,
+    state: &Arc<Mutex<AppState>>,
+) {
+    let mut snapshot = playback_snapshot_from_ui_state(ps);
     let has_recoverable_state = snapshot.current_track.is_some() || !snapshot.queue.is_empty();
     if !has_recoverable_state {
         return;
     }
+
+    let settings = app_settings(state);
+    snapshot.track_repeat_loops_left = if snapshot.repeat_mode == RepeatMode::One
+        && snapshot.current_track.is_some()
+        && settings.auto_release_track_loops
+    {
+        Some(settings.auto_release_track_loops_after.max(1))
+    } else {
+        None
+    };
 
     let persisted = PersistedPlaybackState {
         snapshot,
@@ -269,6 +285,19 @@ pub(super) fn apply_remote_snapshot(
     if ps.repeat_mode.get() != snapshot.repeat_mode {
         ps.repeat_mode.set(snapshot.repeat_mode);
         update_repeat_button_ui(&ps.repeat_btn, snapshot.repeat_mode);
+    }
+
+    if let Some(loops_left) = snapshot
+        .track_repeat_loops_left
+        .filter(|_| snapshot.current_track.is_some())
+    {
+        let loop_label = if loops_left == 1 { "loop" } else { "loops" };
+        ps.np_repeat_loops_left
+            .set_text(&format!("{loops_left} {loop_label} left"));
+        ps.np_repeat_loops_left.set_visible(true);
+    } else {
+        ps.np_repeat_loops_left.set_text("");
+        ps.np_repeat_loops_left.set_visible(false);
     }
 
     let previous_video_id = ps
@@ -349,6 +378,8 @@ pub(super) fn apply_remote_snapshot(
                 .set(ps.lyrics_request_serial.get().wrapping_add(1));
             show_lyrics_idle(ps);
             ps.np_title.set_text("Nothing playing");
+            ps.np_repeat_loops_left.set_text("");
+            ps.np_repeat_loops_left.set_visible(false);
             ps.np_artist.set_text("");
             ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
             ps.time_label.set_text("0:00 / 0:00");

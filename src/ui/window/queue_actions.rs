@@ -242,11 +242,7 @@ fn spawn_jump_to_radio_seed_tail_refresh(
     });
 }
 
-pub(super) fn jump_to_radio_seed(
-    index: usize,
-    ps: &Rc<PlayerState>,
-    state: &Arc<Mutex<AppState>>,
-) {
+pub(super) fn jump_to_radio_seed(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     if !is_radio_queue(ps) {
         return;
     }

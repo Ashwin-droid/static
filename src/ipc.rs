@@ -56,6 +56,8 @@ pub struct PlaybackSnapshot {
     pub playlist_context: Option<PlaylistContext>,
     pub radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     pub repeat_mode: RepeatMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_repeat_loops_left: Option<u32>,
     pub paused: bool,
     pub volume: f64,
     pub position_millis: Option<u64>,
@@ -118,6 +120,7 @@ impl Default for PlaybackSnapshot {
             playlist_context: None,
             radio_virtual_playlist: None,
             repeat_mode: RepeatMode::Off,
+            track_repeat_loops_left: None,
             paused: false,
             volume: 1.0,
             position_millis: None,
@@ -583,6 +586,7 @@ mod tests {
             }),
             radio_virtual_playlist: None,
             repeat_mode: RepeatMode::All,
+            track_repeat_loops_left: Some(3),
             paused: true,
             volume: 0.75,
             position_millis: Some(12_345),
@@ -617,6 +621,10 @@ mod tests {
                 .map(|context| context.playlist_id.as_str())
         );
         assert_eq!(loaded.snapshot.repeat_mode, persisted.snapshot.repeat_mode);
+        assert_eq!(
+            loaded.snapshot.track_repeat_loops_left,
+            persisted.snapshot.track_repeat_loops_left
+        );
         assert_eq!(loaded.snapshot.paused, persisted.snapshot.paused);
         assert_eq!(loaded.snapshot.volume, persisted.snapshot.volume);
         assert_eq!(

@@ -143,6 +143,13 @@ struct ProbeRestoreState {
     queue_video_id: Option<String>,
     position_millis: Option<u64>,
     resume_playback: bool,
+    track_repeat_loops_left: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+enum TrackRepeatBudgetMode {
+    ResetForCurrentTrack,
+    PreserveCurrent,
 }
 
 struct DaemonState {
@@ -155,6 +162,7 @@ struct DaemonState {
     playlist_context: Option<PlaylistContext>,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
+    track_repeat_loops_left: Option<u32>,
     active_track: Option<ActiveTrack>,
     probe_context: Option<ProbeRestoreState>,
     sponsor_segments: Vec<SponsorSegment>,
@@ -337,6 +345,72 @@ impl ExternalMprisCoordinator {
 
         self.last_logged_playing_services = self.playing_services.clone();
     }
+}
+
+fn configured_track_repeat_loops(settings: &AppSettings) -> Option<u32> {
+    settings
+        .auto_release_track_loops
+        .then_some(settings.auto_release_track_loops_after.max(1))
+}
+
+fn snapshot_track_repeat_loops_left(
+    repeat_mode: RepeatMode,
+    has_current_track: bool,
+    settings: &AppSettings,
+) -> Option<u32> {
+    if repeat_mode == RepeatMode::One && has_current_track {
+        configured_track_repeat_loops(settings)
+    } else {
+        None
+    }
+}
+
+fn next_repeat_state_after_natural_end(
+    repeat_mode: RepeatMode,
+    track_repeat_loops_left: Option<u32>,
+) -> (RepeatMode, Option<u32>) {
+    if repeat_mode != RepeatMode::One {
+        return (repeat_mode, track_repeat_loops_left);
+    }
+
+    let Some(loops_left) = track_repeat_loops_left else {
+        return (repeat_mode, None);
+    };
+
+    if loops_left > 0 {
+        (repeat_mode, Some(loops_left - 1))
+    } else {
+        (RepeatMode::Off, None)
+    }
+}
+
+fn reset_track_repeat_budget_for_current_track(state: &mut DaemonState) {
+    state.track_repeat_loops_left =
+        if state.repeat_mode == RepeatMode::One && state.active_track.is_some() {
+            configured_track_repeat_loops(&state.settings)
+        } else {
+            None
+        };
+}
+
+fn rearm_track_repeat_loops_for_snapshot(snapshot: &mut PlaybackSnapshot, settings: &AppSettings) {
+    snapshot.track_repeat_loops_left = snapshot_track_repeat_loops_left(
+        snapshot.repeat_mode,
+        snapshot.current_track.is_some(),
+        settings,
+    );
+}
+
+fn advance_repeat_mode_for_natural_end(state: &mut DaemonState) -> RepeatMode {
+    let previous_repeat_mode = state.repeat_mode;
+    let (repeat_mode, track_repeat_loops_left) =
+        next_repeat_state_after_natural_end(state.repeat_mode, state.track_repeat_loops_left);
+    state.repeat_mode = repeat_mode;
+    state.track_repeat_loops_left = track_repeat_loops_left;
+    if previous_repeat_mode != state.repeat_mode {
+        sync_mpris(state);
+    }
+    state.repeat_mode
 }
 
 struct CommandEnvelope {
@@ -534,6 +608,7 @@ impl DaemonMprisBridge {
                     MprisLoopStatus::Playlist => RepeatMode::All,
                     _ => RepeatMode::Off,
                 };
+                reset_track_repeat_budget_for_current_track(&mut state);
                 sync_mpris(&state);
             });
         }
@@ -673,6 +748,7 @@ pub fn run() -> Result<()> {
         playlist_context: None,
         radio_virtual_playlist: None,
         repeat_mode: RepeatMode::Off,
+        track_repeat_loops_left: None,
         active_track: None,
         probe_context: None,
         sponsor_segments: Vec::new(),
@@ -830,7 +906,11 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.radio_virtual_playlist = radio_virtual_playlist;
             state.radio_append_in_flight = false;
             state.last_radio_append_anchor = None;
+            let repeat_mode_changed = state.repeat_mode != repeat_mode;
             state.repeat_mode = repeat_mode;
+            if repeat_mode_changed {
+                reset_track_repeat_budget_for_current_track(state);
+            }
             prefetch_upcoming(state);
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
@@ -919,6 +999,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         }
         DaemonRequest::SetRepeatMode { repeat_mode } => {
             state.repeat_mode = repeat_mode;
+            reset_track_repeat_budget_for_current_track(state);
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
@@ -1117,17 +1198,23 @@ fn maintain_playback(state: &mut DaemonState) {
             return;
         }
 
+        let repeat_mode = advance_repeat_mode_for_natural_end(state);
         let queue_len = effective_queue_len(
             state.queue.len(),
-            state.repeat_mode,
+            repeat_mode,
             state
                 .radio_virtual_playlist
                 .as_ref()
                 .map(|radio| radio.touched_len),
         );
-        match natural_end_target_index(queue_len, state.queue_index, state.repeat_mode) {
+        match natural_end_target_index(queue_len, state.queue_index, repeat_mode) {
             Some(target) => {
-                if let Err(err) = play_index(state, target) {
+                let budget_mode = if repeat_mode == RepeatMode::One && target == state.queue_index {
+                    TrackRepeatBudgetMode::PreserveCurrent
+                } else {
+                    TrackRepeatBudgetMode::ResetForCurrentTrack
+                };
+                if let Err(err) = play_index_with_startup_retries(state, target, 0, budget_mode) {
                     eprintln!("[DAEMON] failed to auto-advance: {err}");
                 }
             }
@@ -1155,6 +1242,7 @@ fn play_queue_at(
     state.radio_append_in_flight = false;
     state.last_radio_append_anchor = None;
     state.repeat_mode = repeat_mode;
+    state.track_repeat_loops_left = None;
     play_index(state, state.queue_index)
 }
 
@@ -1181,6 +1269,7 @@ fn capture_probe_restore_state(state: &DaemonState) -> ProbeRestoreState {
         queue_video_id,
         position_millis,
         resume_playback: state.active_track.is_some() && !state.player.is_paused(),
+        track_repeat_loops_left: state.track_repeat_loops_left,
     }
 }
 
@@ -1214,6 +1303,7 @@ fn suspend_playback_for_probe(state: &mut DaemonState) {
     state.player.stop();
     state.player = PlaybackEngine::new();
     state.active_track.take();
+    state.track_repeat_loops_left = None;
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
@@ -1302,6 +1392,11 @@ fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result
     };
 
     play_index(state, index)?;
+    state.track_repeat_loops_left = if state.repeat_mode == RepeatMode::One {
+        probe.track_repeat_loops_left
+    } else {
+        None
+    };
 
     if let Some(position_millis) = probe.position_millis.filter(|position| *position > 0) {
         seek_to_position(state, ClockTime::from_mseconds(position_millis));
@@ -1707,7 +1802,12 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
             state.cache.remove_temp_audio(&video_id);
         }
 
-        if let Err(err) = play_index_with_startup_retries(state, queue_index, next_retry) {
+        if let Err(err) = play_index_with_startup_retries(
+            state,
+            queue_index,
+            next_retry,
+            TrackRepeatBudgetMode::PreserveCurrent,
+        ) {
             eprintln!("[DAEMON] startup retry failed for {video_id}: {err}");
             stop_playback(state, false);
         }
@@ -1831,14 +1931,19 @@ fn resume_for_user_action(state: &mut DaemonState) {
 }
 
 fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
-    play_index_with_startup_retries(state, index, 0)
+    play_index_with_startup_retries(state, index, 0, TrackRepeatBudgetMode::ResetForCurrentTrack)
 }
 
 fn play_index_with_startup_retries(
     state: &mut DaemonState,
     index: usize,
     startup_retries: u8,
+    budget_mode: TrackRepeatBudgetMode,
 ) -> Result<()> {
+    let preserved_track_repeat_loops_left = match budget_mode {
+        TrackRepeatBudgetMode::ResetForCurrentTrack => None,
+        TrackRepeatBudgetMode::PreserveCurrent => state.track_repeat_loops_left,
+    };
     stop_playback(state, false);
     state.player = PlaybackEngine::new();
     state.probe_context = None;
@@ -1884,6 +1989,14 @@ fn play_index_with_startup_retries(
         awaiting_fresh_position: true,
         bootstrapped_watchtime: false,
     });
+    match budget_mode {
+        TrackRepeatBudgetMode::ResetForCurrentTrack => {
+            reset_track_repeat_budget_for_current_track(state)
+        }
+        TrackRepeatBudgetMode::PreserveCurrent => {
+            state.track_repeat_loops_left = preserved_track_repeat_loops_left;
+        }
+    }
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
@@ -1922,6 +2035,7 @@ fn stop_playback(state: &mut DaemonState, exiting: bool) {
         flush_active_track(track, current_position_millis, exiting);
     }
     state.player.stop();
+    state.track_repeat_loops_left = None;
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
@@ -2070,6 +2184,7 @@ fn reload_settings(state: &mut DaemonState) {
     match state.cache.load_settings() {
         Ok(settings) => {
             state.settings = settings;
+            reset_track_repeat_budget_for_current_track(state);
             if !state.settings.respect_other_mpris_players {
                 state.peer_mpris.deactivate();
             }
@@ -3001,13 +3116,14 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
             .as_ref()
             .is_some_and(hide_timing_for_track);
 
-    Some(PlaybackSnapshot {
+    let mut snapshot = PlaybackSnapshot {
         current_track: persisted_playback_track_snapshot(state),
         queue: state.queue.clone(),
         queue_index: state.queue_index.min(state.queue.len().saturating_sub(1)),
         playlist_context: state.playlist_context.clone(),
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
+        track_repeat_loops_left: state.track_repeat_loops_left,
         paused: state.probe_context.is_some()
             || (state.active_track.is_some() && state.player.is_paused()),
         volume: logical_volume(state),
@@ -3028,7 +3144,9 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
             .unwrap_or(0.0),
         probe_active: false,
         probe_restore_position_millis: None,
-    })
+    };
+    rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
+    Some(snapshot)
 }
 
 fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
@@ -3055,6 +3173,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         playlist_context: state.playlist_context.clone(),
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
+        track_repeat_loops_left: state.track_repeat_loops_left,
         paused: state.player.is_paused(),
         volume: logical_volume(state),
         position_millis: (!hide_timing)
@@ -3658,12 +3777,14 @@ mod tests {
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
         PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
         hide_timing_for_track, mpris_position_millis_for_track, natural_end_target_index,
-        pause_previous_threshold_clock_for_track, playback_position_confirms_start,
-        playback_start_stalled, previous_action, previous_threshold_millis,
+        next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
+        playback_position_confirms_start, playback_start_stalled, previous_action,
+        previous_threshold_millis, rearm_track_repeat_loops_for_snapshot,
         reset_previous_threshold_clock_for_track, should_emit_live_mpris_seeked_hint,
         should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
     };
-    use crate::ipc::RepeatMode;
+    use crate::cache::AppSettings;
+    use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::ytmusic::client::SongRating;
     use std::time::{Duration, Instant};
 
@@ -3685,6 +3806,14 @@ mod tests {
             startup_retries: 0,
             awaiting_fresh_position: true,
             bootstrapped_watchtime: false,
+        }
+    }
+
+    fn test_repeat_settings(after: u32) -> AppSettings {
+        AppSettings {
+            auto_release_track_loops: true,
+            auto_release_track_loops_after: after.max(1),
+            ..AppSettings::default()
         }
     }
 
@@ -3761,6 +3890,22 @@ mod tests {
     }
 
     #[test]
+    fn natural_end_decrements_track_repeat_budget_before_releasing() {
+        assert_eq!(
+            next_repeat_state_after_natural_end(RepeatMode::One, Some(3)),
+            (RepeatMode::One, Some(2))
+        );
+    }
+
+    #[test]
+    fn natural_end_releases_track_repeat_to_off_when_budget_is_exhausted() {
+        assert_eq!(
+            next_repeat_state_after_natural_end(RepeatMode::One, Some(0)),
+            (RepeatMode::Off, None)
+        );
+    }
+
+    #[test]
     fn natural_end_repeats_current_track_in_repeat_one_mode() {
         assert_eq!(natural_end_target_index(5, 2, RepeatMode::One), Some(2));
     }
@@ -3773,6 +3918,27 @@ mod tests {
     #[test]
     fn natural_end_stops_after_last_track_when_repeat_is_off() {
         assert_eq!(natural_end_target_index(3, 2, RepeatMode::Off), None);
+    }
+
+    #[test]
+    fn persisted_snapshots_rearm_track_repeat_budget_to_full_setting() {
+        let settings = test_repeat_settings(4);
+        let mut snapshot = PlaybackSnapshot {
+            current_track: Some(ActiveTrackSnapshot {
+                video_id: "video-123".to_string(),
+                title: "Track".to_string(),
+                artist: "Artist".to_string(),
+                thumb_url: None,
+                rating: SongRating::Indifferent,
+            }),
+            repeat_mode: RepeatMode::One,
+            track_repeat_loops_left: Some(1),
+            ..PlaybackSnapshot::default()
+        };
+
+        rearm_track_repeat_loops_for_snapshot(&mut snapshot, &settings);
+
+        assert_eq!(snapshot.track_repeat_loops_left, Some(4));
     }
 
     #[test]

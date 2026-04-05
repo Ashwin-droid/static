@@ -26,6 +26,12 @@ const STATIC_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
+const YTM_WEB_REMIX_HEADER_CLIENT_NAME: &str = "67";
+const YTM_WEB_REMIX_CLIENT_NAME: &str = "WEB_REMIX";
+const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20240101.01.00";
+const YTM_WEB_FALLBACK_HEADER_CLIENT_NAME: &str = "1";
+const YTM_WEB_FALLBACK_CLIENT_NAME: &str = "WEB";
+const YTM_WEB_FALLBACK_CLIENT_VERSION: &str = "2.20260403.01.00";
 const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
 const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
 
@@ -693,10 +699,13 @@ impl YtMusicClient {
             "referer",
             HeaderValue::from_static("https://music.youtube.com/"),
         );
-        headers.insert("x-youtube-client-name", HeaderValue::from_static("67"));
+        headers.insert(
+            "x-youtube-client-name",
+            HeaderValue::from_static(YTM_WEB_REMIX_HEADER_CLIENT_NAME),
+        );
         headers.insert(
             "x-youtube-client-version",
-            HeaderValue::from_static("1.20240101.01.00"),
+            HeaderValue::from_static(YTM_WEB_REMIX_CLIENT_VERSION),
         );
         headers.insert("x-origin", HeaderValue::from_static(YTM_ORIGIN));
 
@@ -747,11 +756,15 @@ impl YtMusicClient {
     }
 
     fn client_context() -> Value {
+        Self::client_context_with(YTM_WEB_REMIX_CLIENT_NAME, YTM_WEB_REMIX_CLIENT_VERSION)
+    }
+
+    fn client_context_with(client_name: &str, client_version: &str) -> Value {
         json!({
             "context": {
                 "client": {
-                    "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20240101.01.00",
+                    "clientName": client_name,
+                    "clientVersion": client_version,
                     "hl": "en",
                     "gl": "US",
                 }
@@ -1133,42 +1146,90 @@ impl YtMusicClient {
                 );
             }
 
-            let mut body = json!({
-                "context": {
-                    "client": {
-                        "clientName": "WEB_REMIX",
-                        "clientVersion": "1.20240101.01.00",
-                        "hl": "en",
-                        "gl": "US",
-                    }
-                }
-            });
-            body["videoId"] = json!(&video_id);
+            // WEB_REMIX no longer reliably returns playbackTracking on music.youtube.com.
+            // Fall back to the WEB client on the same Music origin so we recover tracking
+            // URLs without switching the request surface over to www.youtube.com.
+            let mut tracking_bootstrap = None;
+            for (profile_name, header_client_name, client_name, client_version) in [
+                (
+                    YTM_WEB_REMIX_CLIENT_NAME,
+                    YTM_WEB_REMIX_HEADER_CLIENT_NAME,
+                    YTM_WEB_REMIX_CLIENT_NAME,
+                    YTM_WEB_REMIX_CLIENT_VERSION,
+                ),
+                (
+                    YTM_WEB_FALLBACK_CLIENT_NAME,
+                    YTM_WEB_FALLBACK_HEADER_CLIENT_NAME,
+                    YTM_WEB_FALLBACK_CLIENT_NAME,
+                    YTM_WEB_FALLBACK_CLIENT_VERSION,
+                ),
+            ] {
+                let mut body = Self::client_context_with(client_name, client_version);
+                body["videoId"] = json!(&video_id);
 
-            let Ok(resp) = self
-                .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
-                .json(&body)
-                .send()
-                .await
-            else {
-                eprintln!("[TRACKING] player bootstrap request failed for {video_id}");
-                return None;
-            };
-            let Ok(json): Result<Value, _> = resp.json().await else {
-                eprintln!("[TRACKING] player bootstrap response was not valid JSON for {video_id}");
+                let resp = match self
+                    .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
+                    .header("x-youtube-client-name", header_client_name)
+                    .header("x-youtube-client-version", client_version)
+                    .json(&body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) => {
+                        eprintln!(
+                            "[TRACKING] {profile_name} player bootstrap request failed for {video_id}: {err}"
+                        );
+                        continue;
+                    }
+                };
+                let json: Value = match resp.json().await {
+                    Ok(json) => json,
+                    Err(err) => {
+                        eprintln!(
+                            "[TRACKING] {profile_name} player bootstrap response was not valid JSON for {video_id}: {err}"
+                        );
+                        continue;
+                    }
+                };
+
+                let tracking = &json["playbackTracking"];
+                let playback_url = tracking
+                    .get("videostatsPlaybackUrl")
+                    .and_then(|url| url.get("baseUrl"))
+                    .and_then(|url| url.as_str())
+                    .map(rewrite_tracking_base_url);
+                let watchtime_url = tracking
+                    .get("videostatsWatchtimeUrl")
+                    .and_then(|url| url.get("baseUrl"))
+                    .and_then(|url| url.as_str())
+                    .map(rewrite_tracking_base_url);
+
+                if playback_url.is_some() || watchtime_url.is_some() {
+                    if profile_name == YTM_WEB_FALLBACK_CLIENT_NAME {
+                        eprintln!(
+                            "[TRACKING] recovered playbackTracking for {video_id} via WEB on music.youtube.com"
+                        );
+                    }
+                    tracking_bootstrap = Some((json, playback_url, watchtime_url));
+                    break;
+                }
+
+                if profile_name == YTM_WEB_REMIX_CLIENT_NAME {
+                    eprintln!(
+                        "[TRACKING] WEB_REMIX bootstrap returned no tracking URLs for {video_id}; retrying with WEB on music.youtube.com"
+                    );
+                }
+            }
+
+            let Some((json, playback_url, watchtime_url)) = tracking_bootstrap else {
+                eprintln!("[TRACKING] playbackTracking block missing for {video_id}");
+                eprintln!("[TRACKING] playback bootstrap URL missing for {video_id}");
+                eprintln!("[TRACKING] watchtime URL missing for {video_id}");
                 return None;
             };
 
             let tracking = &json["playbackTracking"];
-            let rewrite_url = |key: &str| -> Option<String> {
-                tracking
-                    .get(key)
-                    .and_then(|u| u["baseUrl"].as_str())
-                    .map(rewrite_tracking_base_url)
-            };
-
-            let playback_url = rewrite_url("videostatsPlaybackUrl");
-            let watchtime_url = rewrite_url("videostatsWatchtimeUrl");
             if tracking.is_null() {
                 eprintln!("[TRACKING] playbackTracking block missing for {video_id}");
             }

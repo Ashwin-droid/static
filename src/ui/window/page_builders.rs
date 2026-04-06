@@ -877,6 +877,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         queue: RefCell::new(Vec::new()),
         queue_index: Cell::new(0),
         playlist_context: RefCell::new(None),
+        playlist_like_queue: Cell::new(false),
         radio_virtual_playlist: RefCell::new(None),
         radio_append_in_flight: Cell::new(false),
         last_radio_append_anchor: RefCell::new(None),

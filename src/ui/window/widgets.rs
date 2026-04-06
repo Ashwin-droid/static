@@ -261,21 +261,20 @@ pub(super) fn build_sidebar_recent_item(
     }
     pop_box.append(&add_queue_btn);
 
-    if is_radio_queue(ps) {
-        let jump_btn = Button::with_label("Jump to");
-        jump_btn.add_css_class("popover-action-btn");
-        {
-            let track = track.clone();
-            let ps = ps.clone();
-            let state = state.clone();
-            let popover = popover.clone();
-            jump_btn.connect_clicked(move |_| {
-                popover.popdown();
-                jump_to_radio_seed_from_track(track.clone(), &ps, &state);
-            });
-        }
-        pop_box.append(&jump_btn);
+    let jump_btn = Button::with_label("Jump to");
+    jump_btn.add_css_class("popover-action-btn");
+    jump_btn.set_visible(can_jump_to_radio(ps));
+    {
+        let track = track.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        let popover = popover.clone();
+        jump_btn.connect_clicked(move |_| {
+            popover.popdown();
+            jump_to_radio_seed_from_track(track.clone(), &ps, &state);
+        });
     }
+    pop_box.append(&jump_btn);
 
     let probe_btn = Button::with_label("Probe");
     probe_btn.add_css_class("popover-action-btn");
@@ -301,7 +300,10 @@ pub(super) fn build_sidebar_recent_item(
     gesture.set_button(3);
     {
         let popover = popover.clone();
+        let jump_btn = jump_btn.clone();
+        let ps = ps.clone();
         gesture.connect_pressed(move |_, _, _, _| {
+            jump_btn.set_visible(can_jump_to_radio(&ps));
             popover.popup();
         });
     }

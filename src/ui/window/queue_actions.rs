@@ -34,6 +34,7 @@ pub(super) fn play_track(
             touched_len: 1,
             chips: Vec::new(),
         }),
+        false,
     );
     ps.radio_append_in_flight.set(true);
     render_queue_panel(ps, state);
@@ -128,6 +129,7 @@ pub(super) fn play_track(
                     touched_len: 1,
                     chips: radio.chips,
                 }),
+                false,
             );
             render_queue_panel(&ps, &state);
             sync_remote_queue(&ps);
@@ -244,8 +246,36 @@ fn spawn_jump_to_radio_seed_tail_refresh(
     });
 }
 
+fn start_radio_after_playlist_seed(
+    expected_index: usize,
+    prefix_len: usize,
+    seed_track: Track,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    ps.playlist_like_queue.set(false);
+    *ps.radio_virtual_playlist.borrow_mut() = Some(RadioVirtualPlaylist {
+        source_video_id: seed_track.video_id.clone(),
+        touched_len: prefix_len,
+        chips: Vec::new(),
+    });
+    ps.radio_append_in_flight.set(true);
+    *ps.last_radio_append_anchor.borrow_mut() = None;
+    render_queue_panel(ps, state);
+    sync_remote_queue(ps);
+    sync_mpris_transport(ps, state);
+    spawn_jump_to_radio_seed_tail_refresh(expected_index, prefix_len, seed_track, ps, state);
+}
+
 pub(super) fn jump_to_radio_seed(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     if !is_radio_queue(ps) {
+        let (Some(seed_track), queue_len) = ({
+            let queue = ps.queue.borrow();
+            (queue.get(index).cloned(), queue.len())
+        }) else {
+            return;
+        };
+        start_radio_after_playlist_seed(index, queue_len, seed_track, ps, state);
         return;
     }
 
@@ -273,6 +303,25 @@ pub(super) fn jump_to_radio_seed_from_track(
     state: &Arc<Mutex<AppState>>,
 ) {
     if !is_radio_queue(ps) {
+        let existing_index = {
+            let queue = ps.queue.borrow();
+            queue
+                .iter()
+                .position(|queued| queued.video_id == track.video_id)
+        };
+        if let Some(index) = existing_index {
+            let prefix_len = ps.queue.borrow().len();
+            start_radio_after_playlist_seed(index, prefix_len, track, ps, state);
+            return;
+        }
+
+        let (insert_at, prefix_len) = {
+            let mut queue = ps.queue.borrow_mut();
+            queue.push(track.clone());
+            let insert_at = queue.len().saturating_sub(1);
+            (insert_at, queue.len())
+        };
+        start_radio_after_playlist_seed(insert_at, prefix_len, track, ps, state);
         return;
     }
 
@@ -664,7 +713,8 @@ pub(super) fn play_all(
 
     *ps.queue.borrow_mut() = queue;
     ps.queue_index.set(0);
-    set_queue_context(ps, playlist_context, None);
+    let playlist_like_queue = playlist_context.is_none();
+    set_queue_context(ps, playlist_context, None, playlist_like_queue);
 
     play_from_queue(state, ps, 0);
 }
@@ -1061,7 +1111,7 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
 
         let pop_box = GtkBox::new(Orientation::Vertical, 0);
 
-        if is_radio_queue(ps) {
+        if can_jump_to_radio(ps) {
             let jump_btn = Button::with_label("Jump to");
             jump_btn.add_css_class("popover-action-btn");
             {

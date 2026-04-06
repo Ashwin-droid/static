@@ -294,6 +294,7 @@ struct PlayerState {
     queue: RefCell<Vec<Track>>,
     queue_index: Cell<usize>,
     playlist_context: RefCell<Option<PlaylistContext>>,
+    playlist_like_queue: Cell<bool>,
     radio_virtual_playlist: RefCell<Option<RadioVirtualPlaylist>>,
     radio_append_in_flight: Cell<bool>,
     last_radio_append_anchor: RefCell<Option<String>>,
@@ -709,6 +710,14 @@ fn is_radio_queue(ps: &PlayerState) -> bool {
     ps.radio_virtual_playlist.borrow().is_some()
 }
 
+fn has_playlist_like_queue(ps: &PlayerState) -> bool {
+    ps.playlist_context.borrow().is_some() || ps.playlist_like_queue.get()
+}
+
+fn can_jump_to_radio(ps: &PlayerState) -> bool {
+    is_radio_queue(ps) || has_playlist_like_queue(ps) || !ps.queue.borrow().is_empty()
+}
+
 fn radio_chips(ps: &PlayerState) -> Vec<RadioChip> {
     ps.radio_virtual_playlist
         .borrow()
@@ -744,8 +753,10 @@ fn set_queue_context(
     ps: &PlayerState,
     playlist_context: Option<PlaylistContext>,
     radio: Option<RadioVirtualPlaylist>,
+    playlist_like_queue: bool,
 ) {
     *ps.playlist_context.borrow_mut() = playlist_context;
+    ps.playlist_like_queue.set(playlist_like_queue);
     *ps.radio_virtual_playlist.borrow_mut() = radio;
     ps.radio_append_in_flight.set(false);
     *ps.last_radio_append_anchor.borrow_mut() = None;
@@ -932,7 +943,7 @@ fn play_from_context(
 ) {
     *ps.queue.borrow_mut() = tracks.to_vec();
     ps.queue_index.set(index);
-    set_queue_context(ps, playlist_context, None);
+    set_queue_context(ps, playlist_context, None, false);
     play_from_queue(state, ps, index);
 }
 
@@ -940,6 +951,7 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     let _ = state;
     let _ = ps.player.stop();
     clear_sponsorblock_state(ps);
+    ps.playlist_like_queue.set(false);
     ps.last_mpris_length_micros.set(None);
     ps.lyrics_request_serial
         .set(ps.lyrics_request_serial.get().wrapping_add(1));

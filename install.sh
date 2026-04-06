@@ -126,6 +126,7 @@ elif mode == "restore":
                     "playlist_context": state.get("playlist_context"),
                     "radio_virtual_playlist": state.get("radio_virtual_playlist"),
                     "repeat_mode": state.get("repeat_mode", "Off"),
+                    "suppress_reporting": True,
                 }
             }
         )

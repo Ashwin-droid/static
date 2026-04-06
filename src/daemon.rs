@@ -873,6 +873,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             playlist_context,
             radio_virtual_playlist,
             repeat_mode,
+            suppress_reporting,
         } => {
             if !queue.is_empty() {
                 pause_other_mpris_players(state);
@@ -884,6 +885,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 playlist_context,
                 radio_virtual_playlist,
                 repeat_mode,
+                suppress_reporting,
             ) {
                 Ok(()) => {
                     maybe_persist_playback_state(state, true);
@@ -1213,7 +1215,9 @@ fn maintain_playback(state: &mut DaemonState) {
                 } else {
                     TrackRepeatBudgetMode::ResetForCurrentTrack
                 };
-                if let Err(err) = play_index_with_startup_retries(state, target, 0, budget_mode) {
+                if let Err(err) =
+                    play_index_with_startup_retries(state, target, 0, budget_mode, false)
+                {
                     eprintln!("[DAEMON] failed to auto-advance: {err}");
                 }
             }
@@ -1229,6 +1233,7 @@ fn play_queue_at(
     playlist_context: Option<PlaylistContext>,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
+    suppress_reporting: bool,
 ) -> Result<()> {
     if queue.is_empty() {
         stop_playback(state, false);
@@ -1242,7 +1247,7 @@ fn play_queue_at(
     state.last_radio_append_anchor = None;
     state.repeat_mode = repeat_mode;
     state.track_repeat_loops_left = None;
-    play_index(state, state.queue_index)
+    play_index_with_reporting(state, state.queue_index, suppress_reporting)
 }
 
 fn capture_probe_restore_state(state: &DaemonState) -> ProbeRestoreState {
@@ -1805,6 +1810,7 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
             queue_index,
             next_retry,
             TrackRepeatBudgetMode::PreserveCurrent,
+            false,
         ) {
             eprintln!("[DAEMON] startup retry failed for {video_id}: {err}");
             stop_playback(state, false);
@@ -1929,7 +1935,21 @@ fn resume_for_user_action(state: &mut DaemonState) {
 }
 
 fn play_index(state: &mut DaemonState, index: usize) -> Result<()> {
-    play_index_with_startup_retries(state, index, 0, TrackRepeatBudgetMode::ResetForCurrentTrack)
+    play_index_with_reporting(state, index, false)
+}
+
+fn play_index_with_reporting(
+    state: &mut DaemonState,
+    index: usize,
+    suppress_reporting: bool,
+) -> Result<()> {
+    play_index_with_startup_retries(
+        state,
+        index,
+        0,
+        TrackRepeatBudgetMode::ResetForCurrentTrack,
+        suppress_reporting,
+    )
 }
 
 fn play_index_with_startup_retries(
@@ -1937,6 +1957,7 @@ fn play_index_with_startup_retries(
     index: usize,
     startup_retries: u8,
     budget_mode: TrackRepeatBudgetMode,
+    suppress_reporting: bool,
 ) -> Result<()> {
     let preserved_track_repeat_loops_left = match budget_mode {
         TrackRepeatBudgetMode::ResetForCurrentTrack => None,
@@ -1975,7 +1996,7 @@ fn play_index_with_startup_retries(
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
         playback_source,
-        reporting_enabled: true,
+        reporting_enabled: !suppress_reporting,
         rating: SongRating::Indifferent,
         tracking: None,
         started_at: now,
@@ -1997,13 +2018,20 @@ fn play_index_with_startup_retries(
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
-    state
-        .deferred_actions
-        .push_back(DeferredAction::StartPlaybackTracking {
-            video_id: track.video_id.clone(),
-            attempt: 0,
-            not_before: Instant::now(),
-        });
+    if suppress_reporting {
+        eprintln!(
+            "[TRACKING] suppressing telemetry bootstrap for restored playback of {}",
+            track.video_id
+        );
+    } else {
+        state
+            .deferred_actions
+            .push_back(DeferredAction::StartPlaybackTracking {
+                video_id: track.video_id.clone(),
+                attempt: 0,
+                not_before: Instant::now(),
+            });
+    }
     refresh_sponsorblock_for_current_track(state);
     prefetch_upcoming(state);
     state.last_pipewire_poll_at = None;

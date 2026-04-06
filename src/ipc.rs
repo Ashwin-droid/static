@@ -142,6 +142,8 @@ pub enum DaemonRequest {
         playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
+        #[serde(default)]
+        suppress_reporting: bool,
     },
     ReplaceQueue {
         queue: Vec<Track>,
@@ -443,6 +445,7 @@ impl DaemonClient {
             playlist_context,
             radio_virtual_playlist,
             repeat_mode,
+            suppress_reporting: false,
         })? {
             DaemonResponse::State(state) => Ok(state),
             DaemonResponse::Error(err) => bail!(err),
@@ -543,13 +546,14 @@ pub fn millis_to_clock_time(value: Option<u64>) -> Option<ClockTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTrackSnapshot, PLAYBACK_STATE_ROW_KEY, PersistedPlaybackState, PlaybackSnapshot,
-        PlaylistContext, PlaylistContextSource, clear_persisted_state_at_path, current_unix_millis,
-        load_persisted_state_at_path, store_persisted_state_at_path,
+        ActiveTrackSnapshot, DaemonRequest, PLAYBACK_STATE_ROW_KEY, PersistedPlaybackState,
+        PlaybackSnapshot, PlaylistContext, PlaylistContextSource, clear_persisted_state_at_path,
+        current_unix_millis, load_persisted_state_at_path, store_persisted_state_at_path,
     };
     use crate::ipc::RepeatMode;
     use crate::models::Track;
     use crate::ytmusic::client::SongRating;
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -731,6 +735,27 @@ mod tests {
         let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir(parent);
+        }
+    }
+
+    #[test]
+    fn play_queue_at_requests_default_to_reporting_when_flag_is_missing() {
+        let request = serde_json::from_value::<DaemonRequest>(json!({
+            "PlayQueueAt": {
+                "queue": [],
+                "index": 0,
+                "playlist_context": null,
+                "radio_virtual_playlist": null,
+                "repeat_mode": "Off"
+            }
+        }))
+        .expect("request should deserialize");
+
+        match request {
+            DaemonRequest::PlayQueueAt {
+                suppress_reporting, ..
+            } => assert!(!suppress_reporting),
+            other => panic!("unexpected request variant: {other:?}"),
         }
     }
 }

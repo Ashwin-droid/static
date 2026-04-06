@@ -720,9 +720,10 @@ fn finalize_synced_lyric_lines(lines: &mut [SyncedLyricLine]) {
     for index in 0..lines.len() {
         let next_start = lines.get(index + 1).map(|line| line.start_millis);
         let computed_end = match (lines[index].end_millis, next_start) {
-            (Some(end_millis), Some(next_start)) => end_millis.max(next_start),
+            // The UI can only highlight one line at a time, so let each line
+            // hand off to the next line's start instead of keeping overlaps.
+            (_, Some(next_start)) => next_start,
             (Some(end_millis), None) => end_millis,
-            (None, Some(next_start)) => next_start,
             (None, None) => lines[index].start_millis.saturating_add(4_000),
         };
         lines[index].end_millis = Some(computed_end.max(lines[index].start_millis + 1));
@@ -2095,10 +2096,10 @@ impl YtMusicClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptionTrack, TrackingInfo, YtMusicClient, generate_cpn,
+        CaptionTrack, TrackingInfo, YtMusicClient, finalize_synced_lyric_lines, generate_cpn,
         lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
     };
-    use crate::models::SyncedLyricsSource;
+    use crate::models::{SyncedLyricLine, SyncedLyricsSource};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::{Duration, Instant};
@@ -2273,6 +2274,27 @@ mod tests {
         assert_eq!(lyrics.lines[0].start_millis, 9200);
         assert_eq!(lyrics.lines[0].end_millis, Some(10680));
         assert_eq!(lyrics.lines[1].end_millis, Some(12540));
+    }
+
+    #[test]
+    fn finalize_synced_lyrics_clamps_overlapping_ranges_to_next_line_start() {
+        let mut lines = vec![
+            SyncedLyricLine {
+                start_millis: 1_000,
+                end_millis: Some(4_000),
+                text: "First".to_string(),
+            },
+            SyncedLyricLine {
+                start_millis: 3_500,
+                end_millis: Some(5_000),
+                text: "Second".to_string(),
+            },
+        ];
+
+        finalize_synced_lyric_lines(&mut lines);
+
+        assert_eq!(lines[0].end_millis, Some(3_500));
+        assert_eq!(lines[1].end_millis, Some(5_000));
     }
 
     #[test]

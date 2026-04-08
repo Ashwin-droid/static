@@ -1,19 +1,11 @@
 use super::*;
 
-pub(super) fn store_storage_root(root: &str) -> Result<(), keyring::Error> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT)?;
-    entry.set_password(root)
-}
-
-pub(super) fn get_storage_root() -> Option<String> {
-    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT).ok()?;
-    entry.get_password().ok()
+pub(super) fn store_storage_root(root: &str) -> Result<(), crate::network::SecretStoreError> {
+    crate::network::store_storage_root(root)
 }
 
 pub(super) fn delete_storage_root() {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT) {
-        let _ = entry.delete_credential();
-    }
+    crate::network::delete_storage_root();
 }
 
 pub(super) fn app_settings(state: &Arc<Mutex<AppState>>) -> AppSettings {

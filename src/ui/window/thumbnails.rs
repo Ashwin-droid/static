@@ -31,9 +31,6 @@ pub(super) fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
 }
 
 pub(super) fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
-    const MAX_ATTEMPTS: usize = 3;
-    const BACKOFF_MS: [u64; MAX_ATTEMPTS] = [250, 700, 1500];
-
     if let Some(path) = url.strip_prefix("file://") {
         return std::fs::read(path).ok();
     }
@@ -42,35 +39,12 @@ pub(super) fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
         return Some(bytes);
     }
 
-    for attempt in 0..MAX_ATTEMPTS {
-        let response = THUMB_CLIENT.get(url).send();
-        match response
-            .and_then(|resp| resp.error_for_status())
-            .and_then(|resp| resp.bytes())
-        {
-            Ok(bytes) => {
-                let bytes = bytes.to_vec();
-                THUMBNAIL_BYTES_CACHE
-                    .lock()
-                    .unwrap()
-                    .insert(url.to_string(), bytes.clone());
-                return Some(bytes);
-            }
-            Err(err) => {
-                eprintln!(
-                    "[ART] thumbnail fetch failed (attempt {}/{}): {} ({err})",
-                    attempt + 1,
-                    MAX_ATTEMPTS,
-                    url
-                );
-                if attempt + 1 < MAX_ATTEMPTS {
-                    std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt]));
-                }
-            }
-        }
-    }
-
-    None
+    let bytes = network_fetch_thumbnail_bytes(url)?;
+    THUMBNAIL_BYTES_CACHE
+        .lock()
+        .unwrap()
+        .insert(url.to_string(), bytes.clone());
+    Some(bytes)
 }
 
 pub(super) fn build_thumbnail_texture(bytes: &[u8], size: i32) -> Option<gtk::gdk::Texture> {

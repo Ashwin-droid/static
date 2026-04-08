@@ -1,14 +1,15 @@
-mod cache;
 mod daemon;
 mod ipc;
 mod logging;
 mod models;
+mod network;
+mod network_parser;
+mod network_state;
+mod offline;
 mod pipewire_monitor;
 mod playback_engine;
 mod player;
-mod sponsorblock;
 mod ui;
-mod ytmusic;
 
 use gtk::prelude::*;
 

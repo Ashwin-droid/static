@@ -1,12 +1,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-use anyhow::Context;
 use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
@@ -14,13 +11,6 @@ use gtk::{
     GestureClick, Image, Label, MessageDialog, MessageType, Orientation, Overlay, Paned, Picture,
     Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton, Stack,
     StackTransitionType, Switch, gio, glib,
-};
-use pbkdf2::pbkdf2_hmac;
-use rusqlite::Connection as SqliteConnection;
-use sha1::Sha1;
-use zbus::{
-    blocking::Connection as ZbusConnection,
-    zvariant::{OwnedObjectPath, OwnedValue, Value},
 };
 
 macro_rules! eprintln {
@@ -47,7 +37,15 @@ const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
-use crate::cache::{AppSettings, MusicCache};
+use crate::network::{
+    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, SponsorBlockClient, SponsorSegment,
+    default_skip_categories, delete_cookie, get_cookie, get_storage_root,
+    download_media_bytes, fetch_thumbnail_bytes as network_fetch_thumbnail_bytes,
+    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
+    store_vr_refresh_token,
+};
+use crate::network_state::NetworkState;
+use crate::offline::{AppSettings, MusicCache};
 use crate::ipc::{
     ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
     PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playback_state,
@@ -59,36 +57,6 @@ use crate::models::{
     SyncedLyrics, SyncedLyricsSource, Track,
 };
 use crate::player::Player;
-use crate::sponsorblock::{
-    SPONSORBLOCK_CATEGORY_OPTIONS, SponsorBlockClient, SponsorSegment, default_skip_categories,
-    sanitize_categories,
-};
-use crate::ytmusic::YtMusicClient;
-use crate::ytmusic::client::SongRating;
-
-const KEYRING_SERVICE: &str = "com.static.music";
-const KEYRING_USER: &str = "cookie";
-const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
-const KEYRING_STORAGE_ROOT: &str = "storage_root";
-
-type Aes128CbcDec = cbc::Decryptor<aes::Aes128>;
-type SecretResponse = (OwnedObjectPath, Vec<u8>, Vec<u8>, String);
-
-static THUMB_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap()
-});
-
-/// Separate client for downloading full audio files — longer timeout and proper user-agent.
-static DOWNLOAD_CLIENT: LazyLock<reqwest::blocking::Client> = LazyLock::new(|| {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
-        .build()
-        .unwrap()
-});
 
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -124,7 +92,7 @@ use self::views::*;
 use self::widgets::*;
 
 struct AppState {
-    client: Option<Arc<YtMusicClient>>,
+    client: Option<Arc<NetworkState>>,
     cache: MusicCache,
     settings: AppSettings,
     home_cache: Option<HomePage>,
@@ -177,7 +145,7 @@ impl DetailPanelView {
     }
 }
 
-fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<YtMusicClient>> {
+fn app_client(state: &Arc<Mutex<AppState>>) -> Option<Arc<NetworkState>> {
     state.lock().unwrap().client.clone()
 }
 

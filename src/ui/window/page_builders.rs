@@ -87,11 +87,11 @@ pub(super) fn build_onboarding_page(stack: &Stack, state: &Arc<Mutex<AppState>>)
             connect_btn_inner.set_label("Connecting...");
             status_label.set_text("");
 
-            match YtMusicClient::new(&cookie_text) {
-                Ok(ytm) => {
+            match NetworkState::from_cookie(&cookie_text) {
+                Ok(network) => {
                     {
                         let mut guard = state.lock().unwrap();
-                        guard.client = Some(Arc::new(ytm));
+                        guard.client = Some(Arc::new(network));
                         guard.home_cache = None;
                     }
                     let state = state.clone();

@@ -935,13 +935,7 @@ pub(super) fn ensure_track_available_offline(
         }
     };
 
-    let audio = match DOWNLOAD_CLIENT
-        .get(&url)
-        .header("Range", "bytes=0-")
-        .send()
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.bytes())
-    {
+    let audio = match download_media_bytes(&url, Some("bytes=0-")) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("[{log_prefix}] download failed for {vid}: {err}");

@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
-use crate::sponsorblock::{
+use crate::network::{
     SponsorSegment, default_skip_categories, normalize_segments, sanitize_categories,
 };
 

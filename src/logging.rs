@@ -4,11 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
-use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
-const KEYRING_SERVICE: &str = "com.static.music";
-const KEYRING_STORAGE_ROOT: &str = "storage_root";
 const LOG_FILE_NAME: &str = "static.log";
 const LOG_DAY_STAMP_FILE_NAME: &str = ".static.log.day";
 
@@ -42,8 +39,7 @@ fn default_static_root() -> PathBuf {
 }
 
 fn configured_storage_root() -> Option<String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT).ok()?;
-    entry.get_password().ok()
+    crate::network::get_storage_root()
 }
 
 fn resolve_storage_root(raw: &str) -> PathBuf {

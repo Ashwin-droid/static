@@ -11,7 +11,7 @@ use zbus::blocking::{Connection, Proxy};
 
 use crate::logging::LogSource;
 use crate::models::{RadioVirtualPlaylist, Track};
-use crate::ytmusic::client::SongRating;
+use crate::network::SongRating;
 
 pub const DAEMON_BUS_NAME: &str = "com.static.music.staticd";
 pub const DAEMON_OBJECT_PATH: &str = "/com/static/music/Staticd";
@@ -552,7 +552,7 @@ mod tests {
     };
     use crate::ipc::RepeatMode;
     use crate::models::Track;
-    use crate::ytmusic::client::SongRating;
+    use crate::network::SongRating;
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;

@@ -20,7 +20,7 @@ use crate::models::{
     SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
 };
 
-use super::parsers;
+use crate::network_parser as parsers;
 
 const YTM_BASE_URL: &str = "https://music.youtube.com/youtubei/v1";
 const YTM_PARAMS: &str = "prettyPrint=false";

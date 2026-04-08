@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{
-    Arc, LazyLock,
+    Arc,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -12,19 +12,16 @@ use anyhow::{Context, Result, anyhow};
 use dbus::ffidisp::{BusType as DbusBusType, Connection as DbusConnection};
 use gstreamer::ClockTime;
 use gstreamer::glib;
-use keyring::Entry;
 use mpris::{PlaybackStatus as PeerPlaybackStatus, Player as PeerMprisPlayer};
 use mpris_server::{
     LoopStatus as MprisLoopStatus, Metadata, PlaybackStatus as MprisPlaybackStatus,
     Player as MprisPlayer, Time as MprisTime, TrackId,
 };
-use reqwest::blocking::Client as BlockingClient;
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::flag;
 use zbus::blocking::{Connection, Proxy};
 use zbus::interface;
 
-use crate::cache::{AppSettings, MusicCache};
 use crate::ipc::{
     ActiveTrackSnapshot, DAEMON_BUS_NAME, DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse,
     PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, RepeatMode,
@@ -32,14 +29,15 @@ use crate::ipc::{
     store_persisted_playlist_state,
 };
 use crate::models::{RadioVirtualPlaylist, Track};
-use crate::pipewire_monitor::PipeWireMonitor;
-use crate::playback_engine::PlaybackEngine;
-use crate::sponsorblock::{
-    SponsorBlockClient, SponsorSegment, default_skip_categories, filter_segments_for_categories,
+use crate::network::{
+    SongRating, SponsorBlockClient, SponsorSegment, TrackingInfo, default_skip_categories,
+    download_media_bytes, fetch_thumbnail_bytes, filter_segments_for_categories,
     sanitize_categories,
 };
-use crate::ytmusic::YtMusicClient;
-use crate::ytmusic::client::{SongRating, TrackingInfo};
+use crate::network_state::NetworkState;
+use crate::offline::{AppSettings, MusicCache};
+use crate::pipewire_monitor::PipeWireMonitor;
+use crate::playback_engine::PlaybackEngine;
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -47,10 +45,6 @@ macro_rules! eprintln {
     }};
 }
 
-const KEYRING_SERVICE: &str = "com.static.music";
-const KEYRING_USER: &str = "cookie";
-const KEYRING_VR_TOKEN: &str = "vr_refresh_token";
-const KEYRING_STORAGE_ROOT: &str = "storage_root";
 const UI_APP_OBJECT_PATH: &str = "/com/static/music";
 const MIN_LISTEN_SECS: u64 = 10;
 const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
@@ -71,21 +65,6 @@ const DBUS_OBJECT_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
 const STATIC_MPRIS_BUS_NAME: &str = "org.mpris.MediaPlayer2.static";
 const PEER_MPRIS_TIMEOUT_MS: i32 = 500;
-
-static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
-    BlockingClient::builder()
-        .timeout(Duration::from_secs(120))
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
-        .build()
-        .unwrap()
-});
-
-static THUMB_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
-    BlockingClient::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap()
-});
 
 struct ActiveTrack {
     video_id: String,
@@ -155,7 +134,7 @@ struct DaemonState {
     player: PlaybackEngine,
     cache: MusicCache,
     settings: AppSettings,
-    client: Option<Rc<YtMusicClient>>,
+    client: Option<Rc<NetworkState>>,
     queue: Vec<Track>,
     queue_index: usize,
     playlist_context: Option<PlaylistContext>,
@@ -2190,17 +2169,12 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
     stop_playback(state, false);
 }
 
-fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<YtMusicClient>> {
+fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<NetworkState>> {
     if let Some(client) = state.client.as_ref() {
         return Ok(client.clone());
     }
 
-    let cookie = get_cookie()
-        .ok_or_else(|| anyhow!("Not authenticated: no playable cookie available in the keyring"))?;
-    let client = Rc::new(YtMusicClient::new(&cookie)?);
-    if let Some(token) = get_vr_refresh_token() {
-        client.set_vr_refresh_token(&token);
-    }
+    let client = Rc::new(NetworkState::from_saved_session()?);
     state.client = Some(client.clone());
     Ok(client)
 }
@@ -2255,21 +2229,16 @@ fn schedule_offline_cache_sync(state: &mut DaemonState) {
 fn run_offline_cache_sync(
     settings: &AppSettings,
     cookie: Option<&str>,
-    vr_refresh_token: Option<&str>,
+    _vr_refresh_token: Option<&str>,
     storage_root: Option<&str>,
 ) -> Result<()> {
     let mut cache = MusicCache::new_with_storage_root(storage_root)
         .context("Failed to initialise music cache")?;
 
-    let client = cookie.and_then(|cookie| match YtMusicClient::new(cookie) {
-        Ok(client) => {
-            if let Some(token) = vr_refresh_token {
-                client.set_vr_refresh_token(token);
-            }
-            Some(client)
-        }
+    let client = cookie.and_then(|cookie| match NetworkState::from_cookie(cookie) {
+        Ok(client) => Some(client),
         Err(err) => {
-            eprintln!("[OFFLINE_SYNC] failed to initialize YT Music client: {err}");
+            eprintln!("[OFFLINE_SYNC] failed to initialize network state: {err}");
             None
         }
     });
@@ -2280,7 +2249,7 @@ fn run_offline_cache_sync(
     Ok(())
 }
 
-fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&YtMusicClient>) {
+fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&NetworkState>) {
     let offline_playlists = cache.offline_playlists().unwrap_or_default();
     if offline_playlists.is_empty() {
         return;
@@ -2354,7 +2323,7 @@ fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&YtMusicClie
 fn sync_auto_offline_cache(
     cache: &mut MusicCache,
     settings: &AppSettings,
-    client: Option<&YtMusicClient>,
+    client: Option<&NetworkState>,
 ) {
     let cache_target = settings.offline_cache_target as usize;
     let top = if !settings.auto_manage_offline_cache && !settings.auto_cache_listen_again {
@@ -2397,18 +2366,7 @@ fn sync_auto_offline_cache(
         };
 
         eprintln!("[CACHE] downloading {video_id} for offline...");
-        let audio = match DOWNLOAD_CLIENT
-            .get(&url)
-            .header("Range", "bytes=0-")
-            .send()
-            .and_then(|response| {
-                let status = response.status();
-                eprintln!(
-                    "[CACHE] {video_id} response: {status}, content-length: {:?}",
-                    response.content_length()
-                );
-                response.error_for_status()?.bytes()
-            }) {
+        let audio = match download_media_bytes(&url, Some("bytes=0-")) {
             Ok(bytes) => {
                 eprintln!("[CACHE] {video_id} downloaded {} KB", bytes.len() / 1024);
                 bytes
@@ -2429,7 +2387,7 @@ fn sync_auto_offline_cache(
 
 fn ensure_track_available_offline(
     cache: &mut MusicCache,
-    client: &YtMusicClient,
+    client: &NetworkState,
     track: &Track,
     pin: bool,
     log_prefix: &str,
@@ -2461,13 +2419,7 @@ fn ensure_track_available_offline(
         }
     };
 
-    let audio = match DOWNLOAD_CLIENT
-        .get(&url)
-        .header("Range", "bytes=0-")
-        .send()
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.bytes())
-    {
+    let audio = match download_media_bytes(&url, Some("bytes=0-")) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("[{log_prefix}] download failed for {video_id}: {err}");
@@ -2516,20 +2468,6 @@ fn hydrate_offline_sponsorblock_cache(cache: &mut MusicCache, video_id: &str) {
     if let Err(err) = cache.store_offline_sponsor_segments(video_id, &segments) {
         eprintln!("[SPONSORBLOCK] failed to store offline cache for {video_id}: {err}");
     }
-}
-
-fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
-    if let Some(path) = url.strip_prefix("file://") {
-        return std::fs::read(path).ok();
-    }
-
-    THUMB_CLIENT
-        .get(url)
-        .send()
-        .ok()?
-        .bytes()
-        .ok()
-        .map(|bytes| bytes.to_vec())
 }
 
 fn maybe_run_deferred_action(state: &mut DaemonState) {
@@ -2696,7 +2634,6 @@ fn maybe_extend_radio_queue(state: &mut DaemonState) {
     state.radio_append_in_flight = true;
 
     let background_tx = state.background_tx.clone();
-    let vr_refresh_token = get_vr_refresh_token();
 
     std::thread::spawn(move || {
         let Some(cookie) = get_cookie() else {
@@ -2708,10 +2645,10 @@ fn maybe_extend_radio_queue(state: &mut DaemonState) {
             return;
         };
 
-        let client = match YtMusicClient::new(&cookie) {
+        let client = match NetworkState::from_cookie(&cookie) {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("[RADIO] failed to initialize YT Music client: {err}");
+                eprintln!("[RADIO] failed to initialize network state: {err}");
                 let _ = background_tx.send(BackgroundEvent::RadioExtensionReady {
                     anchor_video_id,
                     tracks: Vec::new(),
@@ -2720,10 +2657,6 @@ fn maybe_extend_radio_queue(state: &mut DaemonState) {
                 return;
             }
         };
-        if let Some(token) = vr_refresh_token.as_deref() {
-            client.set_vr_refresh_token(token);
-        }
-
         let (tracks, chips) = match client.get_radio(&anchor_video_id, None, None) {
             Ok(radio) => (radio.tracks, radio.chips),
             Err(err) => {
@@ -3038,7 +2971,6 @@ fn prefetch_upcoming(state: &mut DaemonState) {
     state.prefetch_in_flight.extend(to_fetch.iter().cloned());
 
     let cookie = get_cookie();
-    let vr_refresh_token = get_vr_refresh_token();
     let storage_root = get_storage_root();
     let background_tx = state.background_tx.clone();
 
@@ -3061,19 +2993,16 @@ fn prefetch_upcoming(state: &mut DaemonState) {
             }
         };
 
-        let client = match YtMusicClient::new(&cookie) {
+        let client = match NetworkState::from_cookie(&cookie) {
             Ok(client) => client,
             Err(err) => {
-                eprintln!("[PREFETCH] failed to initialize YT Music client: {err}");
+                eprintln!("[PREFETCH] failed to initialize network state: {err}");
                 for video_id in to_fetch {
                     let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 }
                 return;
             }
         };
-        if let Some(token) = vr_refresh_token.as_deref() {
-            client.set_vr_refresh_token(token);
-        }
 
         for video_id in to_fetch {
             if cache.is_cached(&video_id) || cache.get_temp_audio(&video_id).is_some() {
@@ -3086,13 +3015,7 @@ fn prefetch_upcoming(state: &mut DaemonState) {
                 continue;
             };
 
-            let Ok(audio) = DOWNLOAD_CLIENT
-                .get(&url)
-                .header("Range", "bytes=0-")
-                .send()
-                .and_then(|response| response.error_for_status())
-                .and_then(|response| response.bytes())
-            else {
+            let Ok(audio) = download_media_bytes(&url, Some("bytes=0-")) else {
                 let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             };
@@ -3687,7 +3610,7 @@ fn activate_existing_ui_instance() -> Result<()> {
     let connection = Connection::session().context("Failed to connect to the session D-Bus")?;
     let proxy = Proxy::new(
         &connection,
-        KEYRING_SERVICE,
+        "com.static.music",
         UI_APP_OBJECT_PATH,
         "org.freedesktop.Application",
     )
@@ -3794,31 +3717,15 @@ fn ensure_local_icon_for_current_exe(
 }
 
 fn get_cookie() -> Option<String> {
-    let entry = match Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        Ok(entry) => entry,
-        Err(err) => {
-            eprintln!("[AUTH] failed to open cookie keyring entry: {err}");
-            return None;
-        }
-    };
-
-    match entry.get_password() {
-        Ok(cookie) => Some(cookie),
-        Err(err) => {
-            eprintln!("[AUTH] failed to read cookie from keyring: {err}");
-            None
-        }
-    }
+    crate::network::get_cookie()
 }
 
 fn get_vr_refresh_token() -> Option<String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_VR_TOKEN).ok()?;
-    entry.get_password().ok()
+    crate::network::get_vr_refresh_token()
 }
 
 fn get_storage_root() -> Option<String> {
-    let entry = Entry::new(KEYRING_SERVICE, KEYRING_STORAGE_ROOT).ok()?;
-    entry.get_password().ok()
+    crate::network::get_storage_root()
 }
 
 #[cfg(test)]
@@ -3833,9 +3740,9 @@ mod tests {
         reset_previous_threshold_clock_for_track, should_emit_live_mpris_seeked_hint,
         should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
     };
-    use crate::cache::AppSettings;
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
-    use crate::ytmusic::client::SongRating;
+    use crate::network::SongRating;
+    use crate::offline::AppSettings;
     use std::time::{Duration, Instant};
 
     fn test_active_track(started_at: Instant) -> ActiveTrack {

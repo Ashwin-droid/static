@@ -1,5 +1,10 @@
 use super::*;
 
+pub(super) fn configure_cover_picture(picture: &Picture) {
+    picture.set_can_shrink(true);
+    picture.set_content_fit(gtk::ContentFit::Cover);
+}
+
 pub(super) fn load_thumbnail_into(picture: &Picture, url: &str, size: i32) {
     if let Some(texture) = cached_thumbnail_texture(url, size) {
         picture.set_paintable(Some(&texture));

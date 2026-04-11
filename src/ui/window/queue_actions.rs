@@ -56,7 +56,7 @@ pub(super) fn play_track(
     ps.menu_btn.set_sensitive(false);
 
     if let Some(url) = thumb_url {
-        load_thumbnail_into(&ps.np_thumb, url, 80);
+        load_thumbnail_into(&ps.np_thumb, url, 40);
     } else {
         ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
     }
@@ -157,7 +157,7 @@ pub(super) fn probe_track(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<
     ps.play_pause_btn.set_sensitive(false);
 
     if let Some(url) = &thumb_url {
-        load_thumbnail_into(&ps.np_thumb, url, 80);
+        load_thumbnail_into(&ps.np_thumb, url, 40);
     } else {
         ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
     }
@@ -643,7 +643,7 @@ pub(super) fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>
     ps.play_pause_btn.set_sensitive(false);
 
     if let Some(url) = &thumb_url {
-        load_thumbnail_into(&ps.np_thumb, url, 80);
+        load_thumbnail_into(&ps.np_thumb, url, 40);
     } else {
         ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
     }

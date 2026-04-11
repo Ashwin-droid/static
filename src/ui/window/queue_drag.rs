@@ -86,11 +86,11 @@ pub(super) fn build_queue_row_visual(
     art.set_overflow(gtk::Overflow::Hidden);
 
     if let Some(url) = preview.thumbnail_url.as_deref() {
-        let pic = Picture::new();
-        pic.set_keep_aspect_ratio(true);
-        pic.set_size_request(40, 40);
-        art.append(&pic);
-        load_thumbnail_into(&pic, url, 80);
+        let picture = Picture::new();
+        configure_cover_picture(&picture);
+        picture.set_size_request(40, 40);
+        art.append(&picture);
+        load_thumbnail_into(&picture, url, 40);
     }
 
     row.append(&art);
@@ -284,7 +284,7 @@ pub(super) fn refresh_queue_drop_indicator(ps: &PlayerState) {
             .set_text(preview.duration.as_deref().unwrap_or(""));
         if let Some(url) = preview.thumbnail_url.as_deref() {
             ps.queue_drop_indicator_thumb.set_visible(true);
-            load_thumbnail_into(&ps.queue_drop_indicator_thumb, url, 80);
+            load_thumbnail_into(&ps.queue_drop_indicator_thumb, url, 40);
         } else {
             ps.queue_drop_indicator_thumb
                 .set_paintable(Option::<&gtk::gdk::Paintable>::None);

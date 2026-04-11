@@ -452,10 +452,10 @@ pub(super) fn build_home_browse_row(
 
     if let Some(url) = card.thumbnail_url.as_deref() {
         let picture = Picture::new();
-        picture.set_keep_aspect_ratio(true);
+        configure_cover_picture(&picture);
         picture.set_size_request(44, 44);
         art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 88);
+        load_thumbnail_into(&picture, url, 44);
     } else {
         let initial = card
             .title

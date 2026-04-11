@@ -343,7 +343,7 @@ pub(super) fn apply_remote_snapshot(
             ps.np_title.set_text(&track.title);
             ps.np_artist.set_text(&track.artist);
             if let Some(url) = track.thumb_url.as_deref() {
-                load_thumbnail_into(&ps.np_thumb, url, 80);
+                load_thumbnail_into(&ps.np_thumb, url, 40);
             } else {
                 ps.np_thumb.set_paintable(None::<&gtk::gdk::Texture>);
             }

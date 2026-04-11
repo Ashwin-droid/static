@@ -143,10 +143,10 @@ pub(super) fn render_resume_dropped_section(
     art.set_overflow(gtk::Overflow::Hidden);
     if let Some(url) = track.thumbnail_url.as_deref() {
         let picture = Picture::new();
-        picture.set_keep_aspect_ratio(true);
+        configure_cover_picture(&picture);
         picture.set_size_request(56, 56);
         art.append(&picture);
-        load_thumbnail_into(&picture, url, 112);
+        load_thumbnail_into(&picture, url, 56);
     } else {
         let initial = track
             .title
@@ -1229,10 +1229,10 @@ pub(super) fn build_track_row(
 
     if let Some(url) = &track.thumbnail_url {
         let picture = Picture::new();
-        picture.set_keep_aspect_ratio(true);
+        configure_cover_picture(&picture);
         picture.set_size_request(44, 44);
         art_container.append(&picture);
-        load_thumbnail_into(&picture, url, 88);
+        load_thumbnail_into(&picture, url, 44);
     } else {
         let initial = track
             .title

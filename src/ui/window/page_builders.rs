@@ -603,7 +603,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     np_thumb_frame.set_valign(Align::Center);
 
     let np_thumb = Picture::new();
-    np_thumb.set_keep_aspect_ratio(true);
+    configure_cover_picture(&np_thumb);
     np_thumb.set_size_request(40, 40);
     np_thumb_frame.append(&np_thumb);
     track_info_box.append(&np_thumb_frame);
@@ -771,7 +771,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
 
     let queue_drop_indicator_thumb = Picture::new();
     queue_drop_indicator_thumb.add_css_class("queue-drop-indicator-thumb");
-    queue_drop_indicator_thumb.set_keep_aspect_ratio(true);
+    configure_cover_picture(&queue_drop_indicator_thumb);
     queue_drop_indicator_thumb.set_size_request(40, 40);
     queue_drop_indicator_row.append(&queue_drop_indicator_thumb);
 

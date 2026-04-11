@@ -19,7 +19,7 @@ assets = [
 
 [dependencies]
 # GTK4 UI
-gtk = { package = "gtk4", version = "0.9" }
+gtk = { package = "gtk4", version = "0.9", features = ["v4_8"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

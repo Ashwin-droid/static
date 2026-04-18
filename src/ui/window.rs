@@ -37,15 +37,6 @@ const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
-use crate::network::{
-    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, SponsorBlockClient, SponsorSegment,
-    default_skip_categories, delete_cookie, get_cookie, get_storage_root,
-    download_media_bytes, fetch_thumbnail_bytes as network_fetch_thumbnail_bytes,
-    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
-    store_vr_refresh_token,
-};
-use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, MusicCache};
 use crate::ipc::{
     ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
     PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playback_state,
@@ -56,6 +47,14 @@ use crate::models::{
     HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyricLine,
     SyncedLyrics, SyncedLyricsSource, Track,
 };
+use crate::network::{
+    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, SponsorBlockClient, SponsorSegment,
+    default_skip_categories, delete_cookie, download_media_bytes,
+    fetch_thumbnail_bytes as network_fetch_thumbnail_bytes, get_cookie, get_storage_root,
+    load_cookie_from_chromium_profile, sanitize_categories, store_cookie, store_vr_refresh_token,
+};
+use crate::network_state::NetworkState;
+use crate::offline::{AppSettings, MusicCache};
 use crate::player::Player;
 
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
@@ -807,11 +806,17 @@ fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Tra
     deduped
 }
 
+fn apply_radio_chip_update(radio: &mut RadioVirtualPlaylist, chips: Option<Vec<RadioChip>>) {
+    if let Some(chips) = chips {
+        radio.chips = chips;
+    }
+}
+
 fn replace_radio_tail(
     ps: &PlayerState,
     prefix_len: usize,
     tracks: Vec<Track>,
-    chips: Vec<RadioChip>,
+    chips: Option<Vec<RadioChip>>,
 ) {
     let prefix_len = prefix_len.min(ps.queue.borrow().len());
     {
@@ -823,7 +828,7 @@ fn replace_radio_tail(
 
     if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
         radio.touched_len = radio.touched_len.min(prefix_len);
-        radio.chips = chips;
+        apply_radio_chip_update(radio, chips);
     }
     *ps.last_radio_append_anchor.borrow_mut() = None;
 }
@@ -1219,10 +1224,10 @@ fn clear_box(container: &GtkBox) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowseBackTarget, ContentViewKind, dedupe_radio_recommendations,
+        BrowseBackTarget, ContentViewKind, apply_radio_chip_update, dedupe_radio_recommendations,
         radio_touched_len_after_reorder, selected_browse_back_target_kind,
     };
-    use crate::models::{Artist, Track};
+    use crate::models::{Artist, RadioChip, RadioVirtualPlaylist, Track};
 
     fn test_track(video_id: &str) -> Track {
         Track {
@@ -1239,6 +1244,14 @@ mod tests {
             playback_params: None,
             not_interested_feedback_token: None,
             undo_feedback_token: None,
+        }
+    }
+
+    fn test_chip(label: &str, playlist_id: &str, params: Option<&str>) -> RadioChip {
+        RadioChip {
+            label: label.to_string(),
+            playlist_id: playlist_id.to_string(),
+            params: params.map(str::to_string),
         }
     }
 
@@ -1270,6 +1283,37 @@ mod tests {
         );
 
         assert_eq!(deduped, vec![test_track("fresh")]);
+    }
+
+    #[test]
+    fn radio_chip_update_preserves_existing_chips_when_not_replaced() {
+        let existing_chips = vec![
+            test_chip("All", "RDseed", None),
+            test_chip("Discover", "RDdiscover", Some("discover-params")),
+        ];
+        let mut radio = RadioVirtualPlaylist {
+            source_video_id: "seed".to_string(),
+            touched_len: 1,
+            chips: existing_chips.clone(),
+        };
+
+        apply_radio_chip_update(&mut radio, None);
+
+        assert_eq!(radio.chips, existing_chips);
+    }
+
+    #[test]
+    fn radio_chip_update_replaces_existing_chips_when_provided() {
+        let mut radio = RadioVirtualPlaylist {
+            source_video_id: "seed".to_string(),
+            touched_len: 1,
+            chips: vec![test_chip("All", "RDseed", None)],
+        };
+        let replacement_chips = vec![test_chip("J-pop", "RDjpop", Some("jpop-params"))];
+
+        apply_radio_chip_update(&mut radio, Some(replacement_chips.clone()));
+
+        assert_eq!(radio.chips, replacement_chips);
     }
 
     #[test]

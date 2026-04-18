@@ -236,7 +236,7 @@ fn spawn_jump_to_radio_seed_tail_refresh(
                 radio.tracks.insert(0, seed_track);
             }
 
-            replace_radio_tail(&ps, prefix_len, radio.tracks, radio.chips);
+            replace_radio_tail(&ps, prefix_len, radio.tracks, Some(radio.chips));
             render_queue_panel(&ps, &state);
             sync_remote_queue(&ps);
             sync_mpris_transport(&ps, &state);
@@ -1334,7 +1334,7 @@ pub(super) fn load_radio_filter(
                 radio.tracks.insert(0, t);
             }
 
-            replace_radio_tail(&ps, prefix_len, radio.tracks, radio.chips);
+            replace_radio_tail(&ps, prefix_len, radio.tracks, None);
             render_queue_panel(&ps, &state);
             sync_remote_queue(&ps);
             sync_mpris_transport(&ps, &state);

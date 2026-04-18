@@ -12,7 +12,9 @@ impl NetworkState {
         };
 
         if page_index > 0 && continuation.is_none() {
-            return Err(anyhow!("Home page {page_index} has not been discovered yet"));
+            return Err(anyhow!(
+                "Home page {page_index} has not been discovered yet"
+            ));
         }
 
         let page = self.client.get_home_page(continuation.as_deref())?;

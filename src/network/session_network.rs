@@ -294,9 +294,7 @@ fn find_secret_item_path(
 }
 
 fn secret_item_label(username: &str) -> String {
-    format!(
-        "{username}@{KEYRING_SERVICE}:{SECRET_DEFAULT_TARGET} (static via zbus)"
-    )
+    format!("{username}@{KEYRING_SERVICE}:{SECRET_DEFAULT_TARGET} (static via zbus)")
 }
 
 fn secret_item_properties(username: &str) -> HashMap<String, OwnedValue> {
@@ -576,9 +574,7 @@ pub fn decrypt_chromium_cookie(
     None
 }
 
-pub fn load_cookie_from_chromium_profile(
-    settings: &AppSettings,
-) -> anyhow::Result<Option<String>> {
+pub fn load_cookie_from_chromium_profile(settings: &AppSettings) -> anyhow::Result<Option<String>> {
     let db_path = if settings.chromium_cookie_path.trim().is_empty() {
         match newest_existing_path(candidate_chromium_cookie_paths()) {
             Some(path) => path,

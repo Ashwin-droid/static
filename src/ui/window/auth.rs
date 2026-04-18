@@ -28,10 +28,7 @@ pub(super) async fn validate_cookie_and_build_client(
     }
 }
 
-pub(super) async fn stage_restored_client(
-    client: Arc<NetworkState>,
-    state: &Arc<Mutex<AppState>>,
-) {
+pub(super) async fn stage_restored_client(client: Arc<NetworkState>, state: &Arc<Mutex<AppState>>) {
     let mut guard = state.lock().unwrap();
     guard.client = Some(client);
     guard.home_cache = None;

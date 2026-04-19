@@ -1,15 +1,15 @@
 use std::collections::HashSet;
 use std::sync::Once;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::ipc::{
-    daemon_is_running, load_persisted_playback_state, DaemonClient, PlaybackSnapshot, RepeatMode,
+    DaemonClient, PlaybackSnapshot, RepeatMode, daemon_is_running, load_persisted_playback_state,
 };
 use crate::models::{HomeItem, RadioVirtualPlaylist, SearchResult, Track};
 use crate::network::{
-    delete_cookie, get_cookie, get_storage_root, load_cookie_from_chromium_profile,
-    sanitize_categories, store_cookie, SongRating,
+    SongRating, delete_cookie, get_cookie, get_storage_root, load_cookie_from_chromium_profile,
+    sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{AppSettings, MusicCache};
@@ -685,11 +685,7 @@ fn print_queue(snapshot: &PlaybackSnapshot) {
 
     for (index, track) in snapshot.queue.iter().enumerate() {
         let marker = if index == snapshot.queue_index {
-            if snapshot.paused {
-                "||"
-            } else {
-                ">>"
-            }
+            if snapshot.paused { "||" } else { ">>" }
         } else if snapshot
             .radio_virtual_playlist
             .as_ref()
@@ -971,11 +967,7 @@ fn playback_status(snapshot: &PlaybackSnapshot) -> &'static str {
     if snapshot.probe_active {
         "probe"
     } else if snapshot.current_track.is_some() {
-        if snapshot.paused {
-            "paused"
-        } else {
-            "playing"
-        }
+        if snapshot.paused { "paused" } else { "playing" }
     } else {
         "stopped"
     }
@@ -1016,11 +1008,7 @@ pub(crate) fn rating_label(rating: SongRating) -> &'static str {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 fn yes_no_bool(value: bool) -> String {

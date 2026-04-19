@@ -12,9 +12,10 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use image::DynamicImage;
+use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -24,11 +25,10 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, Gauge, List, ListItem, Padding, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
-use ratatui::Frame;
 use ratatui_image::{
+    CropOptions, Resize, StatefulImage,
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
-    CropOptions, Resize, StatefulImage,
 };
 
 use crate::cli::{
@@ -36,14 +36,14 @@ use crate::cli::{
     restore_playback_snapshot_via_daemon, saved_network_state,
 };
 use crate::ipc::{
-    load_persisted_playback_state, ActiveTrackSnapshot, DaemonClient, PlaybackSnapshot,
-    PlaylistContext, PlaylistContextSource, RepeatMode,
+    ActiveTrackSnapshot, DaemonClient, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
+    RepeatMode, load_persisted_playback_state,
 };
 use crate::models::{
-    HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, RadioVirtualPlaylist, SyncedLyrics,
-    Track,
+    BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
+    RadioVirtualPlaylist, SyncedLyrics, Track,
 };
-use crate::network::{fetch_thumbnail_bytes, SongRating};
+use crate::network::{SongRating, fetch_thumbnail_bytes};
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -59,6 +59,7 @@ const QUEUE_ROW_HEIGHT: u16 = 3;
 const HOME_LOAD_MORE_THRESHOLD_ROWS: usize = 14;
 const HOME_HEADER_PLAY_ALL_LABEL: &str = "[▶ Play all]";
 const HOME_HEADER_SHUFFLE_ALL_LABEL: &str = "[🔀 Shuffle]";
+const HOME_BANNER_HEIGHT: u16 = 7;
 
 pub fn run() -> Result<()> {
     let client = DaemonClient::new()?;
@@ -208,9 +209,13 @@ struct HomeHeaderActionsLayout {
 #[derive(Clone)]
 struct HomeBanner {
     rect: Rect,
+    eyebrow: String,
     title: String,
     subtitle: String,
     meta: String,
+    hint: Option<String>,
+    thumbnail_url: Option<String>,
+    accent: bool,
 }
 
 #[derive(Clone)]
@@ -248,10 +253,58 @@ struct HomeDocument {
     messages: Vec<HomeMessage>,
 }
 
+#[derive(Clone)]
+enum TuiContentView {
+    Home,
+    Browse(TuiBrowseView),
+}
+
+#[derive(Clone)]
+struct TuiBrowseView {
+    card: HomeBrowseCard,
+    status: BrowseViewStatus,
+}
+
+#[derive(Clone)]
+enum BrowseViewStatus {
+    Loading,
+    Tracks {
+        title: String,
+        thumbnail_url: Option<String>,
+        tracks: Vec<Track>,
+    },
+    Sections {
+        title: String,
+        thumbnail_url: Option<String>,
+        artist_like: bool,
+        sections: Vec<crate::models::HomeSection>,
+    },
+    Error(String),
+}
+
+#[derive(Clone)]
+enum ContentSnapshot {
+    Home {
+        selected: usize,
+        scroll_offset: usize,
+    },
+    Browse {
+        view: TuiBrowseView,
+        selected: usize,
+        scroll_offset: usize,
+    },
+}
+
 enum HomeFeedStatus {
     Loading,
     Ready(HomePage),
     Error(String),
+}
+
+#[derive(Clone)]
+enum BrowseLoadResult {
+    Tracks(Vec<Track>),
+    Sections(BrowseSectionsPage),
 }
 
 enum TuiBackgroundEvent {
@@ -259,6 +312,10 @@ enum TuiBackgroundEvent {
     HomeAppended {
         continuation: String,
         result: Result<HomePage, String>,
+    },
+    BrowseLoaded {
+        browse_id: String,
+        result: Result<BrowseLoadResult, String>,
     },
     HistoryLoaded(Result<Vec<Track>, String>),
     LyricsLoaded {
@@ -275,6 +332,7 @@ enum TuiBackgroundEvent {
 enum ClickTargetKind {
     Action(TuiAction),
     Nav(TuiNavItem),
+    ContentBack,
     DetailTab(DetailTab),
     HomeSectionAction { section_index: usize, shuffle: bool },
     HomeItem(usize),
@@ -424,6 +482,7 @@ enum ThumbnailAsset {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ThumbnailSlot {
     ContentHeader,
+    ContentBanner(usize),
     PlayerBar,
     HomeCard(usize),
 }
@@ -449,6 +508,8 @@ struct InteractiveTui {
     home_scroll_offset: usize,
     home_viewport_rows: usize,
     home_loading_more: bool,
+    content_view: TuiContentView,
+    content_backstack: Vec<ContentSnapshot>,
     focus: TuiFocus,
     detail_tab: DetailTab,
     resume_card: Option<ResumeCardData>,
@@ -497,6 +558,8 @@ impl InteractiveTui {
             home_scroll_offset: 0,
             home_viewport_rows: 12,
             home_loading_more: false,
+            content_view: TuiContentView::Home,
+            content_backstack: Vec::new(),
             focus: TuiFocus::Home,
             detail_tab: DetailTab::Queue,
             resume_card,
@@ -1128,6 +1191,10 @@ impl InteractiveTui {
     }
 
     fn maybe_request_more_home(&mut self) {
+        if !matches!(&self.content_view, TuiContentView::Home) {
+            return;
+        }
+
         if self.home_loading_more {
             return;
         }
@@ -1561,32 +1628,7 @@ impl InteractiveTui {
     }
 
     fn open_browse_card_now(&mut self, card: HomeBrowseCard) -> Result<()> {
-        let network = saved_network_state()?;
-        let tracks = network
-            .get_browse_tracks(&card.browse_id)
-            .with_context(|| format!("Failed to open {}", card.title))?;
-        if tracks.is_empty() {
-            self.status_line = format!("{} has no playable tracks yet.", card.title);
-            return Ok(());
-        }
-
-        let context = PlaylistContext {
-            playlist_id: card.browse_id.clone(),
-            title: card.title.clone(),
-            thumbnail_url: card.thumbnail_url.clone(),
-            subtitle: card.subtitle.clone(),
-            source: PlaylistContextSource::Browse,
-        };
-        let snapshot =
-            self.client
-                .play_queue_at(tracks, 0, Some(context), None, RepeatMode::Off)?;
-        self.apply_snapshot(snapshot);
-        self.detail_tab = DetailTab::Queue;
-        self.queue_selected = self
-            .snapshot
-            .queue_index
-            .min(self.snapshot.queue.len().saturating_sub(1));
-        self.status_line = format!("Opened {}", card.title);
+        self.open_browse_detail(card);
         Ok(())
     }
 
@@ -2248,24 +2290,71 @@ impl InteractiveTui {
         frame.render_widget(header, rows[0]);
         self.thumbnail_slots.remove(&ThumbnailSlot::ContentHeader);
 
-        let header_columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(16), Constraint::Length(12)])
-            .split(header_inner);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "S  T  A  T  I  C",
-                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-            )))
-            .alignment(Alignment::Left),
-            header_columns[0],
-        );
-        frame.render_widget(
-            Paragraph::new(Local::now().format("%a %H:%M").to_string())
-                .style(Style::default().fg(theme.muted))
-                .alignment(Alignment::Right),
-            header_columns[1],
-        );
+        let browse_mode = matches!(&self.content_view, TuiContentView::Browse(_));
+        let header_label = match &self.content_view {
+            TuiContentView::Home => "S  T  A  T  I  C".to_string(),
+            TuiContentView::Browse(view) => format!(
+                "S  T  A  T  I  C   /   {}",
+                browse_label(view.card.page_type).to_uppercase()
+            ),
+        };
+        if browse_mode {
+            let header_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(10),
+                    Constraint::Min(12),
+                    Constraint::Length(12),
+                ])
+                .split(header_inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "[← Back]",
+                    Style::default()
+                        .fg(theme.accent_glow)
+                        .add_modifier(Modifier::BOLD),
+                )))
+                .alignment(Alignment::Left),
+                header_columns[0],
+            );
+            targets.push(ClickTarget {
+                rect: header_columns[0],
+                kind: ClickTargetKind::ContentBack,
+            });
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    header_label,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                )))
+                .alignment(Alignment::Left),
+                header_columns[1],
+            );
+            frame.render_widget(
+                Paragraph::new(Local::now().format("%a %H:%M").to_string())
+                    .style(Style::default().fg(theme.muted))
+                    .alignment(Alignment::Right),
+                header_columns[2],
+            );
+        } else {
+            let header_columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(16), Constraint::Length(12)])
+                .split(header_inner);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    header_label,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                )))
+                .alignment(Alignment::Left),
+                header_columns[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Local::now().format("%a %H:%M").to_string())
+                    .style(Style::default().fg(theme.muted))
+                    .alignment(Alignment::Right),
+                header_columns[1],
+            );
+        }
 
         let feed_block = Block::default()
             .style(Style::default().bg(theme.content_bg))
@@ -2275,11 +2364,14 @@ impl InteractiveTui {
 
         layout.home_viewport = feed_inner;
         self.home_viewport_rows = feed_inner.height as usize;
-        self.home_doc = build_home_document(
-            &self.home_status,
-            feed_inner.width,
-            self.visible_resume_card(),
-        );
+        self.home_doc = match &self.content_view {
+            TuiContentView::Home => build_home_document(
+                &self.home_status,
+                feed_inner.width,
+                self.visible_resume_card(),
+            ),
+            TuiContentView::Browse(view) => build_browse_document(view, feed_inner.width),
+        };
         if !self.home_doc.cards.is_empty() {
             self.home_selected = self
                 .home_selected
@@ -2310,7 +2402,9 @@ impl InteractiveTui {
 
         let visible_top = self.home_scroll_offset;
         let visible_bottom = visible_top.saturating_add(feed_inner.height as usize);
-        for banner in &self.home_doc.banners {
+        let resume_banner_clickable = matches!(&self.content_view, TuiContentView::Home)
+            && self.visible_resume_card().is_some();
+        for (banner_index, banner) in self.home_doc.banners.iter().enumerate() {
             let banner_top = banner.rect.y as usize;
             let banner_bottom = banner_top.saturating_add(banner.rect.height as usize);
             if banner_bottom <= visible_top || banner_top >= visible_bottom {
@@ -2324,11 +2418,13 @@ impl InteractiveTui {
                 banner.rect.width,
                 banner.rect.height,
             );
-            if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
-                targets.push(ClickTarget {
-                    rect: visible_rect,
-                    kind: ClickTargetKind::Action(TuiAction::ResumeSaved),
-                });
+            if resume_banner_clickable && banner_index == 0 {
+                if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
+                    targets.push(ClickTarget {
+                        rect: visible_rect,
+                        kind: ClickTargetKind::Action(TuiAction::ResumeSaved),
+                    });
+                }
             }
         }
         for header in &self.home_doc.headers {
@@ -2387,6 +2483,37 @@ impl InteractiveTui {
         );
 
         if self.terminal_images_enabled() {
+            for index in 0..self.home_doc.banners.len() {
+                let banner = self.home_doc.banners[index].clone();
+                let Some(url) = banner.thumbnail_url.as_deref() else {
+                    continue;
+                };
+                let banner_top = banner.rect.y as usize;
+                let banner_bottom = banner_top.saturating_add(banner.rect.height as usize);
+                if banner_bottom <= visible_top || banner_top >= visible_bottom {
+                    continue;
+                }
+                let screen_rect = Rect::new(
+                    feed_inner.x + banner.rect.x,
+                    feed_inner
+                        .y
+                        .saturating_add(banner.rect.y.saturating_sub(visible_top as u16)),
+                    banner.rect.width,
+                    banner.rect.height,
+                );
+                let Some(thumb_rect) = home_banner_thumbnail_rect(screen_rect) else {
+                    continue;
+                };
+                self.render_cover_thumbnail(
+                    frame,
+                    thumb_rect,
+                    ThumbnailSlot::ContentBanner(index),
+                    Some(url),
+                    placeholder_initials(&banner.title, &banner.subtitle),
+                    theme,
+                    banner.accent,
+                );
+            }
             for index in 0..self.home_doc.cards.len() {
                 let card = self.home_doc.cards[index].clone();
                 let card_top = card.rect.y as usize;
@@ -2603,11 +2730,7 @@ impl InteractiveTui {
                                 Line::from(vec![
                                     Span::styled(
                                         if is_current {
-                                            if self.snapshot.paused {
-                                                "⏸ "
-                                            } else {
-                                                "▶ "
-                                            }
+                                            if self.snapshot.paused { "⏸ " } else { "▶ " }
                                         } else if is_generated {
                                             "≈ "
                                         } else if is_selected {
@@ -3074,7 +3197,7 @@ impl InteractiveTui {
                 Span::styled(&self.status_line, Style::default().fg(theme.muted)),
                 Span::raw("   "),
                 Span::styled(
-                    "tab focus  arrows move  enter play  m menu  space toggle  r resume",
+                    "tab focus  arrows move  enter play  m menu  b back  space toggle  r resume",
                     Style::default().fg(theme.border_focus),
                 ),
                 Span::raw("   "),
@@ -3141,6 +3264,11 @@ impl InteractiveTui {
 
         match code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            KeyCode::Backspace | KeyCode::Char('b')
+                if !matches!(&self.content_view, TuiContentView::Home) =>
+            {
+                self.go_back_content();
+            }
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::Char(' ') => self.run_action(TuiAction::TogglePause)?,
             KeyCode::Char('r') => self.run_action(TuiAction::ResumeSaved)?,
@@ -3339,6 +3467,61 @@ impl InteractiveTui {
                         }
                     }
                 }
+                TuiBackgroundEvent::BrowseLoaded { browse_id, result } => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Browse(view) => Some(view),
+                        TuiContentView::Home => None,
+                    }) else {
+                        continue;
+                    };
+
+                    if view.card.browse_id != browse_id
+                        || !matches!(&view.status, BrowseViewStatus::Loading)
+                    {
+                        continue;
+                    }
+
+                    match result {
+                        Ok(BrowseLoadResult::Tracks(tracks)) => {
+                            view.status = BrowseViewStatus::Tracks {
+                                title: view.card.title.clone(),
+                                thumbnail_url: view.card.thumbnail_url.clone(),
+                                tracks,
+                            };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = format!("Opened {}", shorten(&view.card.title, 32));
+                        }
+                        Ok(BrowseLoadResult::Sections(page)) => {
+                            let title = page
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| view.card.title.clone());
+                            let thumbnail_url = page
+                                .thumbnail_url
+                                .clone()
+                                .or_else(|| view.card.thumbnail_url.clone());
+                            view.status = BrowseViewStatus::Sections {
+                                title,
+                                thumbnail_url,
+                                artist_like: page.artist_like,
+                                sections: page.sections,
+                            };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = format!("Opened {}", shorten(&view.card.title, 32));
+                        }
+                        Err(message) => {
+                            view.status = BrowseViewStatus::Error(message.clone());
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = format!(
+                                "Could not open {}: {message}",
+                                shorten(&view.card.title, 28)
+                            );
+                        }
+                    }
+                }
                 TuiBackgroundEvent::HistoryLoaded(Ok(tracks)) => {
                     self.recent_tracks = tracks.into_iter().take(RECENT_LIMIT).collect();
                     self.recent_selected = self
@@ -3404,6 +3587,83 @@ impl InteractiveTui {
         self.home_status = HomeFeedStatus::Loading;
         self.home_loading_more = false;
         spawn_home_bootstrap(self.background_tx.clone());
+    }
+
+    fn push_content_snapshot(&mut self) {
+        let snapshot = match &self.content_view {
+            TuiContentView::Home => ContentSnapshot::Home {
+                selected: self.home_selected,
+                scroll_offset: self.home_scroll_offset,
+            },
+            TuiContentView::Browse(view) => ContentSnapshot::Browse {
+                view: view.clone(),
+                selected: self.home_selected,
+                scroll_offset: self.home_scroll_offset,
+            },
+        };
+        self.content_backstack.push(snapshot);
+    }
+
+    fn restore_content_snapshot(&mut self, snapshot: ContentSnapshot) {
+        match snapshot {
+            ContentSnapshot::Home {
+                selected,
+                scroll_offset,
+            } => {
+                self.content_view = TuiContentView::Home;
+                self.home_selected = selected;
+                self.home_scroll_offset = scroll_offset;
+            }
+            ContentSnapshot::Browse {
+                view,
+                selected,
+                scroll_offset,
+            } => {
+                self.content_view = TuiContentView::Browse(view);
+                self.home_selected = selected;
+                self.home_scroll_offset = scroll_offset;
+            }
+        }
+    }
+
+    fn open_browse_detail(&mut self, card: HomeBrowseCard) {
+        self.push_content_snapshot();
+        self.content_view = TuiContentView::Browse(TuiBrowseView {
+            card: card.clone(),
+            status: BrowseViewStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.home_loading_more = false;
+        self.status_line = format!("Loading {}...", shorten(&card.title, 32));
+        spawn_browse_load(self.background_tx.clone(), card);
+    }
+
+    fn go_back_content(&mut self) {
+        if let Some(snapshot) = self.content_backstack.pop() {
+            self.restore_content_snapshot(snapshot);
+            self.status_line = "Returned to the previous page.".to_string();
+        } else {
+            self.content_view = TuiContentView::Home;
+            self.home_selected = 0;
+            self.home_scroll_offset = 0;
+            self.status_line = "Back on Home.".to_string();
+        }
+    }
+
+    fn return_home_content(&mut self) {
+        while let Some(snapshot) = self.content_backstack.pop() {
+            if matches!(snapshot, ContentSnapshot::Home { .. }) {
+                self.restore_content_snapshot(snapshot);
+                self.status_line = "Back on Home.".to_string();
+                return;
+            }
+        }
+
+        self.content_view = TuiContentView::Home;
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Back on Home.".to_string();
     }
 
     fn apply_snapshot(&mut self, snapshot: PlaybackSnapshot) {
@@ -3627,18 +3887,47 @@ impl InteractiveTui {
         Ok(())
     }
 
-    fn play_home_section(&mut self, section_index: usize, shuffle: bool) -> Result<()> {
-        let HomeFeedStatus::Ready(page) = &self.home_status else {
-            self.status_line = "Home feed is still loading.".to_string();
-            return Ok(());
-        };
-        let Some(section) = page.sections.get(section_index) else {
-            self.status_line = "That Home section is no longer available.".to_string();
-            return Ok(());
+    fn play_content_section(&mut self, section_index: usize, shuffle: bool) -> Result<()> {
+        let (section_title, mut tracks, context) = match &self.content_view {
+            TuiContentView::Home => {
+                let HomeFeedStatus::Ready(page) = &self.home_status else {
+                    self.status_line = "Home feed is still loading.".to_string();
+                    return Ok(());
+                };
+                let Some(section) = page.sections.get(section_index) else {
+                    self.status_line = "That Home section is no longer available.".to_string();
+                    return Ok(());
+                };
+                (
+                    section.title.clone(),
+                    home_section_tracks(section),
+                    None::<PlaylistContext>,
+                )
+            }
+            TuiContentView::Browse(view) => match &view.status {
+                BrowseViewStatus::Loading => {
+                    self.status_line = "This page is still loading.".to_string();
+                    return Ok(());
+                }
+                BrowseViewStatus::Error(message) => {
+                    self.status_line = format!("This page failed to load: {message}");
+                    return Ok(());
+                }
+                BrowseViewStatus::Tracks { tracks, .. } => (
+                    view.card.title.clone(),
+                    tracks.clone(),
+                    Some(browse_playlist_context(&view.card, tracks.len())),
+                ),
+                BrowseViewStatus::Sections { sections, .. } => {
+                    let Some(section) = sections.get(section_index) else {
+                        self.status_line = "That section is no longer available.".to_string();
+                        return Ok(());
+                    };
+                    (section.title.clone(), home_section_tracks(section), None)
+                }
+            },
         };
 
-        let section_title = section.title.clone();
-        let mut tracks = home_section_tracks(section);
         if tracks.is_empty() {
             self.status_line = format!("{} has no playable tracks.", section_title);
             return Ok(());
@@ -3653,7 +3942,7 @@ impl InteractiveTui {
 
         let snapshot = self
             .client
-            .play_queue_at(tracks, 0, None, None, RepeatMode::Off)?;
+            .play_queue_at(tracks, 0, context, None, RepeatMode::Off)?;
         self.apply_snapshot(snapshot);
         self.detail_tab = DetailTab::Queue;
         self.queue_selected = self
@@ -3670,7 +3959,7 @@ impl InteractiveTui {
 
     fn activate_selection(&mut self) -> Result<()> {
         match self.focus {
-            TuiFocus::Home => self.activate_home_selection(),
+            TuiFocus::Home => self.activate_content_selection(),
             TuiFocus::Queue => self.activate_queue_selection(),
             TuiFocus::Recent => self.activate_recent_selection(),
         }
@@ -3680,6 +3969,10 @@ impl InteractiveTui {
         match kind {
             ClickTargetKind::Action(action) => self.run_action(*action),
             ClickTargetKind::Nav(nav) => self.handle_nav(*nav),
+            ClickTargetKind::ContentBack => {
+                self.go_back_content();
+                Ok(())
+            }
             ClickTargetKind::DetailTab(tab) => {
                 self.detail_tab = *tab;
                 Ok(())
@@ -3687,12 +3980,12 @@ impl InteractiveTui {
             ClickTargetKind::HomeSectionAction {
                 section_index,
                 shuffle,
-            } => self.play_home_section(*section_index, *shuffle),
+            } => self.play_content_section(*section_index, *shuffle),
             ClickTargetKind::HomeItem(index) => {
                 self.focus = TuiFocus::Home;
                 self.home_selected = *index;
                 self.ensure_home_visible();
-                self.activate_home_selection()
+                self.activate_content_selection()
             }
             ClickTargetKind::QueueItem(index) => {
                 self.focus = TuiFocus::Queue;
@@ -3713,8 +4006,12 @@ impl InteractiveTui {
         match nav {
             TuiNavItem::Home => {
                 self.focus = TuiFocus::Home;
-                self.request_home_reload();
-                self.status_line = "Reloading Home.".to_string();
+                if matches!(&self.content_view, TuiContentView::Home) {
+                    self.request_home_reload();
+                    self.status_line = "Reloading Home.".to_string();
+                } else {
+                    self.return_home_content();
+                }
             }
             TuiNavItem::Settings => {
                 self.status_line = "Settings live in the GTK app for now.".to_string();
@@ -3727,41 +4024,64 @@ impl InteractiveTui {
         Ok(())
     }
 
-    fn activate_home_selection(&mut self) -> Result<()> {
+    fn activate_content_selection(&mut self) -> Result<()> {
         let Some(card) = self.home_doc.cards.get(self.home_selected).cloned() else {
-            self.status_line = "Home feed is still loading.".to_string();
+            self.status_line = match &self.content_view {
+                TuiContentView::Home => "Home feed is still loading.".to_string(),
+                TuiContentView::Browse(view) => match &view.status {
+                    BrowseViewStatus::Loading => "This page is still loading.".to_string(),
+                    BrowseViewStatus::Error(message) => {
+                        format!("This page failed to load: {message}")
+                    }
+                    BrowseViewStatus::Tracks { .. } | BrowseViewStatus::Sections { .. } => {
+                        "Nothing is selectable on this page yet.".to_string()
+                    }
+                },
+            };
             return Ok(());
         };
 
         match card.item {
-            TuiHomeItem::Track(track) => {
+            TuiHomeItem::Browse(card) => {
+                self.open_browse_detail(card);
+                return Ok(());
+            }
+            TuiHomeItem::Track(track)
+                if matches!(&self.content_view, TuiContentView::Home)
+                    || matches!(
+                        &self.content_view,
+                        TuiContentView::Browse(TuiBrowseView {
+                            status: BrowseViewStatus::Sections { .. },
+                            ..
+                        })
+                    ) =>
+            {
                 let snapshot = play_track_with_radio(&self.client, track.clone())?;
                 self.apply_snapshot(snapshot);
                 self.detail_tab = DetailTab::Queue;
                 self.status_line = format!("Playing {}", format_track_summary(&track));
             }
-            TuiHomeItem::Browse(card) => {
-                let network = saved_network_state()?;
-                let tracks = network
-                    .get_browse_tracks(&card.browse_id)
-                    .with_context(|| format!("Failed to open {}", card.title))?;
-                if tracks.is_empty() {
-                    self.status_line = format!("{} has no playable tracks yet.", card.title);
+            TuiHomeItem::Track(track) => {
+                let TuiContentView::Browse(view) = &self.content_view else {
                     return Ok(());
-                }
-                let context = PlaylistContext {
-                    playlist_id: card.browse_id.clone(),
-                    title: card.title.clone(),
-                    thumbnail_url: card.thumbnail_url.clone(),
-                    subtitle: card.subtitle.clone(),
-                    source: PlaylistContextSource::Browse,
                 };
-                let snapshot =
-                    self.client
-                        .play_queue_at(tracks, 0, Some(context), None, RepeatMode::Off)?;
+                let BrowseViewStatus::Tracks { tracks, .. } = &view.status else {
+                    return Ok(());
+                };
+                let start_index = tracks
+                    .iter()
+                    .position(|candidate| candidate.video_id == track.video_id)
+                    .unwrap_or(0);
+                let snapshot = self.client.play_queue_at(
+                    tracks.clone(),
+                    start_index,
+                    Some(browse_playlist_context(&view.card, tracks.len())),
+                    None,
+                    RepeatMode::Off,
+                )?;
                 self.apply_snapshot(snapshot);
                 self.detail_tab = DetailTab::Queue;
-                self.status_line = format!("Opened {}", card.title);
+                self.status_line = format!("Playing {}", format_track_summary(&track));
             }
         }
 
@@ -4253,6 +4573,25 @@ fn spawn_home_append(tx: mpsc::Sender<TuiBackgroundEvent>, continuation: String)
     });
 }
 
+fn spawn_browse_load(tx: mpsc::Sender<TuiBackgroundEvent>, card: HomeBrowseCard) {
+    std::thread::spawn(move || {
+        let browse_id = card.browse_id.clone();
+        let result = saved_network_state()
+            .and_then(|network| match card.page_type {
+                HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => network
+                    .get_channel_page(&browse_id)
+                    .map(BrowseLoadResult::Sections),
+                HomeBrowsePageType::Playlist
+                | HomeBrowsePageType::Album
+                | HomeBrowsePageType::PodcastShow => network
+                    .get_browse_tracks(&browse_id)
+                    .map(BrowseLoadResult::Tracks),
+            })
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::BrowseLoaded { browse_id, result });
+    });
+}
+
 fn spawn_lyrics_load(tx: mpsc::Sender<TuiBackgroundEvent>, video_id: String) {
     std::thread::spawn(move || {
         let result = saved_network_state()
@@ -4348,12 +4687,16 @@ fn build_home_document(
 
     if let Some(resume_card) = resume_card {
         doc.banners.push(HomeBanner {
-            rect: Rect::new(0, y as u16, usable_width, 5),
+            rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+            eyebrow: "RESUME".to_string(),
             title: format!("Resume {}", resume_card.track.title),
             subtitle: artist_string(&resume_card.track),
             meta: resume_card.meta.clone(),
+            hint: Some("Press r or click here to restore".to_string()),
+            thumbnail_url: resume_card.track.thumbnail_url.clone(),
+            accent: true,
         });
-        y += 6;
+        y += HOME_BANNER_HEIGHT as usize + 1;
     }
 
     match status {
@@ -4474,6 +4817,287 @@ fn build_home_document(
     doc
 }
 
+fn push_document_section(
+    doc: &mut HomeDocument,
+    y: &mut usize,
+    usable_width: u16,
+    section_index: usize,
+    title: &str,
+    items: &[TuiHomeItem],
+    section_style: HomeCardStyle,
+    show_play_controls: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+
+    doc.headers.push(HomeHeader {
+        y: *y,
+        section_index,
+        title: title.to_uppercase(),
+        meta: format!("· {}", section_meta_label(section_style, items.len())),
+        show_play_controls,
+    });
+    *y += 2;
+
+    let columns = home_columns(usable_width, section_style, items.len());
+    let card_height = home_card_height(section_style);
+    let card_width = ((usable_width.saturating_sub(HOME_GAP * columns.saturating_sub(1)))
+        / columns)
+        .max(match section_style {
+            HomeCardStyle::Featured => 24,
+            HomeCardStyle::TrackRow => 26,
+            HomeCardStyle::BrowseRow | HomeCardStyle::Shelf => 22,
+        });
+
+    for chunk in items.chunks(columns as usize) {
+        for (column, item) in chunk.iter().enumerate() {
+            let x = column as u16 * (card_width + HOME_GAP);
+            let (title, subtitle, meta, badge) = home_card_copy(item, section_style);
+            doc.cards.push(HomeCard {
+                rect: Rect::new(x, *y as u16, card_width, card_height),
+                item: item.clone(),
+                title,
+                subtitle,
+                meta,
+                badge,
+                style: section_style,
+            });
+        }
+        *y += card_height as usize + 1;
+    }
+}
+
+fn build_browse_document(view: &TuiBrowseView, width: u16) -> HomeDocument {
+    let usable_width = width.max(24);
+    let mut doc = HomeDocument::default();
+    let mut y = 0usize;
+    let browse_badge = browse_label(view.card.page_type).to_uppercase();
+
+    match &view.status {
+        BrowseViewStatus::Loading => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: browse_badge,
+                title: view.card.title.clone(),
+                subtitle: view
+                    .card
+                    .subtitle
+                    .clone()
+                    .unwrap_or_else(|| "Loading page details...".to_string()),
+                meta: "Fetching the page layout and playable items".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: view.card.thumbnail_url.clone(),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: "Loading recommendations, tracks, and related shelves...".to_string(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        BrowseViewStatus::Error(message) => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: browse_badge,
+                title: view.card.title.clone(),
+                subtitle: view
+                    .card
+                    .subtitle
+                    .clone()
+                    .unwrap_or_else(|| "Browse page".to_string()),
+                meta: "This page could not be loaded".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: view.card.thumbnail_url.clone(),
+                accent: false,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: message.clone(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        BrowseViewStatus::Tracks {
+            title,
+            thumbnail_url,
+            tracks,
+        } => {
+            let track_count = tracks.len();
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: browse_badge,
+                title: title.clone(),
+                subtitle: view.card.subtitle.clone().unwrap_or_else(|| {
+                    format!("{} page", browse_label(view.card.page_type).to_lowercase())
+                }),
+                meta: if track_count == 1 {
+                    "1 track ready to play".to_string()
+                } else {
+                    format!("{track_count} tracks ready to play")
+                },
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: thumbnail_url.clone(),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+
+            if tracks.is_empty() {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "No playable tracks were returned for this page.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+
+            let items = tracks
+                .iter()
+                .cloned()
+                .map(TuiHomeItem::Track)
+                .collect::<Vec<_>>();
+            push_document_section(
+                &mut doc,
+                &mut y,
+                usable_width,
+                0,
+                "Tracks",
+                &items,
+                HomeCardStyle::TrackRow,
+                true,
+            );
+        }
+        BrowseViewStatus::Sections {
+            title,
+            thumbnail_url,
+            artist_like,
+            sections,
+        } => {
+            let top_songs_index = sections
+                .iter()
+                .position(|section| section.title == "Top songs");
+            let ordered_indices = top_songs_index
+                .into_iter()
+                .chain((0..sections.len()).filter(|index| Some(*index) != top_songs_index))
+                .collect::<Vec<_>>();
+            let featured_sections = ordered_indices
+                .len()
+                .saturating_sub(top_songs_index.is_some() as usize);
+            let top_song_count = top_songs_index
+                .and_then(|index| sections.get(index))
+                .map(home_section_tracks)
+                .map(|tracks| tracks.len());
+            let use_artist_chrome = view.card.page_type == HomeBrowsePageType::Artist
+                || *artist_like
+                || is_artist_sections(sections);
+            let eyebrow = if use_artist_chrome {
+                "ARTIST"
+            } else {
+                "CHANNEL"
+            };
+            let summary = if let Some(count) = top_song_count {
+                format!("{count} top songs  •  {featured_sections} featured sections")
+            } else if sections.len() == 1 {
+                "1 featured section".to_string()
+            } else {
+                format!("{} featured sections", sections.len())
+            };
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: eyebrow.to_string(),
+                title: title.clone(),
+                subtitle: view
+                    .card
+                    .subtitle
+                    .clone()
+                    .unwrap_or_else(|| format!("{} page", eyebrow.to_ascii_lowercase())),
+                meta: summary,
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: thumbnail_url.clone(),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+
+            if sections.is_empty() {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "No sections were returned for this page.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+
+            for (ordinal, index) in ordered_indices.into_iter().enumerate() {
+                let Some(section) = sections.get(index) else {
+                    continue;
+                };
+                if ordinal > 0 {
+                    y += 1;
+                }
+
+                let tracks = home_section_tracks(section);
+                let browse_cards = home_section_browse_cards(section);
+                let (items, section_style) = if tracks.len() == section.contents.len()
+                    && !tracks.is_empty()
+                {
+                    (
+                        tracks
+                            .into_iter()
+                            .map(TuiHomeItem::Track)
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::TrackRow,
+                    )
+                } else if browse_cards.len() == section.contents.len() && !browse_cards.is_empty() {
+                    (
+                        browse_cards
+                            .into_iter()
+                            .map(TuiHomeItem::Browse)
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::BrowseRow,
+                    )
+                } else {
+                    (
+                        section
+                            .contents
+                            .iter()
+                            .filter_map(|item| match item {
+                                HomeItem::Track(track) => Some(TuiHomeItem::Track(track.clone())),
+                                HomeItem::BrowseCard(card) => {
+                                    Some(TuiHomeItem::Browse(card.clone()))
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::Shelf,
+                    )
+                };
+                let show_play_controls = home_section_tracks(section).len()
+                    == section.contents.len()
+                    && !home_section_tracks(section).is_empty();
+                push_document_section(
+                    &mut doc,
+                    &mut y,
+                    usable_width,
+                    index,
+                    &section.title,
+                    &items,
+                    section_style,
+                    show_play_controls,
+                );
+            }
+        }
+    }
+
+    doc.total_height = y.saturating_add(1);
+    doc
+}
+
 fn render_action_button(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -4576,7 +5200,16 @@ fn draw_home_banner(
 
     let x = clip.x + banner.rect.x;
     let y = clip.y as i32 + screen_y;
-    let bg = theme.accent_fill;
+    let bg = if banner.accent {
+        theme.accent_fill
+    } else {
+        theme.elevated_bg
+    };
+    let border = if banner.accent {
+        theme.accent
+    } else {
+        theme.border_subtle
+    };
     draw_box(
         buf,
         clip,
@@ -4584,20 +5217,45 @@ fn draw_home_banner(
         y,
         banner.rect.width,
         banner.rect.height,
-        theme.accent,
+        border,
         bg,
     );
 
     let inner_x = x + 2;
-    let inner_width = banner.rect.width.saturating_sub(4) as usize;
+    let media_width = home_banner_thumbnail_width(banner.rect.width, banner.rect.height);
+    let text_width = banner
+        .rect
+        .width
+        .saturating_sub(4)
+        .saturating_sub(media_width.saturating_add((media_width > 0) as u16))
+        as usize;
+    if media_width > 0 {
+        let media_x = x + banner.rect.width.saturating_sub(media_width + 2);
+        draw_home_thumbnail_well(
+            buf,
+            clip,
+            media_x,
+            y + 1,
+            media_width,
+            banner.rect.height.saturating_sub(2),
+            &placeholder_initials(&banner.title, &banner.subtitle),
+            theme,
+            banner.accent,
+        );
+    }
+
     write_clipped(
         buf,
         clip,
         inner_x,
         y.max(clip.y as i32) as u16 + 1,
-        &banner.title,
+        &shorten(&banner.eyebrow, text_width),
         Style::default()
-            .fg(theme.accent_glow)
+            .fg(if banner.accent {
+                theme.accent_glow
+            } else {
+                theme.muted
+            })
             .bg(bg)
             .add_modifier(Modifier::BOLD),
     );
@@ -4606,20 +5264,38 @@ fn draw_home_banner(
         clip,
         inner_x,
         y.max(clip.y as i32) as u16 + 2,
-        &shorten(&banner.subtitle, inner_width),
-        Style::default().fg(theme.text).bg(bg),
+        &shorten(&banner.title, text_width),
+        Style::default()
+            .fg(theme.text)
+            .bg(bg)
+            .add_modifier(Modifier::BOLD),
     );
     write_clipped(
         buf,
         clip,
         inner_x,
         y.max(clip.y as i32) as u16 + 3,
-        &shorten(
-            &format!("{}  •  press r or click to restore", banner.meta),
-            inner_width,
-        ),
+        &shorten(&banner.subtitle, text_width),
+        Style::default().fg(theme.text).bg(bg),
+    );
+    write_clipped(
+        buf,
+        clip,
+        inner_x,
+        y.max(clip.y as i32) as u16 + 4,
+        &shorten(&banner.meta, text_width),
         Style::default().fg(theme.muted).bg(bg),
     );
+    if let Some(hint) = banner.hint.as_deref() {
+        write_clipped(
+            buf,
+            clip,
+            inner_x,
+            y.max(clip.y as i32) as u16 + 5,
+            &shorten(hint, text_width),
+            Style::default().fg(theme.border_focus).bg(bg),
+        );
+    }
 }
 
 fn draw_home_card(
@@ -5126,6 +5802,31 @@ fn home_card_thumbnail_url(card: &HomeCard) -> Option<&str> {
     }
 }
 
+fn home_banner_thumbnail_width(width: u16, height: u16) -> u16 {
+    if width < 36 || height < 5 {
+        return 0;
+    }
+
+    let preferred = height.saturating_sub(2).min(12);
+    let max_width = width.saturating_sub(22);
+    preferred.min(max_width)
+}
+
+fn home_banner_thumbnail_rect(screen_rect: Rect) -> Option<Rect> {
+    let width = home_banner_thumbnail_width(screen_rect.width, screen_rect.height);
+    let height = screen_rect.height.saturating_sub(2);
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        screen_rect.right().saturating_sub(width + 2),
+        screen_rect.y.saturating_add(1),
+        width,
+        height,
+    ))
+}
+
 fn home_card_thumbnail_width(width: u16, style: HomeCardStyle) -> u16 {
     let inner_width = width.saturating_sub(2);
     if inner_width < 14 {
@@ -5392,6 +6093,15 @@ fn is_listen_again_section(title: &str) -> bool {
         || title.to_ascii_lowercase().contains("listen again")
 }
 
+fn is_artist_sections(sections: &[crate::models::HomeSection]) -> bool {
+    sections.iter().any(|section| {
+        matches!(
+            section.title.as_str(),
+            "Top songs" | "Albums" | "Singles & EPs" | "Featured on" | "Fans might also like"
+        )
+    })
+}
+
 fn home_section_browse_cards(section: &crate::models::HomeSection) -> Vec<HomeBrowseCard> {
     section
         .contents
@@ -5410,6 +6120,21 @@ fn browse_label(page_type: HomeBrowsePageType) -> &'static str {
         HomeBrowsePageType::Artist => "Artist",
         HomeBrowsePageType::UserChannel => "Channel",
         HomeBrowsePageType::PodcastShow => "Podcast",
+    }
+}
+
+fn browse_playlist_context(card: &HomeBrowseCard, track_count: usize) -> PlaylistContext {
+    let subtitle = if track_count == 1 {
+        "1 track".to_string()
+    } else {
+        format!("{track_count} tracks")
+    };
+    PlaylistContext {
+        playlist_id: card.browse_id.clone(),
+        title: card.title.clone(),
+        thumbnail_url: card.thumbnail_url.clone(),
+        subtitle: Some(subtitle),
+        source: PlaylistContextSource::Browse,
     }
 }
 
@@ -5538,4 +6263,88 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
     }
 
     Some(Rect::new(left, top, right - left, bottom - top))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{Artist, HomeSection};
+
+    fn sample_track(title: &str) -> Track {
+        Track {
+            video_id: format!("video-{title}"),
+            title: title.to_string(),
+            artists: vec![Artist {
+                name: "Sample Artist".to_string(),
+                id: None,
+            }],
+            album: Some("Sample Album".to_string()),
+            duration: Some("3:45".to_string()),
+            thumbnail_url: Some("thumb-sample".to_string()),
+            playback_playlist_id: None,
+            playback_params: None,
+            not_interested_feedback_token: None,
+            undo_feedback_token: None,
+        }
+    }
+
+    fn sample_browse_card(page_type: HomeBrowsePageType, title: &str) -> HomeBrowseCard {
+        HomeBrowseCard {
+            browse_id: format!("browse-{title}"),
+            title: title.to_string(),
+            subtitle: Some(format!("{title} subtitle")),
+            thumbnail_url: Some("card-thumb".to_string()),
+            page_type,
+        }
+    }
+
+    #[test]
+    fn track_browse_pages_render_a_playable_tracks_section() {
+        let view = TuiBrowseView {
+            card: sample_browse_card(HomeBrowsePageType::Playlist, "Coding Mix"),
+            status: BrowseViewStatus::Tracks {
+                title: "Coding Mix".to_string(),
+                thumbnail_url: Some("banner-thumb".to_string()),
+                tracks: vec![sample_track("Alpha"), sample_track("Beta")],
+            },
+        };
+
+        let doc = build_browse_document(&view, 80);
+        assert_eq!(doc.banners.len(), 1);
+        assert_eq!(doc.headers.len(), 1);
+        assert_eq!(doc.headers[0].title, "TRACKS");
+        assert!(doc.headers[0].show_play_controls);
+        assert_eq!(doc.cards.len(), 2);
+    }
+
+    #[test]
+    fn artist_browse_pages_surface_top_songs_first() {
+        let top_songs = HomeSection {
+            title: "Top songs".to_string(),
+            contents: vec![HomeItem::Track(sample_track("Hit Single"))],
+        };
+        let albums = HomeSection {
+            title: "Albums".to_string(),
+            contents: vec![HomeItem::BrowseCard(sample_browse_card(
+                HomeBrowsePageType::Album,
+                "Debut Album",
+            ))],
+        };
+        let view = TuiBrowseView {
+            card: sample_browse_card(HomeBrowsePageType::Artist, "Sample Artist"),
+            status: BrowseViewStatus::Sections {
+                title: "Sample Artist".to_string(),
+                thumbnail_url: Some("artist-thumb".to_string()),
+                artist_like: true,
+                sections: vec![albums, top_songs],
+            },
+        };
+
+        let doc = build_browse_document(&view, 90);
+        assert_eq!(doc.banners.len(), 1);
+        assert_eq!(doc.banners[0].eyebrow, "ARTIST");
+        assert_eq!(doc.headers.len(), 2);
+        assert_eq!(doc.headers[0].title, "TOP SONGS");
+        assert!(doc.headers[0].show_play_controls);
+    }
 }

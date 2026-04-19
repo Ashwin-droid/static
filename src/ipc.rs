@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use gstreamer::ClockTime;
 use rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -575,9 +575,9 @@ pub fn millis_to_clock_time(value: Option<u64>) -> Option<ClockTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        clear_persisted_state_at_path, current_unix_millis, load_persisted_state_at_path,
-        store_persisted_state_at_path, ActiveTrackSnapshot, DaemonRequest, PersistedPlaybackState,
-        PlaybackSnapshot, PlaylistContext, PlaylistContextSource, PLAYBACK_STATE_ROW_KEY,
+        ActiveTrackSnapshot, DaemonRequest, PLAYBACK_STATE_ROW_KEY, PersistedPlaybackState,
+        PlaybackSnapshot, PlaylistContext, PlaylistContextSource, clear_persisted_state_at_path,
+        current_unix_millis, load_persisted_state_at_path, store_persisted_state_at_path,
     };
     use crate::ipc::RepeatMode;
     use crate::models::Track;
@@ -702,9 +702,11 @@ mod tests {
         store_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY, &persisted).unwrap();
         clear_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY).unwrap();
 
-        assert!(load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY)
-            .unwrap()
-            .is_none());
+        assert!(
+            load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY)
+                .unwrap()
+                .is_none()
+        );
 
         let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {

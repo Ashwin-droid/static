@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -11,8 +12,9 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use image::DynamicImage;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -23,19 +25,22 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use ratatui::Frame;
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::StatefulProtocol,
+    Resize, StatefulImage,
+};
 
 use crate::cli::{
     artist_string, format_millis, format_track_summary, play_track_with_radio, rating_label,
     restore_playback_snapshot_via_daemon, saved_network_state,
 };
 use crate::ipc::{
-    DaemonClient, PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode,
-    load_persisted_playback_state,
+    load_persisted_playback_state, DaemonClient, PlaybackSnapshot, PlaylistContext,
+    PlaylistContextSource, RepeatMode,
 };
-use crate::models::{
-    HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, SyncedLyrics, Track,
-};
-use crate::network::SongRating;
+use crate::models::{HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, SyncedLyrics, Track};
+use crate::network::{fetch_thumbnail_bytes, SongRating};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const MIN_WIDTH: u16 = 124;
@@ -68,7 +73,12 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), Show, DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            Show,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -237,6 +247,10 @@ enum TuiBackgroundEvent {
         video_id: String,
         result: Result<Option<SyncedLyrics>, String>,
     },
+    ThumbnailLoaded {
+        url: String,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 #[derive(Clone)]
@@ -271,10 +285,39 @@ struct ResumeCardData {
 
 enum LyricsState {
     Idle,
-    Loading { video_id: String },
-    Ready { video_id: String, lyrics: SyncedLyrics },
-    Missing { video_id: String, reason: String },
-    Error { video_id: String, message: String },
+    Loading {
+        video_id: String,
+    },
+    Ready {
+        video_id: String,
+        lyrics: SyncedLyrics,
+    },
+    Missing {
+        video_id: String,
+        reason: String,
+    },
+    Error {
+        video_id: String,
+        message: String,
+    },
+}
+
+enum ThumbnailAsset {
+    Loading,
+    Ready(DynamicImage),
+    Failed(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ThumbnailSlot {
+    ContentHeader,
+    PlayerBar,
+    HomeCard(usize),
+}
+
+struct ThumbnailSlotState {
+    url: String,
+    protocol: StatefulProtocol,
 }
 
 struct InteractiveTui {
@@ -302,6 +345,11 @@ struct InteractiveTui {
     rendered_layout: RenderedLayout,
     background_tx: mpsc::Sender<TuiBackgroundEvent>,
     background_rx: mpsc::Receiver<TuiBackgroundEvent>,
+    thumbnail_picker: Option<Picker>,
+    thumbnail_assets: HashMap<String, ThumbnailAsset>,
+    thumbnail_requests: HashSet<String>,
+    thumbnail_slots: HashMap<ThumbnailSlot, ThumbnailSlotState>,
+    thumbnail_mode_label: String,
 }
 
 impl InteractiveTui {
@@ -332,14 +380,18 @@ impl InteractiveTui {
             detail_tab: DetailTab::Queue,
             resume_card,
             lyrics_state: LyricsState::Idle,
-            status_line:
-                "Home mirrors the GTK app now: arrows move, enter plays, mouse works."
-                    .to_string(),
+            status_line: "Home mirrors the GTK app now: arrows move, enter plays, mouse works."
+                .to_string(),
             last_refresh_at: Instant::now(),
             click_targets: Vec::new(),
             rendered_layout: RenderedLayout::default(),
             background_tx,
             background_rx,
+            thumbnail_picker: None,
+            thumbnail_assets: HashMap::new(),
+            thumbnail_requests: HashSet::new(),
+            thumbnail_slots: HashMap::new(),
+            thumbnail_mode_label: "art off".to_string(),
         };
         app.maybe_request_lyrics();
         Ok(app)
@@ -347,6 +399,7 @@ impl InteractiveTui {
 
     fn run(&mut self) -> Result<()> {
         let _guard = TerminalGuard::enter()?;
+        self.initialize_terminal_images();
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).context("Failed to initialize terminal UI")?;
         terminal.clear().ok();
@@ -389,6 +442,240 @@ impl InteractiveTui {
         }
 
         Ok(())
+    }
+
+    fn initialize_terminal_images(&mut self) {
+        let (picker, queried_stdio) = match Picker::from_query_stdio() {
+            Ok(picker) => (picker, true),
+            Err(_) => (Picker::from_fontsize((10, 20)), false),
+        };
+
+        self.thumbnail_mode_label = if queried_stdio {
+            format!("art {}", thumbnail_protocol_label(picker.protocol_type()))
+        } else {
+            format!("art {}?", thumbnail_protocol_label(picker.protocol_type()))
+        };
+        self.thumbnail_picker = Some(picker);
+    }
+
+    fn terminal_images_enabled(&self) -> bool {
+        self.thumbnail_picker.is_some()
+    }
+
+    fn ensure_thumbnail_requested(&mut self, url: Option<&str>) {
+        let Some(url) = url.filter(|url| !url.is_empty()) else {
+            return;
+        };
+        if !self.terminal_images_enabled() {
+            return;
+        }
+        if self.thumbnail_requests.contains(url) || self.thumbnail_assets.contains_key(url) {
+            return;
+        }
+
+        let url = url.to_string();
+        self.thumbnail_requests.insert(url.clone());
+        self.thumbnail_assets
+            .insert(url.clone(), ThumbnailAsset::Loading);
+        spawn_thumbnail_load(self.background_tx.clone(), url);
+    }
+
+    fn thumbnail_source(&self, url: &str) -> Option<DynamicImage> {
+        match self.thumbnail_assets.get(url) {
+            Some(ThumbnailAsset::Ready(image)) => Some(image.clone()),
+            _ => None,
+        }
+    }
+
+    fn thumbnail_failed(&self, url: &str) -> bool {
+        matches!(
+            self.thumbnail_assets.get(url),
+            Some(ThumbnailAsset::Failed(message)) if !message.is_empty()
+        )
+    }
+
+    fn thumbnail_font_size(&self) -> (u16, u16) {
+        self.thumbnail_picker
+            .as_ref()
+            .map(Picker::font_size)
+            .unwrap_or((10, 20))
+    }
+
+    fn square_box_width_for_height(&self, outer_height: u16) -> u16 {
+        if outer_height == 0 {
+            return 0;
+        }
+
+        let (font_width, font_height) = self.thumbnail_font_size();
+        let inner_height = outer_height.saturating_sub(2).max(1);
+        let inner_width =
+            ((inner_height as f64 * font_height as f64 / font_width as f64).round() as u16).max(1);
+        inner_width.saturating_add(2)
+    }
+
+    fn square_thumbnail_rect(&self, area: Rect) -> Rect {
+        if area.width == 0 || area.height == 0 {
+            return area;
+        }
+
+        let (font_width, font_height) = self.thumbnail_font_size();
+
+        let pixel_width = area.width as f64 * font_width as f64;
+        let pixel_height = area.height as f64 * font_height as f64;
+
+        let (target_width, target_height) = if pixel_width > pixel_height {
+            let width = ((pixel_height / font_width as f64).round() as u16)
+                .max(1)
+                .min(area.width);
+            (width, area.height)
+        } else {
+            let height = ((pixel_width / font_height as f64).round() as u16)
+                .max(1)
+                .min(area.height);
+            (area.width, height)
+        };
+
+        Rect::new(
+            area.x + area.width.saturating_sub(target_width) / 2,
+            area.y + area.height.saturating_sub(target_height) / 2,
+            target_width,
+            target_height,
+        )
+    }
+
+    fn render_protocol_thumbnail(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        slot: ThumbnailSlot,
+        url: &str,
+    ) -> bool {
+        if area.width == 0 || area.height == 0 || !self.terminal_images_enabled() {
+            return false;
+        }
+
+        let needs_init = self
+            .thumbnail_slots
+            .get(&slot)
+            .map(|state| state.url.as_str() != url)
+            .unwrap_or(true);
+
+        if needs_init {
+            let Some(source) = self.thumbnail_source(url) else {
+                return false;
+            };
+            let Some(picker) = self.thumbnail_picker.clone() else {
+                return false;
+            };
+            self.thumbnail_slots.insert(
+                slot,
+                ThumbnailSlotState {
+                    url: url.to_string(),
+                    protocol: picker.new_resize_protocol(source),
+                },
+            );
+        }
+
+        let encoding_result = if let Some(slot_state) = self.thumbnail_slots.get_mut(&slot) {
+            frame.render_stateful_widget(
+                StatefulImage::<StatefulProtocol>::default().resize(Resize::Fit(None)),
+                area,
+                &mut slot_state.protocol,
+            );
+            slot_state.protocol.last_encoding_result()
+        } else {
+            None
+        };
+
+        if let Some(Err(err)) = encoding_result {
+            self.status_line = format!("Thumbnail render failed: {err}");
+        }
+
+        true
+    }
+
+    fn render_cover_thumbnail(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        slot: ThumbnailSlot,
+        url: Option<&str>,
+        fallback_initials: String,
+        theme: &TuiTheme,
+        accent: bool,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let failed = url.is_some_and(|url| self.thumbnail_failed(url));
+        let border = if accent && !failed {
+            theme.accent
+        } else {
+            theme.border_subtle
+        };
+        let background = if accent && !failed {
+            theme.accent_fill
+        } else {
+            theme.content_alt_bg
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(background));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let image_rect = self.square_thumbnail_rect(inner);
+
+        if let Some(url) = url {
+            self.ensure_thumbnail_requested(Some(url));
+            if self.render_protocol_thumbnail(frame, image_rect, slot, url) {
+                return;
+            }
+        } else {
+            self.thumbnail_slots.remove(&slot);
+        }
+
+        render_cover_placeholder(frame, image_rect, fallback_initials, theme);
+    }
+
+    fn render_home_card_thumbnail(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        index: usize,
+        card: &HomeCard,
+        theme: &TuiTheme,
+    ) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let image_rect = self.square_thumbnail_rect(area);
+        let url = home_card_thumbnail_url(card);
+        let failed = url.is_some_and(|url| self.thumbnail_failed(url));
+        if let Some(url) = url {
+            self.ensure_thumbnail_requested(Some(url));
+            if self.render_protocol_thumbnail(
+                frame,
+                image_rect,
+                ThumbnailSlot::HomeCard(index),
+                url,
+            ) {
+                return;
+            }
+        } else {
+            self.thumbnail_slots.remove(&ThumbnailSlot::HomeCard(index));
+        }
+
+        render_home_thumbnail_fallback(
+            frame,
+            image_rect,
+            placeholder_initials(&card.title, &card.subtitle),
+            theme,
+            matches!(card.style, HomeCardStyle::Featured) && !failed,
+        );
     }
 
     fn render_frame(&mut self, frame: &mut Frame<'_>) -> (Vec<ClickTarget>, RenderedLayout) {
@@ -440,31 +727,24 @@ impl InteractiveTui {
 
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(SIDEBAR_WIDTH),
-                Constraint::Min(60),
-            ])
+            .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(60)])
             .split(area);
         let sidebar_area = columns[0];
         let shell_area = columns[1];
 
         let shell_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(18),
-                Constraint::Length(PLAYER_BAR_HEIGHT),
-            ])
+            .constraints([Constraint::Min(18), Constraint::Length(PLAYER_BAR_HEIGHT)])
             .split(shell_area);
         let upper_area = shell_rows[0];
         let player_area = shell_rows[1];
 
-        let detail_width = DETAIL_WIDTH.min(upper_area.width.saturating_sub(42)).max(30);
+        let detail_width = DETAIL_WIDTH
+            .min(upper_area.width.saturating_sub(42))
+            .max(30);
         let upper_columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(40),
-                Constraint::Length(detail_width),
-            ])
+            .constraints([Constraint::Min(40), Constraint::Length(detail_width)])
             .split(upper_area);
         let content_area = upper_columns[0];
         let detail_area = upper_columns[1];
@@ -512,9 +792,7 @@ impl InteractiveTui {
                 Line::from(vec![
                     Span::styled(
                         "S  T  A  T  I  C",
-                        Style::default()
-                            .fg(theme.text)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
                     Span::styled(
@@ -554,7 +832,10 @@ impl InteractiveTui {
         frame.render_widget(search_box, rows[1]);
         frame.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled("Search songs...", Style::default().fg(theme.muted))),
+                Line::from(Span::styled(
+                    "Search songs...",
+                    Style::default().fg(theme.muted),
+                )),
                 Line::from(Span::styled(
                     "Use `static exec <query>` for now",
                     Style::default().fg(theme.border_focus),
@@ -611,7 +892,11 @@ impl InteractiveTui {
                     Span::styled(
                         label,
                         Style::default()
-                            .fg(if active { theme.accent_glow } else { theme.text })
+                            .fg(if active {
+                                theme.accent_glow
+                            } else {
+                                theme.text
+                            })
                             .add_modifier(if active {
                                 Modifier::BOLD
                             } else {
@@ -697,7 +982,13 @@ impl InteractiveTui {
                     Paragraph::new(vec![
                         Line::from(vec![
                             Span::styled(
-                                if is_current { "▶ " } else if is_selected { "▸ " } else { "  " },
+                                if is_current {
+                                    "▶ "
+                                } else if is_selected {
+                                    "▸ "
+                                } else {
+                                    "  "
+                                },
                                 Style::default().fg(if is_current {
                                     theme.accent
                                 } else if is_selected {
@@ -707,10 +998,7 @@ impl InteractiveTui {
                                 }),
                             ),
                             Span::styled(
-                                shorten(
-                                    &track.title,
-                                    row_area.width.saturating_sub(3) as usize,
-                                ),
+                                shorten(&track.title, row_area.width.saturating_sub(3) as usize),
                                 Style::default()
                                     .fg(theme.text)
                                     .add_modifier(if is_selected {
@@ -721,7 +1009,10 @@ impl InteractiveTui {
                             ),
                         ]),
                         Line::from(Span::styled(
-                            shorten(&artist_string(track), row_area.width.saturating_sub(2) as usize),
+                            shorten(
+                                &artist_string(track),
+                                row_area.width.saturating_sub(2) as usize,
+                            ),
                             Style::default().fg(theme.muted),
                         )),
                     ]),
@@ -733,8 +1024,8 @@ impl InteractiveTui {
                 });
             }
 
-            let mut scrollbar_state = ScrollbarState::new(self.recent_tracks.len())
-                .position(self.recent_scroll_offset);
+            let mut scrollbar_state =
+                ScrollbarState::new(self.recent_tracks.len()).position(self.recent_scroll_offset);
             frame.render_stateful_widget(
                 Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
@@ -794,6 +1085,18 @@ impl InteractiveTui {
             .style(Style::default().bg(theme.content_alt_bg));
         let header_inner = header.inner(rows[0]);
         frame.render_widget(header, rows[0]);
+        let header_art_width = self.square_box_width_for_height(header_inner.height).max(6);
+        let header_show_thumbnail =
+            self.terminal_images_enabled() && header_inner.width >= 24 + header_art_width;
+        let (header_copy_area, header_thumbnail_area) = if header_show_thumbnail {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(24), Constraint::Length(header_art_width)])
+                .split(header_inner);
+            (columns[0], Some(columns[1]))
+        } else {
+            (header_inner, None)
+        };
         let header_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -802,7 +1105,7 @@ impl InteractiveTui {
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
-            .split(header_inner);
+            .split(header_copy_area);
 
         let home_meta = match &self.home_status {
             HomeFeedStatus::Loading => "refreshing home feed".to_string(),
@@ -832,9 +1135,7 @@ impl InteractiveTui {
             Paragraph::new(Line::from(vec![
                 Span::styled(
                     "S  T  A  T  I  C",
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -852,9 +1153,7 @@ impl InteractiveTui {
                         .as_ref()
                         .map(|track| shorten(&track.title, header_rows[2].width as usize / 2))
                         .unwrap_or_else(|| "Nothing playing".to_string()),
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
@@ -881,6 +1180,24 @@ impl InteractiveTui {
             ])),
             header_rows[3],
         );
+        if let Some(header_thumbnail_area) = header_thumbnail_area {
+            let current_thumb_url = self
+                .snapshot
+                .current_track
+                .as_ref()
+                .and_then(|track| track.thumb_url.clone());
+            self.render_cover_thumbnail(
+                frame,
+                header_thumbnail_area,
+                ThumbnailSlot::ContentHeader,
+                current_thumb_url.as_deref(),
+                current_initials(&self.snapshot),
+                theme,
+                true,
+            );
+        } else {
+            self.thumbnail_slots.remove(&ThumbnailSlot::ContentHeader);
+        }
 
         let feed_block = Block::default()
             .style(Style::default().bg(theme.content_bg))
@@ -912,6 +1229,7 @@ impl InteractiveTui {
                 selected_index: self.home_selected,
                 focus: self.focus == TuiFocus::Home,
                 theme: theme.clone(),
+                show_thumbnail_wells: self.terminal_images_enabled(),
                 current_video_id: self
                     .snapshot
                     .current_track
@@ -929,8 +1247,9 @@ impl InteractiveTui {
             if banner_bottom <= visible_top || banner_top >= visible_bottom {
                 continue;
             }
-            let translated_y =
-                feed_inner.y.saturating_add(banner.rect.y.saturating_sub(visible_top as u16));
+            let translated_y = feed_inner
+                .y
+                .saturating_add(banner.rect.y.saturating_sub(visible_top as u16));
             targets.push(ClickTarget {
                 rect: Rect::new(
                     feed_inner.x + banner.rect.x,
@@ -947,8 +1266,9 @@ impl InteractiveTui {
             if card_bottom <= visible_top || card_top >= visible_bottom {
                 continue;
             }
-            let translated_y =
-                feed_inner.y.saturating_add(card.rect.y.saturating_sub(visible_top as u16));
+            let translated_y = feed_inner
+                .y
+                .saturating_add(card.rect.y.saturating_sub(visible_top as u16));
             targets.push(ClickTarget {
                 rect: Rect::new(
                     feed_inner.x + card.rect.x,
@@ -969,6 +1289,30 @@ impl InteractiveTui {
             rows[1],
             &mut scrollbar_state,
         );
+
+        if self.terminal_images_enabled() {
+            for index in 0..self.home_doc.cards.len() {
+                let card = self.home_doc.cards[index].clone();
+                let card_top = card.rect.y as usize;
+                let card_bottom = card_top.saturating_add(card.rect.height as usize);
+                if card_bottom <= visible_top || card_top >= visible_bottom {
+                    continue;
+                }
+                let translated_y = feed_inner
+                    .y
+                    .saturating_add(card.rect.y.saturating_sub(visible_top as u16));
+                let screen_rect = Rect::new(
+                    feed_inner.x + card.rect.x,
+                    translated_y,
+                    card.rect.width,
+                    card.rect.height.min(feed_inner.height),
+                );
+                let Some(thumb_rect) = home_card_thumbnail_rect(screen_rect, card.style) else {
+                    continue;
+                };
+                self.render_home_card_thumbnail(frame, thumb_rect, index, &card, theme);
+            }
+        }
 
         targets
     }
@@ -994,12 +1338,20 @@ impl InteractiveTui {
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(8), Constraint::Length(4)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(8),
+                Constraint::Length(4),
+            ])
             .split(inner);
 
         let tab_columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(12), Constraint::Length(12), Constraint::Min(6)])
+            .constraints([
+                Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Min(6),
+            ])
             .split(rows[0]);
         for (area, tab, label) in [
             (tab_columns[0], DetailTab::Queue, "Up Next"),
@@ -1025,7 +1377,11 @@ impl InteractiveTui {
                 Paragraph::new(Line::from(Span::styled(
                     label,
                     Style::default()
-                        .fg(if active { theme.accent_glow } else { theme.muted })
+                        .fg(if active {
+                            theme.accent_glow
+                        } else {
+                            theme.muted
+                        })
                         .add_modifier(if active {
                             Modifier::BOLD
                         } else {
@@ -1077,7 +1433,11 @@ impl InteractiveTui {
                                 spans.push(Span::styled(
                                     format!(" {} ", label),
                                     Style::default()
-                                        .fg(if index == 0 { theme.accent_glow } else { theme.text })
+                                        .fg(if index == 0 {
+                                            theme.accent_glow
+                                        } else {
+                                            theme.text
+                                        })
                                         .bg(if index == 0 {
                                             theme.accent_fill
                                         } else {
@@ -1153,7 +1513,11 @@ impl InteractiveTui {
                                 Line::from(vec![
                                     Span::styled(
                                         if is_current {
-                                            if self.snapshot.paused { "⏸ " } else { "▶ " }
+                                            if self.snapshot.paused {
+                                                "⏸ "
+                                            } else {
+                                                "▶ "
+                                            }
                                         } else if is_generated {
                                             "≈ "
                                         } else if is_selected {
@@ -1178,17 +1542,20 @@ impl InteractiveTui {
                                             &track.title,
                                             row_area.width.saturating_sub(6) as usize,
                                         ),
-                                        Style::default()
-                                            .fg(theme.text)
-                                            .add_modifier(if is_selected {
+                                        Style::default().fg(theme.text).add_modifier(
+                                            if is_selected {
                                                 Modifier::BOLD
                                             } else {
                                                 Modifier::empty()
-                                            }),
+                                            },
+                                        ),
                                     ),
                                 ]),
                                 Line::from(Span::styled(
-                                    shorten(&artist_string(track), row_area.width.saturating_sub(2) as usize),
+                                    shorten(
+                                        &artist_string(track),
+                                        row_area.width.saturating_sub(2) as usize,
+                                    ),
                                     Style::default().fg(theme.muted),
                                 )),
                                 Line::from(vec![
@@ -1206,7 +1573,10 @@ impl InteractiveTui {
                                     ),
                                     Span::raw("  "),
                                     Span::styled(
-                                        track.duration.clone().unwrap_or_else(|| "--:--".to_string()),
+                                        track
+                                            .duration
+                                            .clone()
+                                            .unwrap_or_else(|| "--:--".to_string()),
                                         Style::default().fg(theme.muted),
                                     ),
                                 ]),
@@ -1238,23 +1608,19 @@ impl InteractiveTui {
                 let footer_inner = footer_block.inner(rows[2]);
                 frame.render_widget(footer_block, rows[2]);
 
-                let selected_track = self
-                    .snapshot
-                    .queue
-                    .get(self.queue_selected)
-                    .or_else(|| self.snapshot.current_track.as_ref().and_then(|current| {
+                let selected_track = self.snapshot.queue.get(self.queue_selected).or_else(|| {
+                    self.snapshot.current_track.as_ref().and_then(|current| {
                         self.snapshot
                             .queue
                             .iter()
                             .find(|track| track.video_id == current.video_id)
-                    }));
+                    })
+                });
                 let selection_lines = if let Some(track) = selected_track {
                     vec![
                         Line::from(Span::styled(
                             shorten(&track.title, footer_inner.width as usize),
-                            Style::default()
-                                .fg(theme.text)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                         )),
                         Line::from(vec![
                             Span::styled(
@@ -1282,7 +1648,10 @@ impl InteractiveTui {
                         Style::default().fg(theme.muted),
                     ))]
                 };
-                frame.render_widget(Paragraph::new(selection_lines).wrap(Wrap { trim: true }), footer_inner);
+                frame.render_widget(
+                    Paragraph::new(selection_lines).wrap(Wrap { trim: true }),
+                    footer_inner,
+                );
             }
             DetailTab::Lyrics => {
                 let lyrics_block = Block::default()
@@ -1379,9 +1748,7 @@ impl InteractiveTui {
                         );
                         let visible_lines = inner_rows[1].height.max(1) as usize;
                         let start = active_index.saturating_sub(visible_lines / 2);
-                        let end = start
-                            .saturating_add(visible_lines)
-                            .min(lyrics.lines.len());
+                        let end = start.saturating_add(visible_lines).min(lyrics.lines.len());
                         let items = lyrics.lines[start..end]
                             .iter()
                             .enumerate()
@@ -1447,7 +1814,11 @@ impl InteractiveTui {
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(4), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(4),
+                Constraint::Length(1),
+            ])
             .split(inner);
 
         let progress_ratio = self
@@ -1455,11 +1826,7 @@ impl InteractiveTui {
             .duration_millis
             .filter(|duration| *duration > 0)
             .map(|duration| {
-                self.snapshot
-                    .position_millis
-                    .unwrap_or(0)
-                    .min(duration) as f64
-                    / duration as f64
+                self.snapshot.position_millis.unwrap_or(0).min(duration) as f64 / duration as f64
             })
             .unwrap_or(0.0);
         layout.player_progress_viewport = rows[0];
@@ -1511,7 +1878,11 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             transport[1],
-            if self.snapshot.paused { "Play" } else { "Pause" },
+            if self.snapshot.paused {
+                "Play"
+            } else {
+                "Pause"
+            },
             TuiAction::TogglePause,
             theme,
             true,
@@ -1550,14 +1921,25 @@ impl InteractiveTui {
 
         let track_info = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(8), Constraint::Min(16)])
+            .constraints([
+                Constraint::Length(self.square_box_width_for_height(rows[1].height).max(6)),
+                Constraint::Min(16),
+            ])
             .split(control_columns[1]);
 
-        render_cover_tile(
+        let current_thumb_url = self
+            .snapshot
+            .current_track
+            .as_ref()
+            .and_then(|track| track.thumb_url.clone());
+        self.render_cover_thumbnail(
             frame,
             track_info[0],
+            ThumbnailSlot::PlayerBar,
+            current_thumb_url.as_deref(),
             current_initials(&self.snapshot),
             theme,
+            true,
         );
         frame.render_widget(
             Paragraph::new(vec![
@@ -1565,24 +1947,22 @@ impl InteractiveTui {
                     shorten(
                         &self
                             .snapshot
-                        .current_track
-                        .as_ref()
-                        .map(|track| track.title.clone())
-                        .unwrap_or_else(|| "Nothing playing".to_string()),
+                            .current_track
+                            .as_ref()
+                            .map(|track| track.title.clone())
+                            .unwrap_or_else(|| "Nothing playing".to_string()),
                         track_info[1].width.saturating_sub(1) as usize,
                     ),
-                    Style::default()
-                        .fg(theme.text)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     shorten(
                         &self
                             .snapshot
-                        .current_track
-                        .as_ref()
-                        .map(|track| track.artist.clone())
-                        .unwrap_or_else(|| "Static daemon is ready".to_string()),
+                            .current_track
+                            .as_ref()
+                            .map(|track| track.artist.clone())
+                            .unwrap_or_else(|| "Static daemon is ready".to_string()),
                         track_info[1].width.saturating_sub(1) as usize,
                     ),
                     Style::default().fg(theme.muted),
@@ -1615,8 +1995,7 @@ impl InteractiveTui {
             TuiAction::Dislike,
             theme,
             false,
-            self
-                .snapshot
+            self.snapshot
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Dislike),
@@ -1628,8 +2007,7 @@ impl InteractiveTui {
             TuiAction::Like,
             theme,
             false,
-            self
-                .snapshot
+            self.snapshot
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Like),
@@ -1681,6 +2059,11 @@ impl InteractiveTui {
                 Span::styled(
                     "tab focus  enter play  space toggle  r resume  mouse enabled",
                     Style::default().fg(theme.border_focus),
+                ),
+                Span::raw("   "),
+                Span::styled(
+                    &self.thumbnail_mode_label,
+                    Style::default().fg(theme.accent),
                 ),
             ]))
             .wrap(Wrap { trim: true }),
@@ -1742,7 +2125,11 @@ impl InteractiveTui {
                     self.focus = TuiFocus::Home;
                 } else if contains(self.rendered_layout.queue_viewport, mouse.column, mouse.row) {
                     self.focus = TuiFocus::Queue;
-                } else if contains(self.rendered_layout.recent_viewport, mouse.column, mouse.row) {
+                } else if contains(
+                    self.rendered_layout.recent_viewport,
+                    mouse.column,
+                    mouse.row,
+                ) {
                     self.focus = TuiFocus::Recent;
                 }
             }
@@ -1797,6 +2184,17 @@ impl InteractiveTui {
                         },
                         Err(message) => LyricsState::Error { video_id, message },
                     };
+                }
+                TuiBackgroundEvent::ThumbnailLoaded { url, result } => {
+                    let asset = match result {
+                        Ok(bytes) => match image::load_from_memory(&bytes) {
+                            Ok(image) => ThumbnailAsset::Ready(center_crop_square(image)),
+                            Err(err) => ThumbnailAsset::Failed(err.to_string()),
+                        },
+                        Err(message) => ThumbnailAsset::Failed(message),
+                    };
+
+                    self.thumbnail_assets.insert(url, asset);
                 }
             }
         }
@@ -1977,10 +2375,8 @@ impl InteractiveTui {
                 self.status_line = "Settings live in the GTK app for now.".to_string();
             }
             TuiNavItem::Likes | TuiNavItem::Playlists | TuiNavItem::Offline => {
-                self.status_line = format!(
-                    "{} rendering is next on the TUI roadmap.",
-                    nav_label(nav)
-                );
+                self.status_line =
+                    format!("{} rendering is next on the TUI roadmap.", nav_label(nav));
             }
         }
         Ok(())
@@ -2015,13 +2411,9 @@ impl InteractiveTui {
                     subtitle: card.subtitle.clone(),
                     source: PlaylistContextSource::Browse,
                 };
-                let snapshot = self.client.play_queue_at(
-                    tracks,
-                    0,
-                    Some(context),
-                    None,
-                    RepeatMode::Off,
-                )?;
+                let snapshot =
+                    self.client
+                        .play_queue_at(tracks, 0, Some(context), None, RepeatMode::Off)?;
                 self.apply_snapshot(snapshot);
                 self.detail_tab = DetailTab::Queue;
                 self.status_line = format!("Opened {}", card.title);
@@ -2184,11 +2576,8 @@ impl InteractiveTui {
             }
             TuiFocus::Queue => {
                 let delta = direction * self.queue_viewport_rows.max(1) as isize;
-                self.queue_selected = move_index(
-                    self.queue_selected,
-                    self.snapshot.queue.len(),
-                    delta,
-                );
+                self.queue_selected =
+                    move_index(self.queue_selected, self.snapshot.queue.len(), delta);
                 self.ensure_queue_visible();
             }
             TuiFocus::Recent => {
@@ -2254,7 +2643,11 @@ impl InteractiveTui {
     }
 
     fn seek_from_progress_click(&mut self, column: u16) -> Result<()> {
-        let Some(duration) = self.snapshot.duration_millis.filter(|duration| *duration > 0) else {
+        let Some(duration) = self
+            .snapshot
+            .duration_millis
+            .filter(|duration| *duration > 0)
+        else {
             return Ok(());
         };
         let rect = self.rendered_layout.player_progress_viewport;
@@ -2262,7 +2655,9 @@ impl InteractiveTui {
             return Ok(());
         }
 
-        let relative = column.saturating_sub(rect.x).min(rect.width.saturating_sub(1));
+        let relative = column
+            .saturating_sub(rect.x)
+            .min(rect.width.saturating_sub(1));
         let ratio = relative as f64 / rect.width.saturating_sub(1).max(1) as f64;
         let target = (duration as f64 * ratio) as u64;
         match self.client.seek_to_millis(target) {
@@ -2283,9 +2678,7 @@ impl InteractiveTui {
             .total_height
             .saturating_sub(self.home_viewport_rows.max(1));
         if delta < 0 {
-            self.home_scroll_offset = self
-                .home_scroll_offset
-                .saturating_sub(delta.unsigned_abs());
+            self.home_scroll_offset = self.home_scroll_offset.saturating_sub(delta.unsigned_abs());
         } else {
             self.home_scroll_offset = self
                 .home_scroll_offset
@@ -2368,6 +2761,7 @@ struct HomeFeedWidget {
     selected_index: usize,
     focus: bool,
     theme: TuiTheme,
+    show_thumbnail_wells: bool,
     current_video_id: Option<String>,
 }
 
@@ -2437,6 +2831,7 @@ impl Widget for HomeFeedWidget {
                 card,
                 index == self.selected_index,
                 self.focus,
+                self.show_thumbnail_wells,
                 self.current_video_id
                     .as_deref()
                     .is_some_and(|video_id| matches!(&card.item, TuiHomeItem::Track(track) if track.video_id == video_id)),
@@ -2469,6 +2864,14 @@ fn spawn_lyrics_load(tx: mpsc::Sender<TuiBackgroundEvent>, video_id: String) {
             .and_then(|network| network.get_synced_lyrics(&video_id))
             .map_err(|err| err.to_string());
         let _ = tx.send(TuiBackgroundEvent::LyricsLoaded { video_id, result });
+    });
+}
+
+fn spawn_thumbnail_load(tx: mpsc::Sender<TuiBackgroundEvent>, url: String) {
+    std::thread::spawn(move || {
+        let result = fetch_thumbnail_bytes(&url)
+            .ok_or_else(|| format!("Could not fetch thumbnail bytes from {url}"));
+        let _ = tx.send(TuiBackgroundEvent::ThumbnailLoaded { url, result });
     });
 }
 
@@ -2525,8 +2928,15 @@ fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
     };
     match snapshot.position_millis {
         Some(position_millis) if position_millis > 0 => {
-            let action = if snapshot.paused { "Paused at" } else { "Resume at" };
-            format!("{queue_label} • {action} {}", format_millis(position_millis))
+            let action = if snapshot.paused {
+                "Paused at"
+            } else {
+                "Resume at"
+            };
+            format!(
+                "{queue_label} • {action} {}",
+                format_millis(position_millis)
+            )
         }
         _ => queue_label.to_string(),
     }
@@ -2604,7 +3014,10 @@ fn build_home_document(
                 doc.headers.push(HomeHeader {
                     y,
                     title: section.title.to_uppercase(),
-                    meta: format!("· {}", section_meta_label(section_style, section.contents.len())),
+                    meta: format!(
+                        "· {}",
+                        section_meta_label(section_style, section.contents.len())
+                    ),
                 });
                 y += 2;
 
@@ -2641,8 +3054,7 @@ fn build_home_document(
                 for chunk in items.chunks(columns as usize) {
                     for (column, item) in chunk.iter().enumerate() {
                         let x = column as u16 * (card_width + HOME_GAP);
-                        let (title, subtitle, meta, badge) =
-                            home_card_copy(item, section_style);
+                        let (title, subtitle, meta, badge) = home_card_copy(item, section_style);
                         doc.cards.push(HomeCard {
                             rect: Rect::new(x, y as u16, card_width, card_height),
                             item: item.clone(),
@@ -2673,9 +3085,7 @@ fn render_action_button(
     primary: bool,
     active: bool,
 ) -> ClickTarget {
-    let mut style = Style::default()
-        .bg(theme.elevated_bg)
-        .fg(theme.text);
+    let mut style = Style::default().bg(theme.elevated_bg).fg(theme.text);
     let mut border = theme.border;
     if primary {
         style = style.bg(theme.accent_fill).fg(Color::Rgb(255, 255, 255));
@@ -2707,14 +3117,11 @@ fn render_action_button(
     }
 }
 
-fn render_cover_tile(frame: &mut Frame<'_>, area: Rect, initials: String, theme: &TuiTheme) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.accent))
-        .style(Style::default().bg(theme.accent_fill));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+fn render_cover_placeholder(frame: &mut Frame<'_>, area: Rect, initials: String, theme: &TuiTheme) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.accent_fill)),
+        area,
+    );
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(""),
@@ -2726,7 +3133,34 @@ fn render_cover_tile(frame: &mut Frame<'_>, area: Rect, initials: String, theme:
             )),
         ])
         .alignment(Alignment::Center),
-        inner,
+        area,
+    );
+}
+
+fn render_home_thumbnail_fallback(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    initials: String,
+    theme: &TuiTheme,
+    accent: bool,
+) {
+    let background = if accent {
+        theme.accent_fill
+    } else {
+        theme.content_alt_bg
+    };
+    frame.render_widget(
+        Block::default().style(Style::default().bg(background)),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(initials).alignment(Alignment::Center).style(
+            Style::default()
+                .fg(theme.accent_glow)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        ),
+        area,
     );
 }
 
@@ -2745,7 +3179,16 @@ fn draw_home_banner(
     let x = clip.x + banner.rect.x;
     let y = clip.y as i32 + screen_y;
     let bg = theme.accent_fill;
-    draw_box(buf, clip, x, y, banner.rect.width, banner.rect.height, theme.accent, bg);
+    draw_box(
+        buf,
+        clip,
+        x,
+        y,
+        banner.rect.width,
+        banner.rect.height,
+        theme.accent,
+        bg,
+    );
 
     let inner_x = x + 2;
     let inner_width = banner.rect.width.saturating_sub(4) as usize;
@@ -2773,7 +3216,10 @@ fn draw_home_banner(
         clip,
         inner_x,
         y.max(clip.y as i32) as u16 + 3,
-        &shorten(&format!("{}  •  press r or click to restore", banner.meta), inner_width),
+        &shorten(
+            &format!("{}  •  press r or click to restore", banner.meta),
+            inner_width,
+        ),
         Style::default().fg(theme.muted).bg(bg),
     );
 }
@@ -2785,6 +3231,7 @@ fn draw_home_card(
     card: &HomeCard,
     selected: bool,
     focus: bool,
+    show_thumbnail_wells: bool,
     current: bool,
     theme: &TuiTheme,
 ) {
@@ -2827,11 +3274,26 @@ fn draw_home_card(
     draw_box(buf, clip, x, y, width, height, border, bg);
 
     let inner_x = x + 1;
-    let inner_width = width.saturating_sub(2) as usize;
-    let title_style = Style::default().fg(theme.text).bg(bg).add_modifier(Modifier::BOLD);
+    let media_width = if show_thumbnail_wells {
+        home_card_thumbnail_width(width, card.style)
+    } else {
+        0
+    };
+    let text_width = width
+        .saturating_sub(2)
+        .saturating_sub(media_width.saturating_add((media_width > 0) as u16))
+        as usize;
+    let title_style = Style::default()
+        .fg(theme.text)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
     let subtitle_style = Style::default().fg(theme.muted).bg(bg);
     let meta_style = Style::default()
-        .fg(if current { theme.positive } else { theme.accent_glow })
+        .fg(if current {
+            theme.positive
+        } else {
+            theme.accent_glow
+        })
         .bg(bg);
     let badge_style = Style::default()
         .fg(if matches!(card.style, HomeCardStyle::Featured) {
@@ -2842,20 +3304,35 @@ fn draw_home_card(
         .bg(bg)
         .add_modifier(Modifier::BOLD);
 
+    if media_width > 0 {
+        let media_x = x + width.saturating_sub(1 + media_width);
+        draw_home_thumbnail_well(
+            buf,
+            clip,
+            media_x,
+            y + 1,
+            media_width,
+            height.saturating_sub(2),
+            &placeholder_initials(&card.title, &card.subtitle),
+            theme,
+            matches!(card.style, HomeCardStyle::Featured),
+        );
+    }
+
     if y + 1 >= clip.y as i32 {
         write_clipped(
             buf,
             clip,
             inner_x,
             (y + 1) as u16,
-            &shorten(&card.badge, inner_width),
+            &shorten(&card.badge, text_width),
             badge_style,
         );
     }
 
     match card.style {
         HomeCardStyle::Featured => {
-            let wrapped_title = wrap_text(&card.title, inner_width, 2);
+            let wrapped_title = wrap_text(&card.title, text_width, 2);
             for (offset, line) in wrapped_title.iter().enumerate() {
                 write_clipped(
                     buf,
@@ -2871,7 +3348,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 4) as u16,
-                &shorten(&card.subtitle, inner_width),
+                &shorten(&card.subtitle, text_width),
                 subtitle_style,
             );
             write_clipped(
@@ -2879,7 +3356,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 5) as u16,
-                &shorten(&card.meta, inner_width),
+                &shorten(&card.meta, text_width),
                 meta_style,
             );
         }
@@ -2889,7 +3366,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 2) as u16,
-                &shorten(&card.title, inner_width),
+                &shorten(&card.title, text_width),
                 title_style,
             );
             write_clipped(
@@ -2897,7 +3374,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 3) as u16,
-                &shorten(&format!("{}  •  {}", card.subtitle, card.meta), inner_width),
+                &shorten(&format!("{}  •  {}", card.subtitle, card.meta), text_width),
                 subtitle_style,
             );
         }
@@ -2907,7 +3384,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 2) as u16,
-                &shorten(&card.title, inner_width),
+                &shorten(&card.title, text_width),
                 title_style,
             );
             write_clipped(
@@ -2915,7 +3392,7 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 3) as u16,
-                &shorten(&card.subtitle, inner_width),
+                &shorten(&card.subtitle, text_width),
                 subtitle_style,
             );
             write_clipped(
@@ -2923,10 +3400,62 @@ fn draw_home_card(
                 clip,
                 inner_x,
                 (y + 4) as u16,
-                &shorten(&card.meta, inner_width),
+                &shorten(&card.meta, text_width),
                 meta_style,
             );
         }
+    }
+}
+
+fn draw_home_thumbnail_well(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: i32,
+    width: u16,
+    height: u16,
+    initials: &str,
+    theme: &TuiTheme,
+    accent: bool,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let background = if accent {
+        theme.accent_fill
+    } else {
+        theme.content_alt_bg
+    };
+    for row in 0..height {
+        let screen_y = y + row as i32;
+        if screen_y < clip.y as i32 || screen_y >= clip.bottom() as i32 {
+            continue;
+        }
+        write_clipped(
+            buf,
+            clip,
+            x,
+            screen_y as u16,
+            &" ".repeat(width as usize),
+            Style::default().bg(background),
+        );
+    }
+
+    let center_y = y + height as i32 / 2;
+    if center_y >= clip.y as i32 && center_y < clip.bottom() as i32 {
+        let offset = width.saturating_sub(initials.chars().count() as u16) / 2;
+        write_clipped(
+            buf,
+            clip,
+            x.saturating_add(offset),
+            center_y as u16,
+            initials,
+            Style::default()
+                .fg(theme.accent_glow)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        );
     }
 }
 
@@ -3022,14 +3551,7 @@ fn fill_clipped_area(buf: &mut Buffer, clip: Rect, area: Rect, style: Style) {
     }
 }
 
-fn write_clipped(
-    buf: &mut Buffer,
-    clip: Rect,
-    x: u16,
-    y: u16,
-    text: &str,
-    style: Style,
-) {
+fn write_clipped(buf: &mut Buffer, clip: Rect, x: u16, y: u16, text: &str, style: Style) {
     if y < clip.y || y >= clip.bottom() || x >= clip.right() {
         return;
     }
@@ -3068,6 +3590,55 @@ fn home_card_copy(item: &TuiHomeItem, style: HomeCardStyle) -> (String, String, 
     }
 }
 
+fn home_card_thumbnail_url(card: &HomeCard) -> Option<&str> {
+    match &card.item {
+        TuiHomeItem::Track(track) => track.thumbnail_url.as_deref(),
+        TuiHomeItem::Browse(card) => card.thumbnail_url.as_deref(),
+    }
+}
+
+fn home_card_thumbnail_width(width: u16, style: HomeCardStyle) -> u16 {
+    let inner_width = width.saturating_sub(2);
+    if inner_width < 14 {
+        return 0;
+    }
+
+    let preferred = match style {
+        HomeCardStyle::Featured => 12,
+        HomeCardStyle::TrackRow => 8,
+        HomeCardStyle::BrowseRow | HomeCardStyle::Shelf => 9,
+    };
+    let max_width = inner_width.saturating_sub(10);
+    preferred.min(max_width)
+}
+
+fn home_card_thumbnail_rect(screen_rect: Rect, style: HomeCardStyle) -> Option<Rect> {
+    let width = home_card_thumbnail_width(screen_rect.width, style);
+    let height = screen_rect.height.saturating_sub(2);
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        screen_rect.right().saturating_sub(1 + width),
+        screen_rect.y.saturating_add(1),
+        width,
+        height,
+    ))
+}
+
+fn placeholder_initials(primary: &str, secondary: &str) -> String {
+    let first = primary
+        .chars()
+        .find(|ch| ch.is_alphanumeric())
+        .unwrap_or('S');
+    let second = secondary
+        .chars()
+        .find(|ch| ch.is_alphanumeric())
+        .unwrap_or(first);
+    format!("{}{}", first.to_uppercase(), second.to_uppercase())
+}
+
 fn current_initials(snapshot: &PlaybackSnapshot) -> String {
     let title = snapshot
         .current_track
@@ -3079,9 +3650,20 @@ fn current_initials(snapshot: &PlaybackSnapshot) -> String {
         .as_ref()
         .map(|track| track.artist.as_str())
         .unwrap_or("Daemon");
-    let first = title.chars().find(|ch| ch.is_alphanumeric()).unwrap_or('S');
-    let second = artist.chars().find(|ch| ch.is_alphanumeric()).unwrap_or('T');
-    format!("{}{}", first.to_uppercase(), second.to_uppercase())
+    placeholder_initials(title, artist)
+}
+
+fn center_crop_square(image: DynamicImage) -> DynamicImage {
+    let width = image.width();
+    let height = image.height();
+    let size = width.min(height);
+    if size == 0 || width == height {
+        return image;
+    }
+
+    let x = (width.saturating_sub(size)) / 2;
+    let y = (height.saturating_sub(size)) / 2;
+    image.crop_imm(x, y, size, size)
 }
 
 fn home_columns(width: u16, style: HomeCardStyle, item_count: usize) -> u16 {
@@ -3131,13 +3713,7 @@ fn queue_chip_labels(snapshot: &PlaybackSnapshot) -> Vec<String> {
         labels.push("Radio".to_string());
     }
     if let Some(radio) = snapshot.radio_virtual_playlist.as_ref() {
-        labels.extend(
-            radio
-                .chips
-                .iter()
-                .take(3)
-                .map(|chip| chip.label.clone()),
-        );
+        labels.extend(radio.chips.iter().take(3).map(|chip| chip.label.clone()));
     }
     labels
 }
@@ -3262,7 +3838,11 @@ fn playback_status(snapshot: &PlaybackSnapshot) -> &'static str {
     if snapshot.probe_active {
         "probe"
     } else if snapshot.current_track.is_some() {
-        if snapshot.paused { "paused" } else { "playing" }
+        if snapshot.paused {
+            "paused"
+        } else {
+            "playing"
+        }
     } else {
         "stopped"
     }
@@ -3317,6 +3897,15 @@ fn nav_label(nav: TuiNavItem) -> &'static str {
     }
 }
 
+fn thumbnail_protocol_label(protocol: ProtocolType) -> &'static str {
+    match protocol {
+        ProtocolType::Halfblocks => "fallback",
+        ProtocolType::Sixel => "sixel",
+        ProtocolType::Kitty => "kitty",
+        ProtocolType::Iterm2 => "iterm2",
+    }
+}
+
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -3324,7 +3913,9 @@ fn move_index(current: usize, len: usize, delta: isize) -> usize {
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        current.saturating_add(delta as usize).min(len.saturating_sub(1))
+        current
+            .saturating_add(delta as usize)
+            .min(len.saturating_sub(1))
     }
 }
 

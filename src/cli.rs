@@ -112,7 +112,10 @@ fn run_exec(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn play_track_with_radio(client: &DaemonClient, track: Track) -> Result<PlaybackSnapshot> {
+pub(crate) fn play_track_with_radio(
+    client: &DaemonClient,
+    track: Track,
+) -> Result<PlaybackSnapshot> {
     client.play_queue_at(
         vec![track.clone()],
         0,
@@ -140,7 +143,13 @@ pub(crate) fn play_track_with_radio(client: &DaemonClient, track: Track) -> Resu
                 touched_len: 1,
                 chips: radio.chips,
             };
-            client.replace_queue(queue, 0, None, Some(radio_virtual_playlist), RepeatMode::Off)
+            client.replace_queue(
+                queue,
+                0,
+                None,
+                Some(radio_virtual_playlist),
+                RepeatMode::Off,
+            )
         }
         Err(_) => client.state(),
     }
@@ -216,7 +225,10 @@ fn run_info() -> Result<()> {
         "buffered_percent: {:.1}",
         (snapshot.buffered_fraction * 100.0).clamp(0.0, 100.0)
     );
-    println!("volume_percent: {:.0}", (snapshot.volume * 100.0).clamp(0.0, 100.0));
+    println!(
+        "volume_percent: {:.0}",
+        (snapshot.volume * 100.0).clamp(0.0, 100.0)
+    );
 
     if let Some(track) = snapshot.current_track.as_ref() {
         println!("video_id: {}", track.video_id);
@@ -674,68 +686,57 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "auto_sync_chromium_cookies",
         kind: ConfigKind::Bool,
-        description:
-            "Automatically import cookies from a Chromium-family browser when the saved session is missing or stale.",
+        description: "Automatically import cookies from a Chromium-family browser when the saved session is missing or stale.",
     },
     ConfigSpec {
         name: "chromium_cookie_path",
         kind: ConfigKind::String,
-        description:
-            "Path to the Chromium cookie database. Leave empty to let Static auto-detect it.",
+        description: "Path to the Chromium cookie database. Leave empty to let Static auto-detect it.",
     },
     ConfigSpec {
         name: "auto_release_track_loops",
         kind: ConfigKind::Bool,
-        description:
-            "Convert repeat-one into a finite loop budget for saved resume state so tracks do not loop forever after restore.",
+        description: "Convert repeat-one into a finite loop budget for saved resume state so tracks do not loop forever after restore.",
     },
     ConfigSpec {
         name: "auto_release_track_loops_after",
         kind: ConfigKind::U32,
-        description:
-            "How many repeat-one loops remain after a resume snapshot is restored when auto release is enabled.",
+        description: "How many repeat-one loops remain after a resume snapshot is restored when auto release is enabled.",
     },
     ConfigSpec {
         name: "auto_manage_offline_cache",
         kind: ConfigKind::Bool,
-        description:
-            "Allow Static to automatically keep or evict offline tracks to stay near the configured cache target.",
+        description: "Allow Static to automatically keep or evict offline tracks to stay near the configured cache target.",
     },
     ConfigSpec {
         name: "auto_cache_listen_again",
         kind: ConfigKind::Bool,
-        description:
-            "Automatically keep strong Listen again candidates available offline.",
+        description: "Automatically keep strong Listen again candidates available offline.",
     },
     ConfigSpec {
         name: "listen_again_cache_days",
         kind: ConfigKind::U32,
-        description:
-            "How far back Listen again activity is considered when picking tracks for auto-caching.",
+        description: "How far back Listen again activity is considered when picking tracks for auto-caching.",
     },
     ConfigSpec {
         name: "offline_cache_target",
         kind: ConfigKind::U32,
-        description:
-            "Approximate maximum number of automatically managed offline tracks.",
+        description: "Approximate maximum number of automatically managed offline tracks.",
     },
     ConfigSpec {
         name: "offline_rewatch_threshold",
         kind: ConfigKind::U32,
-        description:
-            "Minimum historical replay count before a track is considered for heuristic auto-caching.",
+        description: "Minimum historical replay count before a track is considered for heuristic auto-caching.",
     },
     ConfigSpec {
         name: "score_decay_window_days",
         kind: ConfigKind::U32,
-        description:
-            "Decay window for the heuristic offline score so newer plays weigh more heavily.",
+        description: "Decay window for the heuristic offline score so newer plays weigh more heavily.",
     },
     ConfigSpec {
         name: "minimum_offline_score",
         kind: ConfigKind::F64,
-        description:
-            "Minimum heuristic score a track needs before Static keeps it in the managed offline cache.",
+        description: "Minimum heuristic score a track needs before Static keeps it in the managed offline cache.",
     },
     ConfigSpec {
         name: "prefetch_enabled",
@@ -750,38 +751,32 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "prefer_local_cache_on_playback",
         kind: ConfigKind::Bool,
-        description:
-            "Prefer local cached audio over network playback when a track is already available offline.",
+        description: "Prefer local cached audio over network playback when a track is already available offline.",
     },
     ConfigSpec {
         name: "respect_other_mpris_players",
         kind: ConfigKind::Bool,
-        description:
-            "Pause or coordinate with other active MPRIS players when Static starts playback.",
+        description: "Pause or coordinate with other active MPRIS players when Static starts playback.",
     },
     ConfigSpec {
         name: "pipewire_ducking_enabled",
         kind: ConfigKind::Bool,
-        description:
-            "Watch PipeWire activity and duck or pause Static when other audio streams are active for long enough.",
+        description: "Watch PipeWire activity and duck or pause Static when other audio streams are active for long enough.",
     },
     ConfigSpec {
         name: "pipewire_duck_pause",
         kind: ConfigKind::Bool,
-        description:
-            "Pause instead of lowering volume when the PipeWire ducking rule is triggered.",
+        description: "Pause instead of lowering volume when the PipeWire ducking rule is triggered.",
     },
     ConfigSpec {
         name: "pipewire_ducking_threshold_secs",
         kind: ConfigKind::U32,
-        description:
-            "How long another PipeWire stream must stay active before ducking or pausing Static.",
+        description: "How long another PipeWire stream must stay active before ducking or pausing Static.",
     },
     ConfigSpec {
         name: "pipewire_ducking_volume",
         kind: ConfigKind::F64,
-        description:
-            "Duck target volume as a 0.0-1.0 fraction when PipeWire ducking is enabled.",
+        description: "Duck target volume as a 0.0-1.0 fraction when PipeWire ducking is enabled.",
     },
     ConfigSpec {
         name: "sponsorblock_enabled",
@@ -791,8 +786,7 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "sponsorblock_categories",
         kind: ConfigKind::StringList,
-        description:
-            "Comma-separated SponsorBlock category list to skip, such as `sponsor,selfpromo,interaction`.",
+        description: "Comma-separated SponsorBlock category list to skip, such as `sponsor,selfpromo,interaction`.",
     },
 ];
 
@@ -835,9 +829,7 @@ fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
         "minimum_offline_score" => settings.minimum_offline_score.to_string(),
         "prefetch_enabled" => yes_no_bool(settings.prefetch_enabled),
         "prefetch_ahead" => settings.prefetch_ahead.to_string(),
-        "prefer_local_cache_on_playback" => {
-            yes_no_bool(settings.prefer_local_cache_on_playback)
-        }
+        "prefer_local_cache_on_playback" => yes_no_bool(settings.prefer_local_cache_on_playback),
         "respect_other_mpris_players" => yes_no_bool(settings.respect_other_mpris_players),
         "pipewire_ducking_enabled" => yes_no_bool(settings.pipewire_ducking_enabled),
         "pipewire_duck_pause" => yes_no_bool(settings.pipewire_duck_pause),
@@ -852,9 +844,7 @@ fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
 fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Result<()> {
     let trimmed = value.trim();
     match name {
-        "auto_sync_chromium_cookies" => {
-            settings.auto_sync_chromium_cookies = parse_bool(trimmed)?
-        }
+        "auto_sync_chromium_cookies" => settings.auto_sync_chromium_cookies = parse_bool(trimmed)?,
         "chromium_cookie_path" => settings.chromium_cookie_path = trimmed.to_string(),
         "auto_release_track_loops" => settings.auto_release_track_loops = parse_bool(trimmed)?,
         "auto_release_track_loops_after" => {

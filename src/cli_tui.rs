@@ -28,7 +28,7 @@ use ratatui::Frame;
 use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
-    Resize, StatefulImage,
+    CropOptions, Resize, StatefulImage,
 };
 
 use crate::cli::{
@@ -57,6 +57,8 @@ const RECENT_LIMIT: usize = 32;
 const RECENT_ROW_HEIGHT: u16 = 2;
 const QUEUE_ROW_HEIGHT: u16 = 3;
 const HOME_LOAD_MORE_THRESHOLD_ROWS: usize = 14;
+const HOME_HEADER_PLAY_ALL_LABEL: &str = "[▶ Play all]";
+const HOME_HEADER_SHUFFLE_ALL_LABEL: &str = "[🔀 Shuffle]";
 
 pub fn run() -> Result<()> {
     let client = DaemonClient::new()?;
@@ -189,8 +191,18 @@ enum TuiHomeItem {
 #[derive(Clone)]
 struct HomeHeader {
     y: usize,
+    section_index: usize,
     title: String,
     meta: String,
+    show_play_controls: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HomeHeaderActionsLayout {
+    play_x: u16,
+    play_width: u16,
+    shuffle_x: u16,
+    shuffle_width: u16,
 }
 
 #[derive(Clone)]
@@ -264,6 +276,7 @@ enum ClickTargetKind {
     Action(TuiAction),
     Nav(TuiNavItem),
     DetailTab(DetailTab),
+    HomeSectionAction { section_index: usize, shuffle: bool },
     HomeItem(usize),
     QueueItem(usize),
     RecentItem(usize),
@@ -661,6 +674,7 @@ impl InteractiveTui {
         area: Rect,
         slot: ThumbnailSlot,
         url: &str,
+        resize: Resize,
     ) -> bool {
         if area.width == 0 || area.height == 0 || !self.terminal_images_enabled() {
             return false;
@@ -690,7 +704,7 @@ impl InteractiveTui {
 
         let encoding_result = if let Some(slot_state) = self.thumbnail_slots.get_mut(&slot) {
             frame.render_stateful_widget(
-                StatefulImage::<StatefulProtocol>::default().resize(Resize::Fit(None)),
+                StatefulImage::<StatefulProtocol>::default().resize(resize),
                 area,
                 &mut slot_state.protocol,
             );
@@ -742,7 +756,7 @@ impl InteractiveTui {
 
         if let Some(url) = url {
             self.ensure_thumbnail_requested(Some(url));
-            if self.render_protocol_thumbnail(frame, image_rect, slot, url) {
+            if self.render_protocol_thumbnail(frame, image_rect, slot, url, Resize::Fit(None)) {
                 return;
             }
         } else {
@@ -756,24 +770,34 @@ impl InteractiveTui {
         &mut self,
         frame: &mut Frame<'_>,
         area: Rect,
+        visible_area: Rect,
         index: usize,
         card: &HomeCard,
         theme: &TuiTheme,
     ) {
-        if area.width == 0 || area.height == 0 {
+        if area.width == 0
+            || area.height == 0
+            || visible_area.width == 0
+            || visible_area.height == 0
+        {
             return;
         }
 
         let image_rect = self.square_thumbnail_rect(area);
+        let Some(visible_rect) = intersect_rect(image_rect, visible_area) else {
+            return;
+        };
         let url = home_card_thumbnail_url(card);
         let failed = url.is_some_and(|url| self.thumbnail_failed(url));
         if let Some(url) = url {
             self.ensure_thumbnail_requested(Some(url));
+            let resize = thumbnail_resize_for_visible_rect(image_rect, visible_rect);
             if self.render_protocol_thumbnail(
                 frame,
-                image_rect,
+                visible_rect,
                 ThumbnailSlot::HomeCard(index),
                 url,
+                resize,
             ) {
                 return;
             }
@@ -783,7 +807,7 @@ impl InteractiveTui {
 
         render_home_thumbnail_fallback(
             frame,
-            image_rect,
+            visible_rect,
             placeholder_initials(&card.title, &card.subtitle),
             theme,
             matches!(card.style, HomeCardStyle::Featured) && !failed,
@@ -2292,17 +2316,42 @@ impl InteractiveTui {
             if banner_bottom <= visible_top || banner_top >= visible_bottom {
                 continue;
             }
-            let translated_y = feed_inner
-                .y
-                .saturating_add(banner.rect.y.saturating_sub(visible_top as u16));
+            let screen_rect = Rect::new(
+                feed_inner.x + banner.rect.x,
+                feed_inner
+                    .y
+                    .saturating_add(banner.rect.y.saturating_sub(visible_top as u16)),
+                banner.rect.width,
+                banner.rect.height,
+            );
+            if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
+                targets.push(ClickTarget {
+                    rect: visible_rect,
+                    kind: ClickTargetKind::Action(TuiAction::ResumeSaved),
+                });
+            }
+        }
+        for header in &self.home_doc.headers {
+            let header_y = feed_inner.y as i32 + header.y as i32 - visible_top as i32;
+            if header_y < feed_inner.y as i32 || header_y >= feed_inner.bottom() as i32 {
+                continue;
+            }
+            let Some(layout) = home_header_actions_layout(feed_inner, header) else {
+                continue;
+            };
             targets.push(ClickTarget {
-                rect: Rect::new(
-                    feed_inner.x + banner.rect.x,
-                    translated_y,
-                    banner.rect.width,
-                    banner.rect.height.min(feed_inner.height),
-                ),
-                kind: ClickTargetKind::Action(TuiAction::ResumeSaved),
+                rect: Rect::new(layout.play_x, header_y as u16, layout.play_width, 1),
+                kind: ClickTargetKind::HomeSectionAction {
+                    section_index: header.section_index,
+                    shuffle: false,
+                },
+            });
+            targets.push(ClickTarget {
+                rect: Rect::new(layout.shuffle_x, header_y as u16, layout.shuffle_width, 1),
+                kind: ClickTargetKind::HomeSectionAction {
+                    section_index: header.section_index,
+                    shuffle: true,
+                },
             });
         }
         for (index, card) in self.home_doc.cards.iter().enumerate() {
@@ -2311,18 +2360,20 @@ impl InteractiveTui {
             if card_bottom <= visible_top || card_top >= visible_bottom {
                 continue;
             }
-            let translated_y = feed_inner
-                .y
-                .saturating_add(card.rect.y.saturating_sub(visible_top as u16));
-            targets.push(ClickTarget {
-                rect: Rect::new(
-                    feed_inner.x + card.rect.x,
-                    translated_y,
-                    card.rect.width,
-                    card.rect.height.min(feed_inner.height),
-                ),
-                kind: ClickTargetKind::HomeItem(index),
-            });
+            let screen_rect = Rect::new(
+                feed_inner.x + card.rect.x,
+                feed_inner
+                    .y
+                    .saturating_add(card.rect.y.saturating_sub(visible_top as u16)),
+                card.rect.width,
+                card.rect.height,
+            );
+            if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
+                targets.push(ClickTarget {
+                    rect: visible_rect,
+                    kind: ClickTargetKind::HomeItem(index),
+                });
+            }
         }
 
         let mut scrollbar_state = ScrollbarState::new(self.home_doc.total_height.max(1))
@@ -2343,19 +2394,18 @@ impl InteractiveTui {
                 if card_bottom <= visible_top || card_top >= visible_bottom {
                     continue;
                 }
-                let translated_y = feed_inner
-                    .y
-                    .saturating_add(card.rect.y.saturating_sub(visible_top as u16));
                 let screen_rect = Rect::new(
                     feed_inner.x + card.rect.x,
-                    translated_y,
+                    feed_inner
+                        .y
+                        .saturating_add(card.rect.y.saturating_sub(visible_top as u16)),
                     card.rect.width,
-                    card.rect.height.min(feed_inner.height),
+                    card.rect.height,
                 );
                 let Some(thumb_rect) = home_card_thumbnail_rect(screen_rect, card.style) else {
                     continue;
                 };
-                self.render_home_card_thumbnail(frame, thumb_rect, index, &card, theme);
+                self.render_home_card_thumbnail(frame, thumb_rect, feed_inner, index, &card, theme);
             }
         }
 
@@ -3577,6 +3627,47 @@ impl InteractiveTui {
         Ok(())
     }
 
+    fn play_home_section(&mut self, section_index: usize, shuffle: bool) -> Result<()> {
+        let HomeFeedStatus::Ready(page) = &self.home_status else {
+            self.status_line = "Home feed is still loading.".to_string();
+            return Ok(());
+        };
+        let Some(section) = page.sections.get(section_index) else {
+            self.status_line = "That Home section is no longer available.".to_string();
+            return Ok(());
+        };
+
+        let section_title = section.title.clone();
+        let mut tracks = home_section_tracks(section);
+        if tracks.is_empty() {
+            self.status_line = format!("{} has no playable tracks.", section_title);
+            return Ok(());
+        }
+
+        if shuffle {
+            use rand::seq::SliceRandom;
+
+            let mut rng = rand::rng();
+            tracks.shuffle(&mut rng);
+        }
+
+        let snapshot = self
+            .client
+            .play_queue_at(tracks, 0, None, None, RepeatMode::Off)?;
+        self.apply_snapshot(snapshot);
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = self
+            .snapshot
+            .queue_index
+            .min(self.snapshot.queue.len().saturating_sub(1));
+        self.status_line = if shuffle {
+            format!("Shuffled {}", shorten(&section_title, 28))
+        } else {
+            format!("Playing all from {}", shorten(&section_title, 28))
+        };
+        Ok(())
+    }
+
     fn activate_selection(&mut self) -> Result<()> {
         match self.focus {
             TuiFocus::Home => self.activate_home_selection(),
@@ -3593,6 +3684,10 @@ impl InteractiveTui {
                 self.detail_tab = *tab;
                 Ok(())
             }
+            ClickTargetKind::HomeSectionAction {
+                section_index,
+                shuffle,
+            } => self.play_home_section(*section_index, *shuffle),
             ClickTargetKind::HomeItem(index) => {
                 self.focus = TuiFocus::Home;
                 self.home_selected = *index;
@@ -4051,19 +4146,31 @@ impl Widget for HomeFeedWidget {
             if y < area.y as i32 || y >= area.bottom() as i32 {
                 continue;
             }
+            let actions_layout = home_header_actions_layout(area, header);
+            let header_text = format!("{}  {}", header.title, header.meta);
+            let text_right = actions_layout
+                .as_ref()
+                .map(|layout| layout.play_x.saturating_sub(2))
+                .unwrap_or(area.right());
+            let text_width = text_right.saturating_sub(area.x) as usize;
             write_clipped(
                 buf,
                 area,
                 area.x,
                 y as u16,
-                &format!("{}  {}", header.title, header.meta),
+                &shorten(&header_text, text_width.max(1)),
                 Style::default()
                     .fg(self.theme.text)
                     .add_modifier(Modifier::BOLD),
             );
-            if area.width > header.title.len() as u16 + header.meta.len() as u16 + 6 {
-                let divider_x = area.x + (header.title.len() + header.meta.len() + 4) as u16;
-                let divider_width = area.right().saturating_sub(divider_x) as usize;
+            let header_text_width = text_cell_width(&header_text) as u16;
+            let divider_end = actions_layout
+                .as_ref()
+                .map(|layout| layout.play_x.saturating_sub(2))
+                .unwrap_or(area.right());
+            if divider_end > area.x.saturating_add(header_text_width).saturating_add(4) {
+                let divider_x = area.x.saturating_add(header_text_width).saturating_add(4);
+                let divider_width = divider_end.saturating_sub(divider_x) as usize;
                 write_clipped(
                     buf,
                     area,
@@ -4071,6 +4178,30 @@ impl Widget for HomeFeedWidget {
                     y as u16,
                     &"─".repeat(divider_width),
                     Style::default().fg(self.theme.border_subtle),
+                );
+            }
+            if let Some(layout) = actions_layout {
+                write_clipped(
+                    buf,
+                    area,
+                    layout.play_x,
+                    y as u16,
+                    HOME_HEADER_PLAY_ALL_LABEL,
+                    Style::default()
+                        .fg(self.theme.accent_glow)
+                        .bg(self.theme.elevated_alt_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+                write_clipped(
+                    buf,
+                    area,
+                    layout.shuffle_x,
+                    y as u16,
+                    HOME_HEADER_SHUFFLE_ALL_LABEL,
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .bg(self.theme.elevated_bg)
+                        .add_modifier(Modifier::BOLD),
                 );
             }
         }
@@ -4275,13 +4406,16 @@ fn build_home_document(
                 } else {
                     HomeCardStyle::Shelf
                 };
+                let show_play_controls = home_section_should_show_play_controls(section, &tracks);
                 doc.headers.push(HomeHeader {
                     y,
+                    section_index,
                     title: section.title.to_uppercase(),
                     meta: format!(
                         "· {}",
                         section_meta_label(section_style, section.contents.len())
                     ),
+                    show_play_controls,
                 });
                 y += 2;
 
@@ -5245,6 +5379,19 @@ fn home_section_tracks(section: &crate::models::HomeSection) -> Vec<Track> {
         .collect()
 }
 
+fn home_section_should_show_play_controls(
+    section: &crate::models::HomeSection,
+    tracks: &[Track],
+) -> bool {
+    !tracks.is_empty()
+        && (tracks.len() == section.contents.len() || is_listen_again_section(&section.title))
+}
+
+fn is_listen_again_section(title: &str) -> bool {
+    title.eq_ignore_ascii_case("Listen again")
+        || title.to_ascii_lowercase().contains("listen again")
+}
+
 fn home_section_browse_cards(section: &crate::models::HomeSection) -> Vec<HomeBrowseCard> {
     section
         .contents
@@ -5338,4 +5485,57 @@ fn shorten(value: &str, width: usize) -> String {
 
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
+}
+
+fn text_cell_width(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn home_header_actions_layout(area: Rect, header: &HomeHeader) -> Option<HomeHeaderActionsLayout> {
+    if !header.show_play_controls || area.height == 0 {
+        return None;
+    }
+
+    let play_width = text_cell_width(HOME_HEADER_PLAY_ALL_LABEL) as u16;
+    let shuffle_width = text_cell_width(HOME_HEADER_SHUFFLE_ALL_LABEL) as u16;
+    let total_width = play_width.saturating_add(1).saturating_add(shuffle_width);
+    if total_width.saturating_add(6) > area.width {
+        return None;
+    }
+
+    let shuffle_x = area.right().saturating_sub(shuffle_width);
+    let play_x = shuffle_x.saturating_sub(1 + play_width);
+    if play_x < area.x {
+        return None;
+    }
+
+    Some(HomeHeaderActionsLayout {
+        play_x,
+        play_width,
+        shuffle_x,
+        shuffle_width,
+    })
+}
+
+fn thumbnail_resize_for_visible_rect(full_rect: Rect, visible_rect: Rect) -> Resize {
+    if visible_rect == full_rect {
+        return Resize::Fit(None);
+    }
+
+    Resize::Crop(Some(CropOptions {
+        clip_top: visible_rect.y > full_rect.y,
+        clip_left: visible_rect.x > full_rect.x,
+    }))
+}
+
+fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    if left >= right || top >= bottom {
+        return None;
+    }
+
+    Some(Rect::new(left, top, right - left, bottom - top))
 }

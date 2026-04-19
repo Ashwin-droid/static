@@ -436,7 +436,7 @@ pub(super) fn render_artist_view(
     art_frame.set_overflow(gtk::Overflow::Hidden);
     if let Some(url) = thumbnail_url {
         let picture = Picture::new();
-        picture.set_keep_aspect_ratio(false);
+        picture.set_content_fit(gtk::ContentFit::Fill);
         picture.set_size_request(180, 180);
         art_frame.append(&picture);
         load_thumbnail_into(&picture, url, 300);
@@ -1011,7 +1011,7 @@ pub(super) fn build_square_cover_art(
         picture.set_valign(Align::Start);
         picture.set_hexpand(false);
         picture.set_vexpand(false);
-        picture.set_keep_aspect_ratio(false);
+        picture.set_content_fit(gtk::ContentFit::Fill);
         art_container.append(&picture);
         load_thumbnail_into(&picture, url, load_size);
     } else {

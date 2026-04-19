@@ -45,7 +45,8 @@ use crate::models::{
 };
 use crate::network::{fetch_thumbnail_bytes, SongRating};
 
-const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_WIDTH: u16 = 124;
 const MIN_HEIGHT: u16 = 34;
 const SIDEBAR_WIDTH: u16 = 30;
@@ -55,6 +56,7 @@ const HOME_GAP: u16 = 2;
 const RECENT_LIMIT: usize = 32;
 const RECENT_ROW_HEIGHT: u16 = 2;
 const QUEUE_ROW_HEIGHT: u16 = 3;
+const HOME_LOAD_MORE_THRESHOLD_ROWS: usize = 14;
 
 pub fn run() -> Result<()> {
     let client = DaemonClient::new()?;
@@ -155,7 +157,6 @@ enum TuiAction {
     Dislike,
     Neutral,
     CycleRepeat,
-    RefreshAll,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -245,6 +246,10 @@ enum HomeFeedStatus {
 
 enum TuiBackgroundEvent {
     HomeLoaded(Result<HomePage, String>),
+    HomeAppended {
+        continuation: String,
+        result: Result<HomePage, String>,
+    },
     HistoryLoaded(Result<Vec<Track>, String>),
     LyricsLoaded {
         video_id: String,
@@ -300,6 +305,12 @@ enum ContextMenuAction {
     PlayQueueNow {
         index: usize,
     },
+    JumpToTrackRadio {
+        track: Track,
+    },
+    JumpToQueueRadio {
+        index: usize,
+    },
     QueueTrackNext {
         track: Track,
     },
@@ -325,6 +336,8 @@ enum ContextMenuAction {
         token: String,
         verb: &'static str,
         title: String,
+        video_id: String,
+        reveal_undo: bool,
     },
 }
 
@@ -424,12 +437,15 @@ struct InteractiveTui {
     home_selected: usize,
     home_scroll_offset: usize,
     home_viewport_rows: usize,
+    home_loading_more: bool,
     focus: TuiFocus,
     detail_tab: DetailTab,
     resume_card: Option<ResumeCardData>,
     lyrics_state: LyricsState,
     status_line: String,
-    last_refresh_at: Instant,
+    last_snapshot_at: Instant,
+    last_daemon_poll_at: Instant,
+    feedback_undo_ready: HashSet<String>,
     click_targets: Vec<ClickTarget>,
     rendered_layout: RenderedLayout,
     background_tx: mpsc::Sender<TuiBackgroundEvent>,
@@ -469,13 +485,16 @@ impl InteractiveTui {
             home_selected: 0,
             home_scroll_offset: 0,
             home_viewport_rows: 12,
+            home_loading_more: false,
             focus: TuiFocus::Home,
             detail_tab: DetailTab::Queue,
             resume_card,
             lyrics_state: LyricsState::Idle,
             status_line: "Home mirrors the GTK app now: arrows move, enter plays, mouse works."
                 .to_string(),
-            last_refresh_at: Instant::now(),
+            last_snapshot_at: Instant::now(),
+            last_daemon_poll_at: Instant::now(),
+            feedback_undo_ready: HashSet::new(),
             click_targets: Vec::new(),
             rendered_layout: RenderedLayout::default(),
             background_tx,
@@ -516,9 +535,7 @@ impl InteractiveTui {
             self.click_targets = click_targets;
             self.rendered_layout = rendered_layout;
 
-            let timeout = REFRESH_INTERVAL
-                .checked_sub(self.last_refresh_at.elapsed())
-                .unwrap_or(Duration::ZERO);
+            let timeout = UI_TICK_INTERVAL;
 
             if event::poll(timeout).context("Failed to poll terminal events")? {
                 match event::read().context("Failed to read terminal event")? {
@@ -533,7 +550,7 @@ impl InteractiveTui {
                 }
             }
 
-            if self.last_refresh_at.elapsed() >= REFRESH_INTERVAL {
+            if self.last_daemon_poll_at.elapsed() >= DAEMON_POLL_INTERVAL {
                 self.refresh_snapshot();
             }
         }
@@ -833,6 +850,45 @@ impl InteractiveTui {
         }
     }
 
+    fn focused_context_menu_target(&self) -> Option<(ClickTargetKind, u16, u16)> {
+        let target =
+            self.click_targets
+                .iter()
+                .find(|target| match (&self.focus, &target.kind) {
+                    (TuiFocus::Home, ClickTargetKind::HomeItem(index)) => {
+                        *index == self.home_selected
+                    }
+                    (TuiFocus::Queue, ClickTargetKind::QueueItem(index)) => {
+                        *index == self.queue_selected
+                    }
+                    (TuiFocus::Recent, ClickTargetKind::RecentItem(index)) => {
+                        *index == self.recent_selected
+                    }
+                    _ => false,
+                })?;
+
+        let anchor_column = target
+            .rect
+            .x
+            .saturating_add(target.rect.width.saturating_sub(1) / 2);
+        let anchor_row = target
+            .rect
+            .y
+            .saturating_add(target.rect.height.saturating_sub(1) / 2);
+        Some((target.kind.clone(), anchor_column, anchor_row))
+    }
+
+    fn open_context_menu_for_focus(&mut self) {
+        let Some((kind, anchor_column, anchor_row)) = self.focused_context_menu_target() else {
+            self.status_line = "Focus a song or collection first.".to_string();
+            return;
+        };
+
+        if !self.open_context_menu(&kind, anchor_column, anchor_row) {
+            self.status_line = "That selection has no context menu.".to_string();
+        }
+    }
+
     fn queue_visible_len(&self) -> usize {
         self.snapshot
             .queue
@@ -985,7 +1041,6 @@ impl InteractiveTui {
             shorten(&moved_track.title, 28),
             insert_at.saturating_add(1)
         );
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1032,7 +1087,6 @@ impl InteractiveTui {
         } else {
             format!("Queued {} tracks.", added)
         };
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1051,9 +1105,80 @@ impl InteractiveTui {
         }
     }
 
+    fn maybe_request_more_home(&mut self) {
+        if self.home_loading_more {
+            return;
+        }
+
+        let continuation = match &self.home_status {
+            HomeFeedStatus::Ready(page) => page.continuation.clone(),
+            HomeFeedStatus::Loading | HomeFeedStatus::Error(_) => None,
+        };
+        let Some(continuation) = continuation.filter(|token| !token.is_empty()) else {
+            return;
+        };
+
+        let viewport = self.home_viewport_rows.max(1);
+        let remaining = self
+            .home_doc
+            .total_height
+            .saturating_sub(self.home_scroll_offset.saturating_add(viewport));
+        if remaining > HOME_LOAD_MORE_THRESHOLD_ROWS {
+            return;
+        }
+
+        self.home_loading_more = true;
+        self.status_line = "Loading more Home sections...".to_string();
+        spawn_home_append(self.background_tx.clone(), continuation);
+    }
+
     fn close_context_menu(&mut self) {
         self.context_menu = None;
         self.rendered_context_menu = RenderedContextMenu::default();
+    }
+
+    fn can_jump_to_radio(&self) -> bool {
+        self.snapshot.radio_virtual_playlist.is_some()
+            || self.snapshot.playlist_context.is_some()
+            || !self.snapshot.queue.is_empty()
+    }
+
+    fn push_feedback_context_items(&self, items: &mut Vec<ContextMenuItem>, track: &Track) {
+        let undo_visible = self.feedback_undo_ready.contains(&track.video_id);
+
+        if !undo_visible {
+            if let Some(token) = track.not_interested_feedback_token.clone() {
+                items.push(ContextMenuItem {
+                    label: "Not interested".to_string(),
+                    hint: "feedback".to_string(),
+                    tone: ContextMenuTone::Danger,
+                    action: ContextMenuAction::SubmitFeedbackToken {
+                        token,
+                        verb: "Marked as not interested",
+                        title: track.title.clone(),
+                        video_id: track.video_id.clone(),
+                        reveal_undo: true,
+                    },
+                });
+            }
+        }
+
+        if undo_visible {
+            if let Some(token) = track.undo_feedback_token.clone() {
+                items.push(ContextMenuItem {
+                    label: "Undo feedback".to_string(),
+                    hint: "restore".to_string(),
+                    tone: ContextMenuTone::Default,
+                    action: ContextMenuAction::SubmitFeedbackToken {
+                        token,
+                        verb: "Feedback undone for",
+                        title: track.title.clone(),
+                        video_id: track.video_id.clone(),
+                        reveal_undo: false,
+                    },
+                });
+            }
+        }
     }
 
     fn context_menu_track_items(&self, track: &Track) -> Vec<ContextMenuItem> {
@@ -1082,40 +1207,28 @@ impl InteractiveTui {
                     track: track.clone(),
                 },
             },
-            ContextMenuItem {
-                label: "Probe headless".to_string(),
-                hint: "no radio".to_string(),
-                tone: ContextMenuTone::Default,
-                action: ContextMenuAction::ProbeTrack {
-                    track: track.clone(),
-                },
-            },
         ];
 
-        if let Some(token) = track.not_interested_feedback_token.clone() {
+        if self.can_jump_to_radio() {
             items.push(ContextMenuItem {
-                label: "Not interested".to_string(),
-                hint: "feedback".to_string(),
-                tone: ContextMenuTone::Danger,
-                action: ContextMenuAction::SubmitFeedbackToken {
-                    token,
-                    verb: "Marked as not interested",
-                    title: track.title.clone(),
-                },
-            });
-        }
-        if let Some(token) = track.undo_feedback_token.clone() {
-            items.push(ContextMenuItem {
-                label: "Undo feedback".to_string(),
-                hint: "restore".to_string(),
+                label: "Jump to".to_string(),
+                hint: "radio seed".to_string(),
                 tone: ContextMenuTone::Default,
-                action: ContextMenuAction::SubmitFeedbackToken {
-                    token,
-                    verb: "Feedback undone for",
-                    title: track.title.clone(),
+                action: ContextMenuAction::JumpToTrackRadio {
+                    track: track.clone(),
                 },
             });
         }
+
+        items.push(ContextMenuItem {
+            label: "Probe headless".to_string(),
+            hint: "no radio".to_string(),
+            tone: ContextMenuTone::Default,
+            action: ContextMenuAction::ProbeTrack {
+                track: track.clone(),
+            },
+        });
+        self.push_feedback_context_items(&mut items, track);
 
         items
     }
@@ -1138,46 +1251,29 @@ impl InteractiveTui {
         let (title, subtitle, items) = match kind {
             ClickTargetKind::QueueItem(index) => {
                 let track = self.snapshot.queue.get(*index)?.clone();
-                let mut items = vec![
-                    ContextMenuItem {
-                        label: "Play now".to_string(),
-                        hint: "keep queue".to_string(),
-                        tone: ContextMenuTone::Accent,
-                        action: ContextMenuAction::PlayQueueNow { index: *index },
-                    },
-                    ContextMenuItem {
-                        label: "Probe headless".to_string(),
-                        hint: "no radio".to_string(),
-                        tone: ContextMenuTone::Default,
-                        action: ContextMenuAction::ProbeTrack {
-                            track: track.clone(),
-                        },
-                    },
-                ];
-                if let Some(token) = track.not_interested_feedback_token.clone() {
+                let mut items = vec![ContextMenuItem {
+                    label: "Play now".to_string(),
+                    hint: "keep queue".to_string(),
+                    tone: ContextMenuTone::Accent,
+                    action: ContextMenuAction::PlayQueueNow { index: *index },
+                }];
+                if self.can_jump_to_radio() {
                     items.push(ContextMenuItem {
-                        label: "Not interested".to_string(),
-                        hint: "feedback".to_string(),
-                        tone: ContextMenuTone::Danger,
-                        action: ContextMenuAction::SubmitFeedbackToken {
-                            token,
-                            verb: "Marked as not interested",
-                            title: track.title.clone(),
-                        },
+                        label: "Jump to".to_string(),
+                        hint: "radio seed".to_string(),
+                        tone: ContextMenuTone::Default,
+                        action: ContextMenuAction::JumpToQueueRadio { index: *index },
                     });
                 }
-                if let Some(token) = track.undo_feedback_token.clone() {
-                    items.push(ContextMenuItem {
-                        label: "Undo feedback".to_string(),
-                        hint: "restore".to_string(),
-                        tone: ContextMenuTone::Default,
-                        action: ContextMenuAction::SubmitFeedbackToken {
-                            token,
-                            verb: "Feedback undone for",
-                            title: track.title.clone(),
-                        },
-                    });
-                }
+                items.push(ContextMenuItem {
+                    label: "Probe headless".to_string(),
+                    hint: "no radio".to_string(),
+                    tone: ContextMenuTone::Default,
+                    action: ContextMenuAction::ProbeTrack {
+                        track: track.clone(),
+                    },
+                });
+                self.push_feedback_context_items(&mut items, &track);
                 if *index != self.snapshot.queue_index {
                     items.push(ContextMenuItem {
                         label: "Remove from queue".to_string(),
@@ -1292,6 +1388,144 @@ impl InteractiveTui {
             .unwrap_or(self.snapshot.queue.len())
     }
 
+    fn jump_to_queue_radio_seed(&mut self, index: usize) -> Result<()> {
+        if !self.can_jump_to_radio() {
+            self.status_line = "Jump to needs an active queue or playlist context.".to_string();
+            return Ok(());
+        }
+
+        let Some(seed_track) = self.snapshot.queue.get(index).cloned() else {
+            self.status_line = "Queue item is gone.".to_string();
+            return Ok(());
+        };
+
+        let prefix_len = self
+            .snapshot
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.touched_len.max(index.saturating_add(1)))
+            .unwrap_or(self.snapshot.queue.len())
+            .min(self.snapshot.queue.len());
+
+        self.apply_jump_to_radio_seed(
+            self.snapshot.queue.clone(),
+            prefix_len,
+            seed_track,
+            index.min(self.snapshot.queue.len().saturating_sub(1)),
+        )
+    }
+
+    fn jump_to_track_radio_seed(&mut self, track: Track) -> Result<()> {
+        if !self.can_jump_to_radio() {
+            self.status_line = "Jump to needs an active queue or playlist context.".to_string();
+            return Ok(());
+        }
+
+        let mut queue = self.snapshot.queue.clone();
+        let selected_index = if self.snapshot.radio_virtual_playlist.is_some() {
+            let insert_at = self.queue_last_slot().min(queue.len());
+            queue.insert(insert_at, track.clone());
+            insert_at
+        } else if let Some(existing_index) = queue
+            .iter()
+            .position(|queued| queued.video_id == track.video_id)
+        {
+            existing_index
+        } else {
+            queue.push(track.clone());
+            queue.len().saturating_sub(1)
+        };
+
+        let prefix_len = if self.snapshot.radio_virtual_playlist.is_some() {
+            self.snapshot
+                .radio_virtual_playlist
+                .as_ref()
+                .map(|radio| {
+                    if selected_index < radio.touched_len {
+                        radio.touched_len
+                    } else {
+                        radio.touched_len.saturating_add(1)
+                    }
+                })
+                .unwrap_or(selected_index.saturating_add(1))
+                .min(queue.len())
+        } else {
+            queue.len()
+        };
+
+        self.apply_jump_to_radio_seed(queue, prefix_len, track, selected_index)
+    }
+
+    fn apply_jump_to_radio_seed(
+        &mut self,
+        queue: Vec<Track>,
+        prefix_len: usize,
+        seed_track: Track,
+        selected_index: usize,
+    ) -> Result<()> {
+        let mut final_queue = queue.clone();
+        let mut chips = Vec::new();
+        let mut tail_refreshed = false;
+
+        if let Ok(mut radio) = saved_network_state()
+            .and_then(|network| network.get_radio(&seed_track.video_id, None, None))
+        {
+            if let Some(seed_index) = radio
+                .tracks
+                .iter()
+                .position(|track| track.video_id == seed_track.video_id)
+            {
+                if seed_index > 0 {
+                    let track = radio.tracks.remove(seed_index);
+                    radio.tracks.insert(0, track);
+                }
+            } else {
+                radio.tracks.insert(0, seed_track.clone());
+            }
+
+            final_queue.truncate(prefix_len.min(final_queue.len()));
+            final_queue.extend(dedupe_radio_recommendations(
+                final_queue.as_slice(),
+                radio.tracks,
+            ));
+            chips = radio.chips;
+            tail_refreshed = true;
+        }
+
+        let current_index = if final_queue.is_empty() {
+            0
+        } else {
+            self.snapshot
+                .queue_index
+                .min(final_queue.len().saturating_sub(1))
+        };
+        let snapshot = self.client.replace_queue(
+            final_queue,
+            current_index,
+            self.snapshot.playlist_context.clone(),
+            Some(RadioVirtualPlaylist {
+                source_video_id: seed_track.video_id.clone(),
+                touched_len: prefix_len,
+                chips,
+            }),
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.focus = TuiFocus::Queue;
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = selected_index.min(self.snapshot.queue.len().saturating_sub(1));
+        self.ensure_queue_visible();
+        self.status_line = if tail_refreshed {
+            format!("Jumped radio to {}.", shorten(&seed_track.title, 28))
+        } else {
+            format!(
+                "Jumped radio to {}. Keeping the current tail for now.",
+                shorten(&seed_track.title, 28)
+            )
+        };
+        Ok(())
+    }
+
     fn play_track_now(&mut self, track: Track) -> Result<()> {
         let snapshot = play_track_with_radio(&self.client, track.clone())?;
         self.apply_snapshot(snapshot);
@@ -1301,7 +1535,6 @@ impl InteractiveTui {
             .queue_index
             .min(self.snapshot.queue.len().saturating_sub(1));
         self.status_line = format!("Playing {}", format_track_summary(&track));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1332,7 +1565,6 @@ impl InteractiveTui {
             .queue_index
             .min(self.snapshot.queue.len().saturating_sub(1));
         self.status_line = format!("Opened {}", card.title);
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1340,7 +1572,6 @@ impl InteractiveTui {
         let snapshot = self.client.probe_track(track.clone())?;
         self.apply_snapshot(snapshot);
         self.status_line = format!("Probing {}", format_track_summary(&track));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1368,7 +1599,6 @@ impl InteractiveTui {
                 .map(format_track_summary)
                 .unwrap_or_else(|| "selection".to_string())
         );
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1402,7 +1632,6 @@ impl InteractiveTui {
         self.queue_selected = index.min(self.snapshot.queue.len().saturating_sub(1));
         self.ensure_queue_visible();
         self.status_line = format!("Removed {}.", shorten(&removed.title, 28));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1411,10 +1640,16 @@ impl InteractiveTui {
         token: String,
         verb: &'static str,
         title: String,
+        video_id: String,
+        reveal_undo: bool,
     ) -> Result<()> {
         saved_network_state()?.submit_feedback_token(&token)?;
+        if reveal_undo {
+            self.feedback_undo_ready.insert(video_id);
+        } else {
+            self.feedback_undo_ready.remove(&video_id);
+        }
         self.status_line = format!("{verb} {}.", shorten(&title, 28));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -1422,6 +1657,8 @@ impl InteractiveTui {
         match action {
             ContextMenuAction::PlayTrackNow { track } => self.play_track_now(track),
             ContextMenuAction::PlayQueueNow { index } => self.play_queue_index_now(index),
+            ContextMenuAction::JumpToTrackRadio { track } => self.jump_to_track_radio_seed(track),
+            ContextMenuAction::JumpToQueueRadio { index } => self.jump_to_queue_radio_seed(index),
             ContextMenuAction::QueueTrackNext { track } => {
                 self.handle_drag_drop(TuiDragPayload::Track { track }, self.queue_next_slot())
             }
@@ -1439,9 +1676,13 @@ impl InteractiveTui {
             ),
             ContextMenuAction::ProbeTrack { track } => self.probe_track_now(track),
             ContextMenuAction::RemoveQueueItem { index } => self.remove_queue_item(index),
-            ContextMenuAction::SubmitFeedbackToken { token, verb, title } => {
-                self.submit_feedback_token_action(token, verb, title)
-            }
+            ContextMenuAction::SubmitFeedbackToken {
+                token,
+                verb,
+                title,
+                video_id,
+                reveal_undo,
+            } => self.submit_feedback_token_action(token, verb, title, video_id, reveal_undo),
         }
     }
 
@@ -2010,7 +2251,7 @@ impl InteractiveTui {
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(6), Constraint::Min(8)])
+            .constraints([Constraint::Length(3), Constraint::Min(8)])
             .split(inner);
 
         let header = Block::default()
@@ -2019,119 +2260,26 @@ impl InteractiveTui {
             .style(Style::default().bg(theme.content_alt_bg));
         let header_inner = header.inner(rows[0]);
         frame.render_widget(header, rows[0]);
-        let header_art_width = self.square_box_width_for_height(header_inner.height).max(6);
-        let header_show_thumbnail =
-            self.terminal_images_enabled() && header_inner.width >= 24 + header_art_width;
-        let (header_copy_area, header_thumbnail_area) = if header_show_thumbnail {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(24), Constraint::Length(header_art_width)])
-                .split(header_inner);
-            (columns[0], Some(columns[1]))
-        } else {
-            (header_inner, None)
-        };
-        let header_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .split(header_copy_area);
+        self.thumbnail_slots.remove(&ThumbnailSlot::ContentHeader);
 
-        let home_meta = match &self.home_status {
-            HomeFeedStatus::Loading => "refreshing home feed".to_string(),
-            HomeFeedStatus::Ready(page) => format!("{} sections live", page.sections.len()),
-            HomeFeedStatus::Error(_) => "home feed offline".to_string(),
-        };
+        let header_columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(16), Constraint::Length(12)])
+            .split(header_inner);
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "HOME",
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   "),
-                Span::styled(home_meta, Style::default().fg(theme.muted)),
-                Span::raw("   "),
-                Span::styled(
-                    Local::now().format("%a %H:%M").to_string(),
-                    Style::default().fg(theme.muted),
-                ),
-            ]))
+            Paragraph::new(Line::from(Span::styled(
+                "S  T  A  T  I  C",
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            )))
             .alignment(Alignment::Left),
-            header_rows[0],
+            header_columns[0],
         );
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "S  T  A  T  I  C",
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    "alternate-screen control room",
-                    Style::default().fg(theme.border_focus),
-                ),
-            ])),
-            header_rows[1],
+            Paragraph::new(Local::now().format("%a %H:%M").to_string())
+                .style(Style::default().fg(theme.muted))
+                .alignment(Alignment::Right),
+            header_columns[1],
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    self.snapshot
-                        .current_track
-                        .as_ref()
-                        .map(|track| shorten(&track.title, header_rows[2].width as usize / 2))
-                        .unwrap_or_else(|| "Nothing playing".to_string()),
-                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    self.snapshot
-                        .current_track
-                        .as_ref()
-                        .map(|track| track.artist.clone())
-                        .unwrap_or_else(|| "Daemon ready for headless playback".to_string()),
-                    Style::default().fg(theme.muted),
-                ),
-            ])),
-            header_rows[2],
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("enter", Style::default().fg(theme.accent)),
-                Span::styled(" play selected", Style::default().fg(theme.muted)),
-                Span::raw("   "),
-                Span::styled("space", Style::default().fg(theme.accent)),
-                Span::styled(" pause/resume", Style::default().fg(theme.muted)),
-                Span::raw("   "),
-                Span::styled("1/2", Style::default().fg(theme.accent)),
-                Span::styled(" queue/lyrics", Style::default().fg(theme.muted)),
-            ])),
-            header_rows[3],
-        );
-        if let Some(header_thumbnail_area) = header_thumbnail_area {
-            let current_thumb_url = self
-                .snapshot
-                .current_track
-                .as_ref()
-                .and_then(|track| track.thumb_url.clone());
-            self.render_cover_thumbnail(
-                frame,
-                header_thumbnail_area,
-                ThumbnailSlot::ContentHeader,
-                current_thumb_url.as_deref(),
-                current_initials(&self.snapshot),
-                theme,
-                true,
-            );
-        } else {
-            self.thumbnail_slots.remove(&ThumbnailSlot::ContentHeader);
-        }
 
         let feed_block = Block::default()
             .style(Style::default().bg(theme.content_bg))
@@ -2155,6 +2303,7 @@ impl InteractiveTui {
             self.home_scroll_offset = 0;
         }
         self.ensure_home_visible();
+        self.maybe_request_more_home();
 
         frame.render_widget(
             HomeFeedWidget {
@@ -2708,7 +2857,7 @@ impl InteractiveTui {
 
                         let active_index = active_lyric_line_index(
                             lyrics,
-                            self.snapshot.position_millis.unwrap_or(0),
+                            self.displayed_position_millis().unwrap_or(0),
                         );
                         let visible_lines = inner_rows[1].height.max(1) as usize;
                         let start = active_index.saturating_sub(visible_lines / 2);
@@ -2790,7 +2939,7 @@ impl InteractiveTui {
             .duration_millis
             .filter(|duration| *duration > 0)
             .map(|duration| {
-                self.snapshot.position_millis.unwrap_or(0).min(duration) as f64 / duration as f64
+                self.displayed_position_millis().unwrap_or(0).min(duration) as f64 / duration as f64
             })
             .unwrap_or(0.0);
         layout.player_progress_viewport = rows[0];
@@ -2800,8 +2949,7 @@ impl InteractiveTui {
                 .gauge_style(Style::default().fg(theme.red).bg(theme.border_subtle))
                 .label(format!(
                     "{} / {}",
-                    self.snapshot
-                        .position_millis
+                    self.displayed_position_millis()
                         .map(format_millis)
                         .unwrap_or_else(|| "0:00".to_string()),
                     self.snapshot
@@ -2815,25 +2963,24 @@ impl InteractiveTui {
         let control_columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(26),
+                Constraint::Length(16),
                 Constraint::Min(26),
-                Constraint::Length(44),
+                Constraint::Length(24),
             ])
             .split(rows[1]);
 
         let transport = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
+                Constraint::Length(5),
                 Constraint::Length(6),
-                Constraint::Length(8),
-                Constraint::Length(6),
-                Constraint::Length(6),
+                Constraint::Length(5),
             ])
             .split(control_columns[0]);
         targets.push(render_action_button(
             frame,
             transport[0],
-            "Prev",
+            "⏮",
             TuiAction::Previous,
             theme,
             false,
@@ -2842,11 +2989,7 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             transport[1],
-            if self.snapshot.paused {
-                "Play"
-            } else {
-                "Pause"
-            },
+            if self.snapshot.paused { "▶" } else { "⏸" },
             TuiAction::TogglePause,
             theme,
             true,
@@ -2855,33 +2998,12 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             transport[2],
-            "Next",
+            "⏭",
             TuiAction::Next,
             theme,
             false,
             false,
         ));
-
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    playback_status(&self.snapshot).to_uppercase(),
-                    Style::default()
-                        .fg(status_color(theme, &self.snapshot))
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    format!(
-                        "{}/{}",
-                        self.snapshot.queue_index.saturating_add(1),
-                        self.snapshot.queue.len().max(1)
-                    ),
-                    Style::default().fg(theme.muted),
-                )),
-            ])
-            .alignment(Alignment::Center),
-            transport[3],
-        );
 
         let track_info = Layout::default()
             .direction(Direction::Horizontal)
@@ -2943,11 +3065,10 @@ impl InteractiveTui {
         let actions = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(6),
-                Constraint::Length(6),
-                Constraint::Length(8),
-                Constraint::Length(7),
-                Constraint::Length(8),
+                Constraint::Length(5),
+                Constraint::Length(5),
+                Constraint::Length(5),
+                Constraint::Length(5),
                 Constraint::Length(4),
             ])
             .split(control_columns[2]);
@@ -2955,7 +3076,7 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             actions[0],
-            "Dis",
+            "👎",
             TuiAction::Dislike,
             theme,
             false,
@@ -2967,7 +3088,7 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             actions[1],
-            "Like",
+            "👍",
             TuiAction::Like,
             theme,
             false,
@@ -2979,7 +3100,7 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             actions[2],
-            repeat_button_label(self.snapshot.repeat_mode),
+            repeat_button_emoji(self.snapshot.repeat_mode),
             TuiAction::CycleRepeat,
             theme,
             false,
@@ -2988,16 +3109,7 @@ impl InteractiveTui {
         targets.push(render_action_button(
             frame,
             actions[3],
-            "Sync",
-            TuiAction::RefreshAll,
-            theme,
-            false,
-            false,
-        ));
-        targets.push(render_action_button(
-            frame,
-            actions[4],
-            "Resume",
+            "↺",
             TuiAction::ResumeSaved,
             theme,
             false,
@@ -3013,7 +3125,7 @@ impl InteractiveTui {
                 Line::from(Span::styled("vol", Style::default().fg(theme.muted))),
             ])
             .alignment(Alignment::Center),
-            actions[5],
+            actions[4],
         );
 
         frame.render_widget(
@@ -3099,7 +3211,7 @@ impl InteractiveTui {
             KeyCode::Char('l') => self.run_action(TuiAction::Like)?,
             KeyCode::Char('d') => self.run_action(TuiAction::Dislike)?,
             KeyCode::Char('u') => self.run_action(TuiAction::Neutral)?,
-            KeyCode::Char('R') => self.run_action(TuiAction::RefreshAll)?,
+            KeyCode::Char('m') => self.open_context_menu_for_focus(),
             KeyCode::Left => self.move_selection(NavigationDirection::Left),
             KeyCode::Right => self.move_selection(NavigationDirection::Right),
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(NavigationDirection::Down),
@@ -3242,16 +3354,49 @@ impl InteractiveTui {
         while let Ok(event) = self.background_rx.try_recv() {
             match event {
                 TuiBackgroundEvent::HomeLoaded(Ok(page)) => {
+                    self.home_loading_more = false;
                     self.home_status = HomeFeedStatus::Ready(page);
                     self.home_selected = 0;
                     self.home_scroll_offset = 0;
                     self.status_line = "Home feed loaded.".to_string();
                 }
                 TuiBackgroundEvent::HomeLoaded(Err(err)) => {
+                    self.home_loading_more = false;
                     self.home_status = HomeFeedStatus::Error(err.clone());
                     self.home_selected = 0;
                     self.home_scroll_offset = 0;
                     self.status_line = err;
+                }
+                TuiBackgroundEvent::HomeAppended {
+                    continuation,
+                    result,
+                } => {
+                    self.home_loading_more = false;
+                    match result {
+                        Ok(mut page) => {
+                            let next_continuation = page
+                                .continuation
+                                .clone()
+                                .filter(|token| token != &continuation);
+                            match &mut self.home_status {
+                                HomeFeedStatus::Ready(existing)
+                                    if existing.continuation.as_deref()
+                                        == Some(continuation.as_str()) =>
+                                {
+                                    existing.sections.append(&mut page.sections);
+                                    existing.continuation = next_continuation;
+                                    self.status_line = format!(
+                                        "Home feed expanded to {} sections.",
+                                        existing.sections.len()
+                                    );
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(err) => {
+                            self.status_line = format!("Home pagination failed: {err}");
+                        }
+                    }
                 }
                 TuiBackgroundEvent::HistoryLoaded(Ok(tracks)) => {
                     self.recent_tracks = tracks.into_iter().take(RECENT_LIMIT).collect();
@@ -3308,11 +3453,12 @@ impl InteractiveTui {
                 self.status_line = format!("Daemon refresh failed: {err}");
             }
         }
-        self.last_refresh_at = Instant::now();
+        self.last_daemon_poll_at = Instant::now();
     }
 
     fn request_home_reload(&mut self) {
         self.home_status = HomeFeedStatus::Loading;
+        self.home_loading_more = false;
         spawn_home_bootstrap(self.background_tx.clone());
     }
 
@@ -3328,6 +3474,9 @@ impl InteractiveTui {
             .map(|track| track.video_id.clone());
 
         self.snapshot = snapshot;
+        let now = Instant::now();
+        self.last_snapshot_at = now;
+        self.last_daemon_poll_at = now;
         self.queue_selected = self
             .queue_selected
             .min(self.snapshot.queue.len().saturating_sub(1));
@@ -3377,6 +3526,23 @@ impl InteractiveTui {
         spawn_lyrics_load(self.background_tx.clone(), video_id);
     }
 
+    fn displayed_position_millis(&self) -> Option<u64> {
+        let position_millis = self.snapshot.position_millis?;
+        if self.snapshot.paused
+            || self.snapshot.probe_active
+            || self.snapshot.current_track.is_none()
+        {
+            return Some(position_millis);
+        }
+
+        let advanced =
+            position_millis.saturating_add(self.last_snapshot_at.elapsed().as_millis() as u64);
+        Some(match self.snapshot.duration_millis {
+            Some(duration_millis) => advanced.min(duration_millis),
+            None => advanced,
+        })
+    }
+
     fn toggle_detail_tab(&mut self) {
         self.detail_tab = match self.detail_tab {
             DetailTab::Queue => DetailTab::Lyrics,
@@ -3385,7 +3551,29 @@ impl InteractiveTui {
     }
 
     fn run_action(&mut self, action: TuiAction) -> Result<()> {
-        let result = match action {
+        let effective_action = match action {
+            TuiAction::Like
+                if self
+                    .snapshot
+                    .current_track
+                    .as_ref()
+                    .is_some_and(|track| track.rating == SongRating::Like) =>
+            {
+                TuiAction::Neutral
+            }
+            TuiAction::Dislike
+                if self
+                    .snapshot
+                    .current_track
+                    .as_ref()
+                    .is_some_and(|track| track.rating == SongRating::Dislike) =>
+            {
+                TuiAction::Neutral
+            }
+            _ => action,
+        };
+
+        let result = match effective_action {
             TuiAction::ResumeSaved => {
                 let persisted = load_persisted_playback_state()?
                     .filter(|persisted| !persisted.snapshot.queue.is_empty())
@@ -3405,24 +3593,18 @@ impl InteractiveTui {
                     .next(self.snapshot.radio_virtual_playlist.is_some());
                 self.client.set_repeat_mode(next_mode)
             }
-            TuiAction::RefreshAll => {
-                self.request_home_reload();
-                self.client.state()
-            }
         };
 
         match result {
             Ok(snapshot) => {
                 self.apply_snapshot(snapshot);
-                if matches!(action, TuiAction::ResumeSaved) {
+                if matches!(effective_action, TuiAction::ResumeSaved) {
                     self.resume_card = None;
                 }
-                self.status_line = format!("{} applied.", action_label(action));
+                self.status_line = format!("{} applied.", action_label(effective_action));
             }
             Err(err) => self.status_line = format!("Action failed: {err}"),
         }
-
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -3523,7 +3705,6 @@ impl InteractiveTui {
             .snapshot
             .queue_index
             .min(self.snapshot.queue.len().saturating_sub(1));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -3552,7 +3733,6 @@ impl InteractiveTui {
                 .map(format_track_summary)
                 .unwrap_or_else(|| "selection".to_string())
         );
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -3570,7 +3750,6 @@ impl InteractiveTui {
             .queue_index
             .min(self.snapshot.queue.len().saturating_sub(1));
         self.status_line = format!("Playing {}", format_track_summary(&track));
-        self.last_refresh_at = Instant::now();
         Ok(())
     }
 
@@ -3954,6 +4133,18 @@ fn spawn_home_bootstrap(tx: mpsc::Sender<TuiBackgroundEvent>) {
             )));
             let _ = tx.send(TuiBackgroundEvent::HistoryLoaded(Ok(Vec::new())));
         }
+    });
+}
+
+fn spawn_home_append(tx: mpsc::Sender<TuiBackgroundEvent>, continuation: String) {
+    std::thread::spawn(move || {
+        let result = saved_network_state()
+            .and_then(|network| network.get_home_page(Some(&continuation)))
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::HomeAppended {
+            continuation,
+            result,
+        });
     });
 }
 
@@ -4673,6 +4864,22 @@ fn shrink_radio_touched_for_remove(
     }
 }
 
+fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen_ids = prefix
+        .iter()
+        .map(|track| track.video_id.clone())
+        .collect::<HashSet<_>>();
+    let mut deduped = Vec::with_capacity(tracks.len());
+
+    for track in tracks {
+        if seen_ids.insert(track.video_id.clone()) {
+            deduped.push(track);
+        }
+    }
+
+    deduped
+}
+
 fn draw_box(
     buf: &mut Buffer,
     clip: Rect,
@@ -5087,6 +5294,13 @@ fn repeat_button_label(mode: RepeatMode) -> &'static str {
     }
 }
 
+fn repeat_button_emoji(mode: RepeatMode) -> &'static str {
+    match mode {
+        RepeatMode::One => "🔂",
+        RepeatMode::Off | RepeatMode::All => "🔁",
+    }
+}
+
 fn action_label(action: TuiAction) -> &'static str {
     match action {
         TuiAction::ResumeSaved => "Resume",
@@ -5097,7 +5311,6 @@ fn action_label(action: TuiAction) -> &'static str {
         TuiAction::Dislike => "Dislike",
         TuiAction::Neutral => "Neutral",
         TuiAction::CycleRepeat => "Repeat",
-        TuiAction::RefreshAll => "Refresh",
     }
 }
 

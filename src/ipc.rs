@@ -136,6 +136,9 @@ impl Default for PlaybackSnapshot {
 pub enum DaemonRequest {
     Ping,
     GetState,
+    RateCurrentTrack {
+        rating: SongRating,
+    },
     PlayQueueAt {
         queue: Vec<Track>,
         index: usize,
@@ -398,6 +401,13 @@ pub fn ensure_daemon_running() -> Result<()> {
     bail!("Playback daemon did not become ready in time")
 }
 
+pub fn daemon_is_running() -> bool {
+    matches!(
+        send_request_raw(&DaemonRequest::Ping),
+        Ok(DaemonResponse::Pong)
+    )
+}
+
 pub fn forward_log_message(source: LogSource, message: String) -> Result<()> {
     match send_request_raw(&DaemonRequest::LogMessage { source, message })? {
         DaemonResponse::Ok => Ok(()),
@@ -429,6 +439,10 @@ impl DaemonClient {
             DaemonResponse::Error(err) => bail!(err),
             other => bail!("Unexpected daemon response: {other:?}"),
         }
+    }
+
+    pub fn rate_current_track(&self, rating: SongRating) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::RateCurrentTrack { rating })
     }
 
     pub fn play_queue_at(

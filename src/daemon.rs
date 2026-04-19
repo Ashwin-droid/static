@@ -846,6 +846,26 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::GetState => DaemonResponse::State(state_snapshot(state)),
+        DaemonRequest::RateCurrentTrack { rating } => {
+            let Some(video_id) = state.active_track.as_ref().map(|track| track.video_id.clone())
+            else {
+                return DaemonResponse::Error("No song is currently playing".to_string());
+            };
+
+            match ensure_client_loaded(state).and_then(|client| client.set_song_rating(&video_id, rating))
+            {
+                Ok(()) => {
+                    if let Some(active_track) = state.active_track.as_mut() {
+                        if active_track.video_id == video_id {
+                            active_track.rating = rating;
+                        }
+                    }
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
         DaemonRequest::PlayQueueAt {
             queue,
             index,

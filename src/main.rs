@@ -1,3 +1,5 @@
+mod cli;
+mod cli_tui;
 mod daemon;
 mod ipc;
 mod logging;
@@ -14,12 +16,24 @@ mod ui;
 use gtk::prelude::*;
 
 fn main() {
-    tracing_subscriber::fmt::init();
-    gstreamer::init().expect("Failed to initialise GStreamer");
+    let args = std::env::args().collect::<Vec<_>>();
 
-    if std::env::args().any(|arg| arg == "--daemon") {
+    if args.get(1).is_some_and(|arg| arg == "--daemon") {
+        tracing_subscriber::fmt::init();
+        gstreamer::init().expect("Failed to initialise GStreamer");
         daemon::run().expect("Failed to start playback daemon");
+        return;
+    }
+
+    if cli::wants_cli(&args[1..]) {
+        if let Err(err) = cli::run(&args[1..]) {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+        return;
     } else {
+        tracing_subscriber::fmt::init();
+        gstreamer::init().expect("Failed to initialise GStreamer");
         let app = ui::build_app();
         app.run();
     }

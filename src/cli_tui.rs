@@ -32,12 +32,12 @@ use ratatui_image::{
 };
 
 use crate::cli::{
-    artist_string, format_millis, format_track_summary, play_track_with_radio, rating_label,
+    artist_string, format_millis, format_track_summary, play_track_with_radio,
     restore_playback_snapshot_via_daemon, saved_network_state,
 };
 use crate::ipc::{
-    load_persisted_playback_state, DaemonClient, PlaybackSnapshot, PlaylistContext,
-    PlaylistContextSource, RepeatMode,
+    load_persisted_playback_state, ActiveTrackSnapshot, DaemonClient, PlaybackSnapshot,
+    PlaylistContext, PlaylistContextSource, RepeatMode,
 };
 use crate::models::{
     HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, RadioVirtualPlaylist, SyncedLyrics,
@@ -107,7 +107,6 @@ struct TuiTheme {
     accent_glow: Color,
     red: Color,
     positive: Color,
-    warning: Color,
     danger: Color,
     selected_bg: Color,
 }
@@ -133,7 +132,6 @@ impl TuiTheme {
             accent_glow: Color::Rgb(208, 221, 255),
             red: Color::Rgb(255, 0, 0),
             positive: Color::Rgb(127, 211, 161),
-            warning: Color::Rgb(255, 196, 92),
             danger: Color::Rgb(255, 120, 120),
             selected_bg: Color::Rgb(31, 34, 46),
         }
@@ -1361,7 +1359,7 @@ impl InteractiveTui {
         if let Some(menu) = self.context_menu_for_target(kind, anchor_column, anchor_row) {
             self.context_menu = Some(menu);
             self.status_line =
-                "Context menu open. Enter runs, esc closes, arrows or j/k move.".to_string();
+                "Context menu open. Enter runs, Esc closes, arrow keys move.".to_string();
             true
         } else {
             self.close_context_menu();
@@ -1840,7 +1838,7 @@ impl InteractiveTui {
         }
 
         frame.render_widget(
-            Paragraph::new("enter run  esc close  j/k move")
+            Paragraph::new("enter run  esc close  arrow keys move")
                 .style(Style::default().fg(theme.border_focus)),
             rows[4],
         );
@@ -1953,7 +1951,6 @@ impl InteractiveTui {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
                 Constraint::Length(4),
                 Constraint::Length(11),
                 Constraint::Length(2),
@@ -1962,49 +1959,14 @@ impl InteractiveTui {
             ])
             .split(inner);
 
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        "S  T  A  T  I  C",
-                        Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        "HEADLESS",
-                        Style::default()
-                            .fg(theme.accent)
-                            .bg(theme.accent_fill)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(Span::styled(
-                    "YouTube Music, natively.",
-                    Style::default().fg(theme.muted),
-                )),
-                Line::from(vec![
-                    Span::styled("dbus ", Style::default().fg(theme.accent_glow)),
-                    Span::styled("daemon", Style::default().fg(theme.muted)),
-                    Span::raw("  "),
-                    Span::styled(
-                        playback_status(&self.snapshot).to_uppercase(),
-                        Style::default()
-                            .fg(status_color(theme, &self.snapshot))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-            ]),
-            rows[0],
-        );
-
         let search_box = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .style(Style::default().bg(theme.elevated_bg))
             .padding(Padding::new(1, 1, 0, 0));
-        let search_inner = search_box.inner(rows[1]);
-        frame.render_widget(search_box, rows[1]);
+        let search_inner = search_box.inner(rows[0]);
+        frame.render_widget(search_box, rows[0]);
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
@@ -2025,8 +1987,8 @@ impl InteractiveTui {
             .border_style(Style::default().fg(theme.border_subtle))
             .style(Style::default().bg(theme.content_alt_bg))
             .padding(Padding::new(1, 1, 0, 0));
-        let nav_inner = nav_block.inner(rows[2]);
-        frame.render_widget(nav_block, rows[2]);
+        let nav_inner = nav_block.inner(rows[1]);
+        frame.render_widget(nav_block, rows[1]);
         let nav_rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2094,7 +2056,7 @@ impl InteractiveTui {
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             ))),
-            rows[3],
+            rows[2],
         );
 
         let recent_block = Block::default()
@@ -2106,8 +2068,8 @@ impl InteractiveTui {
                 theme.border_subtle
             }))
             .style(Style::default().bg(theme.elevated_bg));
-        let recent_inner = recent_block.inner(rows[4]);
-        frame.render_widget(recent_block, rows[4]);
+        let recent_inner = recent_block.inner(rows[3]);
+        frame.render_widget(recent_block, rows[3]);
         layout.recent_viewport = recent_inner;
         self.recent_viewport_rows =
             (recent_inner.height as usize / RECENT_ROW_HEIGHT as usize).max(1);
@@ -2205,12 +2167,12 @@ impl InteractiveTui {
                 Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
                     .thumb_style(Style::default().fg(theme.accent)),
-                rows[4],
+                rows[3],
                 &mut scrollbar_state,
             );
         }
 
-        let settings_row = rows[5];
+        let settings_row = rows[4];
         let settings_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -2302,7 +2264,7 @@ impl InteractiveTui {
             self.home_selected = 0;
             self.home_scroll_offset = 0;
         }
-        self.ensure_home_visible();
+        self.clamp_home_scroll_offset();
         self.maybe_request_more_home();
 
         frame.render_widget(
@@ -2421,11 +2383,7 @@ impl InteractiveTui {
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Min(8),
-                Constraint::Length(4),
-            ])
+            .constraints([Constraint::Length(3), Constraint::Min(12)])
             .split(inner);
 
         let tab_columns = Layout::default()
@@ -2479,21 +2437,6 @@ impl InteractiveTui {
                 kind: ClickTargetKind::DetailTab(tab),
             });
         }
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!("{} tracks", self.snapshot.queue.len()),
-                    Style::default().fg(theme.muted),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    repeat_button_label(self.snapshot.repeat_mode),
-                    Style::default().fg(theme.accent),
-                ),
-            ]))
-            .alignment(Alignment::Right),
-            tab_columns[2],
-        );
 
         match self.detail_tab {
             DetailTab::Queue => {
@@ -2712,61 +2655,12 @@ impl InteractiveTui {
                         );
                     }
                 }
-
-                let footer_block = Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.border_subtle))
-                    .style(Style::default().bg(theme.elevated_alt_bg));
-                let footer_inner = footer_block.inner(rows[2]);
-                frame.render_widget(footer_block, rows[2]);
-
-                let selected_track = self.snapshot.queue.get(self.queue_selected).or_else(|| {
-                    self.snapshot.current_track.as_ref().and_then(|current| {
-                        self.snapshot
-                            .queue
-                            .iter()
-                            .find(|track| track.video_id == current.video_id)
-                    })
-                });
-                let selection_lines = if let Some(track) = selected_track {
-                    vec![
-                        Line::from(Span::styled(
-                            shorten(&track.title, footer_inner.width as usize),
-                            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
-                        )),
-                        Line::from(vec![
-                            Span::styled(
-                                shorten(&artist_string(track), footer_inner.width as usize / 2),
-                                Style::default().fg(theme.muted),
-                            ),
-                            Span::raw("  "),
-                            Span::styled(
-                                format!(
-                                    "{}  rating {}",
-                                    repeat_mode_label(self.snapshot.repeat_mode),
-                                    self.snapshot
-                                        .current_track
-                                        .as_ref()
-                                        .map(|current| rating_label(current.rating))
-                                        .unwrap_or("-")
-                                ),
-                                Style::default().fg(theme.accent),
-                            ),
-                        ]),
-                    ]
-                } else {
-                    vec![Line::from(Span::styled(
-                        "No queue selection yet.",
-                        Style::default().fg(theme.muted),
-                    ))]
-                };
-                frame.render_widget(
-                    Paragraph::new(selection_lines).wrap(Wrap { trim: true }),
-                    footer_inner,
-                );
             }
             DetailTab::Lyrics => {
+                let lyrics_rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(6), Constraint::Length(4)])
+                    .split(rows[1]);
                 let lyrics_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2776,8 +2670,8 @@ impl InteractiveTui {
                         theme.border_subtle
                     }))
                     .style(Style::default().bg(theme.elevated_bg));
-                let lyrics_inner = lyrics_block.inner(rows[1]);
-                frame.render_widget(lyrics_block, rows[1]);
+                let lyrics_inner = lyrics_block.inner(lyrics_rows[0]);
+                frame.render_widget(lyrics_block, lyrics_rows[0]);
                 layout.queue_viewport = lyrics_inner;
 
                 match &self.lyrics_state {
@@ -2889,8 +2783,8 @@ impl InteractiveTui {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.border_subtle))
                     .style(Style::default().bg(theme.elevated_alt_bg));
-                let footer_inner = footer_block.inner(rows[2]);
-                frame.render_widget(footer_block, rows[2]);
+                let footer_inner = footer_block.inner(lyrics_rows[1]);
+                frame.render_widget(footer_block, lyrics_rows[1]);
                 frame.render_widget(
                     Paragraph::new(vec![
                         Line::from(Span::styled(
@@ -3053,10 +2947,7 @@ impl InteractiveTui {
                     ),
                     Style::default().fg(theme.muted),
                 )),
-                Line::from(Span::styled(
-                    current_context_label(&self.snapshot),
-                    Style::default().fg(theme.accent),
-                )),
+                Line::from(player_bar_meta_spans(&self.snapshot)),
             ])
             .alignment(Alignment::Left),
             track_info[1],
@@ -3133,7 +3024,7 @@ impl InteractiveTui {
                 Span::styled(&self.status_line, Style::default().fg(theme.muted)),
                 Span::raw("   "),
                 Span::styled(
-                    "tab focus  enter play  space toggle  r resume  mouse enabled",
+                    "tab focus  arrows move  enter play  m menu  space toggle  r resume",
                     Style::default().fg(theme.border_focus),
                 ),
                 Span::raw("   "),
@@ -3157,19 +3048,19 @@ impl InteractiveTui {
                     self.status_line = "Context menu closed.".to_string();
                     return Ok(false);
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     self.move_context_menu_selection(-1);
                     return Ok(false);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     self.move_context_menu_selection(1);
                     return Ok(false);
                 }
-                KeyCode::Home | KeyCode::Char('g') => {
+                KeyCode::Home => {
                     self.select_context_menu_item(0);
                     return Ok(false);
                 }
-                KeyCode::End | KeyCode::Char('G') => {
+                KeyCode::End => {
                     let last = self
                         .context_menu
                         .as_ref()
@@ -3214,10 +3105,10 @@ impl InteractiveTui {
             KeyCode::Char('m') => self.open_context_menu_for_focus(),
             KeyCode::Left => self.move_selection(NavigationDirection::Left),
             KeyCode::Right => self.move_selection(NavigationDirection::Right),
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(NavigationDirection::Down),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(NavigationDirection::Up),
-            KeyCode::Home | KeyCode::Char('g') => self.jump_to_start(),
-            KeyCode::End | KeyCode::Char('G') => self.jump_to_end(),
+            KeyCode::Down => self.move_selection(NavigationDirection::Down),
+            KeyCode::Up => self.move_selection(NavigationDirection::Up),
+            KeyCode::Home => self.jump_to_start(),
+            KeyCode::End => self.jump_to_end(),
             KeyCode::PageDown => self.page_move(1),
             KeyCode::PageUp => self.page_move(-1),
             KeyCode::Enter => self.activate_selection()?,
@@ -3450,7 +3341,10 @@ impl InteractiveTui {
                 self.apply_snapshot(snapshot);
             }
             Err(err) => {
-                self.status_line = format!("Daemon refresh failed: {err}");
+                if let Err(recovery_err) = self.recover_daemon_from_tui_state() {
+                    self.status_line =
+                        format!("Daemon refresh failed: {err}. Recovery failed: {recovery_err}");
+                }
             }
         }
         self.last_daemon_poll_at = Instant::now();
@@ -3484,6 +3378,68 @@ impl InteractiveTui {
         if previous_video_id != next_video_id {
             self.maybe_request_lyrics();
         }
+    }
+
+    fn playback_snapshot_from_tui_state(&self) -> PlaybackSnapshot {
+        let mut snapshot = self.snapshot.clone();
+        snapshot.queue_index = snapshot
+            .queue_index
+            .min(snapshot.queue.len().saturating_sub(1));
+
+        if snapshot.probe_active {
+            let fallback_rating = snapshot
+                .current_track
+                .as_ref()
+                .map(|track| track.rating)
+                .unwrap_or(SongRating::Indifferent);
+            snapshot.current_track = snapshot
+                .queue
+                .get(snapshot.queue_index)
+                .map(|track| active_track_snapshot_from_track(track, fallback_rating));
+            snapshot.position_millis = snapshot.probe_restore_position_millis;
+            snapshot.duration_millis = None;
+            snapshot.buffered_fraction = 0.0;
+            snapshot.paused = true;
+            snapshot.probe_active = false;
+            snapshot.probe_restore_position_millis = None;
+        } else {
+            snapshot.position_millis = self
+                .displayed_position_millis()
+                .or(snapshot.position_millis);
+        }
+
+        if snapshot.current_track.is_none() {
+            snapshot.current_track = snapshot
+                .queue
+                .get(snapshot.queue_index)
+                .map(|track| active_track_snapshot_from_track(track, SongRating::Indifferent));
+        }
+
+        snapshot
+    }
+
+    fn recover_daemon_from_tui_state(&mut self) -> Result<()> {
+        let snapshot = self.playback_snapshot_from_tui_state();
+        let has_recoverable_state = snapshot.current_track.is_some() || !snapshot.queue.is_empty();
+
+        let restored = if has_recoverable_state {
+            restore_playback_snapshot_via_daemon(
+                snapshot.clone(),
+                snapshot.current_track.is_some(),
+            )?
+        } else {
+            let client = DaemonClient::new()?;
+            client.state()?
+        };
+
+        self.client = DaemonClient::new()?;
+        self.apply_snapshot(restored);
+        self.status_line = if has_recoverable_state {
+            "staticd restarted from the TUI state.".to_string()
+        } else {
+            "staticd restarted.".to_string()
+        };
+        Ok(())
     }
 
     fn maybe_request_lyrics(&mut self) {
@@ -3550,6 +3506,30 @@ impl InteractiveTui {
         };
     }
 
+    fn run_action_request(&mut self, action: TuiAction) -> Result<PlaybackSnapshot> {
+        match action {
+            TuiAction::ResumeSaved => {
+                let persisted = load_persisted_playback_state()?
+                    .filter(|persisted| !persisted.snapshot.queue.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("No saved playback state is available"))?;
+                restore_playback_snapshot_via_daemon(persisted.snapshot, true)
+            }
+            TuiAction::TogglePause => self.client.toggle_pause(),
+            TuiAction::Previous => self.client.previous(),
+            TuiAction::Next => self.client.next(),
+            TuiAction::Like => self.client.rate_current_track(SongRating::Like),
+            TuiAction::Dislike => self.client.rate_current_track(SongRating::Dislike),
+            TuiAction::Neutral => self.client.rate_current_track(SongRating::Indifferent),
+            TuiAction::CycleRepeat => {
+                let next_mode = self
+                    .snapshot
+                    .repeat_mode
+                    .next(self.snapshot.radio_virtual_playlist.is_some());
+                self.client.set_repeat_mode(next_mode)
+            }
+        }
+    }
+
     fn run_action(&mut self, action: TuiAction) -> Result<()> {
         let effective_action = match action {
             TuiAction::Like
@@ -3573,26 +3553,15 @@ impl InteractiveTui {
             _ => action,
         };
 
-        let result = match effective_action {
-            TuiAction::ResumeSaved => {
-                let persisted = load_persisted_playback_state()?
-                    .filter(|persisted| !persisted.snapshot.queue.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("No saved playback state is available"))?;
-                restore_playback_snapshot_via_daemon(persisted.snapshot, true)
+        let result = match self.run_action_request(effective_action) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(err) if self.client.state().is_err() => {
+                self.recover_daemon_from_tui_state()
+                    .with_context(|| format!("Action failed: {err}"))?;
+                self.run_action_request(effective_action)
+                    .with_context(|| format!("Action retry failed after daemon recovery: {err}"))
             }
-            TuiAction::TogglePause => self.client.toggle_pause(),
-            TuiAction::Previous => self.client.previous(),
-            TuiAction::Next => self.client.next(),
-            TuiAction::Like => self.client.rate_current_track(SongRating::Like),
-            TuiAction::Dislike => self.client.rate_current_track(SongRating::Dislike),
-            TuiAction::Neutral => self.client.rate_current_track(SongRating::Indifferent),
-            TuiAction::CycleRepeat => {
-                let next_mode = self
-                    .snapshot
-                    .repeat_mode
-                    .next(self.snapshot.radio_virtual_playlist.is_some());
-                self.client.set_repeat_mode(next_mode)
-            }
+            Err(err) => Err(err),
         };
 
         match result {
@@ -4020,6 +3989,11 @@ impl InteractiveTui {
         } else if card_bottom > self.home_scroll_offset.saturating_add(viewport) {
             self.home_scroll_offset = card_bottom.saturating_sub(viewport);
         }
+        self.clamp_home_scroll_offset();
+    }
+
+    fn clamp_home_scroll_offset(&mut self) {
+        let viewport = self.home_viewport_rows.max(1);
         self.home_scroll_offset = self
             .home_scroll_offset
             .min(self.home_doc.total_height.saturating_sub(viewport));
@@ -5074,6 +5048,16 @@ fn current_initials(snapshot: &PlaybackSnapshot) -> String {
     placeholder_initials(title, artist)
 }
 
+fn active_track_snapshot_from_track(track: &Track, rating: SongRating) -> ActiveTrackSnapshot {
+    ActiveTrackSnapshot {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artist: artist_string(track),
+        thumb_url: track.thumbnail_url.clone(),
+        rating,
+    }
+}
+
 fn center_crop_square(image: DynamicImage) -> DynamicImage {
     let width = image.width();
     let height = image.height();
@@ -5150,6 +5134,33 @@ fn current_context_label(snapshot: &PlaybackSnapshot) -> String {
         return format!("Queue · {} tracks", snapshot.queue.len());
     }
     "Single track".to_string()
+}
+
+fn repeat_loops_left_label(snapshot: &PlaybackSnapshot) -> Option<String> {
+    snapshot
+        .track_repeat_loops_left
+        .filter(|_| snapshot.current_track.is_some())
+        .map(|loops_left| {
+            let loop_label = if loops_left == 1 { "loop" } else { "loops" };
+            format!("{loops_left} {loop_label} left")
+        })
+}
+
+fn player_bar_meta_spans(snapshot: &PlaybackSnapshot) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        current_context_label(snapshot),
+        Style::default().fg(Color::Rgb(130, 160, 255)),
+    )];
+
+    if let Some(loop_label) = repeat_loops_left_label(snapshot) {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            loop_label,
+            Style::default().fg(Color::Rgb(208, 221, 255)),
+        ));
+    }
+
+    spans
 }
 
 fn lyrics_meta_label(lyrics: &SyncedLyrics) -> String {
@@ -5252,45 +5263,6 @@ fn browse_label(page_type: HomeBrowsePageType) -> &'static str {
         HomeBrowsePageType::Artist => "Artist",
         HomeBrowsePageType::UserChannel => "Channel",
         HomeBrowsePageType::PodcastShow => "Podcast",
-    }
-}
-
-fn playback_status(snapshot: &PlaybackSnapshot) -> &'static str {
-    if snapshot.probe_active {
-        "probe"
-    } else if snapshot.current_track.is_some() {
-        if snapshot.paused {
-            "paused"
-        } else {
-            "playing"
-        }
-    } else {
-        "stopped"
-    }
-}
-
-fn status_color(theme: &TuiTheme, snapshot: &PlaybackSnapshot) -> Color {
-    match playback_status(snapshot) {
-        "playing" => theme.positive,
-        "paused" => theme.warning,
-        "probe" => theme.accent,
-        _ => theme.muted,
-    }
-}
-
-fn repeat_mode_label(mode: RepeatMode) -> &'static str {
-    match mode {
-        RepeatMode::Off => "repeat off",
-        RepeatMode::All => "repeat all",
-        RepeatMode::One => "repeat one",
-    }
-}
-
-fn repeat_button_label(mode: RepeatMode) -> &'static str {
-    match mode {
-        RepeatMode::Off => "Loop",
-        RepeatMode::All => "Loop+",
-        RepeatMode::One => "Loop1",
     }
 }
 

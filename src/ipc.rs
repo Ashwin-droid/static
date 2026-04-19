@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use gstreamer::ClockTime;
 use rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::logging::LogSource;
 use crate::models::{RadioVirtualPlaylist, Track};
@@ -382,13 +385,25 @@ pub fn ensure_daemon_running() -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to locate current executable")?;
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("--daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Failed to spawn playback daemon")?;
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    command.spawn().context("Failed to spawn playback daemon")?;
 
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
@@ -560,9 +575,9 @@ pub fn millis_to_clock_time(value: Option<u64>) -> Option<ClockTime> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTrackSnapshot, DaemonRequest, PLAYBACK_STATE_ROW_KEY, PersistedPlaybackState,
-        PlaybackSnapshot, PlaylistContext, PlaylistContextSource, clear_persisted_state_at_path,
-        current_unix_millis, load_persisted_state_at_path, store_persisted_state_at_path,
+        clear_persisted_state_at_path, current_unix_millis, load_persisted_state_at_path,
+        store_persisted_state_at_path, ActiveTrackSnapshot, DaemonRequest, PersistedPlaybackState,
+        PlaybackSnapshot, PlaylistContext, PlaylistContextSource, PLAYBACK_STATE_ROW_KEY,
     };
     use crate::ipc::RepeatMode;
     use crate::models::Track;
@@ -687,11 +702,9 @@ mod tests {
         store_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY, &persisted).unwrap();
         clear_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY).unwrap();
 
-        assert!(
-            load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY)
-                .unwrap()
-                .is_none()
-        );
+        assert!(load_persisted_state_at_path(&path, PLAYBACK_STATE_ROW_KEY)
+            .unwrap()
+            .is_none());
 
         let _ = fs::remove_file(&path);
         if let Some(parent) = path.parent() {

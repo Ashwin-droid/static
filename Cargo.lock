@@ -3601,6 +3601,7 @@ dependencies = [
  "gstreamer-play",
  "gtk4",
  "image",
+ "libc",
  "mpris",
  "mpris-server",
  "pbkdf2",

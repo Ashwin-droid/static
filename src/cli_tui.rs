@@ -21,7 +21,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Color, Modifier, Style, Terminal};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Gauge, List, ListItem, Padding, Paragraph, Scrollbar,
+    Block, BorderType, Borders, Clear, Gauge, List, ListItem, Padding, Paragraph, Scrollbar,
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use ratatui::Frame;
@@ -39,7 +39,10 @@ use crate::ipc::{
     load_persisted_playback_state, DaemonClient, PlaybackSnapshot, PlaylistContext,
     PlaylistContextSource, RepeatMode,
 };
-use crate::models::{HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, SyncedLyrics, Track};
+use crate::models::{
+    HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, RadioVirtualPlaylist, SyncedLyrics,
+    Track,
+};
 use crate::network::{fetch_thumbnail_bytes, SongRating};
 
 const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -269,6 +272,92 @@ struct ClickTarget {
     kind: ClickTargetKind,
 }
 
+#[derive(Clone)]
+enum TuiDragPayload {
+    QueueRow { index: usize },
+    Track { track: Track },
+    BrowseCollection { card: HomeBrowseCard },
+}
+
+struct PendingMousePress {
+    origin_column: u16,
+    origin_row: u16,
+    target_kind: ClickTargetKind,
+    target_rect: Rect,
+    payload: Option<TuiDragPayload>,
+}
+
+struct TuiDragState {
+    payload: TuiDragPayload,
+    preview_slot: Option<usize>,
+}
+
+#[derive(Clone)]
+enum ContextMenuAction {
+    PlayTrackNow {
+        track: Track,
+    },
+    PlayQueueNow {
+        index: usize,
+    },
+    QueueTrackNext {
+        track: Track,
+    },
+    QueueTrackLast {
+        track: Track,
+    },
+    OpenBrowseNow {
+        card: HomeBrowseCard,
+    },
+    QueueBrowseNext {
+        card: HomeBrowseCard,
+    },
+    QueueBrowseLast {
+        card: HomeBrowseCard,
+    },
+    ProbeTrack {
+        track: Track,
+    },
+    RemoveQueueItem {
+        index: usize,
+    },
+    SubmitFeedbackToken {
+        token: String,
+        verb: &'static str,
+        title: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ContextMenuTone {
+    Default,
+    Accent,
+    Danger,
+}
+
+#[derive(Clone)]
+struct ContextMenuItem {
+    label: String,
+    hint: String,
+    tone: ContextMenuTone,
+    action: ContextMenuAction,
+}
+
+struct ContextMenuState {
+    title: String,
+    subtitle: String,
+    items: Vec<ContextMenuItem>,
+    selected: usize,
+    anchor_column: u16,
+    anchor_row: u16,
+}
+
+#[derive(Clone, Default)]
+struct RenderedContextMenu {
+    menu_rect: Option<Rect>,
+    item_rects: Vec<Rect>,
+}
+
 #[derive(Clone, Default)]
 struct RenderedLayout {
     home_viewport: Rect,
@@ -350,6 +439,10 @@ struct InteractiveTui {
     thumbnail_requests: HashSet<String>,
     thumbnail_slots: HashMap<ThumbnailSlot, ThumbnailSlotState>,
     thumbnail_mode_label: String,
+    pending_mouse_press: Option<PendingMousePress>,
+    drag_state: Option<TuiDragState>,
+    context_menu: Option<ContextMenuState>,
+    rendered_context_menu: RenderedContextMenu,
 }
 
 impl InteractiveTui {
@@ -392,6 +485,10 @@ impl InteractiveTui {
             thumbnail_requests: HashSet::new(),
             thumbnail_slots: HashMap::new(),
             thumbnail_mode_label: "art off".to_string(),
+            pending_mouse_press: None,
+            drag_state: None,
+            context_menu: None,
+            rendered_context_menu: RenderedContextMenu::default(),
         };
         app.maybe_request_lyrics();
         Ok(app)
@@ -678,6 +775,841 @@ impl InteractiveTui {
         );
     }
 
+    fn queue_accepts_dnd(&self) -> bool {
+        self.detail_tab == DetailTab::Queue
+    }
+
+    fn drag_label(payload: &TuiDragPayload) -> String {
+        match payload {
+            TuiDragPayload::QueueRow { .. } => "Move in queue".to_string(),
+            TuiDragPayload::Track { track } => format!("Queue {}", shorten(&track.title, 28)),
+            TuiDragPayload::BrowseCollection { card } => {
+                format!("Queue {}", shorten(&card.title, 28))
+            }
+        }
+    }
+
+    fn drag_payload_for_target(&self, kind: &ClickTargetKind) -> Option<TuiDragPayload> {
+        match kind {
+            ClickTargetKind::QueueItem(index) => Some(TuiDragPayload::QueueRow { index: *index }),
+            ClickTargetKind::HomeItem(index) => {
+                let card = self.home_doc.cards.get(*index)?;
+                match &card.item {
+                    TuiHomeItem::Track(track) => Some(TuiDragPayload::Track {
+                        track: track.clone(),
+                    }),
+                    TuiHomeItem::Browse(card) => {
+                        Some(TuiDragPayload::BrowseCollection { card: card.clone() })
+                    }
+                }
+            }
+            ClickTargetKind::RecentItem(index) => self
+                .recent_tracks
+                .get(*index)
+                .cloned()
+                .map(|track| TuiDragPayload::Track { track }),
+            _ => None,
+        }
+    }
+
+    fn set_mouse_selection(&mut self, kind: &ClickTargetKind) {
+        match kind {
+            ClickTargetKind::HomeItem(index) => {
+                self.focus = TuiFocus::Home;
+                self.home_selected = *index;
+                self.ensure_home_visible();
+            }
+            ClickTargetKind::QueueItem(index) => {
+                self.focus = TuiFocus::Queue;
+                self.queue_selected = *index;
+                self.ensure_queue_visible();
+            }
+            ClickTargetKind::RecentItem(index) => {
+                self.focus = TuiFocus::Recent;
+                self.recent_selected = *index;
+                self.ensure_recent_visible();
+            }
+            _ => {}
+        }
+    }
+
+    fn queue_visible_len(&self) -> usize {
+        self.snapshot
+            .queue
+            .len()
+            .saturating_sub(self.queue_scroll_offset)
+            .min(self.queue_viewport_rows.max(1))
+    }
+
+    fn queue_raw_slot_for_mouse_row(&self, row: u16) -> usize {
+        if self.snapshot.queue.is_empty() {
+            return 0;
+        }
+
+        let viewport = self.rendered_layout.queue_viewport;
+        if viewport.height == 0 {
+            return self.snapshot.queue.len();
+        }
+
+        if row <= viewport.y {
+            return self.queue_scroll_offset.min(self.snapshot.queue.len());
+        }
+
+        let visible_len = self.queue_visible_len();
+        if visible_len == 0 {
+            return self.snapshot.queue.len();
+        }
+
+        let relative = row.saturating_sub(viewport.y) as usize;
+        let row_height = QUEUE_ROW_HEIGHT as usize;
+        let row_index = (relative / row_height).min(visible_len.saturating_sub(1));
+        let within_row = relative % row_height;
+        let absolute_index = self.queue_scroll_offset + row_index;
+        let midpoint = QUEUE_ROW_HEIGHT as f32 / 2.0;
+        let before_row = (within_row as f32) < midpoint;
+        if before_row {
+            absolute_index
+        } else {
+            absolute_index
+                .saturating_add(1)
+                .min(self.snapshot.queue.len())
+        }
+    }
+
+    fn normalized_preview_slot_for_drag(
+        &self,
+        payload: &TuiDragPayload,
+        raw_slot: usize,
+    ) -> Option<usize> {
+        match payload {
+            TuiDragPayload::QueueRow { index: from } => {
+                let normalized = if *from < raw_slot {
+                    raw_slot.saturating_sub(1)
+                } else {
+                    raw_slot
+                };
+                (normalized != *from).then_some(raw_slot)
+            }
+            _ => Some(raw_slot),
+        }
+    }
+
+    fn maybe_autoscroll_queue_drag(&mut self, row: u16) {
+        if !self.queue_accepts_dnd() {
+            return;
+        }
+        let viewport = self.rendered_layout.queue_viewport;
+        if viewport.height == 0 || self.snapshot.queue.len() <= self.queue_viewport_rows {
+            return;
+        }
+
+        let edge = QUEUE_ROW_HEIGHT.saturating_mul(2);
+        if row <= viewport.y.saturating_add(edge) && self.queue_scroll_offset > 0 {
+            self.queue_scroll_offset = self.queue_scroll_offset.saturating_sub(1);
+        } else if row.saturating_add(edge) >= viewport.bottom()
+            && self
+                .queue_scroll_offset
+                .saturating_add(self.queue_viewport_rows)
+                < self.snapshot.queue.len()
+        {
+            self.queue_scroll_offset = self.queue_scroll_offset.saturating_add(1);
+        }
+    }
+
+    fn update_drag_preview(&mut self, column: u16, row: u16) {
+        let Some(payload) = self.drag_state.as_ref().map(|drag| drag.payload.clone()) else {
+            return;
+        };
+        if !self.queue_accepts_dnd() || !contains(self.rendered_layout.queue_viewport, column, row)
+        {
+            if let Some(drag) = self.drag_state.as_mut() {
+                drag.preview_slot = None;
+            }
+            return;
+        }
+
+        self.focus = TuiFocus::Queue;
+        self.maybe_autoscroll_queue_drag(row);
+        let raw_slot = self.queue_raw_slot_for_mouse_row(row);
+        let preview_slot = self.normalized_preview_slot_for_drag(&payload, raw_slot);
+        if let Some(drag) = self.drag_state.as_mut() {
+            drag.preview_slot = preview_slot;
+        }
+    }
+
+    fn clear_drag_state(&mut self) {
+        self.pending_mouse_press = None;
+        self.drag_state = None;
+    }
+
+    fn current_preview_slot(&self) -> Option<usize> {
+        self.drag_state.as_ref().and_then(|drag| drag.preview_slot)
+    }
+
+    fn apply_queue_row_reorder(&mut self, from: usize, raw_slot: usize) -> Result<()> {
+        let insert_at = if from < raw_slot {
+            raw_slot.saturating_sub(1)
+        } else {
+            raw_slot
+        };
+        if insert_at == from
+            || from >= self.snapshot.queue.len()
+            || raw_slot > self.snapshot.queue.len()
+        {
+            return Ok(());
+        }
+
+        let mut queue = self.snapshot.queue.clone();
+        let moved_track = queue.remove(from);
+        queue.insert(insert_at, moved_track.clone());
+
+        let current_index = adjusted_reorder_index(self.snapshot.queue_index, from, insert_at);
+        let selected_index = adjusted_reorder_index(self.queue_selected, from, insert_at);
+        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
+        update_radio_touched_for_reorder(&mut radio_virtual_playlist, from, insert_at);
+
+        let snapshot = self.client.replace_queue(
+            queue,
+            current_index,
+            self.snapshot.playlist_context.clone(),
+            radio_virtual_playlist,
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.focus = TuiFocus::Queue;
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = selected_index.min(self.snapshot.queue.len().saturating_sub(1));
+        self.ensure_queue_visible();
+        self.status_line = format!(
+            "Moved {} to slot {}.",
+            shorten(&moved_track.title, 28),
+            insert_at.saturating_add(1)
+        );
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn insert_tracks_into_queue(&mut self, tracks: Vec<Track>, raw_slot: usize) -> Result<()> {
+        if tracks.is_empty() {
+            self.status_line = "Nothing to insert into the queue.".to_string();
+            return Ok(());
+        }
+
+        let had_queue = !self.snapshot.queue.is_empty();
+        let insert_at = raw_slot.min(self.snapshot.queue.len());
+        let added = tracks.len();
+        let first_title = tracks
+            .first()
+            .map(|track| shorten(&track.title, 28))
+            .unwrap_or_else(|| "tracks".to_string());
+        let mut queue = self.snapshot.queue.clone();
+        for (offset, track) in tracks.into_iter().enumerate() {
+            queue.insert(insert_at + offset, track);
+        }
+
+        let current_index = if had_queue && insert_at <= self.snapshot.queue_index {
+            self.snapshot.queue_index.saturating_add(added)
+        } else {
+            self.snapshot.queue_index
+        };
+        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
+        extend_radio_touched_for_insert(&mut radio_virtual_playlist, insert_at, added);
+
+        let snapshot = self.client.replace_queue(
+            queue,
+            current_index,
+            self.snapshot.playlist_context.clone(),
+            radio_virtual_playlist,
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.focus = TuiFocus::Queue;
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = insert_at.min(self.snapshot.queue.len().saturating_sub(1));
+        self.ensure_queue_visible();
+        self.status_line = if added == 1 {
+            format!("Queued {}.", first_title)
+        } else {
+            format!("Queued {} tracks.", added)
+        };
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn handle_drag_drop(&mut self, payload: TuiDragPayload, raw_slot: usize) -> Result<()> {
+        match payload {
+            TuiDragPayload::QueueRow { index } => self.apply_queue_row_reorder(index, raw_slot),
+            TuiDragPayload::Track { track } => self.insert_tracks_into_queue(vec![track], raw_slot),
+            TuiDragPayload::BrowseCollection { card } => {
+                let network =
+                    saved_network_state().context("Connect YouTube Music in the GTK app first")?;
+                let tracks = network
+                    .get_browse_tracks(&card.browse_id)
+                    .with_context(|| format!("Failed to open {}", card.title))?;
+                self.insert_tracks_into_queue(tracks, raw_slot)
+            }
+        }
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu = None;
+        self.rendered_context_menu = RenderedContextMenu::default();
+    }
+
+    fn context_menu_track_items(&self, track: &Track) -> Vec<ContextMenuItem> {
+        let mut items = vec![
+            ContextMenuItem {
+                label: "Play now".to_string(),
+                hint: "start radio".to_string(),
+                tone: ContextMenuTone::Accent,
+                action: ContextMenuAction::PlayTrackNow {
+                    track: track.clone(),
+                },
+            },
+            ContextMenuItem {
+                label: "Play next".to_string(),
+                hint: "after current".to_string(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::QueueTrackNext {
+                    track: track.clone(),
+                },
+            },
+            ContextMenuItem {
+                label: "Add to queue".to_string(),
+                hint: "respect radio tail".to_string(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::QueueTrackLast {
+                    track: track.clone(),
+                },
+            },
+            ContextMenuItem {
+                label: "Probe headless".to_string(),
+                hint: "no radio".to_string(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::ProbeTrack {
+                    track: track.clone(),
+                },
+            },
+        ];
+
+        if let Some(token) = track.not_interested_feedback_token.clone() {
+            items.push(ContextMenuItem {
+                label: "Not interested".to_string(),
+                hint: "feedback".to_string(),
+                tone: ContextMenuTone::Danger,
+                action: ContextMenuAction::SubmitFeedbackToken {
+                    token,
+                    verb: "Marked as not interested",
+                    title: track.title.clone(),
+                },
+            });
+        }
+        if let Some(token) = track.undo_feedback_token.clone() {
+            items.push(ContextMenuItem {
+                label: "Undo feedback".to_string(),
+                hint: "restore".to_string(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::SubmitFeedbackToken {
+                    token,
+                    verb: "Feedback undone for",
+                    title: track.title.clone(),
+                },
+            });
+        }
+
+        items
+    }
+
+    fn browse_card_queueable(card: &HomeBrowseCard) -> bool {
+        matches!(
+            card.page_type,
+            HomeBrowsePageType::Album
+                | HomeBrowsePageType::Playlist
+                | HomeBrowsePageType::PodcastShow
+        )
+    }
+
+    fn context_menu_for_target(
+        &self,
+        kind: &ClickTargetKind,
+        anchor_column: u16,
+        anchor_row: u16,
+    ) -> Option<ContextMenuState> {
+        let (title, subtitle, items) = match kind {
+            ClickTargetKind::QueueItem(index) => {
+                let track = self.snapshot.queue.get(*index)?.clone();
+                let mut items = vec![
+                    ContextMenuItem {
+                        label: "Play now".to_string(),
+                        hint: "keep queue".to_string(),
+                        tone: ContextMenuTone::Accent,
+                        action: ContextMenuAction::PlayQueueNow { index: *index },
+                    },
+                    ContextMenuItem {
+                        label: "Probe headless".to_string(),
+                        hint: "no radio".to_string(),
+                        tone: ContextMenuTone::Default,
+                        action: ContextMenuAction::ProbeTrack {
+                            track: track.clone(),
+                        },
+                    },
+                ];
+                if let Some(token) = track.not_interested_feedback_token.clone() {
+                    items.push(ContextMenuItem {
+                        label: "Not interested".to_string(),
+                        hint: "feedback".to_string(),
+                        tone: ContextMenuTone::Danger,
+                        action: ContextMenuAction::SubmitFeedbackToken {
+                            token,
+                            verb: "Marked as not interested",
+                            title: track.title.clone(),
+                        },
+                    });
+                }
+                if let Some(token) = track.undo_feedback_token.clone() {
+                    items.push(ContextMenuItem {
+                        label: "Undo feedback".to_string(),
+                        hint: "restore".to_string(),
+                        tone: ContextMenuTone::Default,
+                        action: ContextMenuAction::SubmitFeedbackToken {
+                            token,
+                            verb: "Feedback undone for",
+                            title: track.title.clone(),
+                        },
+                    });
+                }
+                if *index != self.snapshot.queue_index {
+                    items.push(ContextMenuItem {
+                        label: "Remove from queue".to_string(),
+                        hint: "delete row".to_string(),
+                        tone: ContextMenuTone::Danger,
+                        action: ContextMenuAction::RemoveQueueItem { index: *index },
+                    });
+                }
+                (
+                    format!("Queue #{}", index.saturating_add(1)),
+                    format_track_summary(&track),
+                    items,
+                )
+            }
+            ClickTargetKind::HomeItem(index) => {
+                let card = self.home_doc.cards.get(*index)?.clone();
+                match card.item {
+                    TuiHomeItem::Track(track) => (
+                        track.title.clone(),
+                        artist_string(&track),
+                        self.context_menu_track_items(&track),
+                    ),
+                    TuiHomeItem::Browse(card) => {
+                        let mut items = vec![ContextMenuItem {
+                            label: "Open now".to_string(),
+                            hint: browse_label(card.page_type).to_lowercase(),
+                            tone: ContextMenuTone::Accent,
+                            action: ContextMenuAction::OpenBrowseNow { card: card.clone() },
+                        }];
+                        if Self::browse_card_queueable(&card) {
+                            items.push(ContextMenuItem {
+                                label: "Queue next".to_string(),
+                                hint: "insert collection".to_string(),
+                                tone: ContextMenuTone::Default,
+                                action: ContextMenuAction::QueueBrowseNext { card: card.clone() },
+                            });
+                            items.push(ContextMenuItem {
+                                label: "Add to queue".to_string(),
+                                hint: "append collection".to_string(),
+                                tone: ContextMenuTone::Default,
+                                action: ContextMenuAction::QueueBrowseLast { card: card.clone() },
+                            });
+                        }
+                        (
+                            card.title.clone(),
+                            card.subtitle
+                                .clone()
+                                .unwrap_or_else(|| browse_label(card.page_type).to_string()),
+                            items,
+                        )
+                    }
+                }
+            }
+            ClickTargetKind::RecentItem(index) => {
+                let track = self.recent_tracks.get(*index)?.clone();
+                (
+                    track.title.clone(),
+                    artist_string(&track),
+                    self.context_menu_track_items(&track),
+                )
+            }
+            _ => return None,
+        };
+
+        if items.is_empty() {
+            return None;
+        }
+
+        Some(ContextMenuState {
+            title,
+            subtitle,
+            items,
+            selected: 0,
+            anchor_column,
+            anchor_row,
+        })
+    }
+
+    fn open_context_menu(
+        &mut self,
+        kind: &ClickTargetKind,
+        anchor_column: u16,
+        anchor_row: u16,
+    ) -> bool {
+        if let Some(menu) = self.context_menu_for_target(kind, anchor_column, anchor_row) {
+            self.context_menu = Some(menu);
+            self.status_line =
+                "Context menu open. Enter runs, esc closes, arrows or j/k move.".to_string();
+            true
+        } else {
+            self.close_context_menu();
+            false
+        }
+    }
+
+    fn queue_next_slot(&self) -> usize {
+        if self.snapshot.queue.is_empty() {
+            0
+        } else {
+            self.snapshot
+                .queue_index
+                .saturating_add(1)
+                .min(self.snapshot.queue.len())
+        }
+    }
+
+    fn queue_last_slot(&self) -> usize {
+        self.snapshot
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.touched_len.min(self.snapshot.queue.len()))
+            .unwrap_or(self.snapshot.queue.len())
+    }
+
+    fn play_track_now(&mut self, track: Track) -> Result<()> {
+        let snapshot = play_track_with_radio(&self.client, track.clone())?;
+        self.apply_snapshot(snapshot);
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = self
+            .snapshot
+            .queue_index
+            .min(self.snapshot.queue.len().saturating_sub(1));
+        self.status_line = format!("Playing {}", format_track_summary(&track));
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn open_browse_card_now(&mut self, card: HomeBrowseCard) -> Result<()> {
+        let network = saved_network_state()?;
+        let tracks = network
+            .get_browse_tracks(&card.browse_id)
+            .with_context(|| format!("Failed to open {}", card.title))?;
+        if tracks.is_empty() {
+            self.status_line = format!("{} has no playable tracks yet.", card.title);
+            return Ok(());
+        }
+
+        let context = PlaylistContext {
+            playlist_id: card.browse_id.clone(),
+            title: card.title.clone(),
+            thumbnail_url: card.thumbnail_url.clone(),
+            subtitle: card.subtitle.clone(),
+            source: PlaylistContextSource::Browse,
+        };
+        let snapshot =
+            self.client
+                .play_queue_at(tracks, 0, Some(context), None, RepeatMode::Off)?;
+        self.apply_snapshot(snapshot);
+        self.detail_tab = DetailTab::Queue;
+        self.queue_selected = self
+            .snapshot
+            .queue_index
+            .min(self.snapshot.queue.len().saturating_sub(1));
+        self.status_line = format!("Opened {}", card.title);
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn probe_track_now(&mut self, track: Track) -> Result<()> {
+        let snapshot = self.client.probe_track(track.clone())?;
+        self.apply_snapshot(snapshot);
+        self.status_line = format!("Probing {}", format_track_summary(&track));
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn play_queue_index_now(&mut self, index: usize) -> Result<()> {
+        if self.snapshot.queue.is_empty() || index >= self.snapshot.queue.len() {
+            self.status_line = "Queue item is gone.".to_string();
+            return Ok(());
+        }
+
+        let snapshot = self.client.play_queue_at(
+            self.snapshot.queue.clone(),
+            index,
+            self.snapshot.playlist_context.clone(),
+            self.snapshot.radio_virtual_playlist.clone(),
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.queue_selected = index.min(self.snapshot.queue.len().saturating_sub(1));
+        self.ensure_queue_visible();
+        self.status_line = format!(
+            "Playing {}",
+            self.snapshot
+                .queue
+                .get(index)
+                .map(format_track_summary)
+                .unwrap_or_else(|| "selection".to_string())
+        );
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn remove_queue_item(&mut self, index: usize) -> Result<()> {
+        if self.snapshot.queue.is_empty() || index >= self.snapshot.queue.len() {
+            self.status_line = "Queue row is gone.".to_string();
+            return Ok(());
+        }
+        if index == self.snapshot.queue_index {
+            self.status_line = "Remove a non-playing row or drag the queue around it.".to_string();
+            return Ok(());
+        }
+
+        let mut queue = self.snapshot.queue.clone();
+        let removed = queue.remove(index);
+        let current_index = if index < self.snapshot.queue_index {
+            self.snapshot.queue_index.saturating_sub(1)
+        } else {
+            self.snapshot.queue_index.min(queue.len().saturating_sub(1))
+        };
+        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
+        shrink_radio_touched_for_remove(&mut radio_virtual_playlist, index);
+        let snapshot = self.client.replace_queue(
+            queue,
+            current_index,
+            self.snapshot.playlist_context.clone(),
+            radio_virtual_playlist,
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.queue_selected = index.min(self.snapshot.queue.len().saturating_sub(1));
+        self.ensure_queue_visible();
+        self.status_line = format!("Removed {}.", shorten(&removed.title, 28));
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn submit_feedback_token_action(
+        &mut self,
+        token: String,
+        verb: &'static str,
+        title: String,
+    ) -> Result<()> {
+        saved_network_state()?.submit_feedback_token(&token)?;
+        self.status_line = format!("{verb} {}.", shorten(&title, 28));
+        self.last_refresh_at = Instant::now();
+        Ok(())
+    }
+
+    fn execute_context_menu_action(&mut self, action: ContextMenuAction) -> Result<()> {
+        match action {
+            ContextMenuAction::PlayTrackNow { track } => self.play_track_now(track),
+            ContextMenuAction::PlayQueueNow { index } => self.play_queue_index_now(index),
+            ContextMenuAction::QueueTrackNext { track } => {
+                self.handle_drag_drop(TuiDragPayload::Track { track }, self.queue_next_slot())
+            }
+            ContextMenuAction::QueueTrackLast { track } => {
+                self.handle_drag_drop(TuiDragPayload::Track { track }, self.queue_last_slot())
+            }
+            ContextMenuAction::OpenBrowseNow { card } => self.open_browse_card_now(card),
+            ContextMenuAction::QueueBrowseNext { card } => self.handle_drag_drop(
+                TuiDragPayload::BrowseCollection { card },
+                self.queue_next_slot(),
+            ),
+            ContextMenuAction::QueueBrowseLast { card } => self.handle_drag_drop(
+                TuiDragPayload::BrowseCollection { card },
+                self.queue_last_slot(),
+            ),
+            ContextMenuAction::ProbeTrack { track } => self.probe_track_now(track),
+            ContextMenuAction::RemoveQueueItem { index } => self.remove_queue_item(index),
+            ContextMenuAction::SubmitFeedbackToken { token, verb, title } => {
+                self.submit_feedback_token_action(token, verb, title)
+            }
+        }
+    }
+
+    fn move_context_menu_selection(&mut self, delta: isize) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        if menu.items.is_empty() {
+            menu.selected = 0;
+            return;
+        }
+        menu.selected = move_index(menu.selected, menu.items.len(), delta);
+    }
+
+    fn activate_context_menu_selection(&mut self) -> Result<()> {
+        let Some(action) = self
+            .context_menu
+            .as_ref()
+            .and_then(|menu| menu.items.get(menu.selected))
+            .map(|item| item.action.clone())
+        else {
+            self.close_context_menu();
+            return Ok(());
+        };
+        self.close_context_menu();
+        self.execute_context_menu_action(action)
+    }
+
+    fn select_context_menu_item(&mut self, index: usize) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.selected = index.min(menu.items.len().saturating_sub(1));
+        }
+    }
+
+    fn render_context_menu(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &TuiTheme,
+    ) -> RenderedContextMenu {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return RenderedContextMenu::default();
+        };
+
+        let title_width = menu.title.chars().count();
+        let subtitle_width = menu.subtitle.chars().count();
+        let item_width = menu
+            .items
+            .iter()
+            .map(|item| item.label.chars().count() + item.hint.chars().count() + 6)
+            .max()
+            .unwrap_or(0);
+        let width = (title_width.max(subtitle_width).max(item_width) as u16)
+            .saturating_add(6)
+            .clamp(24, area.width.saturating_sub(2).max(24));
+        let body_height = menu.items.len() as u16;
+        let height = (body_height + 5).clamp(6, area.height.saturating_sub(2).max(6));
+        let x = if menu.anchor_column.saturating_add(width) <= area.right() {
+            menu.anchor_column.min(area.right().saturating_sub(width))
+        } else {
+            area.right().saturating_sub(width)
+        }
+        .max(area.x.saturating_add(1));
+        let y = if menu.anchor_row.saturating_add(height) <= area.bottom() {
+            menu.anchor_row.min(area.bottom().saturating_sub(height))
+        } else {
+            area.bottom().saturating_sub(height)
+        }
+        .max(area.y.saturating_add(1));
+        let menu_rect = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, menu_rect);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border_focus))
+                .style(Style::default().bg(theme.elevated_alt_bg)),
+            menu_rect,
+        );
+
+        let inner = Rect::new(
+            menu_rect.x.saturating_add(1),
+            menu_rect.y.saturating_add(1),
+            menu_rect.width.saturating_sub(2),
+            menu_rect.height.saturating_sub(2),
+        );
+        let item_rows = menu.items.len() as u16;
+        let footer_height = 1u16;
+        let subtitle_height = 1u16;
+        let spacer_height = 1u16;
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(subtitle_height),
+                Constraint::Length(item_rows),
+                Constraint::Length(spacer_height),
+                Constraint::Length(footer_height),
+            ])
+            .split(inner);
+
+        frame.render_widget(
+            Paragraph::new(shorten(&menu.title, rows[0].width as usize))
+                .style(Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+            rows[0],
+        );
+        frame.render_widget(
+            Paragraph::new(shorten(&menu.subtitle, rows[1].width as usize))
+                .style(Style::default().fg(theme.muted)),
+            rows[1],
+        );
+
+        let mut item_rects = Vec::with_capacity(menu.items.len());
+        for (index, item) in menu.items.iter().enumerate() {
+            let row = Rect::new(rows[2].x, rows[2].y + index as u16, rows[2].width, 1);
+            let selected = index == menu.selected;
+            let (fg, bg) = match (item.tone, selected) {
+                (ContextMenuTone::Accent, true) => (theme.accent_glow, theme.accent_fill),
+                (ContextMenuTone::Accent, false) => (theme.accent, theme.elevated_alt_bg),
+                (ContextMenuTone::Danger, true) => (theme.text, theme.danger),
+                (ContextMenuTone::Danger, false) => (theme.danger, theme.elevated_alt_bg),
+                (ContextMenuTone::Default, true) => (theme.text, theme.selected_bg),
+                (ContextMenuTone::Default, false) => (theme.text, theme.elevated_alt_bg),
+            };
+            frame.render_widget(Block::default().style(Style::default().bg(bg)), row);
+            let label = shorten(
+                &format!("{:>2}. {}", index.saturating_add(1), item.label),
+                row.width.saturating_sub(item.hint.len() as u16 + 1) as usize,
+            );
+            let gap = row
+                .width
+                .saturating_sub(label.chars().count() as u16)
+                .saturating_sub(item.hint.chars().count() as u16)
+                .max(1) as usize;
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        label,
+                        Style::default().fg(fg).bg(bg).add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                    Span::raw(" ".repeat(gap)),
+                    Span::styled(
+                        shorten(&item.hint, row.width as usize / 2),
+                        Style::default().fg(theme.muted).bg(bg),
+                    ),
+                ])),
+                row,
+            );
+            item_rects.push(row);
+        }
+
+        frame.render_widget(
+            Paragraph::new("enter run  esc close  j/k move")
+                .style(Style::default().fg(theme.border_focus)),
+            rows[4],
+        );
+
+        RenderedContextMenu {
+            menu_rect: Some(menu_rect),
+            item_rects,
+        }
+    }
+
     fn render_frame(&mut self, frame: &mut Frame<'_>) -> (Vec<ClickTarget>, RenderedLayout) {
         let area = frame.area();
         let theme = TuiTheme::from_snapshot(&self.snapshot);
@@ -722,6 +1654,7 @@ impl InteractiveTui {
                 .wrap(Wrap { trim: true }),
                 inner,
             );
+            self.rendered_context_menu = RenderedContextMenu::default();
             return (Vec::new(), RenderedLayout::default());
         }
 
@@ -756,6 +1689,7 @@ impl InteractiveTui {
         click_targets.extend(self.render_content(frame, content_area, &theme, &mut layout));
         click_targets.extend(self.render_detail_panel(frame, detail_area, &theme, &mut layout));
         click_targets.extend(self.render_player_bar(frame, player_area, &theme, &mut layout));
+        self.rendered_context_menu = self.render_context_menu(frame, area, &theme);
 
         (click_targets, layout)
     }
@@ -1454,11 +2388,15 @@ impl InteractiveTui {
                 let queue_block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(if self.focus == TuiFocus::Queue {
-                        theme.border_focus
-                    } else {
-                        theme.border_subtle
-                    }))
+                    .border_style(Style::default().fg(
+                        if self.drag_state.is_some() && self.queue_accepts_dnd() {
+                            theme.accent
+                        } else if self.focus == TuiFocus::Queue {
+                            theme.border_focus
+                        } else {
+                            theme.border_subtle
+                        },
+                    ))
                     .style(Style::default().bg(theme.elevated_bg));
                 let queue_inner = queue_block.inner(body_rows[1]);
                 frame.render_widget(queue_block, body_rows[1]);
@@ -1468,9 +2406,13 @@ impl InteractiveTui {
 
                 if self.snapshot.queue.is_empty() {
                     frame.render_widget(
-                        Paragraph::new("Queue is empty.")
-                            .alignment(Alignment::Center)
-                            .style(Style::default().fg(theme.muted)),
+                        Paragraph::new(if self.drag_state.is_some() && self.queue_accepts_dnd() {
+                            "Drop into queue."
+                        } else {
+                            "Queue is empty."
+                        })
+                        .alignment(Alignment::Center)
+                        .style(Style::default().fg(theme.muted)),
                         queue_inner,
                     );
                 } else {
@@ -1493,13 +2435,19 @@ impl InteractiveTui {
                         );
                         let is_selected = absolute_index == self.queue_selected;
                         let is_current = absolute_index == self.snapshot.queue_index;
+                        let is_dragging_row = self
+                            .drag_state
+                            .as_ref()
+                            .is_some_and(|drag| matches!(drag.payload, TuiDragPayload::QueueRow { index } if index == absolute_index));
                         let is_generated = self
                             .snapshot
                             .radio_virtual_playlist
                             .as_ref()
                             .is_some_and(|radio| absolute_index >= radio.touched_len);
                         frame.render_widget(
-                            Block::default().style(Style::default().bg(if is_selected {
+                            Block::default().style(Style::default().bg(if is_dragging_row {
+                                theme.accent_fill
+                            } else if is_selected {
                                 theme.selected_bg
                             } else if is_current {
                                 theme.content_alt_bg
@@ -1598,6 +2546,22 @@ impl InteractiveTui {
                         body_rows[1],
                         &mut scrollbar_state,
                     );
+
+                    if let Some(raw_slot) = self.current_preview_slot() {
+                        render_queue_drop_indicator(
+                            frame,
+                            queue_inner,
+                            raw_slot,
+                            self.queue_scroll_offset,
+                            end,
+                            self.snapshot.queue.len(),
+                            theme,
+                            self.drag_state
+                                .as_ref()
+                                .map(|drag| Self::drag_label(&drag.payload))
+                                .unwrap_or_else(|| "Drop".to_string()),
+                        );
+                    }
                 }
 
                 let footer_block = Block::default()
@@ -2074,6 +3038,54 @@ impl InteractiveTui {
     }
 
     fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+        if self.context_menu.is_some() {
+            match code {
+                KeyCode::Esc => {
+                    self.close_context_menu();
+                    self.status_line = "Context menu closed.".to_string();
+                    return Ok(false);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.move_context_menu_selection(-1);
+                    return Ok(false);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.move_context_menu_selection(1);
+                    return Ok(false);
+                }
+                KeyCode::Home | KeyCode::Char('g') => {
+                    self.select_context_menu_item(0);
+                    return Ok(false);
+                }
+                KeyCode::End | KeyCode::Char('G') => {
+                    let last = self
+                        .context_menu
+                        .as_ref()
+                        .map(|menu| menu.items.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    self.select_context_menu_item(last);
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    self.activate_context_menu_selection()?;
+                    return Ok(false);
+                }
+                KeyCode::Char(ch) if ('1'..='9').contains(&ch) => {
+                    let index = ch as usize - '1' as usize;
+                    if self
+                        .context_menu
+                        .as_ref()
+                        .is_some_and(|menu| index < menu.items.len())
+                    {
+                        self.select_context_menu_item(index);
+                        self.activate_context_menu_selection()?;
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         match code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
             KeyCode::Tab => self.cycle_focus(),
@@ -2108,29 +3120,116 @@ impl InteractiveTui {
             MouseEventKind::ScrollDown => self.scroll_panel(mouse.column, mouse.row, 2),
             MouseEventKind::ScrollUp => self.scroll_panel(mouse.column, mouse.row, -2),
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(target_kind) = self
+                let clicked_menu_item = self
+                    .rendered_context_menu
+                    .item_rects
+                    .iter()
+                    .position(|rect| contains(*rect, mouse.column, mouse.row));
+                let clicked_inside_menu = self
+                    .rendered_context_menu
+                    .menu_rect
+                    .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
+                if let Some(index) = clicked_menu_item {
+                    self.select_context_menu_item(index);
+                    self.activate_context_menu_selection()?;
+                    return Ok(());
+                }
+                if self.context_menu.is_some() {
+                    self.close_context_menu();
+                    if clicked_inside_menu {
+                        return Ok(());
+                    }
+                }
+                self.drag_state = None;
+                if let Some(target) = self
                     .click_targets
                     .iter()
                     .find(|target| contains(target.rect, mouse.column, mouse.row))
-                    .map(|target| target.kind.clone())
+                    .cloned()
                 {
-                    self.activate_click_target(&target_kind)?;
+                    if let Some(payload) = self.drag_payload_for_target(&target.kind) {
+                        self.set_mouse_selection(&target.kind);
+                        self.pending_mouse_press = Some(PendingMousePress {
+                            origin_column: mouse.column,
+                            origin_row: mouse.row,
+                            target_kind: target.kind,
+                            target_rect: target.rect,
+                            payload: Some(payload),
+                        });
+                    } else {
+                        self.pending_mouse_press = None;
+                        self.activate_click_target(&target.kind)?;
+                    }
                 } else if contains(
                     self.rendered_layout.player_progress_viewport,
                     mouse.column,
                     mouse.row,
                 ) {
+                    self.pending_mouse_press = None;
                     self.seek_from_progress_click(mouse.column)?;
                 } else if contains(self.rendered_layout.home_viewport, mouse.column, mouse.row) {
+                    self.pending_mouse_press = None;
                     self.focus = TuiFocus::Home;
                 } else if contains(self.rendered_layout.queue_viewport, mouse.column, mouse.row) {
+                    self.pending_mouse_press = None;
                     self.focus = TuiFocus::Queue;
                 } else if contains(
                     self.rendered_layout.recent_viewport,
                     mouse.column,
                     mouse.row,
                 ) {
+                    self.pending_mouse_press = None;
                     self.focus = TuiFocus::Recent;
+                } else {
+                    self.pending_mouse_press = None;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.clear_drag_state();
+                if let Some(target) = self
+                    .click_targets
+                    .iter()
+                    .find(|target| contains(target.rect, mouse.column, mouse.row))
+                    .cloned()
+                {
+                    self.set_mouse_selection(&target.kind);
+                    self.open_context_menu(&target.kind, mouse.column, mouse.row);
+                } else {
+                    self.close_context_menu();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.close_context_menu();
+                if self.drag_state.is_none() {
+                    if let Some(press) = self.pending_mouse_press.as_ref() {
+                        let moved =
+                            mouse.column != press.origin_column || mouse.row != press.origin_row;
+                        if moved {
+                            if let Some(payload) = press.payload.clone() {
+                                self.drag_state = Some(TuiDragState {
+                                    payload,
+                                    preview_slot: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if self.drag_state.is_some() {
+                    self.update_drag_preview(mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(drag) = self.drag_state.take() {
+                    self.pending_mouse_press = None;
+                    if let Some(raw_slot) = drag.preview_slot {
+                        if let Err(err) = self.handle_drag_drop(drag.payload, raw_slot) {
+                            self.status_line = format!("Drag failed: {err}");
+                        }
+                    }
+                } else if let Some(press) = self.pending_mouse_press.take() {
+                    if contains(press.target_rect, mouse.column, mouse.row) {
+                        self.activate_click_target(&press.target_kind)?;
+                    }
                 }
             }
             _ => {}
@@ -3456,6 +4555,121 @@ fn draw_home_thumbnail_well(
                 .bg(background)
                 .add_modifier(Modifier::BOLD),
         );
+    }
+}
+
+fn render_queue_drop_indicator(
+    frame: &mut Frame<'_>,
+    queue_inner: Rect,
+    raw_slot: usize,
+    scroll_offset: usize,
+    visible_end: usize,
+    queue_len: usize,
+    theme: &TuiTheme,
+    label: String,
+) {
+    if queue_inner.width == 0 || queue_inner.height == 0 {
+        return;
+    }
+
+    let y = if queue_len == 0 || raw_slot <= scroll_offset {
+        queue_inner.y
+    } else if raw_slot >= visible_end {
+        queue_inner.bottom().saturating_sub(1)
+    } else {
+        queue_inner.y + (raw_slot.saturating_sub(scroll_offset) as u16 * QUEUE_ROW_HEIGHT)
+    };
+
+    let area = Rect::new(queue_inner.x, y, queue_inner.width.saturating_sub(1), 1);
+    if area.width == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.accent)),
+        area,
+    );
+    frame.render_widget(
+        Paragraph::new(shorten(&format!(" {} ", label), area.width as usize))
+            .style(
+                Style::default()
+                    .fg(theme.canvas)
+                    .bg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+fn adjusted_reorder_index(current: usize, from: usize, insert_at: usize) -> usize {
+    if from == current {
+        insert_at
+    } else if from < current && insert_at >= current {
+        current.saturating_sub(1)
+    } else if from > current && insert_at <= current {
+        current.saturating_add(1)
+    } else {
+        current
+    }
+}
+
+fn extend_radio_touched_for_insert(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    insert_at: usize,
+    added: usize,
+) {
+    if added == 0 {
+        return;
+    }
+
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        let touched_len = radio.touched_len;
+        let inserted_end = insert_at + added;
+        if insert_at < touched_len {
+            radio.touched_len = touched_len + added;
+        } else {
+            radio.touched_len = touched_len.max(inserted_end);
+        }
+    }
+}
+
+fn radio_touched_len_after_reorder(touched_len: usize, from: usize, insert_at: usize) -> usize {
+    let mut touched_len = touched_len;
+
+    if from < touched_len {
+        touched_len = touched_len.saturating_sub(1);
+    }
+
+    if insert_at < touched_len {
+        touched_len + 1
+    } else {
+        touched_len.max(insert_at.saturating_add(1))
+    }
+}
+
+fn update_radio_touched_for_reorder(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    from: usize,
+    insert_at: usize,
+) {
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        radio.touched_len = radio_touched_len_after_reorder(radio.touched_len, from, insert_at);
+    }
+}
+
+fn shrink_radio_touched_for_remove(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    remove_at: usize,
+) {
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        if radio.touched_len == 0 {
+            return;
+        }
+
+        if remove_at < radio.touched_len {
+            radio.touched_len = radio.touched_len.saturating_sub(1);
+        }
     }
 }
 

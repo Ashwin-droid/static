@@ -1,14 +1,20 @@
 use std::collections::HashSet;
+use std::sync::Once;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 use crate::ipc::{
-    DaemonClient, PlaybackSnapshot, RepeatMode, daemon_is_running, load_persisted_playback_state,
+    daemon_is_running, load_persisted_playback_state, DaemonClient, PlaybackSnapshot, RepeatMode,
 };
 use crate::models::{HomeItem, RadioVirtualPlaylist, SearchResult, Track};
-use crate::network::{SongRating, get_storage_root, sanitize_categories};
-use crate::network_state::NetworkState;
+use crate::network::{
+    delete_cookie, get_cookie, get_storage_root, load_cookie_from_chromium_profile,
+    sanitize_categories, store_cookie, SongRating,
+};
+use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{AppSettings, MusicCache};
+
+static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
 const HELP_TEXT: &str = "\
 Static CLI
 
@@ -326,6 +332,7 @@ fn run_config(args: &[String]) -> Result<()> {
 }
 
 fn run_interactive_tui() -> Result<()> {
+    bootstrap_headless_saved_session();
     crate::cli_tui::run()
 }
 
@@ -336,9 +343,48 @@ fn open_music_cache() -> Result<MusicCache> {
 }
 
 pub(crate) fn saved_network_state() -> Result<NetworkState> {
+    bootstrap_headless_saved_session();
     NetworkState::from_saved_session().context(
         "A saved YouTube Music session is required. Open the GTK app once to connect your cookie.",
     )
+}
+
+fn bootstrap_headless_saved_session() {
+    HEADLESS_SESSION_BOOTSTRAP.call_once(bootstrap_headless_saved_session_inner);
+}
+
+fn bootstrap_headless_saved_session_inner() {
+    let saved_cookie = get_cookie().filter(|cookie| !cookie.trim().is_empty());
+    if let Some(cookie) = saved_cookie {
+        match NetworkState::validate_cookie(cookie, "keyring cookie") {
+            NetworkValidationOutcome::Authenticated(_) | NetworkValidationOutcome::Deferred(_) => {
+                return;
+            }
+            NetworkValidationOutcome::Rejected => {
+                delete_cookie();
+            }
+        }
+    }
+
+    let settings = match open_music_cache().and_then(|cache| cache.load_settings()) {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+    if !settings.auto_sync_chromium_cookies {
+        return;
+    }
+
+    let chromium_cookie = match load_cookie_from_chromium_profile(&settings) {
+        Ok(Some(cookie)) if !cookie.trim().is_empty() => cookie,
+        Ok(_) | Err(_) => return,
+    };
+
+    match NetworkState::validate_cookie(chromium_cookie.clone(), "Chromium cookie auto-sync") {
+        NetworkValidationOutcome::Authenticated(_) | NetworkValidationOutcome::Deferred(_) => {
+            let _ = store_cookie(&chromium_cookie);
+        }
+        NetworkValidationOutcome::Rejected => {}
+    }
 }
 
 fn fetch_remote_rating(video_id: &str) -> Result<SongRating> {
@@ -639,7 +685,11 @@ fn print_queue(snapshot: &PlaybackSnapshot) {
 
     for (index, track) in snapshot.queue.iter().enumerate() {
         let marker = if index == snapshot.queue_index {
-            if snapshot.paused { "||" } else { ">>" }
+            if snapshot.paused {
+                "||"
+            } else {
+                ">>"
+            }
         } else if snapshot
             .radio_virtual_playlist
             .as_ref()
@@ -921,7 +971,11 @@ fn playback_status(snapshot: &PlaybackSnapshot) -> &'static str {
     if snapshot.probe_active {
         "probe"
     } else if snapshot.current_track.is_some() {
-        if snapshot.paused { "paused" } else { "playing" }
+        if snapshot.paused {
+            "paused"
+        } else {
+            "playing"
+        }
     } else {
         "stopped"
     }
@@ -962,7 +1016,11 @@ pub(crate) fn rating_label(rating: SongRating) -> &'static str {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn yes_no_bool(value: bool) -> String {

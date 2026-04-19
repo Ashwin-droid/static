@@ -16,7 +16,7 @@ pub use sponsorblock_network::{
     filter_segments_for_categories, normalize_segments, sanitize_categories,
 };
 pub use tracking_network::TrackingInfo;
-pub use ytm_api_network::SongRating;
+pub use ytm_api_network::{SongRating, extract_video_id_from_input};
 pub(crate) use ytm_api_network::YtMusicClient;
 
 #[cfg(test)]

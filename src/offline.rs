@@ -5,4 +5,5 @@ pub mod playlist_offline;
 pub mod settings_offline;
 pub mod store_offline;
 
-pub use store_offline::{AppSettings, MusicCache};
+pub use settings_offline::AppSettings;
+pub use store_offline::MusicCache;

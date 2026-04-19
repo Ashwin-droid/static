@@ -37,4 +37,14 @@ impl NetworkState {
         cache.tokens_by_page.clear();
         cache.tokens_by_page.push(None);
     }
+
+    pub fn get_home_page(&self, continuation: Option<&str>) -> Result<HomePage> {
+        match continuation {
+            Some(continuation) => self.client.get_home_page(Some(continuation)),
+            None => {
+                self.reset_home_pagination();
+                self.home_page(0)
+            }
+        }
+    }
 }

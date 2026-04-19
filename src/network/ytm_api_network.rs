@@ -2093,6 +2093,41 @@ impl YtMusicClient {
     }
 }
 
+/// Extract a YouTube video id from a URL (with or without scheme) or return
+/// the input unchanged if it already looks like a bare id.
+pub fn extract_video_id_from_input(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let normalized = if trimmed.starts_with("music.youtube.com/")
+        || trimmed.starts_with("youtube.com/")
+        || trimmed.starts_with("www.youtube.com/")
+        || trimmed.starts_with("youtu.be/")
+    {
+        format!("https://{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+
+    let parsed = Url::parse(&normalized).ok()?;
+    let host = parsed.host_str()?.trim_start_matches("www.");
+
+    match host {
+        "youtu.be" => parsed
+            .path_segments()
+            .and_then(|mut segments| segments.next())
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string),
+        "youtube.com" | "music.youtube.com" => {
+            if parsed.path().trim_end_matches('/') == "/watch" {
+                return parsed
+                    .query_pairs()
+                    .find_map(|(key, value)| (key == "v").then_some(value.into_owned()));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

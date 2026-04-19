@@ -8,8 +8,8 @@ use crate::ipc::{
 };
 use crate::models::{HomeItem, RadioVirtualPlaylist, SearchResult, Track};
 use crate::network::{
-    SongRating, delete_cookie, get_cookie, get_storage_root, load_cookie_from_chromium_profile,
-    sanitize_categories, store_cookie,
+    SongRating, delete_cookie, extract_video_id_from_input, get_cookie, get_storage_root,
+    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{AppSettings, MusicCache};
@@ -508,39 +508,6 @@ fn resolve_track_input(
     }
 
     bail!("Could not resolve `{trimmed}` as a YouTube URL or video id")
-}
-
-fn extract_video_id_from_input(input: &str) -> Option<String> {
-    let trimmed = input.trim();
-    let normalized = if trimmed.starts_with("music.youtube.com/")
-        || trimmed.starts_with("youtube.com/")
-        || trimmed.starts_with("www.youtube.com/")
-        || trimmed.starts_with("youtu.be/")
-    {
-        format!("https://{trimmed}")
-    } else {
-        trimmed.to_string()
-    };
-
-    let parsed = url::Url::parse(&normalized).ok()?;
-    let host = parsed.host_str()?.trim_start_matches("www.");
-
-    match host {
-        "youtu.be" => parsed
-            .path_segments()
-            .and_then(|mut segments| segments.next())
-            .filter(|segment| !segment.is_empty())
-            .map(str::to_string),
-        "youtube.com" | "music.youtube.com" => {
-            if parsed.path().trim_end_matches('/') == "/watch" {
-                return parsed
-                    .query_pairs()
-                    .find_map(|(key, value)| (key == "v").then_some(value.into_owned()));
-            }
-            None
-        }
-        _ => None,
-    }
 }
 
 fn fetch_track_for_video_id(

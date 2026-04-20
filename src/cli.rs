@@ -8,11 +8,18 @@ use crate::ipc::{
 };
 use crate::models::{HomeItem, RadioVirtualPlaylist, SearchResult, Track};
 use crate::network::{
-    SongRating, delete_cookie, extract_video_id_from_input, get_cookie, get_storage_root,
-    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
+    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, extract_video_id_from_input,
+    get_cookie, get_storage_root, load_cookie_from_chromium_profile, sanitize_categories,
+    store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
-use crate::offline::{AppSettings, CoordinationMode, MusicCache};
+use crate::offline::{
+    AppSettings, CoordinationMode, MusicCache, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+};
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
 const HELP_TEXT: &str = "\
@@ -38,7 +45,12 @@ Usage:
 Notes:
   static without arguments still opens the GTK app.
   static i opens the terminal-native TUI on the alternate screen.
-  Playback commands talk to staticd over D-Bus and auto-start it when needed.";
+  Playback commands talk to staticd over D-Bus and auto-start it when needed.
+  Some config keys intentionally accept a wider CLI range than the GTK settings UI.
+  That is a feature, not a bug: when a saved value sits outside the UI-safe range,
+  the GTK settings page disables that control and treats it as CLI-only until it is
+  brought back into range.
+  Run `static config desc` for detailed behavior, accepted values, and range notes.";
 
 pub fn wants_cli(args: &[String]) -> bool {
     !args.is_empty() && args.first().is_some_and(|arg| arg != "--daemon")
@@ -289,12 +301,13 @@ fn run_config(args: &[String]) -> Result<()> {
             if let Some(name) = args.get(1) {
                 print_config_description(name)?;
             } else {
+                print_config_help_overview();
                 for spec in CONFIG_SPECS {
                     println!(
                         "{} [{}]\n{}",
                         spec.name,
                         config_kind_label(spec.kind),
-                        spec.description
+                        config_description(spec.name)
                     );
                     println!();
                 }
@@ -692,126 +705,325 @@ enum ConfigKind {
 struct ConfigSpec {
     name: &'static str,
     kind: ConfigKind,
-    description: &'static str,
 }
 
 const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "auto_sync_chromium_cookies",
         kind: ConfigKind::Bool,
-        description: "Automatically import cookies from a Chromium-family browser when the saved session is missing or stale.",
     },
     ConfigSpec {
         name: "chromium_cookie_path",
         kind: ConfigKind::String,
-        description: "Path to the Chromium cookie database. Leave empty to let Static auto-detect it.",
     },
     ConfigSpec {
         name: "auto_release_track_loops",
         kind: ConfigKind::Bool,
-        description: "Convert repeat-one into a finite loop budget for saved resume state so tracks do not loop forever after restore.",
     },
     ConfigSpec {
         name: "auto_release_track_loops_after",
         kind: ConfigKind::U32,
-        description: "How many repeat-one loops remain after a resume snapshot is restored when auto release is enabled.",
     },
     ConfigSpec {
         name: "auto_manage_offline_cache",
         kind: ConfigKind::Bool,
-        description: "Allow Static to automatically keep or evict offline tracks to stay near the configured cache target.",
     },
     ConfigSpec {
         name: "auto_cache_listen_again",
         kind: ConfigKind::Bool,
-        description: "Automatically keep strong Listen again candidates available offline.",
     },
     ConfigSpec {
         name: "listen_again_cache_days",
         kind: ConfigKind::U32,
-        description: "How far back Listen again activity is considered when picking tracks for auto-caching.",
     },
     ConfigSpec {
         name: "offline_cache_target",
         kind: ConfigKind::U32,
-        description: "Approximate maximum number of automatically managed offline tracks.",
     },
     ConfigSpec {
         name: "offline_rewatch_threshold",
         kind: ConfigKind::U32,
-        description: "Minimum historical replay count before a track is considered for heuristic auto-caching.",
     },
     ConfigSpec {
         name: "score_decay_window_days",
         kind: ConfigKind::U32,
-        description: "Decay window for the heuristic offline score so newer plays weigh more heavily.",
     },
     ConfigSpec {
         name: "minimum_offline_score",
         kind: ConfigKind::F64,
-        description: "Minimum heuristic score a track needs before Static keeps it in the managed offline cache.",
     },
     ConfigSpec {
         name: "prefetch_enabled",
         kind: ConfigKind::Bool,
-        description: "Enable ahead-of-time audio prefetching for upcoming queue items.",
     },
     ConfigSpec {
         name: "prefetch_ahead",
         kind: ConfigKind::U32,
-        description: "How many upcoming tracks Static should prefetch.",
     },
     ConfigSpec {
         name: "prefer_local_cache_on_playback",
         kind: ConfigKind::Bool,
-        description: "Prefer local cached audio over network playback when a track is already available offline.",
     },
     ConfigSpec {
         name: "other_mpris_mode",
         kind: ConfigKind::String,
-        description: "How Static coordinates with other active MPRIS players. Values: `off`, `respect`, `halt`, or `halt_auto`.",
     },
     ConfigSpec {
         name: "other_mpris_halt_auto_resume_secs",
         kind: ConfigKind::U32,
-        description: "When `other_mpris_mode=halt_auto`, how long peer players must stay paused or stopped before Static resumes itself.",
     },
     ConfigSpec {
         name: "pipewire_ducking_enabled",
         kind: ConfigKind::Bool,
-        description: "Watch PipeWire activity and duck or pause Static when other audio streams are active for long enough.",
     },
     ConfigSpec {
         name: "pipewire_pause_mode",
         kind: ConfigKind::String,
-        description: "How PipeWire-triggered coordination behaves once another audio stream stays active long enough. Values: `off`, `respect`, `halt`, or `halt_auto`.",
     },
     ConfigSpec {
         name: "pipewire_pause_halt_auto_resume_secs",
         kind: ConfigKind::U32,
-        description: "When `pipewire_pause_mode=halt_auto`, how long PipeWire must stay quiet before Static resumes itself.",
     },
     ConfigSpec {
         name: "pipewire_ducking_threshold_secs",
         kind: ConfigKind::U32,
-        description: "How long another PipeWire stream must stay active before ducking or pausing Static.",
     },
     ConfigSpec {
         name: "pipewire_ducking_volume",
         kind: ConfigKind::F64,
-        description: "Duck target volume as a 0.0-1.0 fraction when PipeWire ducking is enabled.",
     },
     ConfigSpec {
         name: "sponsorblock_enabled",
         kind: ConfigKind::Bool,
-        description: "Enable SponsorBlock segment loading and skip behavior.",
     },
     ConfigSpec {
         name: "sponsorblock_categories",
         kind: ConfigKind::StringList,
-        description: "Comma-separated SponsorBlock category list to skip, such as `sponsor,selfpromo,interaction`.",
     },
 ];
+
+fn print_config_help_overview() {
+    println!("CLI config note:");
+    println!("  Some keys intentionally accept a wider range than the GTK settings page.");
+    println!("  That is a feature, not a bug.");
+    println!("  When a saved value sits outside the UI-safe range, the GTK settings page disables");
+    println!(
+        "  that control and treats it as CLI-only until the value is brought back into range."
+    );
+    println!();
+}
+
+fn bool_values_note(enabled: &str, disabled: &str) -> String {
+    format!(
+        "Accepted values: `yes` to {enabled}; `no` to {disabled}. The CLI also accepts \
+`true`/`false`, `1`/`0`, and `on`/`off`."
+    )
+}
+
+fn advanced_cli_range_note(ui_range: &str, cli_range: &str) -> String {
+    format!(
+        "GTK settings UI range: {ui_range}.\nCLI range: {cli_range}. Wider CLI values are \
+supported on purpose; if the saved value sits outside the GTK range, the GTK settings page \
+disables that control and treats it as CLI-only until the value is brought back into range."
+    )
+}
+
+fn sponsorblock_category_list() -> String {
+    SPONSORBLOCK_CATEGORY_OPTIONS
+        .iter()
+        .map(|option| format!("`{}`", option.key))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn config_description(name: &str) -> String {
+    match name {
+        "auto_sync_chromium_cookies" => format!(
+            "Controls whether Static tries to refresh a saved YouTube Music session from a \
+Chromium-family browser profile when the current saved cookie is missing or rejected.\n{}",
+            bool_values_note(
+                "allow automatic cookie imports and session self-healing",
+                "leave cookie management entirely manual"
+            )
+        ),
+        "chromium_cookie_path" => "Overrides which Chromium cookie database Static reads when \
+cookie auto-sync is enabled.\nSet a full path to pin Static to one browser profile, or leave it \
+empty to let Static auto-detect the most likely Chromium-family profile on this machine."
+            .to_string(),
+        "auto_release_track_loops" => format!(
+            "Controls how repeat-one is represented inside saved resume state.\nWith this on, \
+Static converts an effectively infinite repeat-one session into a finite remaining loop budget so \
+restored playback does not get trapped looping forever.\n{}",
+            bool_values_note(
+                "cap repeat-one in saved resume state",
+                "preserve the normal repeat-one behavior exactly as-is"
+            )
+        ),
+        "auto_release_track_loops_after" => "Sets the loop budget that is re-armed after a \
+resume snapshot is restored when `auto_release_track_loops=yes`.\n`1` means the current track may \
+repeat one more time after restore; larger values keep more repeat-one cycles available.\nAccepted \
+range: 1-100."
+            .to_string(),
+        "auto_manage_offline_cache" => format!(
+            "Master switch for Static's automatic offline cache manager.\nWhen enabled, Static \
+may add or evict automatically managed downloads to stay near the configured cache target using \
+the listen-again and heuristic scoring rules.\n{}",
+            bool_values_note(
+                "let Static manage automatically selected offline tracks",
+                "disable automatic offline adds and evictions"
+            )
+        ),
+        "auto_cache_listen_again" => format!(
+            "Controls whether strong Listen again candidates should count toward automatic \
+offline caching.\nThis is one of the signals used by the auto-cache manager, so it matters most \
+when `auto_manage_offline_cache=yes`.\n{}",
+            bool_values_note(
+                "include Listen again activity as an auto-cache source",
+                "ignore Listen again activity when picking automatic downloads"
+            )
+        ),
+        "listen_again_cache_days" => "Lookback window, in days, used when evaluating Listen \
+again activity for automatic offline caching.\nSmaller values bias toward recent habits; larger \
+values let older repeat listening keep influencing the auto-cache decision.\nAccepted range: \
+1-365."
+            .to_string(),
+        "offline_cache_target" => "Approximate size target for the automatically managed \
+offline cache.\nStatic tries to stay near this many auto-managed tracks over time; higher values \
+favor keeping more candidates downloaded, while lower values make eviction more aggressive.\n\
+Accepted range: 0-500."
+            .to_string(),
+        "offline_rewatch_threshold" => "Minimum replay count a track should have before the \
+heuristic offline scorer considers it strong enough to keep around.\n`0` makes the scorer more \
+inclusive; higher values require stronger evidence that you revisit the track.\nAccepted range: \
+0-50."
+            .to_string(),
+        "score_decay_window_days" => "Controls how quickly older plays lose weight in the \
+heuristic offline score.\nShort windows make the score react faster to current tastes; longer \
+windows keep older listening history relevant for longer.\nAccepted range: 1-365."
+            .to_string(),
+        "minimum_offline_score" => "Minimum heuristic score required before Static keeps a \
+track in the automatically managed offline cache.\nLower values keep more marginal candidates; \
+higher values make the cache more selective.\nAccepted range: 0.0-999.0."
+            .to_string(),
+        "prefetch_enabled" => format!(
+            "Controls whether Static fetches upcoming queue items before they are needed for \
+playback.\nThis mainly trades a little more network and temporary disk activity for smoother \
+track transitions.\n{}",
+            bool_values_note(
+                "prefetch upcoming queue items ahead of time",
+                "only fetch tracks when playback reaches them"
+            )
+        ),
+        "prefetch_ahead" => "How many upcoming queue entries Static should try to prefetch when \
+prefetching is enabled.\n`0` effectively disables the ahead-of-time queue depth without changing \
+the switch; larger values are more aggressive.\nAccepted range: 0-12."
+            .to_string(),
+        "prefer_local_cache_on_playback" => format!(
+            "Controls whether playback should favor already cached audio over the network when \
+the same track exists locally.\n{}",
+            bool_values_note(
+                "prefer local cached media when it is available",
+                "prefer normal network playback even if a cached copy exists"
+            )
+        ),
+        "other_mpris_mode" => "Controls how Static reacts when another MPRIS player is active.\n\
+Values:\n  - `off`: ignore peer MPRIS players entirely.\n  - `respect`: pause for the other \
+player and resume as soon as it goes quiet.\n  - `halt`: pause for the other player and stay \
+halted until you resume manually.\n  - `halt_auto`: pause for the other player, then auto-resume \
+after `other_mpris_halt_auto_resume_secs` once peers stay quiet."
+            .to_string(),
+        "other_mpris_halt_auto_resume_secs" => format!(
+            "Quiet window used only when `other_mpris_mode=halt_auto`.\n`5` means resume 5 \
+seconds after peer players stop; `300` means wait 5 minutes before coming back.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+                    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS
+                ),
+                &format!(
+                    "any integer >= {}",
+                    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS
+                )
+            )
+        ),
+        "pipewire_ducking_enabled" => format!(
+            "Master switch for PipeWire-based coordination with non-MPRIS audio such as games, \
+calls, or browsers.\nWhen enabled, Static watches for active foreign streams and then either \
+ducks volume or pauses depending on `pipewire_pause_mode`.\n{}",
+            bool_values_note(
+                "enable PipeWire stream monitoring and coordination",
+                "disable all PipeWire-triggered ducking and pausing"
+            )
+        ),
+        "pipewire_pause_mode" => "Chooses what Static does after PipeWire detects another audio \
+stream staying active long enough to matter.\nValues:\n  - `off`: keep playback running and use \
+ducking volume instead.\n  - `respect`: pause while the foreign stream is active and resume as \
+soon as it goes quiet.\n  - `halt`: pause and stay halted until you resume manually.\n  - \
+`halt_auto`: pause, then auto-resume after `pipewire_pause_halt_auto_resume_secs` once the other \
+audio stays quiet."
+            .to_string(),
+        "pipewire_pause_halt_auto_resume_secs" => format!(
+            "Quiet window used only when `pipewire_pause_mode=halt_auto`.\n`5` means Static \
+comes back 5 seconds after other audio stops; `300` means wait 5 minutes before auto-resuming.\n\
+{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+                    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS
+                ),
+                &format!(
+                    "any integer >= {}",
+                    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS
+                )
+            )
+        ),
+        "pipewire_ducking_threshold_secs" => format!(
+            "How long another PipeWire stream must remain active before Static reacts.\nLow \
+values make ducking or pausing kick in quickly; high values ignore short notification sounds or \
+brief audio blips.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS
+                ),
+                &format!("any integer >= {}", PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS)
+            )
+        ),
+        "pipewire_ducking_volume" => format!(
+            "Target multiplier applied to the saved pre-duck volume while PipeWire ducking is \
+active and `pipewire_pause_mode=off`.\n`0.3` means play at 30% of the original level, `1.0` \
+means do not lower the level at all, and values above `1.0` intentionally overdrive playback so \
+Static can punch through other audio when that is useful.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{:.1}-{:.1}",
+                    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_DUCKING_VOLUME_UI_MAX
+                ),
+                &format!(
+                    "{:.1}-{:.1}",
+                    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_DUCKING_VOLUME_CLI_MAX
+                )
+            )
+        ),
+        "sponsorblock_enabled" => format!(
+            "Controls whether Static loads SponsorBlock metadata and uses it to skip configured \
+segment categories during playback.\n{}",
+            bool_values_note(
+                "enable SponsorBlock loading and category-based skipping",
+                "ignore SponsorBlock data entirely"
+            )
+        ),
+        "sponsorblock_categories" => format!(
+            "Comma-separated SponsorBlock category keys that Static should skip when \
+SponsorBlock is enabled.\nLeave the list empty to skip nothing, or provide any subset of the \
+supported keys.\nSupported keys: {}.",
+            sponsorblock_category_list()
+        ),
+        _ => unreachable!("unknown config description requested for `{name}`"),
+    }
+}
 
 fn config_kind_label(kind: ConfigKind) -> &'static str {
     match kind {
@@ -840,21 +1052,25 @@ fn print_config_description(name: &str) -> Result<()> {
     if name == "respect_other_mpris_players" {
         println!("respect_other_mpris_players [bool]");
         println!(
-            "Legacy alias for `other_mpris_mode`; `true` maps to `respect` and `false` maps to `off`."
+            "Legacy alias for `other_mpris_mode`.\nAccepted values: `yes` maps to `respect`; \
+`no` maps to `off`. This key is kept for backwards compatibility, but new automation or scripts \
+should use `other_mpris_mode` directly."
         );
         return Ok(());
     }
     if name == "pipewire_duck_pause" {
         println!("pipewire_duck_pause [bool]");
         println!(
-            "Legacy alias for `pipewire_pause_mode`; `true` maps to `respect` and `false` maps to `off`."
+            "Legacy alias for `pipewire_pause_mode`.\nAccepted values: `yes` maps to `respect`; \
+`no` maps to `off`. This key is kept for backwards compatibility, but new automation or scripts \
+should use `pipewire_pause_mode` directly."
         );
         return Ok(());
     }
 
     let spec = config_spec(name)?;
     println!("{} [{}]", spec.name, config_kind_label(spec.kind));
-    println!("{}", spec.description);
+    println!("{}", config_description(spec.name));
     Ok(())
 }
 
@@ -924,7 +1140,8 @@ fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Re
         }
         "other_mpris_mode" => settings.other_mpris_mode = parse_coordination_mode(trimmed)?,
         "other_mpris_halt_auto_resume_secs" => {
-            settings.other_mpris_halt_auto_resume_secs = parse_u32(trimmed)?.clamp(1, 60)
+            settings.other_mpris_halt_auto_resume_secs =
+                parse_u32(trimmed)?.max(OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS)
         }
         "respect_other_mpris_players" => {
             settings.other_mpris_mode = if parse_bool(trimmed)? {
@@ -936,7 +1153,8 @@ fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Re
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled = parse_bool(trimmed)?,
         "pipewire_pause_mode" => settings.pipewire_pause_mode = parse_coordination_mode(trimmed)?,
         "pipewire_pause_halt_auto_resume_secs" => {
-            settings.pipewire_pause_halt_auto_resume_secs = parse_u32(trimmed)?.clamp(1, 60)
+            settings.pipewire_pause_halt_auto_resume_secs =
+                parse_u32(trimmed)?.max(PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS)
         }
         "pipewire_duck_pause" => {
             settings.pipewire_pause_mode = if parse_bool(trimmed)? {
@@ -946,10 +1164,14 @@ fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Re
             }
         }
         "pipewire_ducking_threshold_secs" => {
-            settings.pipewire_ducking_threshold_secs = parse_u32(trimmed)?.clamp(1, 30)
+            settings.pipewire_ducking_threshold_secs =
+                parse_u32(trimmed)?.max(PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS)
         }
         "pipewire_ducking_volume" => {
-            settings.pipewire_ducking_volume = parse_f64(trimmed)?.clamp(0.0, 1.0)
+            settings.pipewire_ducking_volume = parse_f64(trimmed)?.clamp(
+                PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+                PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+            )
         }
         "sponsorblock_enabled" => settings.sponsorblock_enabled = parse_bool(trimmed)?,
         "sponsorblock_categories" => {
@@ -988,9 +1210,13 @@ fn parse_u32(value: &str) -> Result<u32> {
 }
 
 fn parse_f64(value: &str) -> Result<f64> {
-    value
+    let parsed = value
         .parse::<f64>()
-        .with_context(|| format!("Expected a number, got `{value}`"))
+        .with_context(|| format!("Expected a number, got `{value}`"))?;
+    if !parsed.is_finite() {
+        bail!("Expected a finite number, got `{value}`");
+    }
+    Ok(parsed)
 }
 
 fn playback_status(snapshot: &PlaybackSnapshot) -> &'static str {
@@ -1043,6 +1269,52 @@ fn yes_no(value: bool) -> &'static str {
 
 fn yes_no_bool(value: bool) -> String {
     yes_no(value).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AppSettings, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+        apply_config_value, config_description,
+    };
+
+    #[test]
+    fn config_set_preserves_cli_only_delay_values() {
+        let mut settings = AppSettings::default();
+
+        apply_config_value(&mut settings, "other_mpris_halt_auto_resume_secs", "300").unwrap();
+        apply_config_value(&mut settings, "pipewire_pause_halt_auto_resume_secs", "300").unwrap();
+        apply_config_value(&mut settings, "pipewire_ducking_threshold_secs", "300").unwrap();
+
+        assert!(
+            settings.other_mpris_halt_auto_resume_secs > OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS
+        );
+        assert_eq!(settings.pipewire_pause_halt_auto_resume_secs, 300);
+        assert_eq!(settings.pipewire_ducking_threshold_secs, 300);
+    }
+
+    #[test]
+    fn config_set_supports_boosted_pipewire_ducking_volume() {
+        let mut settings = AppSettings::default();
+
+        apply_config_value(&mut settings, "pipewire_ducking_volume", "1.75").unwrap();
+        assert!((settings.pipewire_ducking_volume - 1.75).abs() < 0.0001);
+
+        apply_config_value(&mut settings, "pipewire_ducking_volume", "9.0").unwrap();
+        assert_eq!(
+            settings.pipewire_ducking_volume,
+            PIPEWIRE_DUCKING_VOLUME_CLI_MAX
+        );
+    }
+
+    #[test]
+    fn config_descriptions_explain_cli_only_ranges() {
+        let description = config_description("pipewire_ducking_volume");
+
+        assert!(description.contains("GTK settings UI range: 0.0-1.0."));
+        assert!(description.contains("CLI range: 0.0-2.0."));
+        assert!(description.contains("CLI-only"));
+    }
 }
 
 fn format_progress(position_millis: Option<u64>, duration_millis: Option<u64>) -> String {

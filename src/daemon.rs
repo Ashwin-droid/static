@@ -35,7 +35,7 @@ use crate::network::{
     sanitize_categories,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, CoordinationMode, MusicCache};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache, PIPEWIRE_DUCKING_VOLUME_CLI_MAX};
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
 
@@ -3329,7 +3329,12 @@ fn steady_output_volume(state: &DaemonState) -> f64 {
 }
 
 fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
-    (state.pre_duck_volume * state.settings.pipewire_ducking_volume.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    (state.pre_duck_volume
+        * state
+            .settings
+            .pipewire_ducking_volume
+            .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX))
+    .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX)
 }
 
 fn set_logical_volume(state: &mut DaemonState, volume: f64) {
@@ -3377,7 +3382,7 @@ fn start_volume_ramp_with_completion(
     duration: Duration,
     completion: VolumeRampCompletion,
 ) {
-    let target_volume = target_volume.clamp(0.0, 1.0);
+    let target_volume = target_volume.clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX);
     let current_volume = state.player.volume();
     state.player.set_volume(current_volume);
     if volumes_match(current_volume, target_volume) {
@@ -3412,7 +3417,9 @@ fn finish_volume_ramp(
     final_volume: f64,
     completion: VolumeRampCompletion,
 ) {
-    state.player.set_volume(final_volume.clamp(0.0, 1.0));
+    state
+        .player
+        .set_volume(final_volume.clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX));
     state.volume_ramp = None;
 
     match completion {
@@ -3432,7 +3439,8 @@ fn finish_volume_ramp(
 fn volume_ramp_value(ramp: VolumeRamp) -> f64 {
     let progress =
         (ramp.started_at.elapsed().as_secs_f64() / ramp.duration.as_secs_f64()).clamp(0.0, 1.0);
-    (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress).clamp(0.0, 1.0)
+    (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress)
+        .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX)
 }
 
 fn volumes_match(left: f64, right: f64) -> bool {
@@ -3469,13 +3477,8 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
     }
 
     state.last_pipewire_poll_at = Some(Instant::now());
-    let threshold = Duration::from_secs(
-        state
-            .settings
-            .pipewire_ducking_threshold_secs
-            .clamp(1, 30)
-            .into(),
-    );
+    let threshold =
+        Duration::from_secs(state.settings.pipewire_ducking_threshold_secs.max(1).into());
 
     state.pipewire_trigger_active = state
         .pipewire_monitor

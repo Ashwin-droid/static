@@ -976,6 +976,11 @@ popover.context-menu > contents {
     line-height: 1.35;
 }
 
+.settings-row-cli-note {
+    margin-top: 4px;
+    color: rgba(160, 186, 255, 0.82);
+}
+
 switch {
     min-width: 44px;
     min-height: 24px;

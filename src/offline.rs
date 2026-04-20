@@ -5,5 +5,11 @@ pub mod playlist_offline;
 pub mod settings_offline;
 pub mod store_offline;
 
-pub use settings_offline::{AppSettings, CoordinationMode};
+pub use settings_offline::{
+    AppSettings, CoordinationMode, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+};
 pub use store_offline::MusicCache;

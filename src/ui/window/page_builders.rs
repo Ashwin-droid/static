@@ -1807,38 +1807,76 @@ pub(super) fn load_settings_page(
     mpris_halt_auto_hint.set_wrap(true);
     mpris_halt_auto_hint.set_halign(Align::Start);
     mpris_halt_auto_copy.append(&mpris_halt_auto_hint);
+    let mpris_halt_auto_cli_note = settings_cli_only_note();
+    mpris_halt_auto_copy.append(&mpris_halt_auto_cli_note);
     mpris_halt_auto_row.append(&mpris_halt_auto_copy);
-    let mpris_halt_auto_spin = SpinButton::with_range(1.0, 60.0, 1.0);
-    mpris_halt_auto_spin.set_value(settings.other_mpris_halt_auto_resume_secs as f64);
-    mpris_halt_auto_spin.set_sensitive(settings.other_mpris_mode.resumes_after_delay());
+    let mpris_halt_auto_spin = SpinButton::with_range(
+        crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS as f64,
+        crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS as f64,
+        1.0,
+    );
     mpris_halt_auto_row.append(&mpris_halt_auto_spin);
     coordination_section.append(&mpris_halt_auto_row);
 
-    {
+    let refresh_mpris_halt_auto_control: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
         let mpris_halt_auto_spin = mpris_halt_auto_spin.clone();
+        let mpris_halt_auto_cli_note = mpris_halt_auto_cli_note.clone();
+        move || {
+            let settings = app_settings(&state);
+            let cli_only_message = format!(
+                "CLI only right now: currently set to {} seconds. The settings UI only edits \
+{}-{} seconds for this control. Use `static config set other_mpris_halt_auto_resume_secs <seconds>` \
+to keep an advanced value, or move it back into the UI range to re-enable this card.",
+                settings.other_mpris_halt_auto_resume_secs,
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+            );
+            apply_cli_only_spin_state(
+                &mpris_halt_auto_spin,
+                &mpris_halt_auto_cli_note,
+                settings.other_mpris_halt_auto_resume_secs,
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+                settings.other_mpris_mode.resumes_after_delay(),
+                &cli_only_message,
+            );
+        }
+    });
+    (refresh_mpris_halt_auto_control.as_ref())();
+
+    {
+        let state = state.clone();
+        let refresh_mpris_halt_auto_control = Rc::clone(&refresh_mpris_halt_auto_control);
         mpris_dropdown.connect_selected_notify(move |dropdown| {
             let selected = dropdown.selected() as usize;
             let mode = CoordinationMode::ALL
                 .get(selected)
                 .copied()
                 .unwrap_or(CoordinationMode::Respect);
-            mpris_halt_auto_spin.set_sensitive(mode.resumes_after_delay());
             if mode == app_settings(&state).other_mpris_mode {
+                (refresh_mpris_halt_auto_control.as_ref())();
                 return;
             }
             update_app_settings(&state, |s| s.other_mpris_mode = mode);
+            (refresh_mpris_halt_auto_control.as_ref())();
         });
     }
 
     {
         let state = state.clone();
+        let refresh_mpris_halt_auto_control = Rc::clone(&refresh_mpris_halt_auto_control);
         mpris_halt_auto_spin.connect_value_changed(move |spin| {
-            let value = (spin.value() as u32).clamp(1, 60);
+            let value = (spin.value() as u32).clamp(
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+            );
             if value == app_settings(&state).other_mpris_halt_auto_resume_secs {
+                (refresh_mpris_halt_auto_control.as_ref())();
                 return;
             }
             update_app_settings(&state, |s| s.other_mpris_halt_auto_resume_secs = value);
+            (refresh_mpris_halt_auto_control.as_ref())();
         });
     }
 
@@ -1904,11 +1942,13 @@ pub(super) fn load_settings_page(
     pipewire_pause_halt_auto_hint.set_wrap(true);
     pipewire_pause_halt_auto_hint.set_halign(Align::Start);
     pipewire_pause_halt_auto_copy.append(&pipewire_pause_halt_auto_hint);
+    let pipewire_pause_halt_auto_cli_note = settings_cli_only_note();
+    pipewire_pause_halt_auto_copy.append(&pipewire_pause_halt_auto_cli_note);
     pipewire_pause_halt_auto_row.append(&pipewire_pause_halt_auto_copy);
-    let pipewire_pause_halt_auto_spin = SpinButton::with_range(1.0, 60.0, 1.0);
-    pipewire_pause_halt_auto_spin.set_value(settings.pipewire_pause_halt_auto_resume_secs as f64);
-    pipewire_pause_halt_auto_spin.set_sensitive(
-        settings.pipewire_ducking_enabled && settings.pipewire_pause_mode.resumes_after_delay(),
+    let pipewire_pause_halt_auto_spin = SpinButton::with_range(
+        crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS as f64,
+        crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS as f64,
+        1.0,
     );
     pipewire_pause_halt_auto_row.append(&pipewire_pause_halt_auto_spin);
     coordination_section.append(&pipewire_pause_halt_auto_row);
@@ -1928,19 +1968,14 @@ pub(super) fn load_settings_page(
     pipewire_threshold_hint.set_wrap(true);
     pipewire_threshold_hint.set_halign(Align::Start);
     pipewire_threshold_copy.append(&pipewire_threshold_hint);
+    let pipewire_threshold_cli_note = settings_cli_only_note();
+    pipewire_threshold_copy.append(&pipewire_threshold_cli_note);
     pipewire_threshold_row.append(&pipewire_threshold_copy);
-    let pipewire_threshold_spin = SpinButton::with_range(1.0, 30.0, 1.0);
-    pipewire_threshold_spin.set_value(settings.pipewire_ducking_threshold_secs as f64);
-    pipewire_threshold_spin.set_sensitive(settings.pipewire_ducking_enabled);
-    {
-        let state = state.clone();
-        pipewire_threshold_spin.connect_value_changed(move |spin| {
-            let value = spin.value() as u32;
-            update_app_settings(&state, |s| {
-                s.pipewire_ducking_threshold_secs = value.clamp(1, 30)
-            });
-        });
-    }
+    let pipewire_threshold_spin = SpinButton::with_range(
+        crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS as f64,
+        crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS as f64,
+        1.0,
+    );
     pipewire_threshold_row.append(&pipewire_threshold_spin);
     coordination_section.append(&pipewire_threshold_row);
 
@@ -1959,71 +1994,175 @@ pub(super) fn load_settings_page(
     pipewire_volume_hint.set_wrap(true);
     pipewire_volume_hint.set_halign(Align::Start);
     pipewire_volume_copy.append(&pipewire_volume_hint);
+    let pipewire_volume_cli_note = settings_cli_only_note();
+    pipewire_volume_copy.append(&pipewire_volume_cli_note);
     pipewire_volume_row.append(&pipewire_volume_copy);
-    let pipewire_volume_scale = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 0.05);
-    pipewire_volume_scale.set_value(settings.pipewire_ducking_volume);
+    let pipewire_volume_scale = Scale::with_range(
+        Orientation::Horizontal,
+        crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+        crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+        0.05,
+    );
     pipewire_volume_scale.set_digits(2);
     pipewire_volume_scale.set_draw_value(true);
     pipewire_volume_scale.set_size_request(160, -1);
-    pipewire_volume_scale.set_sensitive(
-        settings.pipewire_ducking_enabled && !settings.pipewire_pause_mode.is_enabled(),
-    );
-    {
-        let state = state.clone();
-        pipewire_volume_scale.connect_value_changed(move |scale| {
-            let value = scale.value().clamp(0.0, 1.0);
-            update_app_settings(&state, |s| s.pipewire_ducking_volume = value);
-        });
-    }
     pipewire_volume_row.append(&pipewire_volume_scale);
     coordination_section.append(&pipewire_volume_row);
 
-    {
+    let refresh_pipewire_controls: Rc<dyn Fn()> = Rc::new({
         let state = state.clone();
         let pipewire_pause_dropdown = pipewire_pause_dropdown.clone();
         let pipewire_pause_halt_auto_spin = pipewire_pause_halt_auto_spin.clone();
+        let pipewire_pause_halt_auto_cli_note = pipewire_pause_halt_auto_cli_note.clone();
         let pipewire_threshold_spin = pipewire_threshold_spin.clone();
+        let pipewire_threshold_cli_note = pipewire_threshold_cli_note.clone();
         let pipewire_volume_scale = pipewire_volume_scale.clone();
+        let pipewire_volume_cli_note = pipewire_volume_cli_note.clone();
+        move || {
+            let settings = app_settings(&state);
+            pipewire_pause_dropdown.set_sensitive(settings.pipewire_ducking_enabled);
+
+            let pause_cli_message = format!(
+                "CLI only right now: currently set to {} seconds. The settings UI only edits \
+{}-{} seconds for this control. Use `static config set pipewire_pause_halt_auto_resume_secs \
+<seconds>` to keep an advanced value, or move it back into the UI range to re-enable this card.",
+                settings.pipewire_pause_halt_auto_resume_secs,
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+            );
+            apply_cli_only_spin_state(
+                &pipewire_pause_halt_auto_spin,
+                &pipewire_pause_halt_auto_cli_note,
+                settings.pipewire_pause_halt_auto_resume_secs,
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+                settings.pipewire_ducking_enabled
+                    && settings.pipewire_pause_mode.resumes_after_delay(),
+                &pause_cli_message,
+            );
+
+            let threshold_cli_message = format!(
+                "CLI only right now: currently set to {} seconds. The settings UI only edits \
+{}-{} seconds for this control. Use `static config set pipewire_ducking_threshold_secs \
+<seconds>` to keep an advanced value, or move it back into the UI range to re-enable this card.",
+                settings.pipewire_ducking_threshold_secs,
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+            );
+            apply_cli_only_spin_state(
+                &pipewire_threshold_spin,
+                &pipewire_threshold_cli_note,
+                settings.pipewire_ducking_threshold_secs,
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+                settings.pipewire_ducking_enabled,
+                &threshold_cli_message,
+            );
+
+            let volume_cli_message = format!(
+                "CLI only right now: currently set to {:.2}. The settings UI only edits \
+{:.1}-{:.1} for this control. Use `static config set pipewire_ducking_volume <value>` to keep \
+an advanced value, or move it back into the UI range to re-enable this card. The CLI supports \
+up to {:.1} here on purpose.",
+                settings.pipewire_ducking_volume,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+            );
+            apply_cli_only_scale_state(
+                &pipewire_volume_scale,
+                &pipewire_volume_cli_note,
+                settings.pipewire_ducking_volume,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+                settings.pipewire_ducking_enabled && !settings.pipewire_pause_mode.is_enabled(),
+                &volume_cli_message,
+            );
+        }
+    });
+    (refresh_pipewire_controls.as_ref())();
+
+    {
+        let state = state.clone();
+        let refresh_pipewire_controls = Rc::clone(&refresh_pipewire_controls);
         pipewire_switch.connect_active_notify(move |sw| {
             let active = sw.is_active();
-            let pipewire_pause_mode = app_settings(&state).pipewire_pause_mode;
-            pipewire_pause_dropdown.set_sensitive(active);
-            pipewire_pause_halt_auto_spin
-                .set_sensitive(active && pipewire_pause_mode.resumes_after_delay());
-            pipewire_threshold_spin.set_sensitive(active);
-            pipewire_volume_scale.set_sensitive(active && !pipewire_pause_mode.is_enabled());
+            if active == app_settings(&state).pipewire_ducking_enabled {
+                (refresh_pipewire_controls.as_ref())();
+                return;
+            }
             update_app_settings(&state, |s| s.pipewire_ducking_enabled = active);
+            (refresh_pipewire_controls.as_ref())();
         });
     }
 
     {
         let state = state.clone();
-        let pipewire_pause_halt_auto_spin = pipewire_pause_halt_auto_spin.clone();
-        let pipewire_volume_scale = pipewire_volume_scale.clone();
+        let refresh_pipewire_controls = Rc::clone(&refresh_pipewire_controls);
         pipewire_pause_dropdown.connect_selected_notify(move |dropdown| {
             let selected = dropdown.selected() as usize;
             let mode = CoordinationMode::ALL
                 .get(selected)
                 .copied()
                 .unwrap_or(CoordinationMode::Off);
-            let enabled = app_settings(&state).pipewire_ducking_enabled;
-            pipewire_pause_halt_auto_spin.set_sensitive(enabled && mode.resumes_after_delay());
-            pipewire_volume_scale.set_sensitive(enabled && !mode.is_enabled());
             if mode == app_settings(&state).pipewire_pause_mode {
+                (refresh_pipewire_controls.as_ref())();
                 return;
             }
             update_app_settings(&state, |s| s.pipewire_pause_mode = mode);
+            (refresh_pipewire_controls.as_ref())();
         });
     }
 
     {
         let state = state.clone();
+        let refresh_pipewire_controls = Rc::clone(&refresh_pipewire_controls);
         pipewire_pause_halt_auto_spin.connect_value_changed(move |spin| {
-            let value = (spin.value() as u32).clamp(1, 60);
+            let value = (spin.value() as u32).clamp(
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+            );
             if value == app_settings(&state).pipewire_pause_halt_auto_resume_secs {
+                (refresh_pipewire_controls.as_ref())();
                 return;
             }
             update_app_settings(&state, |s| s.pipewire_pause_halt_auto_resume_secs = value);
+            (refresh_pipewire_controls.as_ref())();
+        });
+    }
+
+    {
+        let state = state.clone();
+        let refresh_pipewire_controls = Rc::clone(&refresh_pipewire_controls);
+        pipewire_threshold_spin.connect_value_changed(move |spin| {
+            let value = (spin.value() as u32).clamp(
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
+                crate::offline::PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+            );
+            if value == app_settings(&state).pipewire_ducking_threshold_secs {
+                (refresh_pipewire_controls.as_ref())();
+                return;
+            }
+            update_app_settings(&state, |s| s.pipewire_ducking_threshold_secs = value);
+            (refresh_pipewire_controls.as_ref())();
+        });
+    }
+
+    {
+        let state = state.clone();
+        let refresh_pipewire_controls = Rc::clone(&refresh_pipewire_controls);
+        pipewire_volume_scale.connect_value_changed(move |scale| {
+            let value = scale.value().clamp(
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+                crate::offline::PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+            );
+            if (value - app_settings(&state).pipewire_ducking_volume).abs() <= 0.0001 {
+                (refresh_pipewire_controls.as_ref())();
+                return;
+            }
+            update_app_settings(&state, |s| s.pipewire_ducking_volume = value);
+            (refresh_pipewire_controls.as_ref())();
         });
     }
 
@@ -3132,6 +3271,84 @@ pub(super) fn settings_switch(active: bool) -> Switch {
     sw.set_valign(Align::Center);
     sw.set_halign(Align::End);
     sw
+}
+
+fn settings_cli_only_note() -> Label {
+    let note = Label::new(None);
+    note.add_css_class("settings-row-copy");
+    note.add_css_class("settings-row-cli-note");
+    note.set_wrap(true);
+    note.set_halign(Align::Start);
+    note.set_visible(false);
+    note
+}
+
+fn ui_range_contains_f64(value: f64, minimum: f64, maximum: f64) -> bool {
+    value.is_finite() && value >= minimum - 0.000_001 && value <= maximum + 0.000_001
+}
+
+fn apply_cli_only_spin_state(
+    spin: &SpinButton,
+    note: &Label,
+    current_value: u32,
+    ui_min: u32,
+    ui_max: u32,
+    base_sensitive: bool,
+    cli_only_message: &str,
+) {
+    let within_ui = (ui_min..=ui_max).contains(&current_value);
+    let display_upper = if within_ui {
+        ui_max
+    } else {
+        current_value.max(ui_max)
+    };
+
+    spin.set_range(ui_min as f64, display_upper as f64);
+    spin.set_value(current_value as f64);
+    spin.set_sensitive(base_sensitive && within_ui);
+
+    if within_ui {
+        note.set_text("");
+        note.set_visible(false);
+        spin.set_tooltip_text(None::<&str>);
+    } else {
+        note.set_text(cli_only_message);
+        note.set_visible(true);
+        spin.set_tooltip_text(Some(cli_only_message));
+    }
+}
+
+fn apply_cli_only_scale_state(
+    scale: &Scale,
+    note: &Label,
+    current_value: f64,
+    ui_min: f64,
+    ui_max: f64,
+    cli_max: f64,
+    base_sensitive: bool,
+    cli_only_message: &str,
+) {
+    let clamped_value = current_value.clamp(ui_min, cli_max);
+    let within_ui = ui_range_contains_f64(clamped_value, ui_min, ui_max);
+    let display_upper = if within_ui {
+        ui_max
+    } else {
+        clamped_value.max(ui_max)
+    };
+
+    scale.set_range(ui_min, display_upper);
+    scale.set_value(clamped_value);
+    scale.set_sensitive(base_sensitive && within_ui);
+
+    if within_ui {
+        note.set_text("");
+        note.set_visible(false);
+        scale.set_tooltip_text(None::<&str>);
+    } else {
+        note.set_text(cli_only_message);
+        note.set_visible(true);
+        scale.set_tooltip_text(Some(cli_only_message));
+    }
 }
 
 pub(super) fn set_button_icon(btn: &Button, svg_bytes: &[u8], size: i32) {

@@ -56,6 +56,16 @@ impl CoordinationMode {
     }
 }
 
+pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 1;
+pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
+pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 1;
+pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
+pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS: u32 = 1;
+pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS: u32 = 30;
+pub const PIPEWIRE_DUCKING_VOLUME_UI_MIN: f64 = 0.0;
+pub const PIPEWIRE_DUCKING_VOLUME_UI_MAX: f64 = 1.0;
+pub const PIPEWIRE_DUCKING_VOLUME_CLI_MAX: f64 = 2.0;
+
 #[derive(Debug, Clone)]
 pub struct AppSettings {
     pub auto_sync_chromium_cookies: bool,
@@ -214,12 +224,11 @@ impl MusicCache {
                     loaded_other_mpris_mode = CoordinationMode::from_str(&row.1);
                 }
                 "other_mpris_halt_auto_resume_secs" => {
-                    settings.other_mpris_halt_auto_resume_secs = row
-                        .1
-                        .parse::<u32>()
-                        .ok()
-                        .unwrap_or(settings.other_mpris_halt_auto_resume_secs)
-                        .clamp(1, 60);
+                    settings.other_mpris_halt_auto_resume_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.other_mpris_halt_auto_resume_secs,
+                        OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+                    );
                 }
                 "respect_other_mpris_players" => {
                     legacy_respect_other_mpris_players = Some(parse_bool_setting(
@@ -235,12 +244,11 @@ impl MusicCache {
                     loaded_pipewire_pause_mode = CoordinationMode::from_str(&row.1);
                 }
                 "pipewire_pause_halt_auto_resume_secs" => {
-                    settings.pipewire_pause_halt_auto_resume_secs = row
-                        .1
-                        .parse::<u32>()
-                        .ok()
-                        .unwrap_or(settings.pipewire_pause_halt_auto_resume_secs)
-                        .clamp(1, 60);
+                    settings.pipewire_pause_halt_auto_resume_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.pipewire_pause_halt_auto_resume_secs,
+                        PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+                    );
                 }
                 "pipewire_duck_pause" => {
                     legacy_pipewire_duck_pause = Some(parse_bool_setting(
@@ -249,20 +257,19 @@ impl MusicCache {
                     ));
                 }
                 "pipewire_ducking_threshold_secs" => {
-                    settings.pipewire_ducking_threshold_secs = row
-                        .1
-                        .parse::<u32>()
-                        .ok()
-                        .unwrap_or(settings.pipewire_ducking_threshold_secs)
-                        .clamp(1, 30);
+                    settings.pipewire_ducking_threshold_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.pipewire_ducking_threshold_secs,
+                        PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
+                    );
                 }
                 "pipewire_ducking_volume" => {
-                    settings.pipewire_ducking_volume = row
-                        .1
-                        .parse::<f64>()
-                        .ok()
-                        .unwrap_or(settings.pipewire_ducking_volume)
-                        .clamp(0.0, 1.0);
+                    settings.pipewire_ducking_volume = parse_f64_setting_in_range(
+                        &row.1,
+                        settings.pipewire_ducking_volume,
+                        PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+                        PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+                    );
                 }
                 "sponsorblock_enabled" => {
                     settings.sponsorblock_enabled =
@@ -414,13 +421,27 @@ fn parse_bool_setting(value: &str, default: bool) -> bool {
     }
 }
 
+fn parse_u32_setting_at_least(value: &str, default: u32, minimum: u32) -> u32 {
+    value.parse::<u32>().ok().unwrap_or(default).max(minimum)
+}
+
+fn parse_f64_setting_in_range(value: &str, default: f64, minimum: f64, maximum: f64) -> f64 {
+    match value.parse::<f64>() {
+        Ok(parsed) if parsed.is_finite() => parsed.clamp(minimum, maximum),
+        _ => default.clamp(minimum, maximum),
+    }
+}
+
 fn bool_setting(value: bool) -> String {
     if value { "1" } else { "0" }.to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CoordinationMode;
+    use super::{
+        CoordinationMode, PIPEWIRE_DUCKING_VOLUME_CLI_MAX, parse_f64_setting_in_range,
+        parse_u32_setting_at_least,
+    };
 
     #[test]
     fn parses_coordination_mode_aliases() {
@@ -439,6 +460,24 @@ mod tests {
         assert_eq!(
             CoordinationMode::from_str("halt-auto"),
             Some(CoordinationMode::HaltAuto)
+        );
+    }
+
+    #[test]
+    fn advanced_u32_settings_preserve_cli_only_values() {
+        assert_eq!(parse_u32_setting_at_least("300", 5, 1), 300);
+        assert_eq!(parse_u32_setting_at_least("0", 5, 1), 1);
+    }
+
+    #[test]
+    fn advanced_f64_settings_allow_boosted_values_but_stay_bounded() {
+        assert_eq!(
+            parse_f64_setting_in_range("1.75", 0.3, 0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX),
+            1.75
+        );
+        assert_eq!(
+            parse_f64_setting_in_range("9.0", 0.3, 0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX),
+            PIPEWIRE_DUCKING_VOLUME_CLI_MAX
         );
     }
 }

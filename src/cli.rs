@@ -12,7 +12,7 @@ use crate::network::{
     load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
-use crate::offline::{AppSettings, MusicCache};
+use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
 const HELP_TEXT: &str = "\
@@ -767,9 +767,14 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
         description: "Prefer local cached audio over network playback when a track is already available offline.",
     },
     ConfigSpec {
-        name: "respect_other_mpris_players",
-        kind: ConfigKind::Bool,
-        description: "Pause or coordinate with other active MPRIS players when Static starts playback.",
+        name: "other_mpris_mode",
+        kind: ConfigKind::String,
+        description: "How Static coordinates with other active MPRIS players. Values: `off`, `respect`, `halt`, or `halt_auto`.",
+    },
+    ConfigSpec {
+        name: "other_mpris_halt_auto_resume_secs",
+        kind: ConfigKind::U32,
+        description: "When `other_mpris_mode=halt_auto`, how long peer players must stay paused or stopped before Static resumes itself.",
     },
     ConfigSpec {
         name: "pipewire_ducking_enabled",
@@ -814,6 +819,12 @@ fn config_kind_label(kind: ConfigKind) -> &'static str {
 }
 
 fn config_spec(name: &str) -> Result<&'static ConfigSpec> {
+    if name == "respect_other_mpris_players" {
+        return Err(anyhow::anyhow!(
+            "`respect_other_mpris_players` is now a legacy alias. Use `other_mpris_mode` instead."
+        ));
+    }
+
     CONFIG_SPECS
         .iter()
         .find(|spec| spec.name == name)
@@ -821,6 +832,14 @@ fn config_spec(name: &str) -> Result<&'static ConfigSpec> {
 }
 
 fn print_config_description(name: &str) -> Result<()> {
+    if name == "respect_other_mpris_players" {
+        println!("respect_other_mpris_players [bool]");
+        println!(
+            "Legacy alias for `other_mpris_mode`; `true` maps to `respect` and `false` maps to `off`."
+        );
+        return Ok(());
+    }
+
     let spec = config_spec(name)?;
     println!("{} [{}]", spec.name, config_kind_label(spec.kind));
     println!("{}", spec.description);
@@ -843,7 +862,11 @@ fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
         "prefetch_enabled" => yes_no_bool(settings.prefetch_enabled),
         "prefetch_ahead" => settings.prefetch_ahead.to_string(),
         "prefer_local_cache_on_playback" => yes_no_bool(settings.prefer_local_cache_on_playback),
-        "respect_other_mpris_players" => yes_no_bool(settings.respect_other_mpris_players),
+        "other_mpris_mode" => settings.other_mpris_mode.as_str().to_string(),
+        "other_mpris_halt_auto_resume_secs" => {
+            settings.other_mpris_halt_auto_resume_secs.to_string()
+        }
+        "respect_other_mpris_players" => yes_no_bool(settings.other_mpris_mode.coordinates_peers()),
         "pipewire_ducking_enabled" => yes_no_bool(settings.pipewire_ducking_enabled),
         "pipewire_duck_pause" => yes_no_bool(settings.pipewire_duck_pause),
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
@@ -883,8 +906,16 @@ fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Re
         "prefer_local_cache_on_playback" => {
             settings.prefer_local_cache_on_playback = parse_bool(trimmed)?
         }
+        "other_mpris_mode" => settings.other_mpris_mode = parse_other_mpris_mode(trimmed)?,
+        "other_mpris_halt_auto_resume_secs" => {
+            settings.other_mpris_halt_auto_resume_secs = parse_u32(trimmed)?.clamp(1, 60)
+        }
         "respect_other_mpris_players" => {
-            settings.respect_other_mpris_players = parse_bool(trimmed)?
+            settings.other_mpris_mode = if parse_bool(trimmed)? {
+                OtherMprisMode::Respect
+            } else {
+                OtherMprisMode::Off
+            }
         }
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled = parse_bool(trimmed)?,
         "pipewire_duck_pause" => settings.pipewire_duck_pause = parse_bool(trimmed)?,
@@ -916,6 +947,12 @@ fn parse_bool(value: &str) -> Result<bool> {
         "0" | "false" | "no" | "n" | "off" => Ok(false),
         _ => bail!("Expected a boolean value, got `{value}`"),
     }
+}
+
+fn parse_other_mpris_mode(value: &str) -> Result<OtherMprisMode> {
+    OtherMprisMode::from_str(value).ok_or_else(|| {
+        anyhow::anyhow!("Expected one of `off`, `respect`, `halt`, or `halt_auto`, got `{value}`")
+    })
 }
 
 fn parse_u32(value: &str) -> Result<u32> {

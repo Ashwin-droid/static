@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use gstreamer::ClockTime;
 use gtk::prelude::*;
 use gtk::{
-    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DropTarget, Entry,
-    GestureClick, Image, Label, MessageDialog, MessageType, Orientation, Overlay, Paned, Picture,
-    Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton, Stack,
+    Align, Application, ApplicationWindow, Box as GtkBox, Button, DragSource, DropDown, DropTarget,
+    Entry, GestureClick, Image, Label, MessageDialog, MessageType, Orientation, Overlay, Paned,
+    Picture, Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton, Stack,
     StackTransitionType, Switch, gio, glib,
 };
 
@@ -54,7 +54,7 @@ use crate::network::{
     load_cookie_from_chromium_profile, sanitize_categories, store_cookie, store_vr_refresh_token,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, MusicCache};
+use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
 use crate::player::Player;
 
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =

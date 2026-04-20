@@ -1749,28 +1749,83 @@ pub(super) fn load_settings_page(
     mpris_row.add_css_class("settings-row");
     let mpris_copy = GtkBox::new(Orientation::Vertical, 2);
     mpris_copy.set_hexpand(true);
-    let mpris_label = Label::new(Some("Respect other MPRIS players"));
+    let mpris_label = Label::new(Some("Other MPRIS behavior"));
     mpris_label.add_css_class("settings-row-title");
     mpris_label.set_halign(Align::Start);
     mpris_copy.append(&mpris_label);
     let mpris_hint = Label::new(Some(
-        "Pause Static when another media app starts playing, and pause that app when you resume here.",
+        "Choose whether Static should auto-resume, stay halted, or wait a few seconds after other media apps stop.",
     ));
     mpris_hint.add_css_class("settings-row-copy");
     mpris_hint.set_wrap(true);
     mpris_hint.set_halign(Align::Start);
     mpris_copy.append(&mpris_hint);
     mpris_row.append(&mpris_copy);
-    let mpris_switch = settings_switch(settings.respect_other_mpris_players);
+    let mpris_mode_labels = [
+        OtherMprisMode::Off.label(),
+        OtherMprisMode::Respect.label(),
+        OtherMprisMode::Halt.label(),
+        OtherMprisMode::HaltAuto.label(),
+    ];
+    let mpris_dropdown = DropDown::from_strings(&mpris_mode_labels);
+    let selected_mode_index = OtherMprisMode::ALL
+        .iter()
+        .position(|mode| *mode == settings.other_mpris_mode)
+        .unwrap_or(1);
+    mpris_dropdown.set_selected(selected_mode_index as u32);
+    mpris_dropdown.set_valign(Align::Center);
+    mpris_row.append(&mpris_dropdown);
+    playback_section.append(&mpris_row);
+
+    let mpris_halt_auto_row = GtkBox::new(Orientation::Horizontal, 12);
+    mpris_halt_auto_row.add_css_class("settings-row");
+    let mpris_halt_auto_copy = GtkBox::new(Orientation::Vertical, 2);
+    mpris_halt_auto_copy.set_hexpand(true);
+    let mpris_halt_auto_label = Label::new(Some("Halt auto delay"));
+    mpris_halt_auto_label.add_css_class("settings-row-title");
+    mpris_halt_auto_label.set_halign(Align::Start);
+    mpris_halt_auto_copy.append(&mpris_halt_auto_label);
+    let mpris_halt_auto_hint = Label::new(Some(
+        "When Halt Auto is selected, wait this long after peer players go quiet before Static starts again.",
+    ));
+    mpris_halt_auto_hint.add_css_class("settings-row-copy");
+    mpris_halt_auto_hint.set_wrap(true);
+    mpris_halt_auto_hint.set_halign(Align::Start);
+    mpris_halt_auto_copy.append(&mpris_halt_auto_hint);
+    mpris_halt_auto_row.append(&mpris_halt_auto_copy);
+    let mpris_halt_auto_spin = SpinButton::with_range(1.0, 60.0, 1.0);
+    mpris_halt_auto_spin.set_value(settings.other_mpris_halt_auto_resume_secs as f64);
+    mpris_halt_auto_spin.set_sensitive(settings.other_mpris_mode.resumes_after_delay());
+    mpris_halt_auto_row.append(&mpris_halt_auto_spin);
+    playback_section.append(&mpris_halt_auto_row);
+
     {
         let state = state.clone();
-        mpris_switch.connect_active_notify(move |sw| {
-            let active = sw.is_active();
-            update_app_settings(&state, |s| s.respect_other_mpris_players = active);
+        let mpris_halt_auto_spin = mpris_halt_auto_spin.clone();
+        mpris_dropdown.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected() as usize;
+            let mode = OtherMprisMode::ALL
+                .get(selected)
+                .copied()
+                .unwrap_or(OtherMprisMode::Respect);
+            mpris_halt_auto_spin.set_sensitive(mode.resumes_after_delay());
+            if mode == app_settings(&state).other_mpris_mode {
+                return;
+            }
+            update_app_settings(&state, |s| s.other_mpris_mode = mode);
         });
     }
-    mpris_row.append(&mpris_switch);
-    playback_section.append(&mpris_row);
+
+    {
+        let state = state.clone();
+        mpris_halt_auto_spin.connect_value_changed(move |spin| {
+            let value = (spin.value() as u32).clamp(1, 60);
+            if value == app_settings(&state).other_mpris_halt_auto_resume_secs {
+                return;
+            }
+            update_app_settings(&state, |s| s.other_mpris_halt_auto_resume_secs = value);
+        });
+    }
 
     let pipewire_row = GtkBox::new(Orientation::Horizontal, 12);
     pipewire_row.add_css_class("settings-row");

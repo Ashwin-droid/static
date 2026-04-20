@@ -4,6 +4,54 @@ use crate::network::{default_skip_categories, sanitize_categories};
 
 use super::store_offline::MusicCache;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtherMprisMode {
+    Off,
+    Respect,
+    Halt,
+    HaltAuto,
+}
+
+impl OtherMprisMode {
+    pub const ALL: [Self; 4] = [Self::Off, Self::Respect, Self::Halt, Self::HaltAuto];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Respect => "respect",
+            Self::Halt => "halt",
+            Self::HaltAuto => "halt_auto",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Respect => "Respect",
+            Self::Halt => "Halt",
+            Self::HaltAuto => "Halt Auto",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "ignore" | "disabled" => Some(Self::Off),
+            "respect" | "true" | "1" | "yes" | "on" => Some(Self::Respect),
+            "halt" | "manual" => Some(Self::Halt),
+            "halt_auto" | "halt-auto" | "haltauto" => Some(Self::HaltAuto),
+            _ => None,
+        }
+    }
+
+    pub fn coordinates_peers(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn resumes_after_delay(self) -> bool {
+        matches!(self, Self::HaltAuto)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSettings {
     pub auto_sync_chromium_cookies: bool,
@@ -20,7 +68,8 @@ pub struct AppSettings {
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
-    pub respect_other_mpris_players: bool,
+    pub other_mpris_mode: OtherMprisMode,
+    pub other_mpris_halt_auto_resume_secs: u32,
     pub pipewire_ducking_enabled: bool,
     pub pipewire_duck_pause: bool,
     pub pipewire_ducking_threshold_secs: u32,
@@ -46,7 +95,8 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
-            respect_other_mpris_players: true,
+            other_mpris_mode: OtherMprisMode::Respect,
+            other_mpris_halt_auto_resume_secs: 5,
             pipewire_ducking_enabled: false,
             pipewire_duck_pause: false,
             pipewire_ducking_threshold_secs: 5,
@@ -60,6 +110,8 @@ impl Default for AppSettings {
 impl MusicCache {
     pub fn load_settings(&self) -> Result<AppSettings> {
         let mut settings = AppSettings::default();
+        let mut loaded_other_mpris_mode = None;
+        let mut legacy_respect_other_mpris_players = None;
         let mut stmt = self.db.prepare("SELECT key, value FROM app_settings")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -150,9 +202,22 @@ impl MusicCache {
                     settings.prefer_local_cache_on_playback =
                         parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
                 }
+                "other_mpris_mode" => {
+                    loaded_other_mpris_mode = OtherMprisMode::from_str(&row.1);
+                }
+                "other_mpris_halt_auto_resume_secs" => {
+                    settings.other_mpris_halt_auto_resume_secs = row
+                        .1
+                        .parse::<u32>()
+                        .ok()
+                        .unwrap_or(settings.other_mpris_halt_auto_resume_secs)
+                        .clamp(1, 60);
+                }
                 "respect_other_mpris_players" => {
-                    settings.respect_other_mpris_players =
-                        parse_bool_setting(&row.1, settings.respect_other_mpris_players);
+                    legacy_respect_other_mpris_players = Some(parse_bool_setting(
+                        &row.1,
+                        settings.other_mpris_mode.coordinates_peers(),
+                    ));
                 }
                 "pipewire_ducking_enabled" => {
                     settings.pipewire_ducking_enabled =
@@ -190,6 +255,16 @@ impl MusicCache {
                 _ => {}
             }
         }
+
+        settings.other_mpris_mode = loaded_other_mpris_mode.unwrap_or_else(|| {
+            if legacy_respect_other_mpris_players
+                .unwrap_or(settings.other_mpris_mode.coordinates_peers())
+            {
+                OtherMprisMode::Respect
+            } else {
+                OtherMprisMode::Off
+            }
+        });
 
         Ok(settings)
     }
@@ -250,8 +325,16 @@ impl MusicCache {
                 bool_setting(settings.prefer_local_cache_on_playback),
             ),
             (
+                "other_mpris_mode",
+                settings.other_mpris_mode.as_str().to_string(),
+            ),
+            (
+                "other_mpris_halt_auto_resume_secs",
+                settings.other_mpris_halt_auto_resume_secs.to_string(),
+            ),
+            (
                 "respect_other_mpris_players",
-                bool_setting(settings.respect_other_mpris_players),
+                bool_setting(settings.other_mpris_mode.coordinates_peers()),
             ),
             (
                 "pipewire_ducking_enabled",
@@ -296,4 +379,26 @@ fn parse_bool_setting(value: &str, default: bool) -> bool {
 
 fn bool_setting(value: bool) -> String {
     if value { "1" } else { "0" }.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OtherMprisMode;
+
+    #[test]
+    fn parses_mpris_mode_aliases() {
+        assert_eq!(OtherMprisMode::from_str("off"), Some(OtherMprisMode::Off));
+        assert_eq!(
+            OtherMprisMode::from_str("true"),
+            Some(OtherMprisMode::Respect)
+        );
+        assert_eq!(
+            OtherMprisMode::from_str("manual"),
+            Some(OtherMprisMode::Halt)
+        );
+        assert_eq!(
+            OtherMprisMode::from_str("halt-auto"),
+            Some(OtherMprisMode::HaltAuto)
+        );
+    }
 }

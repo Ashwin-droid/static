@@ -35,7 +35,7 @@ use crate::network::{
     sanitize_categories,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, MusicCache};
+use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
 
@@ -176,6 +176,7 @@ struct ExternalMprisCoordinator {
     playing_services: Vec<String>,
     last_logged_playing_services: Vec<String>,
     waiting_for_services: Vec<String>,
+    no_playing_services_since: Option<Instant>,
 }
 
 impl ExternalMprisCoordinator {
@@ -186,6 +187,7 @@ impl ExternalMprisCoordinator {
             playing_services: Vec::new(),
             last_logged_playing_services: Vec::new(),
             waiting_for_services: Vec::new(),
+            no_playing_services_since: None,
         }
     }
 
@@ -202,14 +204,10 @@ impl ExternalMprisCoordinator {
 
     fn poll_now(&mut self) {
         match self.scan_other_playing_services() {
-            Ok(services) => {
-                self.playing_services = services;
-                self.log_playing_services_snapshot_change();
-            }
+            Ok(services) => self.update_playing_services(services),
             Err(err) => {
                 self.log_error(format!("[MPRIS] failed to inspect peer players: {err}"));
-                self.playing_services.clear();
-                self.log_playing_services_snapshot_change();
+                self.update_playing_services(Vec::new());
             }
         }
     }
@@ -249,6 +247,7 @@ impl ExternalMprisCoordinator {
                 .iter()
                 .any(|paused_service| paused_service == service)
         });
+        self.update_quiet_since();
         paused
     }
 
@@ -278,6 +277,25 @@ impl ExternalMprisCoordinator {
         self.waiting_for_services = services.to_vec();
     }
 
+    fn update_playing_services(&mut self, services: Vec<String>) {
+        self.playing_services = services;
+        self.update_quiet_since();
+        self.log_playing_services_snapshot_change();
+    }
+
+    fn update_quiet_since(&mut self) {
+        if self.playing_services.is_empty() {
+            self.no_playing_services_since
+                .get_or_insert_with(Instant::now);
+        } else {
+            self.no_playing_services_since = None;
+        }
+    }
+
+    fn no_playing_services_for(&self) -> Option<Duration> {
+        self.no_playing_services_since.map(|since| since.elapsed())
+    }
+
     fn clear_waiting(&mut self) {
         self.waiting_for_services.clear();
     }
@@ -287,6 +305,7 @@ impl ExternalMprisCoordinator {
         self.playing_services.clear();
         self.last_logged_playing_services.clear();
         self.waiting_for_services.clear();
+        self.no_playing_services_since = None;
     }
 
     fn is_waiting_for_peer_pause(&self) -> bool {
@@ -2208,7 +2227,7 @@ fn reload_settings(state: &mut DaemonState) {
         Ok(settings) => {
             state.settings = settings;
             reset_track_repeat_budget_for_current_track(state);
-            if !state.settings.respect_other_mpris_players {
+            if !state.settings.other_mpris_mode.coordinates_peers() {
                 state.peer_mpris.deactivate();
             }
             state.last_pipewire_poll_at = None;
@@ -3443,7 +3462,7 @@ fn maybe_duck_for_pipewire(state: &mut DaemonState) {
 }
 
 fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
-    if !state.settings.respect_other_mpris_players {
+    if !state.settings.other_mpris_mode.coordinates_peers() {
         state.peer_mpris.clear_waiting();
         return;
     }
@@ -3468,7 +3487,7 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
 
 fn pause_other_mpris_players(state: &mut DaemonState) {
     state.peer_mpris.clear_waiting();
-    if !state.settings.respect_other_mpris_players {
+    if !state.settings.other_mpris_mode.coordinates_peers() {
         return;
     }
 
@@ -3484,7 +3503,8 @@ fn pause_other_mpris_players(state: &mut DaemonState) {
 }
 
 fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
-    if !state.settings.respect_other_mpris_players {
+    let other_mpris_mode = state.settings.other_mpris_mode;
+    if !other_mpris_mode.coordinates_peers() {
         state.peer_mpris.clear_waiting();
         return;
     }
@@ -3502,17 +3522,34 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
         return;
     }
 
+    let halt_auto_resume_after =
+        Duration::from_secs(state.settings.other_mpris_halt_auto_resume_secs.max(1) as u64);
+    if !should_resume_after_external_mpris_pause(
+        other_mpris_mode,
+        state.peer_mpris.no_playing_services_for(),
+        halt_auto_resume_after,
+    ) {
+        return;
+    }
+
     let waited_for = state.peer_mpris.waiting_for_services().join(", ");
     state.peer_mpris.clear_waiting();
-    eprintln!(
-        "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
-    );
+    match other_mpris_mode {
+        OtherMprisMode::Respect => eprintln!(
+            "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
+        ),
+        OtherMprisMode::HaltAuto => eprintln!(
+            "[MPRIS] resuming local playback after peer player(s) stayed paused or stopped for {}s: {waited_for}",
+            state.settings.other_mpris_halt_auto_resume_secs.max(1)
+        ),
+        OtherMprisMode::Off | OtherMprisMode::Halt => return,
+    }
     resume_local_playback(state);
     sync_mpris(state);
 }
 
 fn poll_external_mpris(state: &mut DaemonState) {
-    if !state.settings.respect_other_mpris_players {
+    if !state.settings.other_mpris_mode.coordinates_peers() {
         state.peer_mpris.deactivate();
         return;
     }
@@ -3522,6 +3559,20 @@ fn poll_external_mpris(state: &mut DaemonState) {
     }
 
     state.peer_mpris.poll_if_due();
+}
+
+fn should_resume_after_external_mpris_pause(
+    mode: OtherMprisMode,
+    quiet_for: Option<Duration>,
+    halt_auto_resume_after: Duration,
+) -> bool {
+    match mode {
+        OtherMprisMode::Respect => true,
+        OtherMprisMode::HaltAuto => {
+            quiet_for.is_some_and(|quiet_for| quiet_for >= halt_auto_resume_after)
+        }
+        OtherMprisMode::Off | OtherMprisMode::Halt => false,
+    }
 }
 
 fn list_other_mpris_services() -> Result<Vec<String>> {
@@ -3762,11 +3813,12 @@ mod tests {
         playback_position_confirms_start, playback_start_stalled, previous_action,
         previous_threshold_millis, rearm_track_repeat_loops_for_snapshot,
         reset_previous_threshold_clock_for_track, should_emit_live_mpris_seeked_hint,
-        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+        should_resume_after_external_mpris_pause, should_retry_after_offline_cache_failure,
+        should_sync_live_mpris_position,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
-    use crate::offline::AppSettings;
+    use crate::offline::{AppSettings, OtherMprisMode};
     use std::time::{Duration, Instant};
 
     fn test_active_track(started_at: Instant) -> ActiveTrack {
@@ -4064,6 +4116,38 @@ mod tests {
             Some(1_250),
             Some(now - Duration::from_millis(300)),
             now
+        ));
+    }
+
+    #[test]
+    fn respect_mode_resumes_immediately_after_peer_quiet() {
+        assert!(should_resume_after_external_mpris_pause(
+            OtherMprisMode::Respect,
+            None,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn halt_mode_never_auto_resumes() {
+        assert!(!should_resume_after_external_mpris_pause(
+            OtherMprisMode::Halt,
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn halt_auto_mode_waits_for_configured_quiet_window() {
+        assert!(!should_resume_after_external_mpris_pause(
+            OtherMprisMode::HaltAuto,
+            Some(Duration::from_secs(4)),
+            Duration::from_secs(5)
+        ));
+        assert!(should_resume_after_external_mpris_pause(
+            OtherMprisMode::HaltAuto,
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5)
         ));
     }
 

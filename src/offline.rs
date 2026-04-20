@@ -5,5 +5,5 @@ pub mod playlist_offline;
 pub mod settings_offline;
 pub mod store_offline;
 
-pub use settings_offline::{AppSettings, OtherMprisMode};
+pub use settings_offline::{AppSettings, CoordinationMode};
 pub use store_offline::MusicCache;

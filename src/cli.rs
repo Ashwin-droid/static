@@ -12,7 +12,7 @@ use crate::network::{
     load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
-use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache};
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
 const HELP_TEXT: &str = "\
@@ -782,9 +782,14 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
         description: "Watch PipeWire activity and duck or pause Static when other audio streams are active for long enough.",
     },
     ConfigSpec {
-        name: "pipewire_duck_pause",
-        kind: ConfigKind::Bool,
-        description: "Pause instead of lowering volume when the PipeWire ducking rule is triggered.",
+        name: "pipewire_pause_mode",
+        kind: ConfigKind::String,
+        description: "How PipeWire-triggered coordination behaves once another audio stream stays active long enough. Values: `off`, `respect`, `halt`, or `halt_auto`.",
+    },
+    ConfigSpec {
+        name: "pipewire_pause_halt_auto_resume_secs",
+        kind: ConfigKind::U32,
+        description: "When `pipewire_pause_mode=halt_auto`, how long PipeWire must stay quiet before Static resumes itself.",
     },
     ConfigSpec {
         name: "pipewire_ducking_threshold_secs",
@@ -819,9 +824,9 @@ fn config_kind_label(kind: ConfigKind) -> &'static str {
 }
 
 fn config_spec(name: &str) -> Result<&'static ConfigSpec> {
-    if name == "respect_other_mpris_players" {
+    if name == "respect_other_mpris_players" || name == "pipewire_duck_pause" {
         return Err(anyhow::anyhow!(
-            "`respect_other_mpris_players` is now a legacy alias. Use `other_mpris_mode` instead."
+            "This key is now a legacy alias. Use the corresponding coordination mode key instead."
         ));
     }
 
@@ -836,6 +841,13 @@ fn print_config_description(name: &str) -> Result<()> {
         println!("respect_other_mpris_players [bool]");
         println!(
             "Legacy alias for `other_mpris_mode`; `true` maps to `respect` and `false` maps to `off`."
+        );
+        return Ok(());
+    }
+    if name == "pipewire_duck_pause" {
+        println!("pipewire_duck_pause [bool]");
+        println!(
+            "Legacy alias for `pipewire_pause_mode`; `true` maps to `respect` and `false` maps to `off`."
         );
         return Ok(());
     }
@@ -868,7 +880,11 @@ fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
         }
         "respect_other_mpris_players" => yes_no_bool(settings.other_mpris_mode.coordinates_peers()),
         "pipewire_ducking_enabled" => yes_no_bool(settings.pipewire_ducking_enabled),
-        "pipewire_duck_pause" => yes_no_bool(settings.pipewire_duck_pause),
+        "pipewire_pause_mode" => settings.pipewire_pause_mode.as_str().to_string(),
+        "pipewire_pause_halt_auto_resume_secs" => {
+            settings.pipewire_pause_halt_auto_resume_secs.to_string()
+        }
+        "pipewire_duck_pause" => yes_no_bool(settings.pipewire_pause_mode.is_enabled()),
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
         "pipewire_ducking_volume" => settings.pipewire_ducking_volume.to_string(),
         "sponsorblock_enabled" => yes_no_bool(settings.sponsorblock_enabled),
@@ -906,19 +922,29 @@ fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Re
         "prefer_local_cache_on_playback" => {
             settings.prefer_local_cache_on_playback = parse_bool(trimmed)?
         }
-        "other_mpris_mode" => settings.other_mpris_mode = parse_other_mpris_mode(trimmed)?,
+        "other_mpris_mode" => settings.other_mpris_mode = parse_coordination_mode(trimmed)?,
         "other_mpris_halt_auto_resume_secs" => {
             settings.other_mpris_halt_auto_resume_secs = parse_u32(trimmed)?.clamp(1, 60)
         }
         "respect_other_mpris_players" => {
             settings.other_mpris_mode = if parse_bool(trimmed)? {
-                OtherMprisMode::Respect
+                CoordinationMode::Respect
             } else {
-                OtherMprisMode::Off
+                CoordinationMode::Off
             }
         }
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled = parse_bool(trimmed)?,
-        "pipewire_duck_pause" => settings.pipewire_duck_pause = parse_bool(trimmed)?,
+        "pipewire_pause_mode" => settings.pipewire_pause_mode = parse_coordination_mode(trimmed)?,
+        "pipewire_pause_halt_auto_resume_secs" => {
+            settings.pipewire_pause_halt_auto_resume_secs = parse_u32(trimmed)?.clamp(1, 60)
+        }
+        "pipewire_duck_pause" => {
+            settings.pipewire_pause_mode = if parse_bool(trimmed)? {
+                CoordinationMode::Respect
+            } else {
+                CoordinationMode::Off
+            }
+        }
         "pipewire_ducking_threshold_secs" => {
             settings.pipewire_ducking_threshold_secs = parse_u32(trimmed)?.clamp(1, 30)
         }
@@ -949,8 +975,8 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
-fn parse_other_mpris_mode(value: &str) -> Result<OtherMprisMode> {
-    OtherMprisMode::from_str(value).ok_or_else(|| {
+fn parse_coordination_mode(value: &str) -> Result<CoordinationMode> {
+    CoordinationMode::from_str(value).ok_or_else(|| {
         anyhow::anyhow!("Expected one of `off`, `respect`, `halt`, or `halt_auto`, got `{value}`")
     })
 }

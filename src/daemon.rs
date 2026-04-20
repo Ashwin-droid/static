@@ -35,7 +35,7 @@ use crate::network::{
     sanitize_categories,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache};
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
 
@@ -58,6 +58,7 @@ const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 const MPRIS_POSITION_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
@@ -109,10 +110,18 @@ enum PipeWireSuppressionMode {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum VolumeRampCompletion {
+    None,
+    PauseAtPosition { position_millis: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
 struct VolumeRamp {
     started_at: Instant,
     start_volume: f64,
     target_volume: f64,
+    duration: Duration,
+    completion: VolumeRampCompletion,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +169,7 @@ struct DaemonState {
     peer_mpris: ExternalMprisCoordinator,
     pipewire_monitor: PipeWireMonitor,
     pipewire_trigger_active: bool,
+    pipewire_quiet_since: Option<Instant>,
     last_pipewire_poll_at: Option<Instant>,
     ducked: bool,
     pipewire_pause_active: bool,
@@ -496,7 +506,7 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_play_pause(move |_| {
                 let mut state = state.borrow_mut();
-                if state.probe_context.is_some() && !state.player.is_paused() {
+                if state.probe_context.is_some() && !is_logically_paused(&state) {
                     if let Err(err) = restore_after_probe(&mut state, false) {
                         eprintln!("[MPRIS] failed to restore queue after probe PlayPause: {err}");
                         state.probe_context = None;
@@ -512,7 +522,7 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_play(move |_| {
                 let mut state = state.borrow_mut();
-                if state.active_track.is_some() && state.player.is_paused() {
+                if state.active_track.is_some() && is_logically_paused(&state) {
                     resume_for_user_action(&mut state);
                 }
             });
@@ -522,7 +532,7 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_pause(move |_| {
                 let mut state = state.borrow_mut();
-                if state.active_track.is_some() && !state.player.is_paused() {
+                if state.active_track.is_some() && !is_logically_paused(&state) {
                     if state.probe_context.is_some() {
                         if let Err(err) = restore_after_probe(&mut state, false) {
                             eprintln!("[MPRIS] failed to restore queue after probe Pause: {err}");
@@ -765,6 +775,7 @@ pub fn run() -> Result<()> {
         peer_mpris: ExternalMprisCoordinator::new(),
         pipewire_monitor: PipeWireMonitor::new(),
         pipewire_trigger_active: false,
+        pipewire_quiet_since: Some(Instant::now()),
         last_pipewire_poll_at: None,
         ducked: false,
         pipewire_pause_active: false,
@@ -1149,7 +1160,7 @@ fn maintain_playback(state: &mut DaemonState) {
     advance_volume_ramp(state);
 
     if state.active_track.is_some() {
-        if state.player.is_paused() {
+        if is_logically_paused(state) {
             if state.paused_since.is_none() {
                 state.paused_since = Some(Instant::now());
             }
@@ -1278,23 +1289,13 @@ fn capture_probe_restore_state(state: &DaemonState) -> ProbeRestoreState {
         .queue
         .get(queue_index)
         .map(|track| track.video_id.clone());
-    let position_millis = state.active_track.as_ref().map(|track| {
-        track.startup_seek_millis.unwrap_or_else(|| {
-            current_listened_millis(
-                state
-                    .player
-                    .position()
-                    .map(|position| position.nseconds() / 1_000_000),
-                track,
-            )
-        })
-    });
+    let position_millis = pause_anchor_position_millis(state);
 
     ProbeRestoreState {
         queue_index,
         queue_video_id,
         position_millis,
-        resume_playback: state.active_track.is_some() && !state.player.is_paused(),
+        resume_playback: state.active_track.is_some() && !is_logically_paused(state),
         track_repeat_loops_left: state.track_repeat_loops_left,
     }
 }
@@ -1327,6 +1328,7 @@ fn resolve_probe_restore_index(state: &DaemonState, probe: &ProbeRestoreState) -
 
 fn suspend_playback_for_probe(state: &mut DaemonState) {
     state.player.stop();
+    state.volume_ramp = None;
     state.player = PlaybackEngine::new();
     state.active_track.take();
     state.track_repeat_loops_left = None;
@@ -1351,11 +1353,8 @@ fn start_probe_playback(
         playback_source.label(),
     );
     state.player.play_uri(&prepared_uri);
-    if state.volume_ramp.is_some() {
-        advance_volume_ramp(state);
-    } else {
-        state.player.set_volume(current_output_volume(state));
-    }
+    state.player.set_volume(0.0);
+    start_playback_volume_ramp(state, steady_output_volume(state));
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -1538,6 +1537,10 @@ fn hide_timing_for_track(track: &ActiveTrack) -> bool {
 }
 
 fn visible_position_millis(state: &DaemonState) -> Option<u64> {
+    if let Some(position_millis) = pending_pause_position_millis(state) {
+        return Some(position_millis);
+    }
+
     let track = state.active_track.as_ref()?;
     if track.awaiting_fresh_position {
         track
@@ -1573,10 +1576,11 @@ fn mpris_position_millis_for_track(
 
 fn mpris_position_millis(state: &DaemonState) -> Option<u64> {
     let track = state.active_track.as_ref()?;
-    let player_position_millis = state.player.position().map(|position| position.mseconds());
+    let player_position_millis = pending_pause_position_millis(state)
+        .or_else(|| state.player.position().map(|position| position.mseconds()));
     let duration_millis = state.player.duration().map(|duration| duration.mseconds());
     let position_millis =
-        mpris_position_millis_for_track(track, player_position_millis, state.player.is_paused());
+        mpris_position_millis_for_track(track, player_position_millis, is_logically_paused(state));
 
     match (position_millis, duration_millis) {
         (Some(position_millis), Some(duration_millis)) => {
@@ -1620,7 +1624,7 @@ fn should_emit_live_mpris_seeked_hint(
 }
 
 fn maybe_sync_live_mpris_position(state: &DaemonState) {
-    if state.active_track.is_none() || state.player.is_paused() {
+    if state.active_track.is_none() || is_logically_paused(state) {
         return;
     }
 
@@ -1741,35 +1745,77 @@ fn reset_previous_threshold_clock_for_track(track: &mut ActiveTrack, playing: bo
     track.previous_threshold_resumed_at = playing.then_some(Instant::now());
 }
 
+fn pending_pause_position_millis(state: &DaemonState) -> Option<u64> {
+    state.volume_ramp.and_then(|ramp| match ramp.completion {
+        VolumeRampCompletion::PauseAtPosition { position_millis } => Some(position_millis),
+        VolumeRampCompletion::None => None,
+    })
+}
+
+fn is_fading_out_to_pause(state: &DaemonState) -> bool {
+    pending_pause_position_millis(state).is_some() && !state.player.is_paused()
+}
+
+fn is_logically_paused(state: &DaemonState) -> bool {
+    state.player.is_paused() || is_fading_out_to_pause(state)
+}
+
+fn pause_anchor_position_millis(state: &DaemonState) -> Option<u64> {
+    pending_pause_position_millis(state).or_else(|| {
+        state.active_track.as_ref().map(|track| {
+            track.startup_seek_millis.unwrap_or_else(|| {
+                current_listened_millis(
+                    state
+                        .player
+                        .position()
+                        .map(|position| position.nseconds() / 1_000_000),
+                    track,
+                )
+            })
+        })
+    })
+}
+
 fn pause_local_playback(state: &mut DaemonState) {
-    if state.player.is_paused() {
+    if is_logically_paused(state) {
         return;
     }
+    let Some(position_millis) = pause_anchor_position_millis(state) else {
+        return;
+    };
+
     if let Some(track) = state.active_track.as_mut() {
         pause_previous_threshold_clock_for_track(track);
+        track.last_position_millis = position_millis;
     }
-    state.player.pause();
+    start_pause_fade(state, position_millis);
 }
 
 fn resume_local_playback(state: &mut DaemonState) {
-    if !state.player.is_paused() {
+    if !is_logically_paused(state) {
         return;
     }
-    state.player.resume();
+
+    if state.player.is_paused() {
+        state.player.set_volume(0.0);
+        state.player.resume();
+    }
+    start_playback_volume_ramp(state, steady_output_volume(state));
+
     if let Some(track) = state.active_track.as_mut() {
         resume_previous_threshold_clock_for_track(track);
     }
 }
 
 fn reset_previous_threshold_clock(state: &mut DaemonState) {
-    let playing = !state.player.is_paused();
+    let playing = !is_logically_paused(state);
     if let Some(track) = state.active_track.as_mut() {
         reset_previous_threshold_clock_for_track(track, playing);
     }
 }
 
 fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
-    if state.player.is_paused() {
+    if is_logically_paused(state) {
         return false;
     }
 
@@ -1934,12 +1980,12 @@ fn handle_previous_for_user_action(state: &mut DaemonState) -> Result<()> {
 }
 
 fn toggle_pause_for_user_action(state: &mut DaemonState) {
-    if state.player.is_paused() && state.active_track.is_some() {
+    if is_logically_paused(state) && state.active_track.is_some() {
         pause_other_mpris_players(state);
     } else {
         state.peer_mpris.clear_waiting();
     }
-    if state.player.is_paused() {
+    if is_logically_paused(state) {
         resume_local_playback(state);
     } else {
         pause_local_playback(state);
@@ -2005,11 +2051,8 @@ fn play_index_with_startup_retries(
         playback_start_attempt_total(),
     );
     state.player.play_uri(&prepared_uri);
-    if state.volume_ramp.is_some() {
-        advance_volume_ramp(state);
-    } else {
-        state.player.set_volume(current_output_volume(state));
-    }
+    state.player.set_volume(0.0);
+    start_playback_volume_ramp(state, steady_output_volume(state));
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -2075,13 +2118,16 @@ fn mark_radio_touched_through(state: &mut DaemonState, index: usize) {
 fn stop_playback(state: &mut DaemonState, exiting: bool) {
     maybe_persist_playback_state(state, true);
     if let Some(track) = state.active_track.take() {
-        let current_position_millis = state
-            .player
-            .position()
-            .map(|position| position.nseconds() / 1_000_000);
+        let current_position_millis = pending_pause_position_millis(state).or_else(|| {
+            state
+                .player
+                .position()
+                .map(|position| position.nseconds() / 1_000_000)
+        });
         flush_active_track(track, current_position_millis, exiting);
     }
     state.player.stop();
+    state.volume_ramp = None;
     state.track_repeat_loops_left = None;
     state.sponsor_segments.clear();
     state.sponsor_segments_reported.clear();
@@ -2788,7 +2834,7 @@ fn current_listened_millis(current_position_millis: Option<u64>, track: &ActiveT
 }
 
 fn maybe_flush_watchtime_progress(state: &mut DaemonState) {
-    if state.player.is_paused() {
+    if is_logically_paused(state) {
         return;
     }
 
@@ -2921,7 +2967,7 @@ fn refresh_sponsorblock_for_current_track(state: &mut DaemonState) {
 }
 
 fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
-    if state.player.is_paused() {
+    if is_logically_paused(state) {
         return;
     }
 
@@ -3113,19 +3159,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         .probe_context
         .as_ref()
         .and_then(|probe| probe.position_millis)
-        .or_else(|| {
-            state.active_track.as_ref().map(|track| {
-                track.startup_seek_millis.unwrap_or_else(|| {
-                    current_listened_millis(
-                        state
-                            .player
-                            .position()
-                            .map(|position| position.nseconds() / 1_000_000),
-                        track,
-                    )
-                })
-            })
-        });
+        .or_else(|| pause_anchor_position_millis(state));
     let hide_timing = state.probe_context.is_none()
         && state
             .active_track
@@ -3141,7 +3175,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         repeat_mode: state.repeat_mode,
         track_repeat_loops_left: state.track_repeat_loops_left,
         paused: state.probe_context.is_some()
-            || (state.active_track.is_some() && state.player.is_paused()),
+            || (state.active_track.is_some() && is_logically_paused(state)),
         volume: logical_volume(state),
         position_millis,
         duration_millis: (state.probe_context.is_none() && !hide_timing)
@@ -3190,7 +3224,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         track_repeat_loops_left: state.track_repeat_loops_left,
-        paused: state.player.is_paused(),
+        paused: is_logically_paused(state),
         volume: logical_volume(state),
         position_millis: (!hide_timing)
             .then(|| visible_position_millis(state))
@@ -3222,7 +3256,7 @@ fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
 
     if !force
         && state.active_track.is_some()
-        && !state.player.is_paused()
+        && !is_logically_paused(state)
         && state
             .last_persisted_playback_at
             .is_some_and(|saved_at| saved_at.elapsed() < PLAYBACK_STATE_PERSIST_INTERVAL)
@@ -3283,31 +3317,15 @@ fn note_mpris_position_sync(state: &DaemonState, position_millis: Option<u64>, s
 }
 
 fn logical_volume(state: &DaemonState) -> f64 {
-    if state.ducked || is_restoring_from_pipewire_duck(state) {
-        state.pre_duck_volume
+    state.pre_duck_volume
+}
+
+fn steady_output_volume(state: &DaemonState) -> f64 {
+    if state.ducked {
+        pipewire_duck_output_volume(state)
     } else {
-        state.player.volume()
+        logical_volume(state)
     }
-}
-
-fn is_restoring_from_pipewire_duck(state: &DaemonState) -> bool {
-    state
-        .volume_ramp
-        .is_some_and(|ramp| volumes_match(ramp.target_volume, state.pre_duck_volume))
-}
-
-fn current_output_volume(state: &DaemonState) -> f64 {
-    state
-        .volume_ramp
-        .map(volume_ramp_value)
-        .unwrap_or_else(|| {
-            if state.ducked {
-                pipewire_duck_output_volume(state)
-            } else {
-                logical_volume(state)
-            }
-        })
-        .clamp(0.0, 1.0)
 }
 
 fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
@@ -3327,11 +3345,43 @@ fn set_logical_volume(state: &mut DaemonState, volume: f64) {
 }
 
 fn start_volume_ramp(state: &mut DaemonState, target_volume: f64) {
+    start_volume_ramp_with_completion(
+        state,
+        target_volume,
+        PIPEWIRE_VOLUME_RAMP_DURATION,
+        VolumeRampCompletion::None,
+    );
+}
+
+fn start_playback_volume_ramp(state: &mut DaemonState, target_volume: f64) {
+    start_volume_ramp_with_completion(
+        state,
+        target_volume,
+        PLAYBACK_VOLUME_RAMP_DURATION,
+        VolumeRampCompletion::None,
+    );
+}
+
+fn start_pause_fade(state: &mut DaemonState, position_millis: u64) {
+    start_volume_ramp_with_completion(
+        state,
+        0.0,
+        PLAYBACK_VOLUME_RAMP_DURATION,
+        VolumeRampCompletion::PauseAtPosition { position_millis },
+    );
+}
+
+fn start_volume_ramp_with_completion(
+    state: &mut DaemonState,
+    target_volume: f64,
+    duration: Duration,
+    completion: VolumeRampCompletion,
+) {
     let target_volume = target_volume.clamp(0.0, 1.0);
     let current_volume = state.player.volume();
+    state.player.set_volume(current_volume);
     if volumes_match(current_volume, target_volume) {
-        state.volume_ramp = None;
-        state.player.set_volume(target_volume);
+        finish_volume_ramp(state, target_volume, completion);
         return;
     }
 
@@ -3339,6 +3389,8 @@ fn start_volume_ramp(state: &mut DaemonState, target_volume: f64) {
         started_at: Instant::now(),
         start_volume: current_volume,
         target_volume,
+        duration,
+        completion,
     });
 }
 
@@ -3351,15 +3403,35 @@ fn advance_volume_ramp(state: &mut DaemonState) {
     state.player.set_volume(next_volume);
 
     if volumes_match(next_volume, ramp.target_volume) {
-        state.player.set_volume(ramp.target_volume);
-        state.volume_ramp = None;
+        finish_volume_ramp(state, ramp.target_volume, ramp.completion);
+    }
+}
+
+fn finish_volume_ramp(
+    state: &mut DaemonState,
+    final_volume: f64,
+    completion: VolumeRampCompletion,
+) {
+    state.player.set_volume(final_volume.clamp(0.0, 1.0));
+    state.volume_ramp = None;
+
+    match completion {
+        VolumeRampCompletion::None => {}
+        VolumeRampCompletion::PauseAtPosition { position_millis } => {
+            state.player.pause();
+            state.player.seek(ClockTime::from_mseconds(position_millis));
+            if let Some(track) = state.active_track.as_mut() {
+                track.last_position_millis = position_millis;
+            }
+            sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+        }
     }
 }
 
 fn volume_ramp_value(ramp: VolumeRamp) -> f64 {
-    let progress = (ramp.started_at.elapsed().as_secs_f64()
-        / PIPEWIRE_VOLUME_RAMP_DURATION.as_secs_f64())
-    .clamp(0.0, 1.0);
+    let progress =
+        (ramp.started_at.elapsed().as_secs_f64() / ramp.duration.as_secs_f64()).clamp(0.0, 1.0);
     (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress).clamp(0.0, 1.0)
 }
 
@@ -3375,13 +3447,13 @@ fn desired_pipewire_suppression_mode(state: &DaemonState) -> PipeWireSuppression
         return PipeWireSuppressionMode::None;
     }
 
-    if state.settings.pipewire_duck_pause {
-        if state.pipewire_pause_active || !state.player.is_paused() {
+    if state.settings.pipewire_pause_mode.is_enabled() {
+        if state.pipewire_pause_active || !is_logically_paused(state) {
             PipeWireSuppressionMode::Pause
         } else {
             PipeWireSuppressionMode::None
         }
-    } else if state.player.is_paused() {
+    } else if is_logically_paused(state) {
         PipeWireSuppressionMode::None
     } else {
         PipeWireSuppressionMode::Duck
@@ -3410,6 +3482,11 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
         .active_streams()
         .values()
         .any(|first_seen| first_seen.elapsed() >= threshold);
+    if state.pipewire_trigger_active {
+        state.pipewire_quiet_since = None;
+    } else {
+        state.pipewire_quiet_since.get_or_insert_with(Instant::now);
+    }
 }
 
 fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
@@ -3422,12 +3499,27 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
 
     if state.pipewire_pause_active && desired != PipeWireSuppressionMode::Pause {
         let should_resume = state.active_track.is_some()
-            && state.player.is_paused()
-            && !state.peer_mpris.is_waiting_for_peer_pause();
-        state.pipewire_pause_active = false;
+            && is_logically_paused(state)
+            && !state.peer_mpris.is_waiting_for_peer_pause()
+            && should_resume_after_pipewire_pause(
+                state.settings.pipewire_pause_mode,
+                desired,
+                state
+                    .pipewire_quiet_since
+                    .map(|quiet_since| quiet_since.elapsed()),
+                Duration::from_secs(
+                    state.settings.pipewire_pause_halt_auto_resume_secs.max(1) as u64
+                ),
+            );
+        let should_clear_without_resuming = desired == PipeWireSuppressionMode::None
+            && matches!(state.settings.pipewire_pause_mode, CoordinationMode::Halt);
+
         if should_resume {
+            state.pipewire_pause_active = false;
             resume_local_playback(state);
             sync_mpris(state);
+        } else if should_clear_without_resuming {
+            state.pipewire_pause_active = false;
         }
     }
 }
@@ -3452,7 +3544,7 @@ fn maybe_duck_for_pipewire(state: &mut DaemonState) {
                 state.pre_duck_volume = logical_volume(state);
                 state.pipewire_pause_active = true;
             }
-            if !state.player.is_paused() {
+            if !is_logically_paused(state) {
                 pause_local_playback(state);
                 sync_mpris(state);
             }
@@ -3467,7 +3559,7 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
         return;
     }
 
-    if state.active_track.is_none() || state.player.is_paused() {
+    if state.active_track.is_none() || is_logically_paused(state) {
         return;
     }
 
@@ -3510,7 +3602,7 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
     }
 
     if state.active_track.is_none()
-        || !state.player.is_paused()
+        || !is_logically_paused(state)
         || !state.peer_mpris.is_waiting_for_peer_pause()
     {
         return;
@@ -3535,14 +3627,14 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
     let waited_for = state.peer_mpris.waiting_for_services().join(", ");
     state.peer_mpris.clear_waiting();
     match other_mpris_mode {
-        OtherMprisMode::Respect => eprintln!(
+        CoordinationMode::Respect => eprintln!(
             "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
         ),
-        OtherMprisMode::HaltAuto => eprintln!(
+        CoordinationMode::HaltAuto => eprintln!(
             "[MPRIS] resuming local playback after peer player(s) stayed paused or stopped for {}s: {waited_for}",
             state.settings.other_mpris_halt_auto_resume_secs.max(1)
         ),
-        OtherMprisMode::Off | OtherMprisMode::Halt => return,
+        CoordinationMode::Off | CoordinationMode::Halt => return,
     }
     resume_local_playback(state);
     sync_mpris(state);
@@ -3562,16 +3654,35 @@ fn poll_external_mpris(state: &mut DaemonState) {
 }
 
 fn should_resume_after_external_mpris_pause(
-    mode: OtherMprisMode,
+    mode: CoordinationMode,
     quiet_for: Option<Duration>,
     halt_auto_resume_after: Duration,
 ) -> bool {
     match mode {
-        OtherMprisMode::Respect => true,
-        OtherMprisMode::HaltAuto => {
+        CoordinationMode::Respect => true,
+        CoordinationMode::HaltAuto => {
             quiet_for.is_some_and(|quiet_for| quiet_for >= halt_auto_resume_after)
         }
-        OtherMprisMode::Off | OtherMprisMode::Halt => false,
+        CoordinationMode::Off | CoordinationMode::Halt => false,
+    }
+}
+
+fn should_resume_after_pipewire_pause(
+    mode: CoordinationMode,
+    desired: PipeWireSuppressionMode,
+    quiet_for: Option<Duration>,
+    halt_auto_resume_after: Duration,
+) -> bool {
+    match desired {
+        PipeWireSuppressionMode::Duck => true,
+        PipeWireSuppressionMode::Pause => false,
+        PipeWireSuppressionMode::None => match mode {
+            CoordinationMode::Off | CoordinationMode::Respect => true,
+            CoordinationMode::Halt => false,
+            CoordinationMode::HaltAuto => {
+                quiet_for.is_some_and(|quiet_for| quiet_for >= halt_auto_resume_after)
+            }
+        },
     }
 }
 
@@ -3807,18 +3918,19 @@ fn get_storage_root() -> Option<String> {
 mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
-        PlaybackSource, PreviousAction, current_listened_millis, effective_queue_len,
-        hide_timing_for_track, mpris_position_millis_for_track, natural_end_target_index,
-        next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
-        playback_position_confirms_start, playback_start_stalled, previous_action,
-        previous_threshold_millis, rearm_track_repeat_loops_for_snapshot,
-        reset_previous_threshold_clock_for_track, should_emit_live_mpris_seeked_hint,
-        should_resume_after_external_mpris_pause, should_retry_after_offline_cache_failure,
+        PipeWireSuppressionMode, PlaybackSource, PreviousAction, current_listened_millis,
+        effective_queue_len, hide_timing_for_track, mpris_position_millis_for_track,
+        natural_end_target_index, next_repeat_state_after_natural_end,
+        pause_previous_threshold_clock_for_track, playback_position_confirms_start,
+        playback_start_stalled, previous_action, previous_threshold_millis,
+        rearm_track_repeat_loops_for_snapshot, reset_previous_threshold_clock_for_track,
+        should_emit_live_mpris_seeked_hint, should_resume_after_external_mpris_pause,
+        should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
         should_sync_live_mpris_position,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
-    use crate::offline::{AppSettings, OtherMprisMode};
+    use crate::offline::{AppSettings, CoordinationMode};
     use std::time::{Duration, Instant};
 
     fn test_active_track(started_at: Instant) -> ActiveTrack {
@@ -4122,7 +4234,7 @@ mod tests {
     #[test]
     fn respect_mode_resumes_immediately_after_peer_quiet() {
         assert!(should_resume_after_external_mpris_pause(
-            OtherMprisMode::Respect,
+            CoordinationMode::Respect,
             None,
             Duration::from_secs(5)
         ));
@@ -4131,7 +4243,7 @@ mod tests {
     #[test]
     fn halt_mode_never_auto_resumes() {
         assert!(!should_resume_after_external_mpris_pause(
-            OtherMprisMode::Halt,
+            CoordinationMode::Halt,
             Some(Duration::from_secs(60)),
             Duration::from_secs(5)
         ));
@@ -4140,12 +4252,38 @@ mod tests {
     #[test]
     fn halt_auto_mode_waits_for_configured_quiet_window() {
         assert!(!should_resume_after_external_mpris_pause(
-            OtherMprisMode::HaltAuto,
+            CoordinationMode::HaltAuto,
             Some(Duration::from_secs(4)),
             Duration::from_secs(5)
         ));
         assert!(should_resume_after_external_mpris_pause(
-            OtherMprisMode::HaltAuto,
+            CoordinationMode::HaltAuto,
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn pipewire_pause_mode_can_fall_back_to_duck_immediately() {
+        assert!(should_resume_after_pipewire_pause(
+            CoordinationMode::Off,
+            PipeWireSuppressionMode::Duck,
+            None,
+            Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn pipewire_halt_auto_waits_for_quiet_window() {
+        assert!(!should_resume_after_pipewire_pause(
+            CoordinationMode::HaltAuto,
+            PipeWireSuppressionMode::None,
+            Some(Duration::from_secs(4)),
+            Duration::from_secs(5)
+        ));
+        assert!(should_resume_after_pipewire_pause(
+            CoordinationMode::HaltAuto,
+            PipeWireSuppressionMode::None,
             Some(Duration::from_secs(5)),
             Duration::from_secs(5)
         ));

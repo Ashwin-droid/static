@@ -54,7 +54,7 @@ use crate::network::{
     load_cookie_from_chromium_profile, sanitize_categories, store_cookie, store_vr_refresh_token,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, MusicCache, OtherMprisMode};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache};
 use crate::player::Player;
 
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =

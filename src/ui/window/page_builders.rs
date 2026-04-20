@@ -1745,11 +1745,26 @@ pub(super) fn load_settings_page(
         });
     }
 
+    let coordination_section = GtkBox::new(Orientation::Vertical, 12);
+    coordination_section.add_css_class("settings-card");
+    let coordination_title = Label::new(Some("Coordination settings"));
+    coordination_title.add_css_class("settings-card-title");
+    coordination_title.set_halign(Align::Start);
+    coordination_section.append(&coordination_title);
+
+    let coordination_copy = Label::new(Some(
+        "Control how Static reacts when other audio apps or streams take over, including whether playback resumes on its own.",
+    ));
+    coordination_copy.add_css_class("settings-card-copy");
+    coordination_copy.set_wrap(true);
+    coordination_copy.set_halign(Align::Start);
+    coordination_section.append(&coordination_copy);
+
     let mpris_row = GtkBox::new(Orientation::Horizontal, 12);
     mpris_row.add_css_class("settings-row");
     let mpris_copy = GtkBox::new(Orientation::Vertical, 2);
     mpris_copy.set_hexpand(true);
-    let mpris_label = Label::new(Some("Other MPRIS behavior"));
+    let mpris_label = Label::new(Some("MPRIS coordination"));
     mpris_label.add_css_class("settings-row-title");
     mpris_label.set_halign(Align::Start);
     mpris_copy.append(&mpris_label);
@@ -1761,21 +1776,21 @@ pub(super) fn load_settings_page(
     mpris_hint.set_halign(Align::Start);
     mpris_copy.append(&mpris_hint);
     mpris_row.append(&mpris_copy);
-    let mpris_mode_labels = [
-        OtherMprisMode::Off.label(),
-        OtherMprisMode::Respect.label(),
-        OtherMprisMode::Halt.label(),
-        OtherMprisMode::HaltAuto.label(),
+    let coordination_mode_labels = [
+        CoordinationMode::Off.label(),
+        CoordinationMode::Respect.label(),
+        CoordinationMode::Halt.label(),
+        CoordinationMode::HaltAuto.label(),
     ];
-    let mpris_dropdown = DropDown::from_strings(&mpris_mode_labels);
-    let selected_mode_index = OtherMprisMode::ALL
+    let mpris_dropdown = DropDown::from_strings(&coordination_mode_labels);
+    let selected_mode_index = CoordinationMode::ALL
         .iter()
         .position(|mode| *mode == settings.other_mpris_mode)
         .unwrap_or(1);
     mpris_dropdown.set_selected(selected_mode_index as u32);
     mpris_dropdown.set_valign(Align::Center);
     mpris_row.append(&mpris_dropdown);
-    playback_section.append(&mpris_row);
+    coordination_section.append(&mpris_row);
 
     let mpris_halt_auto_row = GtkBox::new(Orientation::Horizontal, 12);
     mpris_halt_auto_row.add_css_class("settings-row");
@@ -1797,17 +1812,17 @@ pub(super) fn load_settings_page(
     mpris_halt_auto_spin.set_value(settings.other_mpris_halt_auto_resume_secs as f64);
     mpris_halt_auto_spin.set_sensitive(settings.other_mpris_mode.resumes_after_delay());
     mpris_halt_auto_row.append(&mpris_halt_auto_spin);
-    playback_section.append(&mpris_halt_auto_row);
+    coordination_section.append(&mpris_halt_auto_row);
 
     {
         let state = state.clone();
         let mpris_halt_auto_spin = mpris_halt_auto_spin.clone();
         mpris_dropdown.connect_selected_notify(move |dropdown| {
             let selected = dropdown.selected() as usize;
-            let mode = OtherMprisMode::ALL
+            let mode = CoordinationMode::ALL
                 .get(selected)
                 .copied()
-                .unwrap_or(OtherMprisMode::Respect);
+                .unwrap_or(CoordinationMode::Respect);
             mpris_halt_auto_spin.set_sensitive(mode.resumes_after_delay());
             if mode == app_settings(&state).other_mpris_mode {
                 return;
@@ -1845,35 +1860,58 @@ pub(super) fn load_settings_page(
     pipewire_row.append(&pipewire_copy);
     let pipewire_switch = settings_switch(settings.pipewire_ducking_enabled);
     pipewire_row.append(&pipewire_switch);
-    playback_section.append(&pipewire_row);
+    coordination_section.append(&pipewire_row);
 
     let pipewire_pause_row = GtkBox::new(Orientation::Horizontal, 12);
     pipewire_pause_row.add_css_class("settings-row");
     let pipewire_pause_copy = GtkBox::new(Orientation::Vertical, 2);
     pipewire_pause_copy.set_hexpand(true);
-    let pipewire_pause_label = Label::new(Some("Duck pause"));
+    let pipewire_pause_label = Label::new(Some("PipeWire coordination"));
     pipewire_pause_label.add_css_class("settings-row-title");
     pipewire_pause_label.set_halign(Align::Start);
     pipewire_pause_copy.append(&pipewire_pause_label);
     let pipewire_pause_hint = Label::new(Some(
-        "Pause Static instead of lowering volume once the PipeWire threshold is reached.",
+        "Choose whether PipeWire activity should duck Static, pause and resume, or halt until you restart playback.",
     ));
     pipewire_pause_hint.add_css_class("settings-row-copy");
     pipewire_pause_hint.set_wrap(true);
     pipewire_pause_hint.set_halign(Align::Start);
     pipewire_pause_copy.append(&pipewire_pause_hint);
     pipewire_pause_row.append(&pipewire_pause_copy);
-    let pipewire_pause_switch = settings_switch(settings.pipewire_duck_pause);
-    pipewire_pause_switch.set_sensitive(settings.pipewire_ducking_enabled);
-    {
-        let state = state.clone();
-        pipewire_pause_switch.connect_active_notify(move |sw| {
-            let active = sw.is_active();
-            update_app_settings(&state, |s| s.pipewire_duck_pause = active);
-        });
-    }
-    pipewire_pause_row.append(&pipewire_pause_switch);
-    playback_section.append(&pipewire_pause_row);
+    let pipewire_pause_dropdown = DropDown::from_strings(&coordination_mode_labels);
+    let pipewire_pause_mode_index = CoordinationMode::ALL
+        .iter()
+        .position(|mode| *mode == settings.pipewire_pause_mode)
+        .unwrap_or(0);
+    pipewire_pause_dropdown.set_selected(pipewire_pause_mode_index as u32);
+    pipewire_pause_dropdown.set_sensitive(settings.pipewire_ducking_enabled);
+    pipewire_pause_dropdown.set_valign(Align::Center);
+    pipewire_pause_row.append(&pipewire_pause_dropdown);
+    coordination_section.append(&pipewire_pause_row);
+
+    let pipewire_pause_halt_auto_row = GtkBox::new(Orientation::Horizontal, 12);
+    pipewire_pause_halt_auto_row.add_css_class("settings-row");
+    let pipewire_pause_halt_auto_copy = GtkBox::new(Orientation::Vertical, 2);
+    pipewire_pause_halt_auto_copy.set_hexpand(true);
+    let pipewire_pause_halt_auto_label = Label::new(Some("PipeWire halt auto delay"));
+    pipewire_pause_halt_auto_label.add_css_class("settings-row-title");
+    pipewire_pause_halt_auto_label.set_halign(Align::Start);
+    pipewire_pause_halt_auto_copy.append(&pipewire_pause_halt_auto_label);
+    let pipewire_pause_halt_auto_hint = Label::new(Some(
+        "When PipeWire coordination is set to Halt Auto, wait this long after other audio stops before Static comes back.",
+    ));
+    pipewire_pause_halt_auto_hint.add_css_class("settings-row-copy");
+    pipewire_pause_halt_auto_hint.set_wrap(true);
+    pipewire_pause_halt_auto_hint.set_halign(Align::Start);
+    pipewire_pause_halt_auto_copy.append(&pipewire_pause_halt_auto_hint);
+    pipewire_pause_halt_auto_row.append(&pipewire_pause_halt_auto_copy);
+    let pipewire_pause_halt_auto_spin = SpinButton::with_range(1.0, 60.0, 1.0);
+    pipewire_pause_halt_auto_spin.set_value(settings.pipewire_pause_halt_auto_resume_secs as f64);
+    pipewire_pause_halt_auto_spin.set_sensitive(
+        settings.pipewire_ducking_enabled && settings.pipewire_pause_mode.resumes_after_delay(),
+    );
+    pipewire_pause_halt_auto_row.append(&pipewire_pause_halt_auto_spin);
+    coordination_section.append(&pipewire_pause_halt_auto_row);
 
     let pipewire_threshold_row = GtkBox::new(Orientation::Horizontal, 12);
     pipewire_threshold_row.add_css_class("settings-row");
@@ -1904,7 +1942,7 @@ pub(super) fn load_settings_page(
         });
     }
     pipewire_threshold_row.append(&pipewire_threshold_spin);
-    playback_section.append(&pipewire_threshold_row);
+    coordination_section.append(&pipewire_threshold_row);
 
     let pipewire_volume_row = GtkBox::new(Orientation::Horizontal, 12);
     pipewire_volume_row.add_css_class("settings-row");
@@ -1927,7 +1965,9 @@ pub(super) fn load_settings_page(
     pipewire_volume_scale.set_digits(2);
     pipewire_volume_scale.set_draw_value(true);
     pipewire_volume_scale.set_size_request(160, -1);
-    pipewire_volume_scale.set_sensitive(settings.pipewire_ducking_enabled);
+    pipewire_volume_scale.set_sensitive(
+        settings.pipewire_ducking_enabled && !settings.pipewire_pause_mode.is_enabled(),
+    );
     {
         let state = state.clone();
         pipewire_volume_scale.connect_value_changed(move |scale| {
@@ -1936,19 +1976,54 @@ pub(super) fn load_settings_page(
         });
     }
     pipewire_volume_row.append(&pipewire_volume_scale);
-    playback_section.append(&pipewire_volume_row);
+    coordination_section.append(&pipewire_volume_row);
 
     {
         let state = state.clone();
-        let pipewire_pause_switch = pipewire_pause_switch.clone();
+        let pipewire_pause_dropdown = pipewire_pause_dropdown.clone();
+        let pipewire_pause_halt_auto_spin = pipewire_pause_halt_auto_spin.clone();
         let pipewire_threshold_spin = pipewire_threshold_spin.clone();
         let pipewire_volume_scale = pipewire_volume_scale.clone();
         pipewire_switch.connect_active_notify(move |sw| {
             let active = sw.is_active();
-            pipewire_pause_switch.set_sensitive(active);
+            let pipewire_pause_mode = app_settings(&state).pipewire_pause_mode;
+            pipewire_pause_dropdown.set_sensitive(active);
+            pipewire_pause_halt_auto_spin
+                .set_sensitive(active && pipewire_pause_mode.resumes_after_delay());
             pipewire_threshold_spin.set_sensitive(active);
-            pipewire_volume_scale.set_sensitive(active);
+            pipewire_volume_scale.set_sensitive(active && !pipewire_pause_mode.is_enabled());
             update_app_settings(&state, |s| s.pipewire_ducking_enabled = active);
+        });
+    }
+
+    {
+        let state = state.clone();
+        let pipewire_pause_halt_auto_spin = pipewire_pause_halt_auto_spin.clone();
+        let pipewire_volume_scale = pipewire_volume_scale.clone();
+        pipewire_pause_dropdown.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected() as usize;
+            let mode = CoordinationMode::ALL
+                .get(selected)
+                .copied()
+                .unwrap_or(CoordinationMode::Off);
+            let enabled = app_settings(&state).pipewire_ducking_enabled;
+            pipewire_pause_halt_auto_spin.set_sensitive(enabled && mode.resumes_after_delay());
+            pipewire_volume_scale.set_sensitive(enabled && !mode.is_enabled());
+            if mode == app_settings(&state).pipewire_pause_mode {
+                return;
+            }
+            update_app_settings(&state, |s| s.pipewire_pause_mode = mode);
+        });
+    }
+
+    {
+        let state = state.clone();
+        pipewire_pause_halt_auto_spin.connect_value_changed(move |spin| {
+            let value = (spin.value() as u32).clamp(1, 60);
+            if value == app_settings(&state).pipewire_pause_halt_auto_resume_secs {
+                return;
+            }
+            update_app_settings(&state, |s| s.pipewire_pause_halt_auto_resume_secs = value);
         });
     }
 
@@ -2008,6 +2083,7 @@ pub(super) fn load_settings_page(
     playback_section.append(&prefetch_count_row);
 
     sections.append(&playback_section);
+    sections.append(&coordination_section);
 
     let sponsorblock_section = GtkBox::new(Orientation::Vertical, 12);
     sponsorblock_section.add_css_class("settings-card");

@@ -115,6 +115,12 @@ enum VolumeRampCompletion {
     PauseAtPosition { position_millis: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackTransition {
+    Immediate,
+    Calm,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VolumeRamp {
     started_at: Instant,
@@ -541,7 +547,7 @@ impl DaemonMprisBridge {
                         }
                     } else {
                         state.peer_mpris.clear_waiting();
-                        pause_local_playback(&mut state);
+                        pause_local_playback(&mut state, PlaybackTransition::Immediate);
                         sync_mpris(&state);
                     }
                 }
@@ -982,7 +988,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 restore_after_probe(state, false)
             } else {
                 state.peer_mpris.clear_waiting();
-                pause_local_playback(state);
+                pause_local_playback(state, PlaybackTransition::Immediate);
                 sync_mpris(state);
                 Ok(())
             };
@@ -1427,7 +1433,7 @@ fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result
     }
 
     if !resume_playback {
-        pause_local_playback(state);
+        pause_local_playback(state, PlaybackTransition::Immediate);
         sync_mpris(state);
     }
 
@@ -1776,7 +1782,7 @@ fn pause_anchor_position_millis(state: &DaemonState) -> Option<u64> {
     })
 }
 
-fn pause_local_playback(state: &mut DaemonState) {
+fn pause_local_playback(state: &mut DaemonState, transition: PlaybackTransition) {
     if is_logically_paused(state) {
         return;
     }
@@ -1788,19 +1794,38 @@ fn pause_local_playback(state: &mut DaemonState) {
         pause_previous_threshold_clock_for_track(track);
         track.last_position_millis = position_millis;
     }
-    start_pause_fade(state, position_millis);
+
+    match transition {
+        PlaybackTransition::Immediate => {
+            state.volume_ramp = None;
+            state.player.pause();
+            state.player.seek(ClockTime::from_mseconds(position_millis));
+        }
+        PlaybackTransition::Calm => start_pause_fade(state, position_millis),
+    }
 }
 
-fn resume_local_playback(state: &mut DaemonState) {
+fn resume_local_playback(state: &mut DaemonState, transition: PlaybackTransition) {
     if !is_logically_paused(state) {
         return;
     }
 
-    if state.player.is_paused() {
-        state.player.set_volume(0.0);
-        state.player.resume();
+    match transition {
+        PlaybackTransition::Immediate => {
+            state.volume_ramp = None;
+            state.player.set_volume(steady_output_volume(state));
+            if state.player.is_paused() {
+                state.player.resume();
+            }
+        }
+        PlaybackTransition::Calm => {
+            if state.player.is_paused() {
+                state.player.set_volume(0.0);
+                state.player.resume();
+            }
+            start_playback_volume_ramp(state, steady_output_volume(state));
+        }
     }
-    start_playback_volume_ramp(state, steady_output_volume(state));
 
     if let Some(track) = state.active_track.as_mut() {
         resume_previous_threshold_clock_for_track(track);
@@ -1986,9 +2011,9 @@ fn toggle_pause_for_user_action(state: &mut DaemonState) {
         state.peer_mpris.clear_waiting();
     }
     if is_logically_paused(state) {
-        resume_local_playback(state);
+        resume_local_playback(state, PlaybackTransition::Immediate);
     } else {
-        pause_local_playback(state);
+        pause_local_playback(state, PlaybackTransition::Immediate);
     }
     sync_mpris(state);
 }
@@ -1998,7 +2023,7 @@ fn resume_for_user_action(state: &mut DaemonState) {
     if state.active_track.is_some() {
         pause_other_mpris_players(state);
     }
-    resume_local_playback(state);
+    resume_local_playback(state, PlaybackTransition::Immediate);
     sync_mpris(state);
 }
 
@@ -3519,7 +3544,7 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
 
         if should_resume {
             state.pipewire_pause_active = false;
-            resume_local_playback(state);
+            resume_local_playback(state, PlaybackTransition::Calm);
             sync_mpris(state);
         } else if should_clear_without_resuming {
             state.pipewire_pause_active = false;
@@ -3548,7 +3573,7 @@ fn maybe_duck_for_pipewire(state: &mut DaemonState) {
                 state.pipewire_pause_active = true;
             }
             if !is_logically_paused(state) {
-                pause_local_playback(state);
+                pause_local_playback(state, PlaybackTransition::Calm);
                 sync_mpris(state);
             }
         }
@@ -3576,7 +3601,7 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
         playing_services.join(", ")
     );
     state.peer_mpris.set_waiting_for_services(&playing_services);
-    pause_local_playback(state);
+    pause_local_playback(state, PlaybackTransition::Calm);
     sync_mpris(state);
 }
 
@@ -3639,7 +3664,7 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
         ),
         CoordinationMode::Off | CoordinationMode::Halt => return,
     }
-    resume_local_playback(state);
+    resume_local_playback(state, PlaybackTransition::Calm);
     sync_mpris(state);
 }
 

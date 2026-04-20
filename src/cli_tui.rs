@@ -51,7 +51,7 @@ const MIN_WIDTH: u16 = 124;
 const MIN_HEIGHT: u16 = 34;
 const SIDEBAR_WIDTH: u16 = 30;
 const DETAIL_WIDTH: u16 = 40;
-const PLAYER_BAR_HEIGHT: u16 = 8;
+const PLAYER_BAR_HEIGHT: u16 = 6;
 const HOME_GAP: u16 = 2;
 const RECENT_LIMIT: usize = 32;
 const RECENT_ROW_HEIGHT: u16 = 2;
@@ -146,7 +146,19 @@ enum TuiFocus {
     Home,
     Queue,
     Recent,
+    Player,
 }
+
+const PLAYER_ACTIONS: &[TuiAction] = &[
+    TuiAction::Previous,
+    TuiAction::TogglePause,
+    TuiAction::Next,
+    TuiAction::Dislike,
+    TuiAction::Like,
+    TuiAction::CycleRepeat,
+    TuiAction::VolumeDown,
+    TuiAction::VolumeUp,
+];
 
 #[derive(Clone, Copy)]
 enum TuiAction {
@@ -158,7 +170,11 @@ enum TuiAction {
     Dislike,
     Neutral,
     CycleRepeat,
+    VolumeDown,
+    VolumeUp,
 }
+
+const VOLUME_STEP: f64 = 0.05;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetailTab {
@@ -168,8 +184,6 @@ enum DetailTab {
 
 #[derive(Clone, Copy)]
 enum NavigationDirection {
-    Up,
-    Down,
     Left,
     Right,
 }
@@ -511,6 +525,7 @@ struct InteractiveTui {
     content_view: TuiContentView,
     content_backstack: Vec<ContentSnapshot>,
     focus: TuiFocus,
+    player_selected: usize,
     detail_tab: DetailTab,
     resume_card: Option<ResumeCardData>,
     lyrics_state: LyricsState,
@@ -531,6 +546,8 @@ struct InteractiveTui {
     drag_state: Option<TuiDragState>,
     context_menu: Option<ContextMenuState>,
     rendered_context_menu: RenderedContextMenu,
+    help_visible: bool,
+    rendered_help_rect: Option<Rect>,
 }
 
 impl InteractiveTui {
@@ -561,6 +578,7 @@ impl InteractiveTui {
             content_view: TuiContentView::Home,
             content_backstack: Vec::new(),
             focus: TuiFocus::Home,
+            player_selected: 1,
             detail_tab: DetailTab::Queue,
             resume_card,
             lyrics_state: LyricsState::Idle,
@@ -582,6 +600,8 @@ impl InteractiveTui {
             drag_state: None,
             context_menu: None,
             rendered_context_menu: RenderedContextMenu::default(),
+            help_visible: false,
+            rendered_help_rect: None,
         };
         app.maybe_request_lyrics();
         Ok(app)
@@ -1915,6 +1935,129 @@ impl InteractiveTui {
         }
     }
 
+    fn render_help_popup(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &TuiTheme,
+    ) -> Option<Rect> {
+        if !self.help_visible {
+            return None;
+        }
+
+        let sections = help_shortcut_sections();
+        let label_width = sections
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .map(|(keys, _)| keys.chars().count())
+            .max()
+            .unwrap_or(6);
+        let desc_width = sections
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .map(|(_, desc)| desc.chars().count())
+            .max()
+            .unwrap_or(12);
+        let body_width = (label_width + 2 + desc_width) as u16;
+        let title_width = "Keyboard shortcuts".chars().count() as u16;
+        let width = body_width
+            .max(title_width)
+            .saturating_add(6)
+            .clamp(32, area.width.saturating_sub(4).max(32));
+
+        let mut body_rows: u16 = 0;
+        for (index, (_, rows)) in sections.iter().enumerate() {
+            if index > 0 {
+                body_rows = body_rows.saturating_add(1);
+            }
+            body_rows = body_rows.saturating_add(1 + rows.len() as u16);
+        }
+        let height = (body_rows + 6).clamp(10, area.height.saturating_sub(2).max(10));
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        let popup_rect = Rect::new(x, y, width, height);
+
+        frame.render_widget(Clear, popup_rect);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border_focus))
+                .style(Style::default().bg(theme.elevated_alt_bg)),
+            popup_rect,
+        );
+
+        let inner = Rect::new(
+            popup_rect.x.saturating_add(2),
+            popup_rect.y.saturating_add(1),
+            popup_rect.width.saturating_sub(4),
+            popup_rect.height.saturating_sub(2),
+        );
+
+        let title_line = Line::from(Span::styled(
+            "Keyboard shortcuts",
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let subtitle_line = Line::from(Span::styled(
+            format!("Thumbnails: {}", self.thumbnail_mode_label),
+            Style::default().fg(theme.muted),
+        ));
+
+        let mut lines = vec![title_line, subtitle_line, Line::from("")];
+        for (section_index, (heading, rows)) in sections.iter().enumerate() {
+            if section_index > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                (*heading).to_string(),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for (keys, desc) in rows.iter() {
+                let padding = label_width.saturating_sub(keys.chars().count());
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{}{}", keys, " ".repeat(padding)),
+                        Style::default()
+                            .fg(theme.accent_glow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        (*desc).to_string(),
+                        Style::default().fg(theme.text),
+                    ),
+                ]));
+            }
+        }
+
+        let footer_height = 2u16;
+        let body_area = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(footer_height),
+        );
+        frame.render_widget(Paragraph::new(lines), body_area);
+
+        let footer = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(1),
+            inner.width,
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new("h or esc close")
+                .style(Style::default().fg(theme.border_focus)),
+            footer,
+        );
+
+        Some(popup_rect)
+    }
+
     fn render_frame(&mut self, frame: &mut Frame<'_>) -> (Vec<ClickTarget>, RenderedLayout) {
         let area = frame.area();
         let theme = TuiTheme::from_snapshot(&self.snapshot);
@@ -1995,6 +2138,7 @@ impl InteractiveTui {
         click_targets.extend(self.render_detail_panel(frame, detail_area, &theme, &mut layout));
         click_targets.extend(self.render_player_bar(frame, player_area, &theme, &mut layout));
         self.rendered_context_menu = self.render_context_menu(frame, area, &theme);
+        self.rendered_help_rect = self.render_help_popup(frame, area, &theme);
 
         (click_targets, layout)
     }
@@ -2994,11 +3138,7 @@ impl InteractiveTui {
 
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(4),
-                Constraint::Length(1),
-            ])
+            .constraints([Constraint::Length(1), Constraint::Length(4)])
             .split(inner);
 
         let progress_ratio = self
@@ -3032,7 +3172,7 @@ impl InteractiveTui {
             .constraints([
                 Constraint::Length(16),
                 Constraint::Min(26),
-                Constraint::Length(24),
+                Constraint::Length(28),
             ])
             .split(rows[1]);
 
@@ -3052,6 +3192,7 @@ impl InteractiveTui {
             theme,
             false,
             false,
+            self.player_action_focused(0),
         ));
         targets.push(render_action_button(
             frame,
@@ -3061,6 +3202,7 @@ impl InteractiveTui {
             theme,
             true,
             true,
+            self.player_action_focused(1),
         ));
         targets.push(render_action_button(
             frame,
@@ -3070,6 +3212,7 @@ impl InteractiveTui {
             theme,
             false,
             false,
+            self.player_action_focused(2),
         ));
 
         let track_info = Layout::default()
@@ -3132,6 +3275,7 @@ impl InteractiveTui {
                 Constraint::Length(5),
                 Constraint::Length(5),
                 Constraint::Length(5),
+                Constraint::Length(4),
                 Constraint::Length(5),
                 Constraint::Length(4),
             ])
@@ -3148,6 +3292,7 @@ impl InteractiveTui {
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Dislike),
+            self.player_action_focused(3),
         ));
         targets.push(render_action_button(
             frame,
@@ -3160,6 +3305,7 @@ impl InteractiveTui {
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Like),
+            self.player_action_focused(4),
         ));
         targets.push(render_action_button(
             frame,
@@ -3169,15 +3315,17 @@ impl InteractiveTui {
             theme,
             false,
             self.snapshot.repeat_mode != RepeatMode::Off,
+            self.player_action_focused(5),
         ));
         targets.push(render_action_button(
             frame,
             actions[3],
-            "↺",
-            TuiAction::ResumeSaved,
+            "−",
+            TuiAction::VolumeDown,
             theme,
             false,
-            self.resume_card.is_some(),
+            false,
+            self.player_action_focused(6),
         ));
 
         frame.render_widget(
@@ -3192,23 +3340,16 @@ impl InteractiveTui {
             actions[4],
         );
 
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(&self.status_line, Style::default().fg(theme.muted)),
-                Span::raw("   "),
-                Span::styled(
-                    "tab focus  arrows move  enter play  m menu  b back  space toggle  r resume",
-                    Style::default().fg(theme.border_focus),
-                ),
-                Span::raw("   "),
-                Span::styled(
-                    &self.thumbnail_mode_label,
-                    Style::default().fg(theme.accent),
-                ),
-            ]))
-            .wrap(Wrap { trim: true }),
-            rows[2],
-        );
+        targets.push(render_action_button(
+            frame,
+            actions[5],
+            "+",
+            TuiAction::VolumeUp,
+            theme,
+            false,
+            false,
+            self.player_action_focused(7),
+        ));
 
         targets
     }
@@ -3262,8 +3403,22 @@ impl InteractiveTui {
             }
         }
 
+        if self.help_visible {
+            match code {
+                KeyCode::Esc | KeyCode::Char('h') | KeyCode::Char('q') => {
+                    self.help_visible = false;
+                    self.rendered_help_rect = None;
+                    return Ok(false);
+                }
+                _ => return Ok(false),
+            }
+        }
+
         match code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('h') => {
+                self.help_visible = true;
+            }
             KeyCode::Backspace | KeyCode::Char('b')
                 if !matches!(&self.content_view, TuiContentView::Home) =>
             {
@@ -3277,14 +3432,17 @@ impl InteractiveTui {
             KeyCode::Char('t') => self.toggle_detail_tab(),
             KeyCode::Char('n') => self.run_action(TuiAction::Next)?,
             KeyCode::Char('p') => self.run_action(TuiAction::Previous)?,
-            KeyCode::Char('l') => self.run_action(TuiAction::Like)?,
+            KeyCode::Char('l') => self.run_action(TuiAction::CycleRepeat)?,
+            KeyCode::Char('f') => self.run_action(TuiAction::Like)?,
             KeyCode::Char('d') => self.run_action(TuiAction::Dislike)?,
             KeyCode::Char('u') => self.run_action(TuiAction::Neutral)?,
+            KeyCode::Char('-') | KeyCode::Char('_') => self.run_action(TuiAction::VolumeDown)?,
+            KeyCode::Char('+') | KeyCode::Char('=') => self.run_action(TuiAction::VolumeUp)?,
             KeyCode::Char('m') => self.open_context_menu_for_focus(),
             KeyCode::Left => self.move_selection(NavigationDirection::Left),
             KeyCode::Right => self.move_selection(NavigationDirection::Right),
-            KeyCode::Down => self.move_selection(NavigationDirection::Down),
-            KeyCode::Up => self.move_selection(NavigationDirection::Up),
+            KeyCode::Up => self.run_action(TuiAction::VolumeUp)?,
+            KeyCode::Down => self.run_action(TuiAction::VolumeDown)?,
             KeyCode::Home => self.jump_to_start(),
             KeyCode::End => self.jump_to_end(),
             KeyCode::PageDown => self.page_move(1),
@@ -3301,6 +3459,16 @@ impl InteractiveTui {
             MouseEventKind::ScrollDown => self.scroll_panel(mouse.column, mouse.row, 2),
             MouseEventKind::ScrollUp => self.scroll_panel(mouse.column, mouse.row, -2),
             MouseEventKind::Down(MouseButton::Left) => {
+                if self.help_visible {
+                    let clicked_inside_help = self
+                        .rendered_help_rect
+                        .is_some_and(|rect| contains(rect, mouse.column, mouse.row));
+                    if !clicked_inside_help {
+                        self.help_visible = false;
+                        self.rendered_help_rect = None;
+                    }
+                    return Ok(());
+                }
                 let clicked_menu_item = self
                     .rendered_context_menu
                     .item_rects
@@ -3837,6 +4005,14 @@ impl InteractiveTui {
                     .next(self.snapshot.radio_virtual_playlist.is_some());
                 self.client.set_repeat_mode(next_mode)
             }
+            TuiAction::VolumeDown => {
+                let next = (self.snapshot.volume - VOLUME_STEP).clamp(0.0, 1.0);
+                self.client.set_volume(next)
+            }
+            TuiAction::VolumeUp => {
+                let next = (self.snapshot.volume + VOLUME_STEP).clamp(0.0, 1.0);
+                self.client.set_volume(next)
+            }
         }
     }
 
@@ -3962,6 +4138,13 @@ impl InteractiveTui {
             TuiFocus::Home => self.activate_content_selection(),
             TuiFocus::Queue => self.activate_queue_selection(),
             TuiFocus::Recent => self.activate_recent_selection(),
+            TuiFocus::Player => {
+                let action = PLAYER_ACTIONS
+                    .get(self.player_selected)
+                    .copied()
+                    .unwrap_or(TuiAction::TogglePause);
+                self.run_action(action)
+            }
         }
     }
 
@@ -4137,11 +4320,16 @@ impl InteractiveTui {
         Ok(())
     }
 
+    fn player_action_focused(&self, index: usize) -> bool {
+        matches!(self.focus, TuiFocus::Player) && self.player_selected == index
+    }
+
     fn cycle_focus(&mut self) {
         self.focus = match self.focus {
-            TuiFocus::Home => TuiFocus::Queue,
-            TuiFocus::Queue => TuiFocus::Recent,
             TuiFocus::Recent => TuiFocus::Home,
+            TuiFocus::Home => TuiFocus::Queue,
+            TuiFocus::Queue => TuiFocus::Player,
+            TuiFocus::Player => TuiFocus::Recent,
         };
     }
 
@@ -4159,8 +4347,8 @@ impl InteractiveTui {
                     return;
                 }
                 let delta = match direction {
-                    NavigationDirection::Up | NavigationDirection::Left => -1,
-                    NavigationDirection::Down | NavigationDirection::Right => 1,
+                    NavigationDirection::Left => -1,
+                    NavigationDirection::Right => 1,
                 };
                 self.queue_selected =
                     move_index(self.queue_selected, self.snapshot.queue.len(), delta);
@@ -4171,12 +4359,20 @@ impl InteractiveTui {
                     return;
                 }
                 let delta = match direction {
-                    NavigationDirection::Up | NavigationDirection::Left => -1,
-                    NavigationDirection::Down | NavigationDirection::Right => 1,
+                    NavigationDirection::Left => -1,
+                    NavigationDirection::Right => 1,
                 };
                 self.recent_selected =
                     move_index(self.recent_selected, self.recent_tracks.len(), delta);
                 self.ensure_recent_visible();
+            }
+            TuiFocus::Player => {
+                let delta = match direction {
+                    NavigationDirection::Left => -1,
+                    NavigationDirection::Right => 1,
+                };
+                self.player_selected =
+                    move_index(self.player_selected, PLAYER_ACTIONS.len(), delta);
             }
         }
     }
@@ -4205,21 +4401,13 @@ impl InteractiveTui {
             let qualifies = match direction {
                 NavigationDirection::Left => delta_x < 0,
                 NavigationDirection::Right => delta_x > 0,
-                NavigationDirection::Up => delta_y < 0,
-                NavigationDirection::Down => delta_y > 0,
             };
             if !qualifies {
                 continue;
             }
 
-            let primary = match direction {
-                NavigationDirection::Left | NavigationDirection::Right => delta_x.abs(),
-                NavigationDirection::Up | NavigationDirection::Down => delta_y.abs(),
-            };
-            let secondary = match direction {
-                NavigationDirection::Left | NavigationDirection::Right => delta_y.abs(),
-                NavigationDirection::Up | NavigationDirection::Down => delta_x.abs(),
-            };
+            let primary = delta_x.abs();
+            let secondary = delta_y.abs();
 
             if (primary, secondary) < best_score {
                 best_score = (primary, secondary);
@@ -4248,6 +4436,10 @@ impl InteractiveTui {
                     move_index(self.recent_selected, self.recent_tracks.len(), delta);
                 self.ensure_recent_visible();
             }
+            TuiFocus::Player => {
+                self.player_selected =
+                    move_index(self.player_selected, PLAYER_ACTIONS.len(), direction);
+            }
         }
     }
 
@@ -4265,6 +4457,9 @@ impl InteractiveTui {
                 self.recent_selected = 0;
                 self.recent_scroll_offset = 0;
             }
+            TuiFocus::Player => {
+                self.player_selected = 0;
+            }
         }
     }
 
@@ -4281,6 +4476,9 @@ impl InteractiveTui {
             TuiFocus::Recent => {
                 self.recent_selected = self.recent_tracks.len().saturating_sub(1);
                 self.ensure_recent_visible();
+            }
+            TuiFocus::Player => {
+                self.player_selected = PLAYER_ACTIONS.len().saturating_sub(1);
             }
         }
     }
@@ -5106,6 +5304,7 @@ fn render_action_button(
     theme: &TuiTheme,
     primary: bool,
     active: bool,
+    focused: bool,
 ) -> ClickTarget {
     let mut style = Style::default().bg(theme.elevated_bg).fg(theme.text);
     let mut border = theme.border;
@@ -5116,10 +5315,18 @@ fn render_action_button(
         style = style.bg(theme.selected_bg).fg(theme.accent);
         border = theme.accent;
     }
+    if focused {
+        border = theme.border_focus;
+    }
+    let border_style = if focused {
+        Style::default().fg(border).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(border)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border))
+        .border_style(border_style)
         .style(style);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -6145,6 +6352,40 @@ fn repeat_button_emoji(mode: RepeatMode) -> &'static str {
     }
 }
 
+fn help_shortcut_sections() -> &'static [(&'static str, &'static [(&'static str, &'static str)])] {
+    const PLAYBACK: &[(&str, &str)] = &[
+        ("space", "Play / pause"),
+        ("n", "Next track"),
+        ("p", "Previous track"),
+        ("f", "Like (favourite)"),
+        ("d", "Dislike"),
+        ("u", "Clear rating"),
+        ("l", "Cycle loop / repeat"),
+        ("r", "Resume saved session"),
+        ("↑ / ↓", "Volume up / down"),
+        ("- / +", "Volume down / up"),
+    ];
+    const NAVIGATION: &[(&str, &str)] = &[
+        ("tab", "Cycle focus"),
+        ("← / →", "Move selection"),
+        ("enter", "Activate selection"),
+        ("m", "Open context menu"),
+        ("b / backspace", "Go back"),
+        ("home / end", "Jump to start / end"),
+        ("pgup / pgdn", "Scroll one page"),
+        ("1 / 2 / t", "Queue · Lyrics · toggle"),
+    ];
+    const APP: &[(&str, &str)] = &[
+        ("h", "Toggle this help"),
+        ("q / esc", "Quit"),
+    ];
+    &[
+        ("Playback", PLAYBACK),
+        ("Navigation", NAVIGATION),
+        ("App", APP),
+    ]
+}
+
 fn action_label(action: TuiAction) -> &'static str {
     match action {
         TuiAction::ResumeSaved => "Resume",
@@ -6155,6 +6396,8 @@ fn action_label(action: TuiAction) -> &'static str {
         TuiAction::Dislike => "Dislike",
         TuiAction::Neutral => "Neutral",
         TuiAction::CycleRepeat => "Repeat",
+        TuiAction::VolumeDown => "Volume down",
+        TuiAction::VolumeUp => "Volume up",
     }
 }
 

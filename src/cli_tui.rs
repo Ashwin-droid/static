@@ -41,7 +41,7 @@ use crate::ipc::{
 };
 use crate::models::{
     BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, PlaylistSummary,
-    RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
+    RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
 };
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
@@ -179,6 +179,7 @@ enum TuiAction {
 }
 
 const VOLUME_STEP: f64 = 0.05;
+const SEEK_STEP_MILLIS: u64 = 10_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetailTab {
@@ -533,6 +534,7 @@ enum ClickTargetKind {
     SearchSuggestion(usize),
     ContentBack,
     DetailTab(DetailTab),
+    RadioChipScroll(isize),
     RadioChip(usize),
     HomeSectionAction { section_index: usize, shuffle: bool },
     HomeItem(usize),
@@ -728,6 +730,7 @@ struct InteractiveTui {
     search_suggestion_debounce_started_at: Option<Instant>,
     search_suggestion_inflight: Option<(u64, String)>,
     radio_chip_scroll_offset: usize,
+    remembered_radio_chips: HashMap<String, Vec<RadioChip>>,
     settings_field_offsets: Vec<(usize, usize)>,
     settings_total_height: usize,
     settings_text_edit: Option<TuiSettingsTextEdit>,
@@ -793,6 +796,7 @@ impl InteractiveTui {
             search_suggestion_debounce_started_at: None,
             search_suggestion_inflight: None,
             radio_chip_scroll_offset: 0,
+            remembered_radio_chips: HashMap::new(),
             settings_field_offsets: Vec::new(),
             settings_total_height: 0,
             settings_text_edit: None,
@@ -822,6 +826,10 @@ impl InteractiveTui {
             help_visible: false,
             rendered_help_rect: None,
         };
+        remember_radio_virtual_playlist_chips(
+            app.snapshot.radio_virtual_playlist.as_ref(),
+            &mut app.remembered_radio_chips,
+        );
         app.maybe_request_lyrics();
         Ok(app)
     }
@@ -2016,7 +2024,8 @@ impl InteractiveTui {
             self.status_line = "Radio chips only appear for radio queues.".to_string();
             return Ok(());
         };
-        let Some(chip) = radio.chips.get(chip_index).cloned() else {
+        let current_chips = self.current_radio_chips();
+        let Some(chip) = current_chips.get(chip_index).cloned() else {
             self.status_line = "That radio filter is no longer available.".to_string();
             return Ok(());
         };
@@ -2064,7 +2073,7 @@ impl InteractiveTui {
             Some(RadioVirtualPlaylist {
                 source_video_id,
                 touched_len: prefix_len,
-                chips: refreshed.chips,
+                chips: merge_radio_chip_update(&current_chips, refreshed.chips),
             }),
             self.snapshot.repeat_mode,
         )?;
@@ -2604,7 +2613,7 @@ impl InteractiveTui {
             .constraints([
                 Constraint::Length(search_height),
                 Constraint::Length(6),
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Min(8),
                 Constraint::Length(3),
             ])
@@ -2733,7 +2742,7 @@ impl InteractiveTui {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .style(Style::default().bg(theme.content_alt_bg))
-            .padding(Padding::new(1, 1, 1, 0));
+            .padding(Padding::new(1, 1, 0, 0));
         let nav_inner = nav_block.inner(rows[1]);
         frame.render_widget(nav_block, rows[1]);
         let active_nav = self.current_nav_item();
@@ -2790,7 +2799,7 @@ impl InteractiveTui {
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             ))),
-            Rect::new(rows[2].x, rows[2].y, rows[2].width, 1),
+            Rect::new(rows[2].x, rows[2].y + 1, rows[2].width, 1),
         );
 
         let recent_block = Block::default()
@@ -3824,14 +3833,9 @@ impl InteractiveTui {
                     .style(Style::default().bg(theme.elevated_alt_bg));
                 let chip_inner = chip_block.inner(body_rows[0]);
                 frame.render_widget(chip_block, body_rows[0]);
-                layout.radio_chip_viewport = chip_inner;
+                layout.radio_chip_viewport = body_rows[0];
 
-                let chips = self
-                    .snapshot
-                    .radio_virtual_playlist
-                    .as_ref()
-                    .map(|radio| radio.chips.clone())
-                    .unwrap_or_default();
+                let chips = self.current_radio_chips();
                 if chips.is_empty() {
                     self.radio_chip_scroll_offset = 0;
                     frame.render_widget(
@@ -3845,17 +3849,13 @@ impl InteractiveTui {
                         .min(chips.len().saturating_sub(1));
                     self.radio_chip_scroll_offset = start;
                     let hidden_before = start > 0;
-                    let mut x = chip_inner.x;
-                    if hidden_before && chip_inner.width > 2 {
-                        frame.render_widget(
-                            Paragraph::new("‹")
-                                .style(Style::default().fg(theme.accent))
-                                .alignment(Alignment::Left),
-                            Rect::new(chip_inner.x, chip_inner.y, 1, chip_inner.height),
-                        );
-                        x = x.saturating_add(2);
-                    }
-
+                    let left_gutter_width = if hidden_before && chip_inner.width > 2 {
+                        chip_inner.width.min(2)
+                    } else {
+                        0
+                    };
+                    let mut next_x = chip_inner.x.saturating_add(left_gutter_width);
+                    let mut visible_chips = Vec::new();
                     let mut has_hidden_after = false;
                     for (index, chip) in chips.iter().enumerate().skip(start) {
                         let label = format!(" {} ", chip.label);
@@ -3863,13 +3863,66 @@ impl InteractiveTui {
                         if width == 0 {
                             continue;
                         }
-                        if x.saturating_add(width) > chip_inner.right() {
+                        if next_x.saturating_add(width) > chip_inner.right() {
                             has_hidden_after = true;
                             break;
                         }
-                        let rect = Rect::new(x, chip_inner.y, width, chip_inner.height);
+                        visible_chips.push((
+                            index,
+                            label,
+                            Rect::new(next_x, chip_inner.y, width, chip_inner.height),
+                        ));
+                        next_x = next_x.saturating_add(width + 1);
+                    }
+
+                    if left_gutter_width > 0 {
+                        let scroll_left_rect = Rect::new(
+                            chip_inner.x,
+                            chip_inner.y,
+                            left_gutter_width,
+                            chip_inner.height,
+                        );
                         frame.render_widget(
-                            Paragraph::new(label.clone())
+                            Paragraph::new("‹")
+                                .style(Style::default().fg(theme.accent))
+                                .alignment(Alignment::Left),
+                            scroll_left_rect,
+                        );
+                        targets.push(ClickTarget {
+                            rect: scroll_left_rect,
+                            kind: ClickTargetKind::RadioChipScroll(-1),
+                        });
+                    }
+
+                    if has_hidden_after && chip_inner.width > 1 {
+                        let right_gutter_width = chip_inner.width.min(2);
+                        let scroll_right_rect = Rect::new(
+                            chip_inner.right().saturating_sub(right_gutter_width),
+                            chip_inner.y,
+                            right_gutter_width,
+                            chip_inner.height,
+                        );
+                        while visible_chips
+                            .last()
+                            .is_some_and(|(_, _, rect)| rect.right() > scroll_right_rect.x)
+                        {
+                            visible_chips.pop();
+                        }
+                        frame.render_widget(
+                            Paragraph::new("›")
+                                .style(Style::default().fg(theme.accent))
+                                .alignment(Alignment::Right),
+                            scroll_right_rect,
+                        );
+                        targets.push(ClickTarget {
+                            rect: scroll_right_rect,
+                            kind: ClickTargetKind::RadioChipScroll(1),
+                        });
+                    }
+
+                    for (index, label, rect) in visible_chips {
+                        frame.render_widget(
+                            Paragraph::new(label)
                                 .style(Style::default().fg(theme.text).bg(theme.elevated_bg)),
                             rect,
                         );
@@ -3877,21 +3930,6 @@ impl InteractiveTui {
                             rect,
                             kind: ClickTargetKind::RadioChip(index),
                         });
-                        x = x.saturating_add(width + 1);
-                    }
-
-                    if has_hidden_after && chip_inner.width > 1 {
-                        frame.render_widget(
-                            Paragraph::new("›")
-                                .style(Style::default().fg(theme.accent))
-                                .alignment(Alignment::Right),
-                            Rect::new(
-                                chip_inner.right().saturating_sub(1),
-                                chip_inner.y,
-                                1,
-                                chip_inner.height,
-                            ),
-                        );
                     }
                 }
 
@@ -4486,7 +4524,11 @@ impl InteractiveTui {
                     self.status_line = "Search cancelled.".to_string();
                 }
                 KeyCode::Enter => {
-                    self.submit_search(None);
+                    let preferred = self
+                        .search_suggestions
+                        .get(self.search_suggestion_selected)
+                        .cloned();
+                    self.submit_search(preferred);
                 }
                 KeyCode::Backspace => {
                     self.search_query.pop();
@@ -4578,12 +4620,14 @@ impl InteractiveTui {
             }
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::Char(' ') => self.run_action(TuiAction::TogglePause)?,
-            KeyCode::Char('r') => self.run_action(TuiAction::ResumeSaved)?,
+            KeyCode::Char('r') => self.refresh_current_view(),
             KeyCode::Char('1') => self.detail_tab = DetailTab::Queue,
             KeyCode::Char('2') => self.detail_tab = DetailTab::Lyrics,
             KeyCode::Char('t') => self.toggle_detail_tab(),
             KeyCode::Char('n') => self.run_action(TuiAction::Next)?,
             KeyCode::Char('p') => self.run_action(TuiAction::Previous)?,
+            KeyCode::Char('a') => self.seek_relative_millis(-(SEEK_STEP_MILLIS as i64))?,
+            KeyCode::Char('s') => self.seek_relative_millis(SEEK_STEP_MILLIS as i64)?,
             KeyCode::Char('l') => self.run_action(TuiAction::CycleRepeat)?,
             KeyCode::Char('f') => self.run_action(TuiAction::Like)?,
             KeyCode::Char('d') => self.run_action(TuiAction::Dislike)?,
@@ -5283,6 +5327,128 @@ impl InteractiveTui {
         spawn_settings_load(self.background_tx.clone());
     }
 
+    fn refresh_current_view(&mut self) {
+        self.settings_text_edit = None;
+        self.clear_search_suggestions();
+
+        match self.content_view.clone() {
+            TuiContentView::Home => {
+                self.home_status = HomeFeedStatus::Loading;
+                self.home_loading_more = false;
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = "Refreshing Home...".to_string();
+                spawn_home_bootstrap(self.background_tx.clone());
+            }
+            TuiContentView::Browse(view) => {
+                let card = view.card;
+                self.content_view = TuiContentView::Browse(TuiBrowseView {
+                    card: card.clone(),
+                    status: BrowseViewStatus::Loading,
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = format!("Refreshing {}...", shorten(&card.title, 32));
+                spawn_browse_load(self.background_tx.clone(), card);
+            }
+            TuiContentView::Likes(view) => {
+                self.content_view = TuiContentView::Likes(TuiTrackPageView {
+                    status: TuiTrackPageStatus::Loading,
+                    ..view
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = "Refreshing liked songs...".to_string();
+                spawn_likes_load(self.background_tx.clone());
+            }
+            TuiContentView::Playlists(view) => {
+                self.content_view = TuiContentView::Playlists(TuiCollectionPageView {
+                    status: TuiCollectionPageStatus::Loading,
+                    ..view
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = "Refreshing playlists...".to_string();
+                spawn_playlists_load(self.background_tx.clone());
+            }
+            TuiContentView::PlaylistDetail(view) => {
+                let source = match view.kind {
+                    TuiTrackPageKind::RemotePlaylist => TuiPlaylistSource::Remote,
+                    TuiTrackPageKind::OfflinePlaylist => TuiPlaylistSource::Offline,
+                    TuiTrackPageKind::Likes => {
+                        self.refresh_current_view_from_likes(view);
+                        return;
+                    }
+                };
+                let playlist = TuiPlaylistCard {
+                    summary: PlaylistSummary {
+                        playlist_id: match source {
+                            TuiPlaylistSource::Remote => {
+                                view.key.trim_start_matches("remote:").to_string()
+                            }
+                            TuiPlaylistSource::Offline => {
+                                view.key.trim_start_matches("offline:").to_string()
+                            }
+                        },
+                        title: view.title.clone(),
+                        thumbnail_url: view.thumbnail_url.clone(),
+                        subtitle: Some(view.subtitle.clone()),
+                    },
+                    source,
+                };
+                self.content_view = TuiContentView::PlaylistDetail(TuiTrackPageView {
+                    status: TuiTrackPageStatus::Loading,
+                    ..view
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line =
+                    format!("Refreshing {}...", shorten(&playlist.summary.title, 32));
+                spawn_playlist_detail_load(self.background_tx.clone(), playlist);
+            }
+            TuiContentView::Offline(_) => {
+                self.content_view = TuiContentView::Offline(TuiOfflineView {
+                    status: TuiOfflineStatus::Loading,
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = "Refreshing offline library...".to_string();
+                spawn_offline_load(self.background_tx.clone());
+            }
+            TuiContentView::Search(view) => {
+                let query = view.query;
+                self.content_view = TuiContentView::Search(TuiSearchView {
+                    query: query.clone(),
+                    status: TuiSearchStatus::Loading,
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = format!("Refreshing {}...", shorten(&query, 28));
+                spawn_search_load(self.background_tx.clone(), query);
+            }
+            TuiContentView::Settings(_) => {
+                self.content_view = TuiContentView::Settings(TuiSettingsView {
+                    status: TuiSettingsStatus::Loading,
+                });
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                self.status_line = "Refreshing settings...".to_string();
+                spawn_settings_load(self.background_tx.clone());
+            }
+        }
+    }
+
+    fn refresh_current_view_from_likes(&mut self, view: TuiTrackPageView) {
+        self.content_view = TuiContentView::Likes(TuiTrackPageView {
+            status: TuiTrackPageStatus::Loading,
+            ..view
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Refreshing liked songs...".to_string();
+        spawn_likes_load(self.background_tx.clone());
+    }
+
     fn go_back_content(&mut self) {
         if let Some(snapshot) = self.content_backstack.pop() {
             self.restore_content_snapshot(snapshot);
@@ -5316,11 +5482,21 @@ impl InteractiveTui {
             .current_track
             .as_ref()
             .map(|track| track.video_id.clone());
+        let mut snapshot = snapshot;
         let next_video_id = snapshot
             .current_track
             .as_ref()
             .map(|track| track.video_id.clone());
 
+        hydrate_radio_virtual_playlist_chips(
+            &mut snapshot.radio_virtual_playlist,
+            self.snapshot.radio_virtual_playlist.as_ref(),
+            &self.remembered_radio_chips,
+        );
+        remember_radio_virtual_playlist_chips(
+            snapshot.radio_virtual_playlist.as_ref(),
+            &mut self.remembered_radio_chips,
+        );
         self.snapshot = snapshot;
         let now = Instant::now();
         self.last_snapshot_at = now;
@@ -5332,6 +5508,13 @@ impl InteractiveTui {
         if previous_video_id != next_video_id {
             self.maybe_request_lyrics();
         }
+    }
+
+    fn current_radio_chips(&self) -> Vec<RadioChip> {
+        effective_radio_chips(
+            self.snapshot.radio_virtual_playlist.as_ref(),
+            &self.remembered_radio_chips,
+        )
     }
 
     fn playback_snapshot_from_tui_state(&self) -> PlaybackSnapshot {
@@ -5682,6 +5865,10 @@ impl InteractiveTui {
             }
             ClickTargetKind::DetailTab(tab) => {
                 self.detail_tab = *tab;
+                Ok(())
+            }
+            ClickTargetKind::RadioChipScroll(delta) => {
+                self.scroll_radio_chips(*delta);
                 Ok(())
             }
             ClickTargetKind::RadioChip(index) => self.activate_radio_chip(*index),
@@ -6380,7 +6567,7 @@ impl InteractiveTui {
 
     fn scroll_panel(&mut self, column: u16, row: u16, delta: isize) {
         if contains(self.rendered_layout.radio_chip_viewport, column, row) {
-            self.scroll_radio_chips(delta);
+            self.scroll_radio_chips(delta.signum());
         } else if contains(self.rendered_layout.queue_viewport, column, row) {
             self.focus = TuiFocus::Queue;
             if self.detail_tab == DetailTab::Queue {
@@ -6417,6 +6604,23 @@ impl InteractiveTui {
             .min(rect.width.saturating_sub(1));
         let ratio = relative as f64 / rect.width.saturating_sub(1).max(1) as f64;
         let target = (duration as f64 * ratio) as u64;
+        self.seek_to_millis(target);
+        Ok(())
+    }
+
+    fn seek_relative_millis(&mut self, delta_millis: i64) -> Result<()> {
+        let Some(current_position) = self.displayed_position_millis() else {
+            self.status_line = "Nothing seekable is playing right now.".to_string();
+            return Ok(());
+        };
+
+        let upper_bound = self.snapshot.duration_millis.unwrap_or(u64::MAX) as i128;
+        let target = (current_position as i128 + delta_millis as i128).clamp(0, upper_bound) as u64;
+        self.seek_to_millis(target);
+        Ok(())
+    }
+
+    fn seek_to_millis(&mut self, target: u64) {
         match self.client.seek_to_millis(target) {
             Ok(snapshot) => {
                 self.apply_snapshot(snapshot);
@@ -6426,7 +6630,6 @@ impl InteractiveTui {
                 self.status_line = format!("Seek failed: {err}");
             }
         }
-        Ok(())
     }
 
     fn scroll_home(&mut self, delta: isize) {
@@ -6447,12 +6650,7 @@ impl InteractiveTui {
     }
 
     fn scroll_radio_chips(&mut self, delta: isize) {
-        let chip_count = self
-            .snapshot
-            .radio_virtual_playlist
-            .as_ref()
-            .map(|radio| radio.chips.len())
-            .unwrap_or(0);
+        let chip_count = self.current_radio_chips().len();
         if chip_count == 0 {
             self.radio_chip_scroll_offset = 0;
             return;
@@ -8939,6 +9137,70 @@ fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Tra
     deduped
 }
 
+fn effective_radio_chips(
+    radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
+    remembered_radio_chips: &HashMap<String, Vec<RadioChip>>,
+) -> Vec<RadioChip> {
+    let Some(radio) = radio_virtual_playlist else {
+        return Vec::new();
+    };
+
+    if !radio.chips.is_empty() {
+        return radio.chips.clone();
+    }
+
+    remembered_radio_chips
+        .get(&radio.source_video_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn hydrate_radio_virtual_playlist_chips(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    current_radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
+    remembered_radio_chips: &HashMap<String, Vec<RadioChip>>,
+) {
+    let Some(radio) = radio_virtual_playlist.as_mut() else {
+        return;
+    };
+    if !radio.chips.is_empty() {
+        return;
+    }
+
+    if let Some(current_radio) = current_radio_virtual_playlist.filter(|current_radio| {
+        current_radio.source_video_id == radio.source_video_id && !current_radio.chips.is_empty()
+    }) {
+        radio.chips = current_radio.chips.clone();
+        return;
+    }
+
+    if let Some(chips) = remembered_radio_chips.get(&radio.source_video_id) {
+        radio.chips = chips.clone();
+    }
+}
+
+fn remember_radio_virtual_playlist_chips(
+    radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
+    remembered_radio_chips: &mut HashMap<String, Vec<RadioChip>>,
+) {
+    let Some(radio) = radio_virtual_playlist else {
+        return;
+    };
+    if radio.chips.is_empty() {
+        return;
+    }
+
+    remembered_radio_chips.insert(radio.source_video_id.clone(), radio.chips.clone());
+}
+
+fn merge_radio_chip_update(existing: &[RadioChip], replacement: Vec<RadioChip>) -> Vec<RadioChip> {
+    if replacement.is_empty() {
+        existing.to_vec()
+    } else {
+        replacement
+    }
+}
+
 fn draw_box(
     buf: &mut Buffer,
     clip: Rect,
@@ -9422,11 +9684,11 @@ fn help_shortcut_sections() -> &'static [(&'static str, &'static [(&'static str,
         ("space", "Play / pause"),
         ("n", "Next track"),
         ("p", "Previous track"),
+        ("a / s", "Seek -10s / +10s"),
         ("f", "Like (favourite)"),
         ("d", "Dislike"),
         ("u", "Clear rating"),
         ("l", "Cycle loop / repeat"),
-        ("r", "Resume saved session"),
         ("↑ / ↓", "Volume (Player focus only)"),
         ("- / +", "Volume down / up"),
     ];
@@ -9440,7 +9702,11 @@ fn help_shortcut_sections() -> &'static [(&'static str, &'static [(&'static str,
         ("pgup / pgdn", "Scroll one page"),
         ("1 / 2 / t", "Queue · Lyrics · toggle"),
     ];
-    const APP: &[(&str, &str)] = &[("h", "Toggle this help"), ("q / esc", "Quit")];
+    const APP: &[(&str, &str)] = &[
+        ("r", "Refresh current page"),
+        ("h", "Toggle this help"),
+        ("q / esc", "Quit"),
+    ];
     &[
         ("Playback", PLAYBACK),
         ("Navigation", NAVIGATION),
@@ -9593,6 +9859,14 @@ mod tests {
         }
     }
 
+    fn sample_radio_chip(label: &str, playlist_id: &str, params: Option<&str>) -> RadioChip {
+        RadioChip {
+            label: label.to_string(),
+            playlist_id: playlist_id.to_string(),
+            params: params.map(str::to_string),
+        }
+    }
+
     #[test]
     fn track_browse_pages_render_a_playable_tracks_section() {
         let view = TuiBrowseView {
@@ -9641,5 +9915,58 @@ mod tests {
         assert_eq!(doc.headers.len(), 2);
         assert_eq!(doc.headers[0].title, "TOP SONGS");
         assert!(doc.headers[0].show_play_controls);
+    }
+
+    #[test]
+    fn effective_radio_chips_fall_back_to_memory_for_same_source() {
+        let remembered = vec![
+            sample_radio_chip("All", "RDseed", None),
+            sample_radio_chip("Discover", "RDdiscover", Some("discover")),
+        ];
+        let mut memory = HashMap::new();
+        memory.insert("seed-video".to_string(), remembered.clone());
+
+        let effective = effective_radio_chips(
+            Some(&RadioVirtualPlaylist {
+                source_video_id: "seed-video".to_string(),
+                touched_len: 1,
+                chips: Vec::new(),
+            }),
+            &memory,
+        );
+
+        assert_eq!(effective, remembered);
+    }
+
+    #[test]
+    fn hydrate_radio_virtual_playlist_uses_previous_snapshot_chips() {
+        let previous_radio = RadioVirtualPlaylist {
+            source_video_id: "seed-video".to_string(),
+            touched_len: 1,
+            chips: vec![sample_radio_chip("All", "RDseed", None)],
+        };
+        let mut next_radio = Some(RadioVirtualPlaylist {
+            source_video_id: "seed-video".to_string(),
+            touched_len: 2,
+            chips: Vec::new(),
+        });
+
+        hydrate_radio_virtual_playlist_chips(
+            &mut next_radio,
+            Some(&previous_radio),
+            &HashMap::new(),
+        );
+
+        assert_eq!(
+            next_radio.expect("radio queue should still exist").chips,
+            previous_radio.chips
+        );
+    }
+
+    #[test]
+    fn merge_radio_chip_update_preserves_existing_when_refresh_returns_empty() {
+        let existing = vec![sample_radio_chip("All", "RDseed", None)];
+
+        assert_eq!(merge_radio_chip_update(&existing, Vec::new()), existing);
     }
 }

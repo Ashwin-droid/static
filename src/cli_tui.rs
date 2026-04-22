@@ -184,6 +184,8 @@ enum DetailTab {
 
 #[derive(Clone, Copy)]
 enum NavigationDirection {
+    Up,
+    Down,
     Left,
     Right,
 }
@@ -3441,8 +3443,20 @@ impl InteractiveTui {
             KeyCode::Char('m') => self.open_context_menu_for_focus(),
             KeyCode::Left => self.move_selection(NavigationDirection::Left),
             KeyCode::Right => self.move_selection(NavigationDirection::Right),
-            KeyCode::Up => self.run_action(TuiAction::VolumeUp)?,
-            KeyCode::Down => self.run_action(TuiAction::VolumeDown)?,
+            KeyCode::Up => {
+                if matches!(self.focus, TuiFocus::Player) {
+                    self.run_action(TuiAction::VolumeUp)?;
+                } else {
+                    self.move_selection(NavigationDirection::Up);
+                }
+            }
+            KeyCode::Down => {
+                if matches!(self.focus, TuiFocus::Player) {
+                    self.run_action(TuiAction::VolumeDown)?;
+                } else {
+                    self.move_selection(NavigationDirection::Down);
+                }
+            }
             KeyCode::Home => self.jump_to_start(),
             KeyCode::End => self.jump_to_end(),
             KeyCode::PageDown => self.page_move(1),
@@ -4347,8 +4361,8 @@ impl InteractiveTui {
                     return;
                 }
                 let delta = match direction {
-                    NavigationDirection::Left => -1,
-                    NavigationDirection::Right => 1,
+                    NavigationDirection::Left | NavigationDirection::Up => -1,
+                    NavigationDirection::Right | NavigationDirection::Down => 1,
                 };
                 self.queue_selected =
                     move_index(self.queue_selected, self.snapshot.queue.len(), delta);
@@ -4359,8 +4373,8 @@ impl InteractiveTui {
                     return;
                 }
                 let delta = match direction {
-                    NavigationDirection::Left => -1,
-                    NavigationDirection::Right => 1,
+                    NavigationDirection::Left | NavigationDirection::Up => -1,
+                    NavigationDirection::Right | NavigationDirection::Down => 1,
                 };
                 self.recent_selected =
                     move_index(self.recent_selected, self.recent_tracks.len(), delta);
@@ -4368,8 +4382,8 @@ impl InteractiveTui {
             }
             TuiFocus::Player => {
                 let delta = match direction {
-                    NavigationDirection::Left => -1,
-                    NavigationDirection::Right => 1,
+                    NavigationDirection::Left | NavigationDirection::Up => -1,
+                    NavigationDirection::Right | NavigationDirection::Down => 1,
                 };
                 self.player_selected =
                     move_index(self.player_selected, PLAYER_ACTIONS.len(), delta);
@@ -4383,8 +4397,9 @@ impl InteractiveTui {
             return;
         };
 
+        let current_y = current.rect.y as i32;
         let current_center_x = current.rect.x as i32 + current.rect.width as i32 / 2;
-        let current_center_y = current.rect.y as i32 + current.rect.height as i32 / 2;
+
         let mut best_index = self.home_selected;
         let mut best_score = (i32::MAX, i32::MAX);
 
@@ -4393,21 +4408,38 @@ impl InteractiveTui {
                 continue;
             }
 
-            let candidate_center_x = candidate.rect.x as i32 + candidate.rect.width as i32 / 2;
-            let candidate_center_y = candidate.rect.y as i32 + candidate.rect.height as i32 / 2;
+            let candidate_y = candidate.rect.y as i32;
+            let candidate_center_x =
+                candidate.rect.x as i32 + candidate.rect.width as i32 / 2;
             let delta_x = candidate_center_x - current_center_x;
-            let delta_y = candidate_center_y - current_center_y;
+            let delta_y = candidate_y - current_y;
 
-            let qualifies = match direction {
-                NavigationDirection::Left => delta_x < 0,
-                NavigationDirection::Right => delta_x > 0,
+            let (primary, secondary) = match direction {
+                NavigationDirection::Left => {
+                    if delta_y != 0 || delta_x >= 0 {
+                        continue;
+                    }
+                    (delta_x.abs(), 0)
+                }
+                NavigationDirection::Right => {
+                    if delta_y != 0 || delta_x <= 0 {
+                        continue;
+                    }
+                    (delta_x.abs(), 0)
+                }
+                NavigationDirection::Up => {
+                    if delta_y >= 0 {
+                        continue;
+                    }
+                    (delta_y.abs(), delta_x.abs())
+                }
+                NavigationDirection::Down => {
+                    if delta_y <= 0 {
+                        continue;
+                    }
+                    (delta_y.abs(), delta_x.abs())
+                }
             };
-            if !qualifies {
-                continue;
-            }
-
-            let primary = delta_x.abs();
-            let secondary = delta_y.abs();
 
             if (primary, secondary) < best_score {
                 best_score = (primary, secondary);
@@ -6362,12 +6394,12 @@ fn help_shortcut_sections() -> &'static [(&'static str, &'static [(&'static str,
         ("u", "Clear rating"),
         ("l", "Cycle loop / repeat"),
         ("r", "Resume saved session"),
-        ("↑ / ↓", "Volume up / down"),
+        ("↑ / ↓", "Volume (Player focus only)"),
         ("- / +", "Volume down / up"),
     ];
     const NAVIGATION: &[(&str, &str)] = &[
         ("tab", "Cycle focus"),
-        ("← / →", "Move selection"),
+        ("arrows", "Move selection"),
         ("enter", "Activate selection"),
         ("m", "Open context menu"),
         ("b / backspace", "Go back"),

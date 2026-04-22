@@ -369,23 +369,32 @@ pub(super) fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<M
     sync_mpris_transport(ps, state);
 }
 
-pub(super) fn dismiss_queue_after_current(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
-    let keep_len = ps.queue_index.get().saturating_add(1);
+fn dismiss_queue_after_current_state(
+    queue: &mut Vec<Track>,
+    keep_len: usize,
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+) -> bool {
     let mut changed = false;
-    {
-        let mut queue = ps.queue.borrow_mut();
-        if queue.len() > keep_len {
-            queue.truncate(keep_len);
-            changed = true;
-        }
+
+    if queue.len() > keep_len {
+        queue.truncate(keep_len);
+        changed = true;
     }
 
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        if radio.touched_len != keep_len {
-            radio.touched_len = keep_len;
-            changed = true;
-        }
+    if radio_virtual_playlist.take().is_some() {
+        changed = true;
     }
+
+    changed
+}
+
+pub(super) fn dismiss_queue_after_current(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
+    let keep_len = ps.queue_index.get().saturating_add(1);
+    let changed = dismiss_queue_after_current_state(
+        &mut ps.queue.borrow_mut(),
+        keep_len,
+        &mut ps.radio_virtual_playlist.borrow_mut(),
+    );
 
     if !changed {
         return;
@@ -1361,5 +1370,77 @@ pub(super) fn add_to_recent(
             recent_list.remove(&c);
         }
         child = next;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dismiss_queue_after_current_state;
+    use crate::models::{Artist, RadioVirtualPlaylist, Track};
+
+    fn test_track(video_id: &str) -> Track {
+        Track {
+            video_id: video_id.to_string(),
+            title: video_id.to_string(),
+            artists: vec![Artist {
+                name: "Artist".to_string(),
+                id: None,
+            }],
+            album: None,
+            duration: None,
+            thumbnail_url: None,
+            playback_playlist_id: None,
+            playback_params: None,
+            not_interested_feedback_token: None,
+            undo_feedback_token: None,
+        }
+    }
+
+    #[test]
+    fn dismiss_queue_after_current_truncates_tail_and_clears_radio_mode() {
+        let mut queue = vec![
+            test_track("seed"),
+            test_track("tail-a"),
+            test_track("tail-b"),
+        ];
+        let mut radio_virtual_playlist = Some(RadioVirtualPlaylist {
+            source_video_id: "seed".to_string(),
+            touched_len: 1,
+            chips: Vec::new(),
+        });
+
+        let changed = dismiss_queue_after_current_state(&mut queue, 1, &mut radio_virtual_playlist);
+
+        assert!(changed);
+        assert_eq!(queue, vec![test_track("seed")]);
+        assert!(radio_virtual_playlist.is_none());
+    }
+
+    #[test]
+    fn dismiss_queue_after_current_clears_radio_mode_without_tail_tracks() {
+        let mut queue = vec![test_track("seed")];
+        let mut radio_virtual_playlist = Some(RadioVirtualPlaylist {
+            source_video_id: "seed".to_string(),
+            touched_len: 1,
+            chips: Vec::new(),
+        });
+
+        let changed = dismiss_queue_after_current_state(&mut queue, 1, &mut radio_virtual_playlist);
+
+        assert!(changed);
+        assert_eq!(queue, vec![test_track("seed")]);
+        assert!(radio_virtual_playlist.is_none());
+    }
+
+    #[test]
+    fn dismiss_queue_after_current_is_noop_without_tail_or_radio() {
+        let mut queue = vec![test_track("seed")];
+        let mut radio_virtual_playlist = None;
+
+        let changed = dismiss_queue_after_current_state(&mut queue, 1, &mut radio_virtual_playlist);
+
+        assert!(!changed);
+        assert_eq!(queue, vec![test_track("seed")]);
+        assert!(radio_virtual_playlist.is_none());
     }
 }

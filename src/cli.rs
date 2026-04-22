@@ -1074,7 +1074,7 @@ should use `pipewire_pause_mode` directly."
     Ok(())
 }
 
-fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
+pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
     Ok(match name {
         "auto_sync_chromium_cookies" => yes_no_bool(settings.auto_sync_chromium_cookies),
         "chromium_cookie_path" => settings.chromium_cookie_path.clone(),
@@ -1109,7 +1109,11 @@ fn format_config_value(settings: &AppSettings, name: &str) -> Result<String> {
     })
 }
 
-fn apply_config_value(settings: &mut AppSettings, name: &str, value: &str) -> Result<()> {
+pub(crate) fn apply_config_value(
+    settings: &mut AppSettings,
+    name: &str,
+    value: &str,
+) -> Result<()> {
     let trimmed = value.trim();
     match name {
         "auto_sync_chromium_cookies" => settings.auto_sync_chromium_cookies = parse_bool(trimmed)?,

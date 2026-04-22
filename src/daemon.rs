@@ -1260,6 +1260,12 @@ fn maintain_playback(state: &mut DaemonState) {
                     eprintln!("[DAEMON] failed to auto-advance: {err}");
                 }
             }
+            None if should_wait_for_radio_extension_at_natural_end(
+                state.queue.len(),
+                state.queue_index,
+                state.radio_virtual_playlist.is_some(),
+                state.radio_append_in_flight,
+            ) => {}
             None => stop_playback(state, false),
         }
     }
@@ -1536,6 +1542,15 @@ fn natural_end_target_index(
     } else {
         None
     }
+}
+
+fn should_wait_for_radio_extension_at_natural_end(
+    queue_len: usize,
+    queue_index: usize,
+    has_radio_queue: bool,
+    radio_append_in_flight: bool,
+) -> bool {
+    radio_append_in_flight && has_radio_queue && queue_len > 0 && queue_index + 1 == queue_len
 }
 
 fn hide_timing_for_track(track: &ActiveTrack) -> bool {
@@ -3954,7 +3969,7 @@ mod tests {
         rearm_track_repeat_loops_for_snapshot, reset_previous_threshold_clock_for_track,
         should_emit_live_mpris_seeked_hint, should_resume_after_external_mpris_pause,
         should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-        should_sync_live_mpris_position,
+        should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
@@ -4090,6 +4105,26 @@ mod tests {
     #[test]
     fn natural_end_stops_after_last_track_when_repeat_is_off() {
         assert_eq!(natural_end_target_index(3, 2, RepeatMode::Off), None);
+    }
+
+    #[test]
+    fn natural_end_waits_for_in_flight_radio_extension_on_last_track() {
+        assert!(should_wait_for_radio_extension_at_natural_end(
+            3, 2, true, true
+        ));
+    }
+
+    #[test]
+    fn natural_end_does_not_wait_without_radio_extension_in_flight() {
+        assert!(!should_wait_for_radio_extension_at_natural_end(
+            3, 2, true, false
+        ));
+        assert!(!should_wait_for_radio_extension_at_natural_end(
+            3, 1, true, true
+        ));
+        assert!(!should_wait_for_radio_extension_at_natural_end(
+            3, 2, false, true
+        ));
     }
 
     #[test]

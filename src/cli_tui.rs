@@ -32,21 +32,25 @@ use ratatui_image::{
 };
 
 use crate::cli::{
-    artist_string, format_millis, format_track_summary, play_track_with_radio,
-    restore_playback_snapshot_via_daemon, saved_network_state,
+    apply_config_value, artist_string, format_config_value, format_millis, format_track_summary,
+    play_track_with_radio, restore_playback_snapshot_via_daemon, saved_network_state,
 };
 use crate::ipc::{
     ActiveTrackSnapshot, DaemonClient, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
     RepeatMode, load_persisted_playback_state,
 };
 use crate::models::{
-    BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    RadioVirtualPlaylist, SyncedLyrics, Track,
+    BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, PlaylistSummary,
+    RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
 };
-use crate::network::{SongRating, fetch_thumbnail_bytes};
+use crate::network::{
+    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
+    get_storage_root, store_storage_root,
+};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache};
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
-const DAEMON_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const MIN_WIDTH: u16 = 124;
 const MIN_HEIGHT: u16 = 34;
 const SIDEBAR_WIDTH: u16 = 30;
@@ -190,7 +194,7 @@ enum NavigationDirection {
     Right,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TuiNavItem {
     Home,
     Likes,
@@ -199,10 +203,23 @@ enum TuiNavItem {
     Settings,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TuiPlaylistSource {
+    Remote,
+    Offline,
+}
+
+#[derive(Clone)]
+struct TuiPlaylistCard {
+    summary: PlaylistSummary,
+    source: TuiPlaylistSource,
+}
+
 #[derive(Clone)]
 enum TuiHomeItem {
     Track(Track),
     Browse(HomeBrowseCard),
+    Playlist(TuiPlaylistCard),
 }
 
 #[derive(Clone)]
@@ -252,6 +269,7 @@ enum HomeCardStyle {
 #[derive(Clone)]
 struct HomeCard {
     rect: Rect,
+    section_index: usize,
     item: TuiHomeItem,
     title: String,
     subtitle: String,
@@ -273,6 +291,12 @@ struct HomeDocument {
 enum TuiContentView {
     Home,
     Browse(TuiBrowseView),
+    Likes(TuiTrackPageView),
+    Playlists(TuiCollectionPageView),
+    PlaylistDetail(TuiTrackPageView),
+    Offline(TuiOfflineView),
+    Search(TuiSearchView),
+    Settings(TuiSettingsView),
 }
 
 #[derive(Clone)]
@@ -299,16 +323,10 @@ enum BrowseViewStatus {
 }
 
 #[derive(Clone)]
-enum ContentSnapshot {
-    Home {
-        selected: usize,
-        scroll_offset: usize,
-    },
-    Browse {
-        view: TuiBrowseView,
-        selected: usize,
-        scroll_offset: usize,
-    },
+struct ContentSnapshot {
+    view: TuiContentView,
+    selected: usize,
+    scroll_offset: usize,
 }
 
 enum HomeFeedStatus {
@@ -323,6 +341,152 @@ enum BrowseLoadResult {
     Sections(BrowseSectionsPage),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TuiTrackPageKind {
+    Likes,
+    RemotePlaylist,
+    OfflinePlaylist,
+}
+
+#[derive(Clone)]
+struct TuiTrackPageView {
+    kind: TuiTrackPageKind,
+    key: String,
+    title: String,
+    subtitle: String,
+    thumbnail_url: Option<String>,
+    status: TuiTrackPageStatus,
+}
+
+#[derive(Clone)]
+enum TuiTrackPageStatus {
+    Loading,
+    Ready {
+        tracks: Vec<Track>,
+        context: Option<PlaylistContext>,
+    },
+    Error(String),
+}
+
+#[derive(Clone)]
+struct TuiCollectionPageView {
+    title: String,
+    subtitle: String,
+    status: TuiCollectionPageStatus,
+}
+
+#[derive(Clone)]
+enum TuiCollectionPageStatus {
+    Loading,
+    Ready { items: Vec<TuiPlaylistCard> },
+    Error(String),
+}
+
+#[derive(Clone)]
+struct TuiOfflineView {
+    status: TuiOfflineStatus,
+}
+
+#[derive(Clone)]
+enum TuiOfflineStatus {
+    Loading,
+    Ready {
+        playlists: Vec<TuiPlaylistCard>,
+        tracks: Vec<Track>,
+        all_track_count: usize,
+    },
+    Error(String),
+}
+
+#[derive(Clone)]
+struct TuiSearchView {
+    query: String,
+    status: TuiSearchStatus,
+}
+
+#[derive(Clone)]
+enum TuiSearchStatus {
+    Loading,
+    Ready(SearchResult),
+    Error(String),
+}
+
+#[derive(Clone)]
+struct TuiSettingsView {
+    status: TuiSettingsStatus,
+}
+
+#[derive(Clone)]
+enum TuiSettingsStatus {
+    Loading,
+    Ready(TuiSettingsPageData),
+    Error(String),
+}
+
+#[derive(Clone)]
+struct TuiSettingsPageData {
+    sections: Vec<TuiSettingsSection>,
+}
+
+#[derive(Clone)]
+struct TuiSettingsSection {
+    title: String,
+    subtitle: String,
+    fields: Vec<TuiSettingsField>,
+}
+
+#[derive(Clone)]
+struct TuiSettingsField {
+    title: String,
+    subtitle: String,
+    control: TuiSettingsControl,
+}
+
+#[derive(Clone)]
+enum TuiSettingsControl {
+    Toggle {
+        key: &'static str,
+        value: bool,
+    },
+    Dropdown {
+        key: &'static str,
+        value: String,
+    },
+    Stepper {
+        key: &'static str,
+        value: String,
+    },
+    TextInput {
+        key: &'static str,
+        value: String,
+        placeholder: String,
+    },
+    SponsorCategory {
+        key: &'static str,
+        label: &'static str,
+        enabled: bool,
+    },
+    StorageRoot {
+        value: String,
+        placeholder: String,
+    },
+    ReadOnly {
+        value: String,
+    },
+}
+
+#[derive(Clone)]
+enum TuiSettingsTextTarget {
+    Config(&'static str),
+    StorageRoot,
+}
+
+#[derive(Clone)]
+struct TuiSettingsTextEdit {
+    target: TuiSettingsTextTarget,
+    buffer: String,
+}
+
 enum TuiBackgroundEvent {
     HomeLoaded(Result<HomePage, String>),
     HomeAppended {
@@ -333,6 +497,23 @@ enum TuiBackgroundEvent {
         browse_id: String,
         result: Result<BrowseLoadResult, String>,
     },
+    LikesLoaded(Result<Vec<Track>, String>),
+    PlaylistsLoaded(Result<Vec<PlaylistSummary>, String>),
+    TrackPageLoaded {
+        key: String,
+        result: Result<Vec<Track>, String>,
+    },
+    OfflineLoaded(Result<(Vec<PlaylistSummary>, Vec<Track>, Vec<Track>), String>),
+    SearchLoaded {
+        query: String,
+        result: Result<SearchResult, String>,
+    },
+    SearchSuggestionsLoaded {
+        request_id: u64,
+        query: String,
+        result: Result<Vec<String>, String>,
+    },
+    SettingsLoaded(Result<TuiSettingsPageData, String>),
     HistoryLoaded(Result<Vec<Track>, String>),
     LyricsLoaded {
         video_id: String,
@@ -348,10 +529,20 @@ enum TuiBackgroundEvent {
 enum ClickTargetKind {
     Action(TuiAction),
     Nav(TuiNavItem),
+    SearchBox,
+    SearchSuggestion(usize),
     ContentBack,
     DetailTab(DetailTab),
+    RadioChip(usize),
     HomeSectionAction { section_index: usize, shuffle: bool },
     HomeItem(usize),
+    SettingsField(usize),
+    SettingsToggle(&'static str),
+    SettingsCycle(&'static str, isize),
+    SettingsAdjust(&'static str, isize),
+    SettingsEdit(TuiSettingsTextTarget),
+    SettingsStorageRootDefault,
+    SettingsSponsorCategory(&'static str),
     QueueItem(usize),
     RecentItem(usize),
 }
@@ -367,6 +558,7 @@ enum TuiDragPayload {
     QueueRow { index: usize },
     Track { track: Track },
     BrowseCollection { card: HomeBrowseCard },
+    PlaylistCollection { card: TuiPlaylistCard },
 }
 
 struct PendingMousePress {
@@ -459,6 +651,7 @@ struct RenderedContextMenu {
 #[derive(Clone, Default)]
 struct RenderedLayout {
     home_viewport: Rect,
+    radio_chip_viewport: Rect,
     queue_viewport: Rect,
     recent_viewport: Rect,
     player_progress_viewport: Rect,
@@ -526,6 +719,18 @@ struct InteractiveTui {
     home_loading_more: bool,
     content_view: TuiContentView,
     content_backstack: Vec<ContentSnapshot>,
+    search_query: String,
+    search_input_active: bool,
+    search_suggestions: Vec<String>,
+    search_suggestions_loading: bool,
+    search_suggestion_selected: usize,
+    search_suggestion_request_id: u64,
+    search_suggestion_debounce_started_at: Option<Instant>,
+    search_suggestion_inflight: Option<(u64, String)>,
+    radio_chip_scroll_offset: usize,
+    settings_field_offsets: Vec<(usize, usize)>,
+    settings_total_height: usize,
+    settings_text_edit: Option<TuiSettingsTextEdit>,
     focus: TuiFocus,
     player_selected: usize,
     detail_tab: DetailTab,
@@ -579,12 +784,24 @@ impl InteractiveTui {
             home_loading_more: false,
             content_view: TuiContentView::Home,
             content_backstack: Vec::new(),
+            search_query: String::new(),
+            search_input_active: false,
+            search_suggestions: Vec::new(),
+            search_suggestions_loading: false,
+            search_suggestion_selected: 0,
+            search_suggestion_request_id: 0,
+            search_suggestion_debounce_started_at: None,
+            search_suggestion_inflight: None,
+            radio_chip_scroll_offset: 0,
+            settings_field_offsets: Vec::new(),
+            settings_total_height: 0,
+            settings_text_edit: None,
             focus: TuiFocus::Home,
             player_selected: 1,
             detail_tab: DetailTab::Queue,
             resume_card,
             lyrics_state: LyricsState::Idle,
-            status_line: "Home mirrors the GTK app now: arrows move, enter plays, mouse works."
+            status_line: "Use / or click Search to query YouTube Music. Home stays cached now."
                 .to_string(),
             last_snapshot_at: Instant::now(),
             last_daemon_poll_at: Instant::now(),
@@ -618,6 +835,7 @@ impl InteractiveTui {
 
         loop {
             self.drain_background_events();
+            self.maybe_request_search_suggestions();
 
             let mut click_targets = Vec::new();
             let mut rendered_layout = RenderedLayout::default();
@@ -636,7 +854,7 @@ impl InteractiveTui {
             if event::poll(timeout).context("Failed to poll terminal events")? {
                 match event::read().context("Failed to read terminal event")? {
                     Event::Key(key_event) if key_event.kind == KeyEventKind::Press => {
-                        if self.handle_key(key_event.code)? {
+                        if self.handle_key(key_event)? {
                             break;
                         }
                     }
@@ -670,6 +888,138 @@ impl InteractiveTui {
 
     fn terminal_images_enabled(&self) -> bool {
         self.thumbnail_picker.is_some()
+    }
+
+    fn current_nav_item(&self) -> Option<TuiNavItem> {
+        match &self.content_view {
+            TuiContentView::Home => Some(TuiNavItem::Home),
+            TuiContentView::Likes(_) => Some(TuiNavItem::Likes),
+            TuiContentView::Playlists(_) => Some(TuiNavItem::Playlists),
+            TuiContentView::PlaylistDetail(view) => match view.kind {
+                TuiTrackPageKind::Likes => Some(TuiNavItem::Likes),
+                TuiTrackPageKind::RemotePlaylist => Some(TuiNavItem::Playlists),
+                TuiTrackPageKind::OfflinePlaylist => Some(TuiNavItem::Offline),
+            },
+            TuiContentView::Offline(_) => Some(TuiNavItem::Offline),
+            TuiContentView::Settings(_) => Some(TuiNavItem::Settings),
+            TuiContentView::Browse(_) | TuiContentView::Search(_) => None,
+        }
+    }
+
+    fn content_has_back_button(&self) -> bool {
+        matches!(
+            self.content_view,
+            TuiContentView::Browse(_)
+                | TuiContentView::PlaylistDetail(_)
+                | TuiContentView::Search(_)
+        )
+    }
+
+    fn activate_search_input(&mut self) {
+        self.search_input_active = true;
+        self.search_suggestion_selected = 0;
+        self.schedule_search_suggestions();
+        self.status_line =
+            "Search mode: type a query, use ↑↓ for suggestions, Tab to fill, Enter to search."
+                .to_string();
+    }
+
+    fn clear_search_suggestions(&mut self) {
+        self.search_suggestions.clear();
+        self.search_suggestions_loading = false;
+        self.search_suggestion_selected = 0;
+        self.search_suggestion_debounce_started_at = None;
+        self.search_suggestion_inflight = None;
+    }
+
+    fn schedule_search_suggestions(&mut self) {
+        let query = self.search_query.trim();
+        if !self.search_input_active || query.is_empty() {
+            self.clear_search_suggestions();
+            return;
+        }
+
+        self.search_suggestions.clear();
+        self.search_suggestions_loading = true;
+        self.search_suggestion_selected = 0;
+        self.search_suggestion_debounce_started_at = Some(Instant::now());
+    }
+
+    fn maybe_request_search_suggestions(&mut self) {
+        let Some(started_at) = self.search_suggestion_debounce_started_at else {
+            return;
+        };
+        if started_at.elapsed() < UI_TICK_INTERVAL {
+            return;
+        }
+
+        let query = self.search_query.trim().to_string();
+        self.search_suggestion_debounce_started_at = None;
+
+        if !self.search_input_active || query.is_empty() {
+            self.clear_search_suggestions();
+            return;
+        }
+
+        if self
+            .search_suggestion_inflight
+            .as_ref()
+            .is_some_and(|(_, current)| current == &query)
+        {
+            return;
+        }
+
+        self.search_suggestion_request_id = self.search_suggestion_request_id.wrapping_add(1);
+        let request_id = self.search_suggestion_request_id;
+        self.search_suggestion_inflight = Some((request_id, query.clone()));
+        self.search_suggestions_loading = true;
+        spawn_search_suggestions_load(self.background_tx.clone(), request_id, query);
+    }
+
+    fn move_search_suggestion_selection(&mut self, delta: isize) {
+        if self.search_suggestions.is_empty() {
+            return;
+        }
+        self.search_suggestion_selected = move_index(
+            self.search_suggestion_selected,
+            self.search_suggestions.len(),
+            delta,
+        );
+    }
+
+    fn fill_selected_search_suggestion(&mut self) {
+        let Some(suggestion) = self
+            .search_suggestions
+            .get(self.search_suggestion_selected)
+            .cloned()
+        else {
+            return;
+        };
+        self.search_query = suggestion;
+        self.schedule_search_suggestions();
+        self.status_line = "Search suggestion filled.".to_string();
+    }
+
+    fn submit_search(&mut self, preferred_query: Option<String>) {
+        self.search_input_active = false;
+        self.search_suggestion_debounce_started_at = None;
+        self.search_suggestion_inflight = None;
+        self.search_suggestions_loading = false;
+
+        let query = preferred_query
+            .unwrap_or_else(|| self.search_query.trim().to_string())
+            .trim()
+            .to_string();
+        self.search_suggestions.clear();
+        self.search_suggestion_selected = 0;
+
+        if query.is_empty() {
+            self.status_line = "Type a query first.".to_string();
+            return;
+        }
+
+        self.search_query = query.clone();
+        self.open_search(query);
     }
 
     fn ensure_thumbnail_requested(&mut self, url: Option<&str>) {
@@ -910,6 +1260,9 @@ impl InteractiveTui {
             TuiDragPayload::BrowseCollection { card } => {
                 format!("Queue {}", shorten(&card.title, 28))
             }
+            TuiDragPayload::PlaylistCollection { card } => {
+                format!("Queue {}", shorten(&card.summary.title, 28))
+            }
         }
     }
 
@@ -925,6 +1278,9 @@ impl InteractiveTui {
                     TuiHomeItem::Browse(card) => {
                         Some(TuiDragPayload::BrowseCollection { card: card.clone() })
                     }
+                    TuiHomeItem::Playlist(card) => {
+                        Some(TuiDragPayload::PlaylistCollection { card: card.clone() })
+                    }
                 }
             }
             ClickTargetKind::RecentItem(index) => self
@@ -939,6 +1295,11 @@ impl InteractiveTui {
     fn set_mouse_selection(&mut self, kind: &ClickTargetKind) {
         match kind {
             ClickTargetKind::HomeItem(index) => {
+                self.focus = TuiFocus::Home;
+                self.home_selected = *index;
+                self.ensure_home_visible();
+            }
+            ClickTargetKind::SettingsField(index) => {
                 self.focus = TuiFocus::Home;
                 self.home_selected = *index;
                 self.ensure_home_visible();
@@ -1209,6 +1570,11 @@ impl InteractiveTui {
                     .with_context(|| format!("Failed to open {}", card.title))?;
                 self.insert_tracks_into_queue(tracks, raw_slot)
             }
+            TuiDragPayload::PlaylistCollection { card } => {
+                let tracks = load_playlist_card_tracks(&card)
+                    .with_context(|| format!("Failed to open {}", card.summary.title))?;
+                self.insert_tracks_into_queue(tracks, raw_slot)
+            }
         }
     }
 
@@ -1436,6 +1802,14 @@ impl InteractiveTui {
                             items,
                         )
                     }
+                    TuiHomeItem::Playlist(card) => (
+                        card.summary.title.clone(),
+                        card.summary
+                            .subtitle
+                            .clone()
+                            .unwrap_or_else(|| playlist_source_label(card.source).to_string()),
+                        Vec::new(),
+                    ),
                 }
             }
             ClickTargetKind::RecentItem(index) => {
@@ -1634,6 +2008,68 @@ impl InteractiveTui {
                 shorten(&seed_track.title, 28)
             )
         };
+        Ok(())
+    }
+
+    fn activate_radio_chip(&mut self, chip_index: usize) -> Result<()> {
+        let Some(radio) = self.snapshot.radio_virtual_playlist.clone() else {
+            self.status_line = "Radio chips only appear for radio queues.".to_string();
+            return Ok(());
+        };
+        let Some(chip) = radio.chips.get(chip_index).cloned() else {
+            self.status_line = "That radio filter is no longer available.".to_string();
+            return Ok(());
+        };
+        let source_video_id = radio.source_video_id;
+        let prefix_len = radio.touched_len.max(1);
+        let source_track = self
+            .snapshot
+            .queue
+            .iter()
+            .find(|track| track.video_id == source_video_id)
+            .cloned()
+            .or_else(|| self.snapshot.queue.first().cloned());
+
+        let mut refreshed = saved_network_state()?.get_radio(
+            &source_video_id,
+            Some(&chip.playlist_id),
+            chip.params.as_deref(),
+        )?;
+
+        if let Some(source_index) = refreshed
+            .tracks
+            .iter()
+            .position(|track| track.video_id == source_video_id)
+        {
+            if source_index > 0 {
+                let track = refreshed.tracks.remove(source_index);
+                refreshed.tracks.insert(0, track);
+            }
+        } else if let Some(source_track) = source_track {
+            refreshed.tracks.insert(0, source_track);
+        }
+
+        let mut queue = self.snapshot.queue.clone();
+        queue.truncate(prefix_len.min(queue.len()));
+        queue.extend(dedupe_radio_recommendations(
+            queue.as_slice(),
+            refreshed.tracks,
+        ));
+
+        let current_index = self.snapshot.queue_index.min(queue.len().saturating_sub(1));
+        let snapshot = self.client.replace_queue(
+            queue,
+            current_index,
+            self.snapshot.playlist_context.clone(),
+            Some(RadioVirtualPlaylist {
+                source_video_id,
+                touched_len: prefix_len,
+                chips: refreshed.chips,
+            }),
+            self.snapshot.repeat_mode,
+        )?;
+        self.apply_snapshot(snapshot);
+        self.status_line = format!("Switched radio to {}.", shorten(&chip.label, 24));
         Ok(())
     }
 
@@ -1998,9 +2434,7 @@ impl InteractiveTui {
 
         let title_line = Line::from(Span::styled(
             "Keyboard shortcuts",
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ));
         let subtitle_line = Line::from(Span::styled(
             format!("Thumbnails: {}", self.thumbnail_mode_label),
@@ -2028,10 +2462,7 @@ impl InteractiveTui {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled(
-                        (*desc).to_string(),
-                        Style::default().fg(theme.text),
-                    ),
+                    Span::styled((*desc).to_string(), Style::default().fg(theme.text)),
                 ]));
             }
         }
@@ -2052,8 +2483,7 @@ impl InteractiveTui {
             1,
         );
         frame.render_widget(
-            Paragraph::new("h or esc close")
-                .style(Style::default().fg(theme.border_focus)),
+            Paragraph::new("h or esc close").style(Style::default().fg(theme.border_focus)),
             footer,
         );
 
@@ -2160,78 +2590,170 @@ impl InteractiveTui {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        let show_suggestions = self.search_input_active
+            && (self.search_suggestions_loading || !self.search_suggestions.is_empty());
+        let suggestion_items = self.search_suggestions.len().min(6) as u16;
+        let suggestion_height = if show_suggestions {
+            suggestion_items.max(1).saturating_add(2)
+        } else {
+            0
+        };
+        let search_height = 5u16.saturating_add(suggestion_height);
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
-                Constraint::Length(11),
-                Constraint::Length(2),
+                Constraint::Length(search_height),
+                Constraint::Length(6),
+                Constraint::Length(1),
                 Constraint::Min(8),
                 Constraint::Length(3),
             ])
             .split(inner);
+        let search_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Length(suggestion_height)])
+            .split(rows[0]);
 
+        let search_active = self.search_input_active;
         let search_box = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border_subtle))
+            .border_style(Style::default().fg(if search_active {
+                theme.border_focus
+            } else {
+                theme.border_subtle
+            }))
             .style(Style::default().bg(theme.elevated_bg))
             .padding(Padding::new(1, 1, 0, 0));
-        let search_inner = search_box.inner(rows[0]);
-        frame.render_widget(search_box, rows[0]);
+        let search_inner = search_box.inner(search_rows[0]);
+        frame.render_widget(search_box, search_rows[0]);
+        let search_prompt = if self.search_query.trim().is_empty() {
+            Span::styled(
+                "Search songs, artists, albums...",
+                Style::default().fg(theme.muted),
+            )
+        } else {
+            Span::styled(self.search_query.as_str(), Style::default().fg(theme.text))
+        };
+        let search_hint = if search_active {
+            if !self.search_suggestions.is_empty() {
+                "↑↓ choose • Tab fill • Enter search"
+            } else if self.search_suggestions_loading {
+                "Fetching suggestions..."
+            } else {
+                "Enter to search • Esc to cancel"
+            }
+        } else {
+            "Press / or click here"
+        };
+        let search_box = Block::default().style(Style::default().bg(theme.elevated_bg));
+        frame.render_widget(search_box, search_inner);
         frame.render_widget(
             Paragraph::new(vec![
+                Line::from(search_prompt),
                 Line::from(Span::styled(
-                    "Search songs...",
-                    Style::default().fg(theme.muted),
-                )),
-                Line::from(Span::styled(
-                    "Use `static exec <query>` for now",
+                    search_hint,
                     Style::default().fg(theme.border_focus),
                 )),
-            ]),
+            ])
+            .wrap(Wrap { trim: true }),
             search_inner,
         );
+        targets.push(ClickTarget {
+            rect: search_rows[0],
+            kind: ClickTargetKind::SearchBox,
+        });
+
+        if show_suggestions {
+            let suggestions_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border_subtle))
+                .style(Style::default().bg(theme.content_alt_bg));
+            let suggestions_inner = suggestions_block.inner(search_rows[1]);
+            frame.render_widget(suggestions_block, search_rows[1]);
+
+            if self.search_suggestions_loading && self.search_suggestions.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("Loading suggestions...")
+                        .style(Style::default().fg(theme.muted)),
+                    suggestions_inner,
+                );
+            } else {
+                for (index, suggestion) in self.search_suggestions.iter().take(6).enumerate() {
+                    let row = Rect::new(
+                        suggestions_inner.x,
+                        suggestions_inner.y + index as u16,
+                        suggestions_inner.width,
+                        1,
+                    );
+                    let selected = index == self.search_suggestion_selected;
+                    frame.render_widget(
+                        Block::default().style(Style::default().bg(if selected {
+                            theme.accent_fill
+                        } else {
+                            theme.content_alt_bg
+                        })),
+                        row,
+                    );
+                    frame.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            Span::styled(
+                                if selected { "▸ " } else { "  " },
+                                Style::default().fg(if selected {
+                                    theme.accent
+                                } else {
+                                    theme.border
+                                }),
+                            ),
+                            Span::styled(
+                                shorten(
+                                    suggestion,
+                                    suggestions_inner.width.saturating_sub(3) as usize,
+                                ),
+                                Style::default().fg(if selected {
+                                    theme.accent_glow
+                                } else {
+                                    theme.text
+                                }),
+                            ),
+                        ])),
+                        row,
+                    );
+                    targets.push(ClickTarget {
+                        rect: row,
+                        kind: ClickTargetKind::SearchSuggestion(index),
+                    });
+                }
+            }
+        }
 
         let nav_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border_subtle))
             .style(Style::default().bg(theme.content_alt_bg))
-            .padding(Padding::new(1, 1, 0, 0));
+            .padding(Padding::new(1, 1, 1, 0));
         let nav_inner = nav_block.inner(rows[1]);
         frame.render_widget(nav_block, rows[1]);
-        let nav_rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
-                Constraint::Length(2),
-            ])
-            .split(nav_inner);
+        let active_nav = self.current_nav_item();
         let nav_items = [
-            ("Home", TuiNavItem::Home, true),
-            ("Likes", TuiNavItem::Likes, false),
-            ("Playlists", TuiNavItem::Playlists, false),
-            ("Offline", TuiNavItem::Offline, false),
+            ("Home", TuiNavItem::Home),
+            ("Likes", TuiNavItem::Likes),
+            ("Playlists", TuiNavItem::Playlists),
+            ("Offline", TuiNavItem::Offline),
         ];
-        for (row, (label, nav, active)) in nav_rows.into_iter().zip(nav_items) {
-            let row_block = Block::default()
-                .style(Style::default().bg(if active {
+        for (index, (label, nav)) in nav_items.into_iter().enumerate() {
+            let row = Rect::new(nav_inner.x, nav_inner.y + index as u16, nav_inner.width, 1);
+            let active = active_nav == Some(nav);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(if active {
                     theme.accent_fill
                 } else {
                     theme.content_alt_bg
-                }))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(if active {
-                    theme.border_focus
-                } else {
-                    theme.border_subtle
-                }));
-            let row_inner = row_block.inner(*row);
-            frame.render_widget(row_block, *row);
+                })),
+                row,
+            );
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(
@@ -2253,10 +2775,10 @@ impl InteractiveTui {
                             }),
                     ),
                 ])),
-                row_inner,
+                row,
             );
             targets.push(ClickTarget {
-                rect: *row,
+                rect: row,
                 kind: ClickTargetKind::Nav(nav),
             });
         }
@@ -2268,7 +2790,7 @@ impl InteractiveTui {
                     .fg(theme.muted)
                     .add_modifier(Modifier::BOLD),
             ))),
-            rows[2],
+            Rect::new(rows[2].x, rows[2].y, rows[2].width, 1),
         );
 
         let recent_block = Block::default()
@@ -2385,18 +2907,46 @@ impl InteractiveTui {
         }
 
         let settings_row = rows[4];
+        let settings_active = active_nav == Some(TuiNavItem::Settings);
         let settings_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border_subtle))
-            .style(Style::default().bg(theme.content_alt_bg));
+            .border_style(Style::default().fg(if settings_active {
+                theme.border_focus
+            } else {
+                theme.border_subtle
+            }))
+            .style(Style::default().bg(if settings_active {
+                theme.accent_fill
+            } else {
+                theme.content_alt_bg
+            }));
         let settings_inner = settings_block.inner(settings_row);
         frame.render_widget(settings_block, settings_row);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("Settings", Style::default().fg(theme.text)),
-                Span::raw("  "),
-                Span::styled("open GTK for full config", Style::default().fg(theme.muted)),
+                Span::styled(
+                    if settings_active { "● " } else { "○ " },
+                    Style::default().fg(if settings_active {
+                        theme.accent
+                    } else {
+                        theme.border
+                    }),
+                ),
+                Span::styled(
+                    "Settings",
+                    Style::default()
+                        .fg(if settings_active {
+                            theme.accent_glow
+                        } else {
+                            theme.text
+                        })
+                        .add_modifier(if settings_active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
             ])),
             settings_inner,
         );
@@ -2436,13 +2986,31 @@ impl InteractiveTui {
         frame.render_widget(header, rows[0]);
         self.thumbnail_slots.remove(&ThumbnailSlot::ContentHeader);
 
-        let browse_mode = matches!(&self.content_view, TuiContentView::Browse(_));
+        let browse_mode = self.content_has_back_button();
         let header_label = match &self.content_view {
             TuiContentView::Home => "S  T  A  T  I  C".to_string(),
             TuiContentView::Browse(view) => format!(
                 "S  T  A  T  I  C   /   {}",
                 browse_label(view.card.page_type).to_uppercase()
             ),
+            TuiContentView::Likes(_) => "S  T  A  T  I  C   /   LIKES".to_string(),
+            TuiContentView::Playlists(_) => "S  T  A  T  I  C   /   PLAYLISTS".to_string(),
+            TuiContentView::PlaylistDetail(view) => format!(
+                "S  T  A  T  I  C   /   {}",
+                match view.kind {
+                    TuiTrackPageKind::Likes => "LIKES",
+                    TuiTrackPageKind::RemotePlaylist => "PLAYLIST",
+                    TuiTrackPageKind::OfflinePlaylist => "OFFLINE",
+                }
+            ),
+            TuiContentView::Offline(_) => "S  T  A  T  I  C   /   OFFLINE".to_string(),
+            TuiContentView::Search(view) => {
+                format!(
+                    "S  T  A  T  I  C   /   SEARCH  /  {}",
+                    shorten(&view.query, 20)
+                )
+            }
+            TuiContentView::Settings(_) => "S  T  A  T  I  C   /   SETTINGS".to_string(),
         };
         if browse_mode {
             let header_columns = Layout::default()
@@ -2510,6 +3078,14 @@ impl InteractiveTui {
 
         layout.home_viewport = feed_inner;
         self.home_viewport_rows = feed_inner.height as usize;
+        if let TuiContentView::Settings(view) = &self.content_view {
+            let view = view.clone();
+            self.home_doc = HomeDocument::default();
+            self.settings_field_offsets.clear();
+            self.settings_total_height = 0;
+            return self.render_settings_page(frame, feed_inner, theme, &view);
+        }
+
         self.home_doc = match &self.content_view {
             TuiContentView::Home => build_home_document(
                 &self.home_status,
@@ -2517,6 +3093,15 @@ impl InteractiveTui {
                 self.visible_resume_card(),
             ),
             TuiContentView::Browse(view) => build_browse_document(view, feed_inner.width),
+            TuiContentView::Likes(view) | TuiContentView::PlaylistDetail(view) => {
+                build_track_page_document(view, feed_inner.width)
+            }
+            TuiContentView::Playlists(view) => {
+                build_collection_page_document(view, feed_inner.width)
+            }
+            TuiContentView::Offline(view) => build_offline_document(view, feed_inner.width),
+            TuiContentView::Search(view) => build_search_document(view, feed_inner.width),
+            TuiContentView::Settings(_) => HomeDocument::default(),
         };
         if !self.home_doc.cards.is_empty() {
             self.home_selected = self
@@ -2685,6 +3270,470 @@ impl InteractiveTui {
         targets
     }
 
+    fn render_settings_page(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &TuiTheme,
+        view: &TuiSettingsView,
+    ) -> Vec<ClickTarget> {
+        let mut targets = Vec::new();
+        self.settings_field_offsets.clear();
+
+        match &view.status {
+            TuiSettingsStatus::Loading => {
+                self.settings_total_height = 6;
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "Settings",
+                            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "Loading current values from the local store...",
+                            Style::default().fg(theme.muted),
+                        )),
+                    ]),
+                    area,
+                );
+                return targets;
+            }
+            TuiSettingsStatus::Error(message) => {
+                self.settings_total_height = 6;
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "Settings",
+                            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            message.clone(),
+                            Style::default().fg(theme.danger),
+                        )),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    area,
+                );
+                return targets;
+            }
+            TuiSettingsStatus::Ready(page) => {
+                let visible_top = self.home_scroll_offset;
+                let visible_bottom = visible_top.saturating_add(area.height as usize);
+                let doc_width = area.width.saturating_sub(1).max(24);
+                let hero_height = 6usize;
+                let row_height = 5usize;
+                let row_gap = 1usize;
+                let section_gap = 1usize;
+                let mut y = 0usize;
+                let mut field_index = 0usize;
+
+                if y.saturating_add(hero_height) > visible_top && y < visible_bottom {
+                    let screen_y = area.y.saturating_add(y.saturating_sub(visible_top) as u16);
+                    let hero_rect = Rect::new(area.x, screen_y, doc_width, hero_height as u16);
+                    let hero_block = Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.border_focus))
+                        .style(Style::default().bg(theme.elevated_alt_bg))
+                        .padding(Padding::new(1, 1, 0, 0));
+                    let hero_inner = hero_block.inner(hero_rect);
+                    frame.render_widget(hero_block, hero_rect);
+                    frame.render_widget(
+                        Paragraph::new(vec![
+                            Line::from(Span::styled(
+                                "Settings",
+                                Style::default()
+                                    .fg(theme.text)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(Span::styled(
+                                "GTK-style controls in the TUI: toggles, dropdowns, text inputs, and numeric steppers.",
+                                Style::default().fg(theme.muted),
+                            )),
+                            Line::from(Span::styled(
+                                "Enter edits text fields. Use ←/→ or +/- for dropdowns and numbers.",
+                                Style::default().fg(theme.accent),
+                            )),
+                        ])
+                        .wrap(Wrap { trim: true }),
+                        hero_inner,
+                    );
+                }
+                y = y.saturating_add(hero_height + section_gap);
+
+                for section in &page.sections {
+                    let section_height = 2usize;
+                    if y.saturating_add(section_height) > visible_top && y < visible_bottom {
+                        let screen_y = area.y.saturating_add(y.saturating_sub(visible_top) as u16);
+                        frame.render_widget(
+                            Paragraph::new(vec![
+                                Line::from(Span::styled(
+                                    section.title.clone(),
+                                    Style::default()
+                                        .fg(theme.accent)
+                                        .add_modifier(Modifier::BOLD),
+                                )),
+                                Line::from(Span::styled(
+                                    section.subtitle.clone(),
+                                    Style::default().fg(theme.muted),
+                                )),
+                            ])
+                            .wrap(Wrap { trim: true }),
+                            Rect::new(area.x, screen_y, doc_width, section_height as u16),
+                        );
+                    }
+                    y = y.saturating_add(section_height);
+
+                    for field in &section.fields {
+                        self.settings_field_offsets.push((y, row_height));
+                        let is_selected =
+                            self.focus == TuiFocus::Home && self.home_selected == field_index;
+                        let field_top = y;
+                        let field_bottom = y.saturating_add(row_height);
+
+                        if field_bottom > visible_top && field_top < visible_bottom {
+                            let screen_y = area
+                                .y
+                                .saturating_add(field_top.saturating_sub(visible_top) as u16);
+                            let row_rect =
+                                Rect::new(area.x, screen_y, doc_width, row_height as u16);
+                            let row_block = Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .border_style(Style::default().fg(if is_selected {
+                                    theme.border_focus
+                                } else {
+                                    theme.border_subtle
+                                }))
+                                .style(Style::default().bg(if is_selected {
+                                    theme.selected_bg
+                                } else {
+                                    theme.elevated_bg
+                                }))
+                                .padding(Padding::new(1, 1, 0, 0));
+                            let row_inner = row_block.inner(row_rect);
+                            frame.render_widget(row_block, row_rect);
+
+                            let columns = Layout::default()
+                                .direction(Direction::Horizontal)
+                                .constraints([
+                                    Constraint::Min(24),
+                                    Constraint::Length((doc_width / 3).clamp(18, 34)),
+                                ])
+                                .split(row_inner);
+                            frame.render_widget(
+                                Paragraph::new(vec![
+                                    Line::from(Span::styled(
+                                        field.title.clone(),
+                                        Style::default().fg(theme.text).add_modifier(
+                                            if is_selected {
+                                                Modifier::BOLD
+                                            } else {
+                                                Modifier::empty()
+                                            },
+                                        ),
+                                    )),
+                                    Line::from(Span::styled(
+                                        shorten(&field.subtitle, columns[0].width as usize),
+                                        Style::default().fg(theme.muted),
+                                    )),
+                                ])
+                                .wrap(Wrap { trim: true }),
+                                columns[0],
+                            );
+
+                            match &field.control {
+                                TuiSettingsControl::Toggle { key, value } => {
+                                    let label = if *value {
+                                        "[x] Enabled"
+                                    } else {
+                                        "[ ] Disabled"
+                                    };
+                                    frame.render_widget(
+                                        Paragraph::new(label)
+                                            .style(Style::default().fg(theme.text))
+                                            .alignment(Alignment::Center),
+                                        columns[1],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: columns[1],
+                                        kind: ClickTargetKind::SettingsToggle(key),
+                                    });
+                                }
+                                TuiSettingsControl::Dropdown { key, value } => {
+                                    let controls = Layout::default()
+                                        .direction(Direction::Horizontal)
+                                        .constraints([
+                                            Constraint::Length(5),
+                                            Constraint::Min(8),
+                                            Constraint::Length(5),
+                                        ])
+                                        .split(columns[1]);
+                                    frame.render_widget(
+                                        Paragraph::new("[<]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[0],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new(format!("< {} >", value))
+                                            .style(Style::default().fg(theme.text))
+                                            .alignment(Alignment::Center),
+                                        controls[1],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new("[>]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[2],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: controls[0],
+                                        kind: ClickTargetKind::SettingsCycle(key, -1),
+                                    });
+                                    targets.push(ClickTarget {
+                                        rect: controls[2],
+                                        kind: ClickTargetKind::SettingsCycle(key, 1),
+                                    });
+                                }
+                                TuiSettingsControl::Stepper { key, value } => {
+                                    let controls = Layout::default()
+                                        .direction(Direction::Horizontal)
+                                        .constraints([
+                                            Constraint::Length(5),
+                                            Constraint::Min(6),
+                                            Constraint::Length(5),
+                                        ])
+                                        .split(columns[1]);
+                                    frame.render_widget(
+                                        Paragraph::new("[-]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[0],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new(value.clone())
+                                            .style(Style::default().fg(theme.text))
+                                            .alignment(Alignment::Center),
+                                        controls[1],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new("[+]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[2],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: controls[0],
+                                        kind: ClickTargetKind::SettingsAdjust(key, -1),
+                                    });
+                                    targets.push(ClickTarget {
+                                        rect: controls[2],
+                                        kind: ClickTargetKind::SettingsAdjust(key, 1),
+                                    });
+                                }
+                                TuiSettingsControl::TextInput {
+                                    key,
+                                    value,
+                                    placeholder,
+                                } => {
+                                    let current_value = match &self.settings_text_edit {
+                                        Some(edit)
+                                            if matches!(
+                                                edit.target,
+                                                TuiSettingsTextTarget::Config(target_key) if target_key == *key
+                                            ) =>
+                                        {
+                                            edit.buffer.clone()
+                                        }
+                                        _ => value.clone(),
+                                    };
+                                    let controls = Layout::default()
+                                        .direction(Direction::Horizontal)
+                                        .constraints([Constraint::Min(8), Constraint::Length(8)])
+                                        .split(columns[1]);
+                                    let display_value = if current_value.is_empty() {
+                                        placeholder.clone()
+                                    } else {
+                                        current_value
+                                    };
+                                    frame.render_widget(
+                                        Paragraph::new(format!(
+                                            "[ {} ]",
+                                            shorten(
+                                                &display_value,
+                                                controls[0].width.saturating_sub(4) as usize
+                                            )
+                                        ))
+                                        .style(
+                                            Style::default().fg(if value.is_empty() {
+                                                theme.muted
+                                            } else {
+                                                theme.text
+                                            }),
+                                        ),
+                                        controls[0],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new("[Edit]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[1],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: controls[0],
+                                        kind: ClickTargetKind::SettingsEdit(
+                                            TuiSettingsTextTarget::Config(key),
+                                        ),
+                                    });
+                                    targets.push(ClickTarget {
+                                        rect: controls[1],
+                                        kind: ClickTargetKind::SettingsEdit(
+                                            TuiSettingsTextTarget::Config(key),
+                                        ),
+                                    });
+                                }
+                                TuiSettingsControl::SponsorCategory {
+                                    key,
+                                    label,
+                                    enabled,
+                                    ..
+                                } => {
+                                    let checkbox = if *enabled { "[x]" } else { "[ ]" };
+                                    frame.render_widget(
+                                        Paragraph::new(format!("{checkbox} {label}"))
+                                            .style(Style::default().fg(theme.text))
+                                            .alignment(Alignment::Center),
+                                        columns[1],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: columns[1],
+                                        kind: ClickTargetKind::SettingsSponsorCategory(key),
+                                    });
+                                }
+                                TuiSettingsControl::StorageRoot { value, placeholder } => {
+                                    let current_value = match &self.settings_text_edit {
+                                        Some(edit)
+                                            if matches!(
+                                                edit.target,
+                                                TuiSettingsTextTarget::StorageRoot
+                                            ) =>
+                                        {
+                                            edit.buffer.clone()
+                                        }
+                                        _ => value.clone(),
+                                    };
+                                    let controls = Layout::default()
+                                        .direction(Direction::Horizontal)
+                                        .constraints([
+                                            Constraint::Min(8),
+                                            Constraint::Length(8),
+                                            Constraint::Length(11),
+                                        ])
+                                        .split(columns[1]);
+                                    let display_value = if current_value.is_empty() {
+                                        placeholder.clone()
+                                    } else {
+                                        current_value
+                                    };
+                                    frame.render_widget(
+                                        Paragraph::new(format!(
+                                            "[ {} ]",
+                                            shorten(
+                                                &display_value,
+                                                controls[0].width.saturating_sub(4) as usize,
+                                            )
+                                        ))
+                                        .style(
+                                            Style::default().fg(if value.is_empty() {
+                                                theme.muted
+                                            } else {
+                                                theme.text
+                                            }),
+                                        ),
+                                        controls[0],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new("[Edit]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[1],
+                                    );
+                                    frame.render_widget(
+                                        Paragraph::new("[Default]")
+                                            .style(Style::default().fg(theme.accent))
+                                            .alignment(Alignment::Center),
+                                        controls[2],
+                                    );
+                                    targets.push(ClickTarget {
+                                        rect: controls[0],
+                                        kind: ClickTargetKind::SettingsEdit(
+                                            TuiSettingsTextTarget::StorageRoot,
+                                        ),
+                                    });
+                                    targets.push(ClickTarget {
+                                        rect: controls[1],
+                                        kind: ClickTargetKind::SettingsEdit(
+                                            TuiSettingsTextTarget::StorageRoot,
+                                        ),
+                                    });
+                                    targets.push(ClickTarget {
+                                        rect: controls[2],
+                                        kind: ClickTargetKind::SettingsStorageRootDefault,
+                                    });
+                                }
+                                TuiSettingsControl::ReadOnly { value } => {
+                                    frame.render_widget(
+                                        Paragraph::new(format!(
+                                            "[ {} ]",
+                                            shorten(
+                                                value,
+                                                columns[1].width.saturating_sub(4) as usize
+                                            ),
+                                        ))
+                                        .style(Style::default().fg(theme.muted))
+                                        .alignment(Alignment::Left),
+                                        columns[1],
+                                    );
+                                }
+                            }
+
+                            targets.push(ClickTarget {
+                                rect: row_rect,
+                                kind: ClickTargetKind::SettingsField(field_index),
+                            });
+                        }
+
+                        y = y.saturating_add(row_height + row_gap);
+                        field_index += 1;
+                    }
+
+                    y = y.saturating_add(section_gap);
+                }
+
+                self.settings_total_height = y.max(area.height as usize);
+                if field_index > 0 {
+                    self.home_selected = self.home_selected.min(field_index.saturating_sub(1));
+                } else {
+                    self.home_selected = 0;
+                }
+                self.clamp_home_scroll_offset();
+
+                let mut scrollbar_state = ScrollbarState::new(self.settings_total_height)
+                    .position(self.home_scroll_offset);
+                frame.render_stateful_widget(
+                    Scrollbar::default()
+                        .orientation(ScrollbarOrientation::VerticalRight)
+                        .thumb_style(Style::default().fg(theme.accent)),
+                    area,
+                    &mut scrollbar_state,
+                );
+
+                return targets;
+            }
+        }
+    }
+
     fn render_detail_panel(
         &mut self,
         frame: &mut Frame<'_>,
@@ -2765,40 +3814,86 @@ impl InteractiveTui {
             DetailTab::Queue => {
                 let body_rows = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Min(6)])
+                    .constraints([Constraint::Length(3), Constraint::Min(6)])
                     .split(rows[1]);
 
-                let chip_labels = queue_chip_labels(&self.snapshot);
-                frame.render_widget(
-                    Paragraph::new(Line::from(
-                        chip_labels
-                            .into_iter()
-                            .enumerate()
-                            .flat_map(|(index, label)| {
-                                let mut spans = Vec::new();
-                                if index > 0 {
-                                    spans.push(Span::raw(" "));
-                                }
-                                spans.push(Span::styled(
-                                    format!(" {} ", label),
-                                    Style::default()
-                                        .fg(if index == 0 {
-                                            theme.accent_glow
-                                        } else {
-                                            theme.text
-                                        })
-                                        .bg(if index == 0 {
-                                            theme.accent_fill
-                                        } else {
-                                            theme.elevated_bg
-                                        }),
-                                ));
-                                spans
-                            })
-                            .collect::<Vec<_>>(),
-                    )),
-                    body_rows[0],
-                );
+                let chip_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_subtle))
+                    .style(Style::default().bg(theme.elevated_alt_bg));
+                let chip_inner = chip_block.inner(body_rows[0]);
+                frame.render_widget(chip_block, body_rows[0]);
+                layout.radio_chip_viewport = chip_inner;
+
+                let chips = self
+                    .snapshot
+                    .radio_virtual_playlist
+                    .as_ref()
+                    .map(|radio| radio.chips.clone())
+                    .unwrap_or_default();
+                if chips.is_empty() {
+                    self.radio_chip_scroll_offset = 0;
+                    frame.render_widget(
+                        Paragraph::new(current_context_label(&self.snapshot))
+                            .style(Style::default().fg(theme.muted)),
+                        chip_inner,
+                    );
+                } else {
+                    let start = self
+                        .radio_chip_scroll_offset
+                        .min(chips.len().saturating_sub(1));
+                    self.radio_chip_scroll_offset = start;
+                    let hidden_before = start > 0;
+                    let mut x = chip_inner.x;
+                    if hidden_before && chip_inner.width > 2 {
+                        frame.render_widget(
+                            Paragraph::new("‹")
+                                .style(Style::default().fg(theme.accent))
+                                .alignment(Alignment::Left),
+                            Rect::new(chip_inner.x, chip_inner.y, 1, chip_inner.height),
+                        );
+                        x = x.saturating_add(2);
+                    }
+
+                    let mut has_hidden_after = false;
+                    for (index, chip) in chips.iter().enumerate().skip(start) {
+                        let label = format!(" {} ", chip.label);
+                        let width = label.chars().count() as u16;
+                        if width == 0 {
+                            continue;
+                        }
+                        if x.saturating_add(width) > chip_inner.right() {
+                            has_hidden_after = true;
+                            break;
+                        }
+                        let rect = Rect::new(x, chip_inner.y, width, chip_inner.height);
+                        frame.render_widget(
+                            Paragraph::new(label.clone())
+                                .style(Style::default().fg(theme.text).bg(theme.elevated_bg)),
+                            rect,
+                        );
+                        targets.push(ClickTarget {
+                            rect,
+                            kind: ClickTargetKind::RadioChip(index),
+                        });
+                        x = x.saturating_add(width + 1);
+                    }
+
+                    if has_hidden_after && chip_inner.width > 1 {
+                        frame.render_widget(
+                            Paragraph::new("›")
+                                .style(Style::default().fg(theme.accent))
+                                .alignment(Alignment::Right),
+                            Rect::new(
+                                chip_inner.right().saturating_sub(1),
+                                chip_inner.y,
+                                1,
+                                chip_inner.height,
+                            ),
+                        );
+                    }
+                }
 
                 let queue_block = Block::default()
                     .borders(Borders::ALL)
@@ -3356,7 +4451,59 @@ impl InteractiveTui {
         targets
     }
 
-    fn handle_key(&mut self, code: KeyCode) -> Result<bool> {
+    fn handle_key(&mut self, key_event: crossterm::event::KeyEvent) -> Result<bool> {
+        let code = key_event.code;
+
+        if let Some(edit) = self.settings_text_edit.clone() {
+            match code {
+                KeyCode::Esc => {
+                    self.settings_text_edit = None;
+                    self.status_line = "Setting edit cancelled.".to_string();
+                }
+                KeyCode::Enter => {
+                    self.save_settings_text_edit(edit)?;
+                }
+                KeyCode::Backspace => {
+                    if let Some(active_edit) = &mut self.settings_text_edit {
+                        active_edit.buffer.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(active_edit) = &mut self.settings_text_edit {
+                        active_edit.buffer.push(ch);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
+        if self.search_input_active {
+            match code {
+                KeyCode::Esc => {
+                    self.search_input_active = false;
+                    self.clear_search_suggestions();
+                    self.status_line = "Search cancelled.".to_string();
+                }
+                KeyCode::Enter => {
+                    self.submit_search(None);
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.schedule_search_suggestions();
+                }
+                KeyCode::Char(ch) => {
+                    self.search_query.push(ch);
+                    self.schedule_search_suggestions();
+                }
+                KeyCode::Up => self.move_search_suggestion_selection(-1),
+                KeyCode::Down => self.move_search_suggestion_selection(1),
+                KeyCode::Tab => self.fill_selected_search_suggestion(),
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         if self.context_menu.is_some() {
             match code {
                 KeyCode::Esc => {
@@ -3421,6 +4568,9 @@ impl InteractiveTui {
             KeyCode::Char('h') => {
                 self.help_visible = true;
             }
+            KeyCode::Char('/') => {
+                self.activate_search_input();
+            }
             KeyCode::Backspace | KeyCode::Char('b')
                 if !matches!(&self.content_view, TuiContentView::Home) =>
             {
@@ -3438,6 +4588,18 @@ impl InteractiveTui {
             KeyCode::Char('f') => self.run_action(TuiAction::Like)?,
             KeyCode::Char('d') => self.run_action(TuiAction::Dislike)?,
             KeyCode::Char('u') => self.run_action(TuiAction::Neutral)?,
+            KeyCode::Char('-') | KeyCode::Char('_')
+                if matches!(self.content_view, TuiContentView::Settings(_))
+                    && matches!(self.focus, TuiFocus::Home) =>
+            {
+                self.adjust_selected_setting(-1)?;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=')
+                if matches!(self.content_view, TuiContentView::Settings(_))
+                    && matches!(self.focus, TuiFocus::Home) =>
+            {
+                self.adjust_selected_setting(1)?;
+            }
             KeyCode::Char('-') | KeyCode::Char('_') => self.run_action(TuiAction::VolumeDown)?,
             KeyCode::Char('+') | KeyCode::Char('=') => self.run_action(TuiAction::VolumeUp)?,
             KeyCode::Char('m') => self.open_context_menu_for_focus(),
@@ -3652,7 +4814,7 @@ impl InteractiveTui {
                 TuiBackgroundEvent::BrowseLoaded { browse_id, result } => {
                     let Some(view) = (match &mut self.content_view {
                         TuiContentView::Browse(view) => Some(view),
-                        TuiContentView::Home => None,
+                        _ => None,
                     }) else {
                         continue;
                     };
@@ -3701,6 +4863,244 @@ impl InteractiveTui {
                                 "Could not open {}: {message}",
                                 shorten(&view.card.title, 28)
                             );
+                        }
+                    }
+                }
+                TuiBackgroundEvent::LikesLoaded(result) => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Likes(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if !matches!(view.status, TuiTrackPageStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok(tracks) => {
+                            view.subtitle = if tracks.is_empty() {
+                                "No liked songs yet".to_string()
+                            } else {
+                                format!("{} liked songs", tracks.len())
+                            };
+                            view.status = TuiTrackPageStatus::Ready {
+                                tracks,
+                                context: Some(PlaylistContext {
+                                    playlist_id: "LM".to_string(),
+                                    title: "Liked Songs".to_string(),
+                                    thumbnail_url: None,
+                                    subtitle: None,
+                                    source: PlaylistContextSource::Remote,
+                                }),
+                            };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = "Loaded liked songs.".to_string();
+                        }
+                        Err(message) => {
+                            view.status = TuiTrackPageStatus::Error(message.clone());
+                            self.status_line = format!("Likes failed: {message}");
+                        }
+                    }
+                }
+                TuiBackgroundEvent::PlaylistsLoaded(result) => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Playlists(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if !matches!(view.status, TuiCollectionPageStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok(items) => {
+                            let count = items.len();
+                            view.subtitle = if count == 0 {
+                                "No playlists found".to_string()
+                            } else {
+                                format!("{count} playlists in your library")
+                            };
+                            view.status = TuiCollectionPageStatus::Ready {
+                                items: items
+                                    .into_iter()
+                                    .map(|summary| TuiPlaylistCard {
+                                        summary,
+                                        source: TuiPlaylistSource::Remote,
+                                    })
+                                    .collect(),
+                            };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = "Loaded playlists.".to_string();
+                        }
+                        Err(message) => {
+                            view.status = TuiCollectionPageStatus::Error(message.clone());
+                            self.status_line = format!("Playlists failed: {message}");
+                        }
+                    }
+                }
+                TuiBackgroundEvent::TrackPageLoaded { key, result } => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::PlaylistDetail(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if view.key != key || !matches!(view.status, TuiTrackPageStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok(tracks) => {
+                            let context = match view.kind {
+                                TuiTrackPageKind::Likes => Some(PlaylistContext {
+                                    playlist_id: "LM".to_string(),
+                                    title: view.title.clone(),
+                                    thumbnail_url: view.thumbnail_url.clone(),
+                                    subtitle: Some(track_count_label(tracks.len())),
+                                    source: PlaylistContextSource::Remote,
+                                }),
+                                TuiTrackPageKind::RemotePlaylist => Some(PlaylistContext {
+                                    playlist_id: view.key.trim_start_matches("remote:").to_string(),
+                                    title: view.title.clone(),
+                                    thumbnail_url: view.thumbnail_url.clone(),
+                                    subtitle: Some(track_count_label(tracks.len())),
+                                    source: PlaylistContextSource::Remote,
+                                }),
+                                TuiTrackPageKind::OfflinePlaylist => Some(PlaylistContext {
+                                    playlist_id: view
+                                        .key
+                                        .trim_start_matches("offline:")
+                                        .to_string(),
+                                    title: view.title.clone(),
+                                    thumbnail_url: view.thumbnail_url.clone(),
+                                    subtitle: Some(track_count_label(tracks.len())),
+                                    source: PlaylistContextSource::Offline,
+                                }),
+                            };
+                            view.subtitle = track_count_label(tracks.len());
+                            view.status = TuiTrackPageStatus::Ready { tracks, context };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = format!("Opened {}", shorten(&view.title, 32));
+                        }
+                        Err(message) => {
+                            view.status = TuiTrackPageStatus::Error(message.clone());
+                            self.status_line =
+                                format!("Could not open {}: {message}", shorten(&view.title, 28));
+                        }
+                    }
+                }
+                TuiBackgroundEvent::OfflineLoaded(result) => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Offline(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if !matches!(view.status, TuiOfflineStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok((playlists, tracks, all_tracks)) => {
+                            view.status = TuiOfflineStatus::Ready {
+                                playlists: playlists
+                                    .into_iter()
+                                    .map(|summary| TuiPlaylistCard {
+                                        summary,
+                                        source: TuiPlaylistSource::Offline,
+                                    })
+                                    .collect(),
+                                tracks,
+                                all_track_count: all_tracks.len(),
+                            };
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = "Loaded offline library.".to_string();
+                        }
+                        Err(message) => {
+                            view.status = TuiOfflineStatus::Error(message.clone());
+                            self.status_line = format!("Offline failed: {message}");
+                        }
+                    }
+                }
+                TuiBackgroundEvent::SearchLoaded { query, result } => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Search(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if view.query != query || !matches!(view.status, TuiSearchStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok(results) => {
+                            let total = search_results_total(&results);
+                            view.status = TuiSearchStatus::Ready(results);
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = format!("Search returned {total} results.");
+                        }
+                        Err(message) => {
+                            view.status = TuiSearchStatus::Error(message.clone());
+                            self.status_line = format!("Search failed: {message}");
+                        }
+                    }
+                }
+                TuiBackgroundEvent::SearchSuggestionsLoaded {
+                    request_id,
+                    query,
+                    result,
+                } => {
+                    let matches_request = self.search_suggestion_inflight.as_ref().is_some_and(
+                        |(current_id, current_query)| {
+                            *current_id == request_id && current_query == &query
+                        },
+                    );
+                    if !matches_request {
+                        continue;
+                    }
+
+                    self.search_suggestion_inflight = None;
+                    if !self.search_input_active || self.search_query.trim() != query {
+                        continue;
+                    }
+
+                    match result {
+                        Ok(suggestions) => {
+                            self.search_suggestions = suggestions.into_iter().take(8).collect();
+                            self.search_suggestion_selected = 0;
+                            self.search_suggestions_loading = false;
+                        }
+                        Err(message) => {
+                            self.search_suggestions.clear();
+                            self.search_suggestion_selected = 0;
+                            self.search_suggestions_loading = false;
+                            self.status_line = format!("Search suggestions failed: {message}");
+                        }
+                    }
+                }
+                TuiBackgroundEvent::SettingsLoaded(result) => {
+                    let Some(view) = (match &mut self.content_view {
+                        TuiContentView::Settings(view) => Some(view),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    if !matches!(view.status, TuiSettingsStatus::Loading) {
+                        continue;
+                    }
+                    match result {
+                        Ok(page) => {
+                            view.status = TuiSettingsStatus::Ready(page);
+                            self.home_selected = 0;
+                            self.home_scroll_offset = 0;
+                            self.status_line = "Loaded settings.".to_string();
+                        }
+                        Err(message) => {
+                            view.status = TuiSettingsStatus::Error(message.clone());
+                            self.status_line = format!("Settings failed: {message}");
                         }
                     }
                 }
@@ -3765,47 +5165,18 @@ impl InteractiveTui {
         self.last_daemon_poll_at = Instant::now();
     }
 
-    fn request_home_reload(&mut self) {
-        self.home_status = HomeFeedStatus::Loading;
-        self.home_loading_more = false;
-        spawn_home_bootstrap(self.background_tx.clone());
-    }
-
     fn push_content_snapshot(&mut self) {
-        let snapshot = match &self.content_view {
-            TuiContentView::Home => ContentSnapshot::Home {
-                selected: self.home_selected,
-                scroll_offset: self.home_scroll_offset,
-            },
-            TuiContentView::Browse(view) => ContentSnapshot::Browse {
-                view: view.clone(),
-                selected: self.home_selected,
-                scroll_offset: self.home_scroll_offset,
-            },
-        };
-        self.content_backstack.push(snapshot);
+        self.content_backstack.push(ContentSnapshot {
+            view: self.content_view.clone(),
+            selected: self.home_selected,
+            scroll_offset: self.home_scroll_offset,
+        });
     }
 
     fn restore_content_snapshot(&mut self, snapshot: ContentSnapshot) {
-        match snapshot {
-            ContentSnapshot::Home {
-                selected,
-                scroll_offset,
-            } => {
-                self.content_view = TuiContentView::Home;
-                self.home_selected = selected;
-                self.home_scroll_offset = scroll_offset;
-            }
-            ContentSnapshot::Browse {
-                view,
-                selected,
-                scroll_offset,
-            } => {
-                self.content_view = TuiContentView::Browse(view);
-                self.home_selected = selected;
-                self.home_scroll_offset = scroll_offset;
-            }
-        }
+        self.content_view = snapshot.view;
+        self.home_selected = snapshot.selected;
+        self.home_scroll_offset = snapshot.scroll_offset;
     }
 
     fn open_browse_detail(&mut self, card: HomeBrowseCard) {
@@ -3819,6 +5190,97 @@ impl InteractiveTui {
         self.home_loading_more = false;
         self.status_line = format!("Loading {}...", shorten(&card.title, 32));
         spawn_browse_load(self.background_tx.clone(), card);
+    }
+
+    fn open_likes(&mut self) {
+        self.push_content_snapshot();
+        self.content_view = TuiContentView::Likes(TuiTrackPageView {
+            kind: TuiTrackPageKind::Likes,
+            key: "likes".to_string(),
+            title: "Liked Songs".to_string(),
+            subtitle: "Your saved thumbs-up collection".to_string(),
+            thumbnail_url: None,
+            status: TuiTrackPageStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Loading liked songs...".to_string();
+        spawn_likes_load(self.background_tx.clone());
+    }
+
+    fn open_playlists(&mut self) {
+        self.push_content_snapshot();
+        self.content_view = TuiContentView::Playlists(TuiCollectionPageView {
+            title: "Your Playlists".to_string(),
+            subtitle: "Library playlists from YouTube Music".to_string(),
+            status: TuiCollectionPageStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Loading playlists...".to_string();
+        spawn_playlists_load(self.background_tx.clone());
+    }
+
+    fn open_playlist_detail(&mut self, playlist: TuiPlaylistCard) {
+        self.push_content_snapshot();
+        let kind = match playlist.source {
+            TuiPlaylistSource::Remote => TuiTrackPageKind::RemotePlaylist,
+            TuiPlaylistSource::Offline => TuiTrackPageKind::OfflinePlaylist,
+        };
+        self.content_view = TuiContentView::PlaylistDetail(TuiTrackPageView {
+            kind,
+            key: playlist_detail_key(&playlist),
+            title: playlist.summary.title.clone(),
+            subtitle: playlist
+                .summary
+                .subtitle
+                .clone()
+                .unwrap_or_else(|| playlist_source_label(playlist.source).to_string()),
+            thumbnail_url: playlist.summary.thumbnail_url.clone(),
+            status: TuiTrackPageStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = format!("Loading {}...", shorten(&playlist.summary.title, 32));
+        spawn_playlist_detail_load(self.background_tx.clone(), playlist);
+    }
+
+    fn open_offline(&mut self) {
+        self.push_content_snapshot();
+        self.content_view = TuiContentView::Offline(TuiOfflineView {
+            status: TuiOfflineStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Loading offline library...".to_string();
+        spawn_offline_load(self.background_tx.clone());
+    }
+
+    fn open_search(&mut self, query: String) {
+        if !matches!(self.content_view, TuiContentView::Search(_)) {
+            self.push_content_snapshot();
+        }
+        self.clear_search_suggestions();
+        self.search_input_active = false;
+        self.content_view = TuiContentView::Search(TuiSearchView {
+            query: query.clone(),
+            status: TuiSearchStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = format!("Searching for {}...", shorten(&query, 28));
+        spawn_search_load(self.background_tx.clone(), query);
+    }
+
+    fn open_settings(&mut self) {
+        self.push_content_snapshot();
+        self.content_view = TuiContentView::Settings(TuiSettingsView {
+            status: TuiSettingsStatus::Loading,
+        });
+        self.home_selected = 0;
+        self.home_scroll_offset = 0;
+        self.status_line = "Loading settings...".to_string();
+        spawn_settings_load(self.background_tx.clone());
     }
 
     fn go_back_content(&mut self) {
@@ -3835,7 +5297,7 @@ impl InteractiveTui {
 
     fn return_home_content(&mut self) {
         while let Some(snapshot) = self.content_backstack.pop() {
-            if matches!(snapshot, ContentSnapshot::Home { .. }) {
+            if matches!(snapshot.view, TuiContentView::Home) {
                 self.restore_content_snapshot(snapshot);
                 self.status_line = "Back on Home.".to_string();
                 return;
@@ -4116,6 +5578,44 @@ impl InteractiveTui {
                     (section.title.clone(), home_section_tracks(section), None)
                 }
             },
+            TuiContentView::Likes(view) | TuiContentView::PlaylistDetail(view) => {
+                let TuiTrackPageStatus::Ready { tracks, context } = &view.status else {
+                    self.status_line = "This page is still loading.".to_string();
+                    return Ok(());
+                };
+                (view.title.clone(), tracks.clone(), context.clone())
+            }
+            TuiContentView::Offline(view) => {
+                let TuiOfflineStatus::Ready { tracks, .. } = &view.status else {
+                    self.status_line = "Offline is still loading.".to_string();
+                    return Ok(());
+                };
+                if section_index != 1 {
+                    self.status_line =
+                        "That section opens collections instead of playing all.".to_string();
+                    return Ok(());
+                }
+                ("Offline songs".to_string(), tracks.clone(), None)
+            }
+            TuiContentView::Search(view) => {
+                let TuiSearchStatus::Ready(results) = &view.status else {
+                    self.status_line = "Search is still loading.".to_string();
+                    return Ok(());
+                };
+                let Some(section) = results.sections.get(section_index) else {
+                    self.status_line = "That search section is no longer available.".to_string();
+                    return Ok(());
+                };
+                (
+                    section.title.clone(),
+                    search_section_tracks(results, section_index),
+                    None,
+                )
+            }
+            TuiContentView::Playlists(_) | TuiContentView::Settings(_) => {
+                self.status_line = "This page does not have a play-all section.".to_string();
+                return Ok(());
+            }
         };
 
         if tracks.is_empty() {
@@ -4166,6 +5666,16 @@ impl InteractiveTui {
         match kind {
             ClickTargetKind::Action(action) => self.run_action(*action),
             ClickTargetKind::Nav(nav) => self.handle_nav(*nav),
+            ClickTargetKind::SearchBox => {
+                self.activate_search_input();
+                Ok(())
+            }
+            ClickTargetKind::SearchSuggestion(index) => {
+                self.search_suggestion_selected = *index;
+                let preferred = self.search_suggestions.get(*index).cloned();
+                self.submit_search(preferred);
+                Ok(())
+            }
             ClickTargetKind::ContentBack => {
                 self.go_back_content();
                 Ok(())
@@ -4174,6 +5684,7 @@ impl InteractiveTui {
                 self.detail_tab = *tab;
                 Ok(())
             }
+            ClickTargetKind::RadioChip(index) => self.activate_radio_chip(*index),
             ClickTargetKind::HomeSectionAction {
                 section_index,
                 shuffle,
@@ -4184,6 +5695,23 @@ impl InteractiveTui {
                 self.ensure_home_visible();
                 self.activate_content_selection()
             }
+            ClickTargetKind::SettingsField(index) => {
+                self.focus = TuiFocus::Home;
+                self.home_selected = *index;
+                self.ensure_home_visible();
+                Ok(())
+            }
+            ClickTargetKind::SettingsToggle(key) => self.toggle_boolean_setting(key),
+            ClickTargetKind::SettingsCycle(key, delta) => {
+                self.cycle_coordination_setting_delta(key, *delta)
+            }
+            ClickTargetKind::SettingsAdjust(key, delta) => self.adjust_numeric_setting(key, *delta),
+            ClickTargetKind::SettingsEdit(target) => {
+                self.start_settings_text_edit(target.clone());
+                Ok(())
+            }
+            ClickTargetKind::SettingsStorageRootDefault => self.reset_storage_root_override(),
+            ClickTargetKind::SettingsSponsorCategory(key) => self.toggle_sponsorblock_category(key),
             ClickTargetKind::QueueItem(index) => {
                 self.focus = TuiFocus::Queue;
                 self.queue_selected = *index;
@@ -4200,28 +5728,45 @@ impl InteractiveTui {
     }
 
     fn handle_nav(&mut self, nav: TuiNavItem) -> Result<()> {
+        self.settings_text_edit = None;
         match nav {
             TuiNavItem::Home => {
                 self.focus = TuiFocus::Home;
                 if matches!(&self.content_view, TuiContentView::Home) {
-                    self.request_home_reload();
-                    self.status_line = "Reloading Home.".to_string();
+                    self.status_line = "Home is already cached locally.".to_string();
                 } else {
                     self.return_home_content();
                 }
             }
-            TuiNavItem::Settings => {
-                self.status_line = "Settings live in the GTK app for now.".to_string();
+            TuiNavItem::Likes => {
+                if !matches!(self.content_view, TuiContentView::Likes(_)) {
+                    self.open_likes();
+                }
             }
-            TuiNavItem::Likes | TuiNavItem::Playlists | TuiNavItem::Offline => {
-                self.status_line =
-                    format!("{} rendering is next on the TUI roadmap.", nav_label(nav));
+            TuiNavItem::Playlists => {
+                if !matches!(self.content_view, TuiContentView::Playlists(_)) {
+                    self.open_playlists();
+                }
+            }
+            TuiNavItem::Offline => {
+                if !matches!(self.content_view, TuiContentView::Offline(_)) {
+                    self.open_offline();
+                }
+            }
+            TuiNavItem::Settings => {
+                if !matches!(self.content_view, TuiContentView::Settings(_)) {
+                    self.open_settings();
+                }
             }
         }
         Ok(())
     }
 
     fn activate_content_selection(&mut self) -> Result<()> {
+        if matches!(self.content_view, TuiContentView::Settings(_)) {
+            return self.activate_selected_setting();
+        }
+
         let Some(card) = self.home_doc.cards.get(self.home_selected).cloned() else {
             self.status_line = match &self.content_view {
                 TuiContentView::Home => "Home feed is still loading.".to_string(),
@@ -4234,6 +5779,14 @@ impl InteractiveTui {
                         "Nothing is selectable on this page yet.".to_string()
                     }
                 },
+                TuiContentView::Likes(_)
+                | TuiContentView::PlaylistDetail(_)
+                | TuiContentView::Playlists(_)
+                | TuiContentView::Offline(_)
+                | TuiContentView::Search(_)
+                | TuiContentView::Settings(_) => {
+                    "Nothing is selectable on this page yet.".to_string()
+                }
             };
             return Ok(());
         };
@@ -4241,6 +5794,10 @@ impl InteractiveTui {
         match card.item {
             TuiHomeItem::Browse(card) => {
                 self.open_browse_detail(card);
+                return Ok(());
+            }
+            TuiHomeItem::Playlist(card) => {
+                self.open_playlist_detail(card);
                 return Ok(());
             }
             TuiHomeItem::Track(track)
@@ -4258,28 +5815,68 @@ impl InteractiveTui {
                 self.detail_tab = DetailTab::Queue;
                 self.status_line = format!("Playing {}", format_track_summary(&track));
             }
-            TuiHomeItem::Track(track) => {
-                let TuiContentView::Browse(view) = &self.content_view else {
-                    return Ok(());
-                };
-                let BrowseViewStatus::Tracks { tracks, .. } = &view.status else {
-                    return Ok(());
-                };
-                let start_index = tracks
-                    .iter()
-                    .position(|candidate| candidate.video_id == track.video_id)
-                    .unwrap_or(0);
-                let snapshot = self.client.play_queue_at(
-                    tracks.clone(),
-                    start_index,
-                    Some(browse_playlist_context(&view.card, tracks.len())),
-                    None,
-                    RepeatMode::Off,
-                )?;
-                self.apply_snapshot(snapshot);
-                self.detail_tab = DetailTab::Queue;
-                self.status_line = format!("Playing {}", format_track_summary(&track));
-            }
+            TuiHomeItem::Track(track) => match &self.content_view {
+                TuiContentView::Browse(view) => {
+                    let BrowseViewStatus::Tracks { tracks, .. } = &view.status else {
+                        return Ok(());
+                    };
+                    self.play_track_collection(
+                        tracks.clone(),
+                        tracks
+                            .iter()
+                            .position(|candidate| candidate.video_id == track.video_id)
+                            .unwrap_or(0),
+                        Some(browse_playlist_context(&view.card, tracks.len())),
+                        &track,
+                    )?;
+                }
+                TuiContentView::Likes(view) | TuiContentView::PlaylistDetail(view) => {
+                    let TuiTrackPageStatus::Ready { tracks, context } = &view.status else {
+                        return Ok(());
+                    };
+                    self.play_track_collection(
+                        tracks.clone(),
+                        tracks
+                            .iter()
+                            .position(|candidate| candidate.video_id == track.video_id)
+                            .unwrap_or(0),
+                        context.clone(),
+                        &track,
+                    )?;
+                }
+                TuiContentView::Offline(view) => {
+                    let TuiOfflineStatus::Ready { tracks, .. } = &view.status else {
+                        return Ok(());
+                    };
+                    self.play_track_collection(
+                        tracks.clone(),
+                        tracks
+                            .iter()
+                            .position(|candidate| candidate.video_id == track.video_id)
+                            .unwrap_or(0),
+                        None,
+                        &track,
+                    )?;
+                }
+                TuiContentView::Search(view) => {
+                    let TuiSearchStatus::Ready(results) = &view.status else {
+                        return Ok(());
+                    };
+                    let section_tracks = search_section_tracks(results, card.section_index);
+                    self.play_track_collection(
+                        section_tracks.clone(),
+                        section_tracks
+                            .iter()
+                            .position(|candidate| candidate.video_id == track.video_id)
+                            .unwrap_or(0),
+                        None,
+                        &track,
+                    )?;
+                }
+                TuiContentView::Home
+                | TuiContentView::Playlists(_)
+                | TuiContentView::Settings(_) => return Ok(()),
+            },
         }
 
         self.queue_selected = self
@@ -4334,6 +5931,238 @@ impl InteractiveTui {
         Ok(())
     }
 
+    fn play_track_collection(
+        &mut self,
+        tracks: Vec<Track>,
+        start_index: usize,
+        context: Option<PlaylistContext>,
+        track: &Track,
+    ) -> Result<()> {
+        if tracks.is_empty() {
+            self.status_line = "Nothing playable is in this section yet.".to_string();
+            return Ok(());
+        }
+        let snapshot =
+            self.client
+                .play_queue_at(tracks, start_index, context, None, RepeatMode::Off)?;
+        self.apply_snapshot(snapshot);
+        self.detail_tab = DetailTab::Queue;
+        self.status_line = format!("Playing {}", format_track_summary(track));
+        Ok(())
+    }
+
+    fn refresh_settings_view(&mut self) {
+        if let TuiContentView::Settings(view) = &mut self.content_view {
+            if let Ok(page) = load_settings_page_data() {
+                view.status = TuiSettingsStatus::Ready(page);
+            }
+        }
+    }
+
+    fn persist_setting_value(&mut self, key: &'static str, value: &str) -> Result<()> {
+        let cache = open_tui_music_cache()?;
+        let mut settings = cache.load_settings()?;
+        apply_config_value(&mut settings, key, value)?;
+        cache.save_settings(&settings)?;
+        self.refresh_settings_view();
+        match self.client.reload_settings() {
+            Ok(snapshot) => self.apply_snapshot(snapshot),
+            Err(err) => {
+                self.status_line = format!("Saved {key}, but daemon reload needs attention: {err}");
+            }
+        }
+        let rendered = format_config_value(&settings, key)?;
+        self.status_line = format!("{key} = {rendered}");
+        Ok(())
+    }
+
+    fn toggle_boolean_setting(&mut self, key: &'static str) -> Result<()> {
+        let cache = open_tui_music_cache()?;
+        let settings = cache.load_settings()?;
+        let next = if current_boolean_setting(&settings, key) {
+            "false"
+        } else {
+            "true"
+        };
+        self.persist_setting_value(key, next)
+    }
+
+    fn cycle_coordination_setting_delta(&mut self, key: &'static str, delta: isize) -> Result<()> {
+        let cache = open_tui_music_cache()?;
+        let settings = cache.load_settings()?;
+        let current = current_coordination_setting(&settings, key);
+        let index = CoordinationMode::ALL
+            .iter()
+            .position(|mode| *mode == current)
+            .unwrap_or(0);
+        let next_index = move_index(index, CoordinationMode::ALL.len(), delta);
+        self.persist_setting_value(key, CoordinationMode::ALL[next_index].as_str())
+    }
+
+    fn adjust_numeric_setting(&mut self, key: &'static str, delta: isize) -> Result<()> {
+        let meta = numeric_setting_meta(key)
+            .with_context(|| format!("No numeric metadata is defined for `{key}`"))?;
+        let cache = open_tui_music_cache()?;
+        let settings = cache.load_settings()?;
+        let current = current_numeric_setting_value(&settings, key);
+        let next = (current + delta as f64 * meta.step).clamp(meta.min, meta.max);
+        let rendered = if meta.integer {
+            format!("{}", next.round() as u32)
+        } else {
+            format!("{:.1}", next)
+        };
+        self.persist_setting_value(key, &rendered)
+    }
+
+    fn toggle_sponsorblock_category(&mut self, key: &'static str) -> Result<()> {
+        let cache = open_tui_music_cache()?;
+        let settings = cache.load_settings()?;
+        let mut categories = settings.sponsorblock_categories.clone();
+        if categories.iter().any(|category| category == key) {
+            categories.retain(|category| category != key);
+        } else {
+            categories.push(key.to_string());
+        }
+        self.persist_setting_value("sponsorblock_categories", &categories.join(","))
+    }
+
+    fn start_settings_text_edit(&mut self, target: TuiSettingsTextTarget) {
+        let Some(buffer) = self.settings_text_buffer_for_target(&target) else {
+            self.status_line = "That field cannot be edited right now.".to_string();
+            return;
+        };
+        self.settings_text_edit = Some(TuiSettingsTextEdit { target, buffer });
+        self.status_line = "Editing setting inline. Enter saves, Esc cancels.".to_string();
+    }
+
+    fn settings_text_buffer_for_target(&self, target: &TuiSettingsTextTarget) -> Option<String> {
+        let TuiContentView::Settings(view) = &self.content_view else {
+            return None;
+        };
+        let TuiSettingsStatus::Ready(page) = &view.status else {
+            return None;
+        };
+
+        page.sections
+            .iter()
+            .flat_map(|section| section.fields.iter())
+            .find_map(|field| match (&field.control, target) {
+                (
+                    TuiSettingsControl::TextInput { key, value, .. },
+                    TuiSettingsTextTarget::Config(target_key),
+                ) if key == target_key => Some(value.clone()),
+                (
+                    TuiSettingsControl::StorageRoot { value, .. },
+                    TuiSettingsTextTarget::StorageRoot,
+                ) => Some(value.clone()),
+                _ => None,
+            })
+    }
+
+    fn save_settings_text_edit(&mut self, edit: TuiSettingsTextEdit) -> Result<()> {
+        let trimmed = edit.buffer.trim().to_string();
+        let result = match edit.target {
+            TuiSettingsTextTarget::Config(key) => self.persist_setting_value(key, &trimmed),
+            TuiSettingsTextTarget::StorageRoot => self.persist_storage_root_override(&trimmed),
+        };
+
+        match result {
+            Ok(()) => {
+                self.settings_text_edit = None;
+                Ok(())
+            }
+            Err(err) => {
+                self.status_line = format!("Save failed: {err}");
+                Ok(())
+            }
+        }
+    }
+
+    fn persist_storage_root_override(&mut self, raw_root: &str) -> Result<()> {
+        let trimmed = raw_root.trim().to_string();
+        let mut cache = open_tui_music_cache()?;
+        cache.migrate_storage_root(&trimmed)?;
+        if trimmed.is_empty() {
+            delete_storage_root();
+            self.status_line = "Static is back on the default storage root.".to_string();
+        } else {
+            store_storage_root(&trimmed)?;
+            self.status_line = format!("Moved Static storage to {}.", shorten(&trimmed, 40));
+        }
+        self.refresh_settings_view();
+        Ok(())
+    }
+
+    fn reset_storage_root_override(&mut self) -> Result<()> {
+        self.persist_storage_root_override("")
+    }
+
+    fn selected_settings_field(&self) -> Option<TuiSettingsField> {
+        let TuiContentView::Settings(view) = &self.content_view else {
+            return None;
+        };
+        let TuiSettingsStatus::Ready(page) = &view.status else {
+            return None;
+        };
+        page.sections
+            .iter()
+            .flat_map(|section| section.fields.iter().cloned())
+            .nth(self.home_selected)
+    }
+
+    fn activate_selected_setting(&mut self) -> Result<()> {
+        let Some(field) = self.selected_settings_field() else {
+            self.status_line = "Settings are still loading.".to_string();
+            return Ok(());
+        };
+
+        match field.control {
+            TuiSettingsControl::Toggle { key, .. } => self.toggle_boolean_setting(key),
+            TuiSettingsControl::Dropdown { key, .. } => {
+                self.cycle_coordination_setting_delta(key, 1)
+            }
+            TuiSettingsControl::Stepper { .. } => {
+                self.status_line = "Use ←/→ or +/- to adjust numeric settings.".to_string();
+                Ok(())
+            }
+            TuiSettingsControl::TextInput { key, .. } => {
+                self.start_settings_text_edit(TuiSettingsTextTarget::Config(key));
+                Ok(())
+            }
+            TuiSettingsControl::SponsorCategory { key, .. } => {
+                self.toggle_sponsorblock_category(key)
+            }
+            TuiSettingsControl::StorageRoot { .. } => {
+                self.start_settings_text_edit(TuiSettingsTextTarget::StorageRoot);
+                Ok(())
+            }
+            TuiSettingsControl::ReadOnly { value } => {
+                self.status_line = shorten(&value, 96);
+                Ok(())
+            }
+        }
+    }
+
+    fn adjust_selected_setting(&mut self, delta: isize) -> Result<()> {
+        let Some(field) = self.selected_settings_field() else {
+            return Ok(());
+        };
+
+        match field.control {
+            TuiSettingsControl::Toggle { key, .. } => self.toggle_boolean_setting(key),
+            TuiSettingsControl::Dropdown { key, .. } => {
+                self.cycle_coordination_setting_delta(key, delta)
+            }
+            TuiSettingsControl::Stepper { key, .. } => self.adjust_numeric_setting(key, delta),
+            TuiSettingsControl::SponsorCategory { key, .. } => {
+                self.toggle_sponsorblock_category(key)
+            }
+            TuiSettingsControl::TextInput { .. }
+            | TuiSettingsControl::StorageRoot { .. }
+            | TuiSettingsControl::ReadOnly { .. } => Ok(()),
+        }
+    }
+
     fn player_action_focused(&self, index: usize) -> bool {
         matches!(self.focus, TuiFocus::Player) && self.player_selected == index
     }
@@ -4350,6 +6179,29 @@ impl InteractiveTui {
     fn move_selection(&mut self, direction: NavigationDirection) {
         match self.focus {
             TuiFocus::Home => {
+                if matches!(self.content_view, TuiContentView::Settings(_)) {
+                    match direction {
+                        NavigationDirection::Up => {
+                            self.home_selected = self.home_selected.saturating_sub(1);
+                            self.ensure_home_visible();
+                        }
+                        NavigationDirection::Down => {
+                            let count = self.settings_field_offsets.len();
+                            if count > 0 {
+                                self.home_selected =
+                                    (self.home_selected + 1).min(count.saturating_sub(1));
+                                self.ensure_home_visible();
+                            }
+                        }
+                        NavigationDirection::Left => {
+                            let _ = self.adjust_selected_setting(-1);
+                        }
+                        NavigationDirection::Right => {
+                            let _ = self.adjust_selected_setting(1);
+                        }
+                    }
+                    return;
+                }
                 if self.home_doc.cards.is_empty() {
                     return;
                 }
@@ -4409,8 +6261,7 @@ impl InteractiveTui {
             }
 
             let candidate_y = candidate.rect.y as i32;
-            let candidate_center_x =
-                candidate.rect.x as i32 + candidate.rect.width as i32 / 2;
+            let candidate_center_x = candidate.rect.x as i32 + candidate.rect.width as i32 / 2;
             let delta_x = candidate_center_x - current_center_x;
             let delta_y = candidate_y - current_y;
 
@@ -4453,6 +6304,14 @@ impl InteractiveTui {
     fn page_move(&mut self, direction: isize) {
         match self.focus {
             TuiFocus::Home => {
+                if matches!(self.content_view, TuiContentView::Settings(_)) {
+                    let rows = (self.home_viewport_rows / 6).max(1) as isize;
+                    let count = self.settings_field_offsets.len();
+                    self.home_selected =
+                        move_index(self.home_selected, count.max(1), direction * rows);
+                    self.ensure_home_visible();
+                    return;
+                }
                 let delta = direction * self.home_viewport_rows.max(1) as isize;
                 self.scroll_home(delta);
             }
@@ -4498,7 +6357,11 @@ impl InteractiveTui {
     fn jump_to_end(&mut self) {
         match self.focus {
             TuiFocus::Home => {
-                self.home_selected = self.home_doc.cards.len().saturating_sub(1);
+                self.home_selected = if matches!(self.content_view, TuiContentView::Settings(_)) {
+                    self.settings_field_offsets.len().saturating_sub(1)
+                } else {
+                    self.home_doc.cards.len().saturating_sub(1)
+                };
                 self.ensure_home_visible();
             }
             TuiFocus::Queue => {
@@ -4516,7 +6379,9 @@ impl InteractiveTui {
     }
 
     fn scroll_panel(&mut self, column: u16, row: u16, delta: isize) {
-        if contains(self.rendered_layout.queue_viewport, column, row) {
+        if contains(self.rendered_layout.radio_chip_viewport, column, row) {
+            self.scroll_radio_chips(delta);
+        } else if contains(self.rendered_layout.queue_viewport, column, row) {
             self.focus = TuiFocus::Queue;
             if self.detail_tab == DetailTab::Queue {
                 self.queue_selected =
@@ -4565,10 +6430,12 @@ impl InteractiveTui {
     }
 
     fn scroll_home(&mut self, delta: isize) {
-        let max_scroll = self
-            .home_doc
-            .total_height
-            .saturating_sub(self.home_viewport_rows.max(1));
+        let total_height = if matches!(self.content_view, TuiContentView::Settings(_)) {
+            self.settings_total_height
+        } else {
+            self.home_doc.total_height
+        };
+        let max_scroll = total_height.saturating_sub(self.home_viewport_rows.max(1));
         if delta < 0 {
             self.home_scroll_offset = self.home_scroll_offset.saturating_sub(delta.unsigned_abs());
         } else {
@@ -4577,6 +6444,21 @@ impl InteractiveTui {
                 .saturating_add(delta as usize)
                 .min(max_scroll);
         }
+    }
+
+    fn scroll_radio_chips(&mut self, delta: isize) {
+        let chip_count = self
+            .snapshot
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.chips.len())
+            .unwrap_or(0);
+        if chip_count == 0 {
+            self.radio_chip_scroll_offset = 0;
+            return;
+        }
+        self.radio_chip_scroll_offset =
+            move_index(self.radio_chip_scroll_offset, chip_count, delta);
     }
 
     fn ensure_queue_visible(&mut self) {
@@ -4620,6 +6502,26 @@ impl InteractiveTui {
     }
 
     fn ensure_home_visible(&mut self) {
+        if matches!(self.content_view, TuiContentView::Settings(_)) {
+            let Some((field_top, field_height)) =
+                self.settings_field_offsets.get(self.home_selected).copied()
+            else {
+                self.home_selected = 0;
+                self.home_scroll_offset = 0;
+                return;
+            };
+
+            let field_bottom = field_top.saturating_add(field_height);
+            let viewport = self.home_viewport_rows.max(1);
+            if field_top < self.home_scroll_offset {
+                self.home_scroll_offset = field_top;
+            } else if field_bottom > self.home_scroll_offset.saturating_add(viewport) {
+                self.home_scroll_offset = field_bottom.saturating_sub(viewport);
+            }
+            self.clamp_home_scroll_offset();
+            return;
+        }
+
         let Some(card) = self.home_doc.cards.get(self.home_selected) else {
             self.home_selected = 0;
             self.home_scroll_offset = 0;
@@ -4639,9 +6541,14 @@ impl InteractiveTui {
 
     fn clamp_home_scroll_offset(&mut self) {
         let viewport = self.home_viewport_rows.max(1);
+        let total_height = if matches!(self.content_view, TuiContentView::Settings(_)) {
+            self.settings_total_height
+        } else {
+            self.home_doc.total_height
+        };
         self.home_scroll_offset = self
             .home_scroll_offset
-            .min(self.home_doc.total_height.saturating_sub(viewport));
+            .min(total_height.saturating_sub(viewport));
     }
 
     fn visible_resume_card(&self) -> Option<&ResumeCardData> {
@@ -4822,6 +6729,72 @@ fn spawn_browse_load(tx: mpsc::Sender<TuiBackgroundEvent>, card: HomeBrowseCard)
     });
 }
 
+fn spawn_likes_load(tx: mpsc::Sender<TuiBackgroundEvent>) {
+    std::thread::spawn(move || {
+        let result = saved_network_state()
+            .and_then(|network| network.get_playlist("LM"))
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::LikesLoaded(result));
+    });
+}
+
+fn spawn_playlists_load(tx: mpsc::Sender<TuiBackgroundEvent>) {
+    std::thread::spawn(move || {
+        let result = saved_network_state()
+            .and_then(|network| network.get_library_playlists())
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::PlaylistsLoaded(result));
+    });
+}
+
+fn spawn_playlist_detail_load(tx: mpsc::Sender<TuiBackgroundEvent>, playlist: TuiPlaylistCard) {
+    std::thread::spawn(move || {
+        let key = playlist_detail_key(&playlist);
+        let result = load_playlist_card_tracks(&playlist).map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::TrackPageLoaded { key, result });
+    });
+}
+
+fn spawn_offline_load(tx: mpsc::Sender<TuiBackgroundEvent>) {
+    std::thread::spawn(move || {
+        let result = load_offline_page_data_tui().map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::OfflineLoaded(result));
+    });
+}
+
+fn spawn_search_load(tx: mpsc::Sender<TuiBackgroundEvent>, query: String) {
+    std::thread::spawn(move || {
+        let result = saved_network_state()
+            .and_then(|network| network.search(&query))
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::SearchLoaded { query, result });
+    });
+}
+
+fn spawn_search_suggestions_load(
+    tx: mpsc::Sender<TuiBackgroundEvent>,
+    request_id: u64,
+    query: String,
+) {
+    std::thread::spawn(move || {
+        let result = saved_network_state()
+            .and_then(|network| network.get_search_suggestions(&query))
+            .map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::SearchSuggestionsLoaded {
+            request_id,
+            query,
+            result,
+        });
+    });
+}
+
+fn spawn_settings_load(tx: mpsc::Sender<TuiBackgroundEvent>) {
+    std::thread::spawn(move || {
+        let result = load_settings_page_data().map_err(|err| err.to_string());
+        let _ = tx.send(TuiBackgroundEvent::SettingsLoaded(result));
+    });
+}
+
 fn spawn_lyrics_load(tx: mpsc::Sender<TuiBackgroundEvent>, video_id: String) {
     std::thread::spawn(move || {
         let result = saved_network_state()
@@ -4837,6 +6810,152 @@ fn spawn_thumbnail_load(tx: mpsc::Sender<TuiBackgroundEvent>, url: String) {
             .ok_or_else(|| format!("Could not fetch thumbnail bytes from {url}"));
         let _ = tx.send(TuiBackgroundEvent::ThumbnailLoaded { url, result });
     });
+}
+
+fn open_tui_music_cache() -> Result<MusicCache> {
+    let storage_root = get_storage_root();
+    MusicCache::new_with_storage_root(storage_root.as_deref())
+        .context("Failed to open Static settings store")
+}
+
+fn load_playlist_card_tracks(card: &TuiPlaylistCard) -> Result<Vec<Track>> {
+    match card.source {
+        TuiPlaylistSource::Remote => saved_network_state()
+            .and_then(|network| network.get_playlist(&card.summary.playlist_id)),
+        TuiPlaylistSource::Offline => {
+            Ok(load_offline_playlist_tracks_tui(&card.summary.playlist_id)?)
+        }
+    }
+}
+
+fn load_offline_page_data_tui() -> Result<(Vec<PlaylistSummary>, Vec<Track>, Vec<Track>)> {
+    let cache = open_tui_music_cache()?;
+    let settings = cache.load_settings()?;
+
+    let mut offline_playlists: Vec<PlaylistSummary> = cache
+        .offline_playlists()?
+        .into_iter()
+        .map(
+            |(playlist_id, title, thumbnail_url, subtitle)| PlaylistSummary {
+                playlist_id,
+                title,
+                thumbnail_url,
+                subtitle,
+            },
+        )
+        .collect();
+
+    let listen_again_track_ids = cache.offline_listen_again_track_ids(&settings)?;
+    if let Some(first_video_id) = listen_again_track_ids.first() {
+        offline_playlists.insert(
+            0,
+            PlaylistSummary {
+                playlist_id: "__listen_again__".to_string(),
+                title: "Listen again".to_string(),
+                thumbnail_url: offline_thumbnail_url_tui(&cache, first_video_id),
+                subtitle: Some("Auto-kept from Listen again".to_string()),
+            },
+        );
+    }
+
+    let all_tracks = cache
+        .offline_tracks()?
+        .into_iter()
+        .map(|(video_id, title, artist, _)| Track {
+            video_id: video_id.clone(),
+            title,
+            artists: if artist.is_empty() {
+                Vec::new()
+            } else {
+                vec![crate::models::Artist {
+                    name: artist,
+                    id: None,
+                }]
+            },
+            album: None,
+            duration: None,
+            thumbnail_url: offline_thumbnail_url_tui(&cache, &video_id),
+            playback_playlist_id: None,
+            playback_params: None,
+            not_interested_feedback_token: None,
+            undo_feedback_token: None,
+        })
+        .collect::<Vec<_>>();
+
+    let playlist_track_ids = offline_playlists
+        .iter()
+        .flat_map(|playlist| {
+            if playlist.playlist_id == "__listen_again__" {
+                listen_again_track_ids.clone()
+            } else {
+                cache
+                    .offline_playlist_track_ids(&playlist.playlist_id)
+                    .unwrap_or_default()
+            }
+        })
+        .collect::<HashSet<_>>();
+
+    let display_tracks = all_tracks
+        .iter()
+        .filter(|track| !playlist_track_ids.contains(&track.video_id))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    Ok((offline_playlists, display_tracks, all_tracks))
+}
+
+fn load_offline_playlist_tracks_tui(playlist_id: &str) -> Result<Vec<Track>> {
+    let cache = open_tui_music_cache()?;
+    let settings = cache.load_settings()?;
+    let video_ids = if playlist_id == "__listen_again__" {
+        cache.offline_listen_again_track_ids(&settings)?
+    } else {
+        cache.offline_playlist_track_ids(playlist_id)?
+    };
+
+    Ok(video_ids
+        .into_iter()
+        .map(|video_id| {
+            let thumbnail_url = offline_thumbnail_url_tui(&cache, &video_id);
+            let (title, artist) = cache
+                .get_track_meta(&video_id)
+                .unwrap_or_else(|| (video_id.clone(), String::new()));
+            Track {
+                video_id,
+                title,
+                artists: if artist.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![crate::models::Artist {
+                        name: artist,
+                        id: None,
+                    }]
+                },
+                album: None,
+                duration: None,
+                thumbnail_url,
+                playback_playlist_id: None,
+                playback_params: None,
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
+            }
+        })
+        .collect())
+}
+
+fn offline_thumbnail_url_tui(cache: &MusicCache, video_id: &str) -> Option<String> {
+    cache
+        .get_cached_art(video_id)
+        .map(|path| format!("file://{}", path.display()))
+        .or_else(|| cache.get_thumbnail_url(video_id))
+}
+
+fn load_settings_page_data() -> Result<TuiSettingsPageData> {
+    let cache = open_tui_music_cache()?;
+    let settings = cache.load_settings()?;
+    Ok(TuiSettingsPageData {
+        sections: build_tui_settings_sections(&settings, &cache)?,
+    })
 }
 
 fn load_resume_card_data() -> Option<ResumeCardData> {
@@ -4904,6 +7023,921 @@ fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
         }
         _ => queue_label.to_string(),
     }
+}
+
+fn playlist_source_label(source: TuiPlaylistSource) -> &'static str {
+    match source {
+        TuiPlaylistSource::Remote => "PLAYLIST",
+        TuiPlaylistSource::Offline => "OFFLINE",
+    }
+}
+
+fn playlist_detail_key(playlist: &TuiPlaylistCard) -> String {
+    match playlist.source {
+        TuiPlaylistSource::Remote => format!("remote:{}", playlist.summary.playlist_id),
+        TuiPlaylistSource::Offline => format!("offline:{}", playlist.summary.playlist_id),
+    }
+}
+
+fn track_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 track".to_string()
+    } else {
+        format!("{count} tracks")
+    }
+}
+
+fn search_results_total(results: &SearchResult) -> usize {
+    results
+        .sections
+        .iter()
+        .map(|section| section.contents.len())
+        .sum()
+}
+
+fn search_results_summary(results: &SearchResult) -> String {
+    let mut tracks = 0usize;
+    let mut playlists = 0usize;
+    let mut artists = 0usize;
+    let mut albums = 0usize;
+    let mut shows = 0usize;
+    let mut channels = 0usize;
+
+    for section in &results.sections {
+        for item in &section.contents {
+            match item {
+                HomeItem::Track(_) => tracks += 1,
+                HomeItem::BrowseCard(card) => match card.page_type {
+                    HomeBrowsePageType::Playlist => playlists += 1,
+                    HomeBrowsePageType::Album => albums += 1,
+                    HomeBrowsePageType::Artist => artists += 1,
+                    HomeBrowsePageType::UserChannel => channels += 1,
+                    HomeBrowsePageType::PodcastShow => shows += 1,
+                },
+            }
+        }
+    }
+
+    let mut parts = Vec::new();
+    if tracks > 0 {
+        parts.push(format!("{tracks} tracks"));
+    }
+    if playlists > 0 {
+        parts.push(format!("{playlists} playlists"));
+    }
+    if artists > 0 {
+        parts.push(format!("{artists} artists"));
+    }
+    if albums > 0 {
+        parts.push(format!("{albums} albums"));
+    }
+    if channels > 0 {
+        parts.push(format!("{channels} channels"));
+    }
+    if shows > 0 {
+        parts.push(format!("{shows} shows"));
+    }
+
+    if parts.is_empty() {
+        "No results".to_string()
+    } else {
+        parts.join("  •  ")
+    }
+}
+
+fn search_section_tracks(results: &SearchResult, section_index: usize) -> Vec<Track> {
+    results
+        .sections
+        .get(section_index)
+        .map(home_section_tracks)
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy)]
+struct NumericSettingMeta {
+    min: f64,
+    max: f64,
+    step: f64,
+    integer: bool,
+}
+
+fn toggle_setting_field(
+    settings: &AppSettings,
+    key: &'static str,
+    title: &str,
+    subtitle: &str,
+) -> TuiSettingsField {
+    TuiSettingsField {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        control: TuiSettingsControl::Toggle {
+            key,
+            value: current_boolean_setting(settings, key),
+        },
+    }
+}
+
+fn dropdown_setting_field(
+    settings: &AppSettings,
+    key: &'static str,
+    title: &str,
+    subtitle: &str,
+) -> TuiSettingsField {
+    TuiSettingsField {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        control: TuiSettingsControl::Dropdown {
+            key,
+            value: current_coordination_setting(settings, key)
+                .label()
+                .to_string(),
+        },
+    }
+}
+
+fn stepper_setting_field(
+    settings: &AppSettings,
+    key: &'static str,
+    title: &str,
+    subtitle: &str,
+) -> Result<TuiSettingsField> {
+    Ok(TuiSettingsField {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        control: TuiSettingsControl::Stepper {
+            key,
+            value: format_config_value(settings, key)?,
+        },
+    })
+}
+
+fn text_setting_field(
+    settings: &AppSettings,
+    key: &'static str,
+    title: &str,
+    subtitle: &str,
+    placeholder: &str,
+) -> Result<TuiSettingsField> {
+    Ok(TuiSettingsField {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        control: TuiSettingsControl::TextInput {
+            key,
+            value: format_config_value(settings, key)?,
+            placeholder: placeholder.to_string(),
+        },
+    })
+}
+
+fn current_boolean_setting(settings: &AppSettings, key: &str) -> bool {
+    match key {
+        "auto_sync_chromium_cookies" => settings.auto_sync_chromium_cookies,
+        "auto_release_track_loops" => settings.auto_release_track_loops,
+        "auto_manage_offline_cache" => settings.auto_manage_offline_cache,
+        "auto_cache_listen_again" => settings.auto_cache_listen_again,
+        "prefetch_enabled" => settings.prefetch_enabled,
+        "prefer_local_cache_on_playback" => settings.prefer_local_cache_on_playback,
+        "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled,
+        "sponsorblock_enabled" => settings.sponsorblock_enabled,
+        _ => false,
+    }
+}
+
+fn current_coordination_setting(settings: &AppSettings, key: &str) -> CoordinationMode {
+    match key {
+        "other_mpris_mode" => settings.other_mpris_mode,
+        "pipewire_pause_mode" => settings.pipewire_pause_mode,
+        _ => CoordinationMode::Off,
+    }
+}
+
+fn current_numeric_setting_value(settings: &AppSettings, key: &str) -> f64 {
+    match key {
+        "auto_release_track_loops_after" => settings.auto_release_track_loops_after as f64,
+        "listen_again_cache_days" => settings.listen_again_cache_days as f64,
+        "offline_cache_target" => settings.offline_cache_target as f64,
+        "offline_rewatch_threshold" => settings.offline_rewatch_threshold as f64,
+        "score_decay_window_days" => settings.score_decay_window_days as f64,
+        "minimum_offline_score" => settings.minimum_offline_score,
+        "prefetch_ahead" => settings.prefetch_ahead as f64,
+        "other_mpris_halt_auto_resume_secs" => settings.other_mpris_halt_auto_resume_secs as f64,
+        "pipewire_pause_halt_auto_resume_secs" => {
+            settings.pipewire_pause_halt_auto_resume_secs as f64
+        }
+        "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs as f64,
+        "pipewire_ducking_volume" => settings.pipewire_ducking_volume,
+        _ => 0.0,
+    }
+}
+
+fn numeric_setting_meta(key: &str) -> Option<NumericSettingMeta> {
+    match key {
+        "auto_release_track_loops_after" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 100.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "listen_again_cache_days" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 365.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "offline_cache_target" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 500.0,
+            step: 5.0,
+            integer: true,
+        }),
+        "offline_rewatch_threshold" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 50.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "score_decay_window_days" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 365.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "minimum_offline_score" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 999.0,
+            step: 0.1,
+            integer: false,
+        }),
+        "prefetch_ahead" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 12.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "other_mpris_halt_auto_resume_secs" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 60.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "pipewire_pause_halt_auto_resume_secs" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 60.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "pipewire_ducking_threshold_secs" => Some(NumericSettingMeta {
+            min: 1.0,
+            max: 30.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "pipewire_ducking_volume" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 1.0,
+            step: 0.1,
+            integer: false,
+        }),
+        _ => None,
+    }
+}
+
+fn build_tui_settings_sections(
+    settings: &AppSettings,
+    cache: &MusicCache,
+) -> Result<Vec<TuiSettingsSection>> {
+    let storage_root_override = get_storage_root().unwrap_or_default();
+    let default_storage_root = std::env::var("HOME")
+        .map(|home| format!("{home}/Music/Static"))
+        .unwrap_or_else(|_| "/tmp/Music/Static".to_string());
+
+    Ok(vec![
+        TuiSettingsSection {
+            title: "Playback & Cache".to_string(),
+            subtitle: "How local cache, loops, and prefetch behave.".to_string(),
+            fields: vec![
+                toggle_setting_field(
+                    settings,
+                    "prefer_local_cache_on_playback",
+                    "Prefer local cache on playback",
+                    "Play offline or prefetched audio first when it exists, then fall back to streaming.",
+                ),
+                toggle_setting_field(
+                    settings,
+                    "auto_release_track_loops",
+                    "Auto-release Track loops",
+                    "Release repeat-one automatically after a few natural loops.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "auto_release_track_loops_after",
+                    "Auto-release Track loops after",
+                    "How many natural self-loops happen before Track repeat turns off.",
+                )?,
+                toggle_setting_field(
+                    settings,
+                    "prefetch_enabled",
+                    "Prefetch upcoming tracks",
+                    "Warm the local temp cache ahead of the queue.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "prefetch_ahead",
+                    "Prefetch ahead",
+                    "How many tracks ahead Static stages locally.",
+                )?,
+            ],
+        },
+        TuiSettingsSection {
+            title: "Offline Manager".to_string(),
+            subtitle: "Automatic offline scoring and retention.".to_string(),
+            fields: vec![
+                toggle_setting_field(
+                    settings,
+                    "auto_manage_offline_cache",
+                    "Auto-manage offline cache",
+                    "Let Static decide what to keep downloaded automatically.",
+                ),
+                toggle_setting_field(
+                    settings,
+                    "auto_cache_listen_again",
+                    "Auto-cache Listen again",
+                    "Bias the manager toward recently resurfacing songs.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "listen_again_cache_days",
+                    "Listen again window",
+                    "How long Listen again activity influences auto-downloads.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "offline_cache_target",
+                    "Offline cache target",
+                    "Approximate number of auto-managed tracks to keep around.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "offline_rewatch_threshold",
+                    "Offline after rewatches",
+                    "How many replays make a song eligible for heuristic offline caching.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "score_decay_window_days",
+                    "Score decay window",
+                    "How slowly songs cool off after their last play.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "minimum_offline_score",
+                    "Minimum offline score",
+                    "Anything below this score is ignored or evicted.",
+                )?,
+            ],
+        },
+        TuiSettingsSection {
+            title: "Coordination".to_string(),
+            subtitle: "How Static reacts to other media and audio streams.".to_string(),
+            fields: vec![
+                dropdown_setting_field(
+                    settings,
+                    "other_mpris_mode",
+                    "MPRIS coordination",
+                    "Choose whether Static respects, halts for, or ignores peer players.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "other_mpris_halt_auto_resume_secs",
+                    "Halt auto delay",
+                    "Delay before Static resumes after peer media goes quiet.",
+                )?,
+                toggle_setting_field(
+                    settings,
+                    "pipewire_ducking_enabled",
+                    "PipeWire ducking",
+                    "Lower or pause Static when other desktop audio becomes active.",
+                ),
+                dropdown_setting_field(
+                    settings,
+                    "pipewire_pause_mode",
+                    "PipeWire coordination",
+                    "Choose whether PipeWire activity ducks, halts, or auto-resumes.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "pipewire_pause_halt_auto_resume_secs",
+                    "PipeWire halt auto delay",
+                    "Delay before Static comes back after PipeWire activity stops.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "pipewire_ducking_threshold_secs",
+                    "PipeWire trigger delay",
+                    "How long foreign audio must stay active before coordination starts.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "pipewire_ducking_volume",
+                    "PipeWire duck volume",
+                    "Temporary playback level while foreign audio is active.",
+                )?,
+            ],
+        },
+        TuiSettingsSection {
+            title: "Import & Filtering".to_string(),
+            subtitle: "Cookie import, SponsorBlock, and local paths.".to_string(),
+            fields: {
+                let mut fields = vec![
+                    toggle_setting_field(
+                        settings,
+                        "auto_sync_chromium_cookies",
+                        "Auto-sync Chromium cookies",
+                        "Pull cookies from Chromium-family browsers at startup if needed.",
+                    ),
+                    text_setting_field(
+                        settings,
+                        "chromium_cookie_path",
+                        "Chromium cookie DB path",
+                        "Leave empty to auto-detect the browser profile.",
+                        "Auto-detect browser profile",
+                    )?,
+                    toggle_setting_field(
+                        settings,
+                        "sponsorblock_enabled",
+                        "SponsorBlock enabled",
+                        "Skip configured sponsor or filler segments automatically.",
+                    ),
+                ];
+                for option in SPONSORBLOCK_CATEGORY_OPTIONS {
+                    fields.push(TuiSettingsField {
+                        title: format!("Skip {}", option.label),
+                        subtitle: option.description.to_string(),
+                        control: TuiSettingsControl::SponsorCategory {
+                            key: option.key,
+                            label: option.label,
+                            enabled: settings
+                                .sponsorblock_categories
+                                .iter()
+                                .any(|category| category == option.key),
+                        },
+                    });
+                }
+                fields.push(TuiSettingsField {
+                    title: "Static storage root".to_string(),
+                    subtitle: "Move offline audio, artwork, and temp cache together. Leave blank to use the default root.".to_string(),
+                    control: TuiSettingsControl::StorageRoot {
+                        value: storage_root_override,
+                        placeholder: default_storage_root,
+                    },
+                });
+                fields.push(TuiSettingsField {
+                    title: "Cache root".to_string(),
+                    subtitle: "Active cache database and artwork location.".to_string(),
+                    control: TuiSettingsControl::ReadOnly {
+                        value: cache.base_dir().display().to_string(),
+                    },
+                });
+                fields.push(TuiSettingsField {
+                    title: "Offline store".to_string(),
+                    subtitle: "Audio files available without the network.".to_string(),
+                    control: TuiSettingsControl::ReadOnly {
+                        value: cache.offline_dir().display().to_string(),
+                    },
+                });
+                fields.push(TuiSettingsField {
+                    title: "Temp prefetch cache".to_string(),
+                    subtitle: "Short-lived prefetched media storage.".to_string(),
+                    control: TuiSettingsControl::ReadOnly {
+                        value: cache.temp_dir().display().to_string(),
+                    },
+                });
+                fields
+            },
+        },
+    ])
+}
+
+fn build_track_page_document(view: &TuiTrackPageView, width: u16) -> HomeDocument {
+    let usable_width = width.max(24);
+    let mut doc = HomeDocument::default();
+    let mut y = 0usize;
+    let eyebrow = match view.kind {
+        TuiTrackPageKind::Likes => "LIKES",
+        TuiTrackPageKind::RemotePlaylist => "PLAYLIST",
+        TuiTrackPageKind::OfflinePlaylist => "OFFLINE",
+    };
+
+    match &view.status {
+        TuiTrackPageStatus::Loading => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: eyebrow.to_string(),
+                title: view.title.clone(),
+                subtitle: view.subtitle.clone(),
+                meta: "Loading songs...".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: view.thumbnail_url.clone(),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: "Fetching tracks from YouTube Music or the local cache...".to_string(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiTrackPageStatus::Error(message) => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: eyebrow.to_string(),
+                title: view.title.clone(),
+                subtitle: view.subtitle.clone(),
+                meta: "This page could not be loaded".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: view.thumbnail_url.clone(),
+                accent: false,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: message.clone(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiTrackPageStatus::Ready { tracks, .. } => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: eyebrow.to_string(),
+                title: view.title.clone(),
+                subtitle: view.subtitle.clone(),
+                meta: track_count_label(tracks.len()),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: view.thumbnail_url.clone(),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            if tracks.is_empty() {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "No tracks are available on this page yet.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+            let items = tracks
+                .iter()
+                .cloned()
+                .map(TuiHomeItem::Track)
+                .collect::<Vec<_>>();
+            push_document_section(
+                &mut doc,
+                &mut y,
+                usable_width,
+                0,
+                "Tracks",
+                &items,
+                HomeCardStyle::TrackRow,
+                true,
+            );
+        }
+    }
+
+    doc.total_height = y.saturating_add(1);
+    doc
+}
+
+fn build_collection_page_document(view: &TuiCollectionPageView, width: u16) -> HomeDocument {
+    let usable_width = width.max(24);
+    let mut doc = HomeDocument::default();
+    let mut y = 0usize;
+
+    match &view.status {
+        TuiCollectionPageStatus::Loading => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "PLAYLISTS".to_string(),
+                title: view.title.clone(),
+                subtitle: view.subtitle.clone(),
+                meta: "Loading playlist covers and summaries...".to_string(),
+                hint: None,
+                thumbnail_url: None,
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: "Fetching your library playlists...".to_string(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiCollectionPageStatus::Error(message) => {
+            doc.messages.push(HomeMessage {
+                y: 2,
+                text: message.clone(),
+                accent: true,
+            });
+            doc.total_height = 6;
+            return doc;
+        }
+        TuiCollectionPageStatus::Ready { items } => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "PLAYLISTS".to_string(),
+                title: view.title.clone(),
+                subtitle: view.subtitle.clone(),
+                meta: if items.is_empty() {
+                    "No playlists found".to_string()
+                } else {
+                    format!("{} saved playlists", items.len())
+                },
+                hint: None,
+                thumbnail_url: items
+                    .first()
+                    .and_then(|item| item.summary.thumbnail_url.clone()),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            if items.is_empty() {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "You do not have any library playlists yet.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+            let items = items
+                .iter()
+                .cloned()
+                .map(TuiHomeItem::Playlist)
+                .collect::<Vec<_>>();
+            push_document_section(
+                &mut doc,
+                &mut y,
+                usable_width,
+                0,
+                "Collections",
+                &items,
+                HomeCardStyle::BrowseRow,
+                false,
+            );
+        }
+    }
+
+    doc.total_height = y.saturating_add(1);
+    doc
+}
+
+fn build_offline_document(view: &TuiOfflineView, width: u16) -> HomeDocument {
+    let usable_width = width.max(24);
+    let mut doc = HomeDocument::default();
+    let mut y = 0usize;
+
+    match &view.status {
+        TuiOfflineStatus::Loading => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "OFFLINE".to_string(),
+                title: "Offline".to_string(),
+                subtitle: "Downloaded tracks and collections".to_string(),
+                meta: "Scanning local cache...".to_string(),
+                hint: None,
+                thumbnail_url: None,
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: "Reading offline metadata from disk...".to_string(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiOfflineStatus::Error(message) => {
+            doc.messages.push(HomeMessage {
+                y: 2,
+                text: message.clone(),
+                accent: true,
+            });
+            doc.total_height = 6;
+            return doc;
+        }
+        TuiOfflineStatus::Ready {
+            playlists,
+            tracks,
+            all_track_count,
+        } => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "OFFLINE".to_string(),
+                title: "Offline".to_string(),
+                subtitle: "Downloaded tracks and saved collections".to_string(),
+                meta: format!(
+                    "{} collections  •  {} offline songs",
+                    playlists.len(),
+                    all_track_count
+                ),
+                hint: None,
+                thumbnail_url: playlists
+                    .first()
+                    .and_then(|item| item.summary.thumbnail_url.clone())
+                    .or_else(|| tracks.first().and_then(|track| track.thumbnail_url.clone())),
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+
+            if playlists.is_empty() && tracks.is_empty() {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "No offline songs yet. Play songs to build your cache.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+
+            if !playlists.is_empty() {
+                let items = playlists
+                    .iter()
+                    .cloned()
+                    .map(TuiHomeItem::Playlist)
+                    .collect::<Vec<_>>();
+                push_document_section(
+                    &mut doc,
+                    &mut y,
+                    usable_width,
+                    0,
+                    "Offline Collections",
+                    &items,
+                    HomeCardStyle::BrowseRow,
+                    false,
+                );
+                y += 1;
+            }
+
+            if !tracks.is_empty() {
+                let items = tracks
+                    .iter()
+                    .cloned()
+                    .map(TuiHomeItem::Track)
+                    .collect::<Vec<_>>();
+                push_document_section(
+                    &mut doc,
+                    &mut y,
+                    usable_width,
+                    1,
+                    "Available Offline",
+                    &items,
+                    HomeCardStyle::TrackRow,
+                    true,
+                );
+            }
+        }
+    }
+
+    doc.total_height = y.saturating_add(1);
+    doc
+}
+
+fn build_search_document(view: &TuiSearchView, width: u16) -> HomeDocument {
+    let usable_width = width.max(24);
+    let mut doc = HomeDocument::default();
+    let mut y = 0usize;
+
+    match &view.status {
+        TuiSearchStatus::Loading => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "SEARCH".to_string(),
+                title: format!("Results for \"{}\"", view.query),
+                subtitle: "Searching YouTube Music".to_string(),
+                meta: "Gathering tracks, albums, artists, and playlists...".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: None,
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: "Search is in flight...".to_string(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiSearchStatus::Error(message) => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "SEARCH".to_string(),
+                title: format!("Results for \"{}\"", view.query),
+                subtitle: "Search failed".to_string(),
+                meta: "The query could not be completed".to_string(),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: None,
+                accent: false,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+            doc.messages.push(HomeMessage {
+                y: y + 1,
+                text: message.clone(),
+                accent: true,
+            });
+            doc.total_height = y.saturating_add(5);
+            return doc;
+        }
+        TuiSearchStatus::Ready(results) => {
+            doc.banners.push(HomeBanner {
+                rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
+                eyebrow: "SEARCH".to_string(),
+                title: format!("Results for \"{}\"", view.query),
+                subtitle: search_results_summary(results),
+                meta: format!("{} total results", search_results_total(results)),
+                hint: Some("Press b or Backspace to go back".to_string()),
+                thumbnail_url: None,
+                accent: true,
+            });
+            y += HOME_BANNER_HEIGHT as usize + 1;
+
+            if results
+                .sections
+                .iter()
+                .all(|section| section.contents.is_empty())
+            {
+                doc.messages.push(HomeMessage {
+                    y: y + 1,
+                    text: "No results found.".to_string(),
+                    accent: true,
+                });
+                doc.total_height = y.saturating_add(4);
+                return doc;
+            }
+
+            for (section_index, section) in results.sections.iter().enumerate() {
+                if section.contents.is_empty() {
+                    continue;
+                }
+                if section_index > 0 {
+                    y += 1;
+                }
+                let tracks = home_section_tracks(section);
+                let browse_cards = home_section_browse_cards(section);
+                let (items, style) = if tracks.len() == section.contents.len() && !tracks.is_empty()
+                {
+                    (
+                        tracks
+                            .into_iter()
+                            .map(TuiHomeItem::Track)
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::TrackRow,
+                    )
+                } else if browse_cards.len() == section.contents.len() && !browse_cards.is_empty() {
+                    (
+                        browse_cards
+                            .into_iter()
+                            .map(TuiHomeItem::Browse)
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::BrowseRow,
+                    )
+                } else {
+                    (
+                        section
+                            .contents
+                            .iter()
+                            .filter_map(|item| match item {
+                                HomeItem::Track(track) => Some(TuiHomeItem::Track(track.clone())),
+                                HomeItem::BrowseCard(card) => {
+                                    Some(TuiHomeItem::Browse(card.clone()))
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                        HomeCardStyle::Shelf,
+                    )
+                };
+                push_document_section(
+                    &mut doc,
+                    &mut y,
+                    usable_width,
+                    section_index,
+                    &section.title,
+                    &items,
+                    style,
+                    !search_section_tracks(results, section_index).is_empty(),
+                );
+            }
+        }
+    }
+
+    doc.total_height = y.saturating_add(1);
+    doc
 }
 
 fn build_home_document(
@@ -5028,6 +8062,7 @@ fn build_home_document(
                         let (title, subtitle, meta, badge) = home_card_copy(item, section_style);
                         doc.cards.push(HomeCard {
                             rect: Rect::new(x, y as u16, card_width, card_height),
+                            section_index,
                             item: item.clone(),
                             title,
                             subtitle,
@@ -5086,6 +8121,7 @@ fn push_document_section(
             let (title, subtitle, meta, badge) = home_card_copy(item, section_style);
             doc.cards.push(HomeCard {
                 rect: Rect::new(x, *y as u16, card_width, card_height),
+                section_index,
                 item: item.clone(),
                 title,
                 subtitle,
@@ -6031,6 +9067,15 @@ fn home_card_copy(item: &TuiHomeItem, style: HomeCardStyle) -> (String, String, 
             format!("Open {}", browse_label(card.page_type).to_lowercase()),
             browse_label(card.page_type).to_uppercase(),
         ),
+        TuiHomeItem::Playlist(card) => (
+            card.summary.title.clone(),
+            card.summary
+                .subtitle
+                .clone()
+                .unwrap_or_else(|| playlist_source_label(card.source).to_string()),
+            "Open collection".to_string(),
+            playlist_source_label(card.source).to_string(),
+        ),
     }
 }
 
@@ -6038,6 +9083,7 @@ fn home_card_thumbnail_url(card: &HomeCard) -> Option<&str> {
     match &card.item {
         TuiHomeItem::Track(track) => track.thumbnail_url.as_deref(),
         TuiHomeItem::Browse(card) => card.thumbnail_url.as_deref(),
+        TuiHomeItem::Playlist(card) => card.summary.thumbnail_url.as_deref(),
     }
 }
 
@@ -6182,19 +9228,6 @@ fn section_meta_label(style: HomeCardStyle, items: usize) -> String {
         HomeCardStyle::Shelf => "mixed shelf",
     };
     format!("{label} · {items} items")
-}
-
-fn queue_chip_labels(snapshot: &PlaybackSnapshot) -> Vec<String> {
-    let mut labels = vec!["All".to_string()];
-    if let Some(context) = snapshot.playlist_context.as_ref() {
-        labels.push(context.title.clone());
-    } else if snapshot.radio_virtual_playlist.is_some() {
-        labels.push("Radio".to_string());
-    }
-    if let Some(radio) = snapshot.radio_virtual_playlist.as_ref() {
-        labels.extend(radio.chips.iter().take(3).map(|chip| chip.label.clone()));
-    }
-    labels
 }
 
 fn current_context_label(snapshot: &PlaybackSnapshot) -> String {
@@ -6407,10 +9440,7 @@ fn help_shortcut_sections() -> &'static [(&'static str, &'static [(&'static str,
         ("pgup / pgdn", "Scroll one page"),
         ("1 / 2 / t", "Queue · Lyrics · toggle"),
     ];
-    const APP: &[(&str, &str)] = &[
-        ("h", "Toggle this help"),
-        ("q / esc", "Quit"),
-    ];
+    const APP: &[(&str, &str)] = &[("h", "Toggle this help"), ("q / esc", "Quit")];
     &[
         ("Playback", PLAYBACK),
         ("Navigation", NAVIGATION),
@@ -6430,16 +9460,6 @@ fn action_label(action: TuiAction) -> &'static str {
         TuiAction::CycleRepeat => "Repeat",
         TuiAction::VolumeDown => "Volume down",
         TuiAction::VolumeUp => "Volume up",
-    }
-}
-
-fn nav_label(nav: TuiNavItem) -> &'static str {
-    match nav {
-        TuiNavItem::Home => "Home",
-        TuiNavItem::Likes => "Likes",
-        TuiNavItem::Playlists => "Playlists",
-        TuiNavItem::Offline => "Offline",
-        TuiNavItem::Settings => "Settings",
     }
 }
 

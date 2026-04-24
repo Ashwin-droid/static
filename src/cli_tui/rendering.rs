@@ -1,5 +1,5 @@
 use super::*;
-use super::{page_builders::*, playback::*, thumbnails::*, widgets::*};
+use super::{page_builders::*, playback::*, widgets::*};
 
 impl InteractiveTui {
     pub(in crate::cli_tui) fn render_help_popup(
@@ -773,14 +773,9 @@ impl InteractiveTui {
             if banner_bottom <= visible_top || banner_top >= visible_bottom {
                 continue;
             }
-            let screen_rect = Rect::new(
-                feed_inner.x + banner.rect.x,
-                feed_inner
-                    .y
-                    .saturating_add(banner.rect.y.saturating_sub(visible_top as u16)),
-                banner.rect.width,
-                banner.rect.height,
-            );
+            let Some(screen_rect) = scrolled_rect(feed_inner, banner.rect, visible_top) else {
+                continue;
+            };
             if resume_banner_clickable && banner_index == 0 {
                 if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
                     targets.push(ClickTarget {
@@ -819,14 +814,9 @@ impl InteractiveTui {
             if card_bottom <= visible_top || card_top >= visible_bottom {
                 continue;
             }
-            let screen_rect = Rect::new(
-                feed_inner.x + card.rect.x,
-                feed_inner
-                    .y
-                    .saturating_add(card.rect.y.saturating_sub(visible_top as u16)),
-                card.rect.width,
-                card.rect.height,
-            );
+            let Some(screen_rect) = scrolled_rect(feed_inner, card.rect, visible_top) else {
+                continue;
+            };
             if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
                 targets.push(ClickTarget {
                     rect: visible_rect,
@@ -856,14 +846,9 @@ impl InteractiveTui {
                 if banner_bottom <= visible_top || banner_top >= visible_bottom {
                     continue;
                 }
-                let screen_rect = Rect::new(
-                    feed_inner.x + banner.rect.x,
-                    feed_inner
-                        .y
-                        .saturating_add(banner.rect.y.saturating_sub(visible_top as u16)),
-                    banner.rect.width,
-                    banner.rect.height,
-                );
+                let Some(screen_rect) = scrolled_rect(feed_inner, banner.rect, visible_top) else {
+                    continue;
+                };
                 let Some(thumb_rect) = home_banner_thumbnail_rect(screen_rect) else {
                     continue;
                 };
@@ -884,14 +869,9 @@ impl InteractiveTui {
                 if card_bottom <= visible_top || card_top >= visible_bottom {
                     continue;
                 }
-                let screen_rect = Rect::new(
-                    feed_inner.x + card.rect.x,
-                    feed_inner
-                        .y
-                        .saturating_add(card.rect.y.saturating_sub(visible_top as u16)),
-                    card.rect.width,
-                    card.rect.height,
-                );
+                let Some(screen_rect) = scrolled_rect(feed_inner, card.rect, visible_top) else {
+                    continue;
+                };
                 let Some(thumb_rect) = home_card_thumbnail_rect(screen_rect, card.style) else {
                     continue;
                 };

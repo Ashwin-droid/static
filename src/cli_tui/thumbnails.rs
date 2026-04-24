@@ -273,15 +273,3 @@ pub(in crate::cli_tui) fn thumbnail_resize_for_visible_rect(
         clip_left: visible_rect.x > full_rect.x,
     }))
 }
-
-pub(in crate::cli_tui) fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
-    let left = a.x.max(b.x);
-    let top = a.y.max(b.y);
-    let right = a.right().min(b.right());
-    let bottom = a.bottom().min(b.bottom());
-    if left >= right || top >= bottom {
-        return None;
-    }
-
-    Some(Rect::new(left, top, right - left, bottom - top))
-}

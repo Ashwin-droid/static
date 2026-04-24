@@ -49,392 +49,452 @@ impl InteractiveTui {
                 return targets;
             }
             TuiSettingsStatus::Ready(page) => {
-                let visible_top = self.home_scroll_offset;
-                let visible_bottom = visible_top.saturating_add(area.height as usize);
                 let doc_width = area.width.saturating_sub(1).max(24);
                 let hero_height = 6usize;
                 let row_height = 5usize;
                 let row_gap = 1usize;
                 let section_gap = 1usize;
+                let section_height = 2usize;
+
+                self.settings_total_height = settings_document_height(
+                    page,
+                    hero_height,
+                    row_height,
+                    row_gap,
+                    section_gap,
+                    section_height,
+                )
+                .max(area.height as usize);
+                let field_count = settings_field_count(page);
+                if field_count > 0 {
+                    self.home_selected = self.home_selected.min(field_count.saturating_sub(1));
+                } else {
+                    self.home_selected = 0;
+                }
+                self.clamp_home_scroll_offset();
+
+                let visible_top = self.home_scroll_offset;
+                let doc_height = self.settings_total_height.min(u16::MAX as usize) as u16;
+                let doc_area = Rect::new(0, 0, doc_width, doc_height);
+                let mut doc_buf = Buffer::empty(doc_area);
+                fill_area(
+                    &mut doc_buf,
+                    doc_area,
+                    Style::default().bg(theme.content_bg),
+                );
                 let mut y = 0usize;
                 let mut field_index = 0usize;
 
-                if y.saturating_add(hero_height) > visible_top && y < visible_bottom {
-                    let screen_y = area.y.saturating_add(y.saturating_sub(visible_top) as u16);
-                    let hero_rect = Rect::new(area.x, screen_y, doc_width, hero_height as u16);
-                    let hero_block = Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.border_focus))
-                        .style(Style::default().bg(theme.elevated_alt_bg))
-                        .padding(Padding::new(1, 1, 0, 0));
-                    let hero_inner = hero_block.inner(hero_rect);
-                    frame.render_widget(hero_block, hero_rect);
-                    frame.render_widget(
-                        Paragraph::new(vec![
-                            Line::from(Span::styled(
-                                "Settings",
-                                Style::default()
-                                    .fg(theme.text)
-                                    .add_modifier(Modifier::BOLD),
-                            )),
-                            Line::from(Span::styled(
-                                "GTK-style controls in the TUI: toggles, dropdowns, text inputs, and numeric steppers.",
-                                Style::default().fg(theme.muted),
-                            )),
-                            Line::from(Span::styled(
-                                "Enter edits text fields. Use ←/→ or +/- for dropdowns and numbers.",
-                                Style::default().fg(theme.accent),
-                            )),
-                        ])
-                        .wrap(Wrap { trim: true }),
-                        hero_inner,
-                    );
-                }
+                let hero_rect = Rect::new(0, y as u16, doc_width, hero_height as u16);
+                let hero_block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border_focus))
+                    .style(Style::default().bg(theme.elevated_alt_bg))
+                    .padding(Padding::new(1, 1, 0, 0));
+                let hero_inner = hero_block.inner(hero_rect);
+                render_buffer_widget(&mut doc_buf, hero_block, hero_rect);
+                render_buffer_widget(
+                    &mut doc_buf,
+                    Paragraph::new(vec![
+                        Line::from(Span::styled(
+                            "Settings",
+                            Style::default()
+                                .fg(theme.text)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            "GTK-style controls in the TUI: toggles, dropdowns, text inputs, and numeric steppers.",
+                            Style::default().fg(theme.muted),
+                        )),
+                        Line::from(Span::styled(
+                            "Enter edits text fields. Use ←/→ or +/- for dropdowns and numbers.",
+                            Style::default().fg(theme.accent),
+                        )),
+                    ])
+                    .wrap(Wrap { trim: true }),
+                    hero_inner,
+                );
                 y = y.saturating_add(hero_height + section_gap);
 
                 for section in &page.sections {
-                    let section_height = 2usize;
-                    if y.saturating_add(section_height) > visible_top && y < visible_bottom {
-                        let screen_y = area.y.saturating_add(y.saturating_sub(visible_top) as u16);
-                        frame.render_widget(
-                            Paragraph::new(vec![
-                                Line::from(Span::styled(
-                                    section.title.clone(),
-                                    Style::default()
-                                        .fg(theme.accent)
-                                        .add_modifier(Modifier::BOLD),
-                                )),
-                                Line::from(Span::styled(
-                                    section.subtitle.clone(),
-                                    Style::default().fg(theme.muted),
-                                )),
-                            ])
-                            .wrap(Wrap { trim: true }),
-                            Rect::new(area.x, screen_y, doc_width, section_height as u16),
-                        );
-                    }
+                    render_buffer_widget(
+                        &mut doc_buf,
+                        Paragraph::new(vec![
+                            Line::from(Span::styled(
+                                section.title.clone(),
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            )),
+                            Line::from(Span::styled(
+                                section.subtitle.clone(),
+                                Style::default().fg(theme.muted),
+                            )),
+                        ])
+                        .wrap(Wrap { trim: true }),
+                        Rect::new(0, y as u16, doc_width, section_height as u16),
+                    );
                     y = y.saturating_add(section_height);
 
                     for field in &section.fields {
                         self.settings_field_offsets.push((y, row_height));
                         let is_selected =
                             self.focus == TuiFocus::Home && self.home_selected == field_index;
-                        let field_top = y;
-                        let field_bottom = y.saturating_add(row_height);
+                        let row_rect = Rect::new(0, y as u16, doc_width, row_height as u16);
+                        let row_block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if is_selected {
+                                theme.border_focus
+                            } else {
+                                theme.border_subtle
+                            }))
+                            .style(Style::default().bg(if is_selected {
+                                theme.selected_bg
+                            } else {
+                                theme.elevated_bg
+                            }))
+                            .padding(Padding::new(1, 1, 0, 0));
+                        let row_inner = row_block.inner(row_rect);
+                        render_buffer_widget(&mut doc_buf, row_block, row_rect);
 
-                        if field_bottom > visible_top && field_top < visible_bottom {
-                            let screen_y = area
-                                .y
-                                .saturating_add(field_top.saturating_sub(visible_top) as u16);
-                            let row_rect =
-                                Rect::new(area.x, screen_y, doc_width, row_height as u16);
-                            let row_block = Block::default()
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .border_style(Style::default().fg(if is_selected {
-                                    theme.border_focus
+                        let columns = Layout::default()
+                            .direction(Direction::Horizontal)
+                            .constraints([
+                                Constraint::Min(24),
+                                Constraint::Length((doc_width / 3).clamp(18, 34)),
+                            ])
+                            .split(row_inner);
+                        render_buffer_widget(
+                            &mut doc_buf,
+                            Paragraph::new(vec![
+                                Line::from(Span::styled(
+                                    field.title.clone(),
+                                    Style::default()
+                                        .fg(theme.text)
+                                        .add_modifier(if is_selected {
+                                            Modifier::BOLD
+                                        } else {
+                                            Modifier::empty()
+                                        }),
+                                )),
+                                Line::from(Span::styled(
+                                    shorten(&field.subtitle, columns[0].width as usize),
+                                    Style::default().fg(theme.muted),
+                                )),
+                            ])
+                            .wrap(Wrap { trim: true }),
+                            columns[0],
+                        );
+
+                        match &field.control {
+                            TuiSettingsControl::Toggle { key, value } => {
+                                let label = if *value {
+                                    "[x] Enabled"
                                 } else {
-                                    theme.border_subtle
-                                }))
-                                .style(Style::default().bg(if is_selected {
-                                    theme.selected_bg
-                                } else {
-                                    theme.elevated_bg
-                                }))
-                                .padding(Padding::new(1, 1, 0, 0));
-                            let row_inner = row_block.inner(row_rect);
-                            frame.render_widget(row_block, row_rect);
-
-                            let columns = Layout::default()
-                                .direction(Direction::Horizontal)
-                                .constraints([
-                                    Constraint::Min(24),
-                                    Constraint::Length((doc_width / 3).clamp(18, 34)),
-                                ])
-                                .split(row_inner);
-                            frame.render_widget(
-                                Paragraph::new(vec![
-                                    Line::from(Span::styled(
-                                        field.title.clone(),
-                                        Style::default().fg(theme.text).add_modifier(
-                                            if is_selected {
-                                                Modifier::BOLD
-                                            } else {
-                                                Modifier::empty()
-                                            },
-                                        ),
-                                    )),
-                                    Line::from(Span::styled(
-                                        shorten(&field.subtitle, columns[0].width as usize),
-                                        Style::default().fg(theme.muted),
-                                    )),
-                                ])
-                                .wrap(Wrap { trim: true }),
-                                columns[0],
-                            );
-
-                            match &field.control {
-                                TuiSettingsControl::Toggle { key, value } => {
-                                    let label = if *value {
-                                        "[x] Enabled"
-                                    } else {
-                                        "[ ] Disabled"
-                                    };
-                                    frame.render_widget(
-                                        Paragraph::new(label)
-                                            .style(Style::default().fg(theme.text))
-                                            .alignment(Alignment::Center),
-                                        columns[1],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: columns[1],
-                                        kind: ClickTargetKind::SettingsToggle(key),
-                                    });
-                                }
-                                TuiSettingsControl::Dropdown { key, value } => {
-                                    let controls = Layout::default()
-                                        .direction(Direction::Horizontal)
-                                        .constraints([
-                                            Constraint::Length(5),
-                                            Constraint::Min(8),
-                                            Constraint::Length(5),
-                                        ])
-                                        .split(columns[1]);
-                                    frame.render_widget(
-                                        Paragraph::new("[<]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[0],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new(format!("< {} >", value))
-                                            .style(Style::default().fg(theme.text))
-                                            .alignment(Alignment::Center),
-                                        controls[1],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new("[>]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[2],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: controls[0],
-                                        kind: ClickTargetKind::SettingsCycle(key, -1),
-                                    });
-                                    targets.push(ClickTarget {
-                                        rect: controls[2],
-                                        kind: ClickTargetKind::SettingsCycle(key, 1),
-                                    });
-                                }
-                                TuiSettingsControl::Stepper { key, value } => {
-                                    let controls = Layout::default()
-                                        .direction(Direction::Horizontal)
-                                        .constraints([
-                                            Constraint::Length(5),
-                                            Constraint::Min(6),
-                                            Constraint::Length(5),
-                                        ])
-                                        .split(columns[1]);
-                                    frame.render_widget(
-                                        Paragraph::new("[-]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[0],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new(value.clone())
-                                            .style(Style::default().fg(theme.text))
-                                            .alignment(Alignment::Center),
-                                        controls[1],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new("[+]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[2],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: controls[0],
-                                        kind: ClickTargetKind::SettingsAdjust(key, -1),
-                                    });
-                                    targets.push(ClickTarget {
-                                        rect: controls[2],
-                                        kind: ClickTargetKind::SettingsAdjust(key, 1),
-                                    });
-                                }
-                                TuiSettingsControl::TextInput {
-                                    key,
-                                    value,
-                                    placeholder,
-                                } => {
-                                    let current_value = match &self.settings_text_edit {
-                                        Some(edit)
-                                            if matches!(
-                                                edit.target,
-                                                TuiSettingsTextTarget::Config(target_key) if target_key == *key
-                                            ) =>
-                                        {
-                                            edit.buffer.clone()
-                                        }
-                                        _ => value.clone(),
-                                    };
-                                    let controls = Layout::default()
-                                        .direction(Direction::Horizontal)
-                                        .constraints([Constraint::Min(8), Constraint::Length(8)])
-                                        .split(columns[1]);
-                                    let display_value = if current_value.is_empty() {
-                                        placeholder.clone()
-                                    } else {
-                                        current_value
-                                    };
-                                    frame.render_widget(
-                                        Paragraph::new(format!(
-                                            "[ {} ]",
-                                            shorten(
-                                                &display_value,
-                                                controls[0].width.saturating_sub(4) as usize
-                                            )
-                                        ))
-                                        .style(
-                                            Style::default().fg(if value.is_empty() {
-                                                theme.muted
-                                            } else {
-                                                theme.text
-                                            }),
-                                        ),
-                                        controls[0],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new("[Edit]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[1],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: controls[0],
-                                        kind: ClickTargetKind::SettingsEdit(
-                                            TuiSettingsTextTarget::Config(key),
-                                        ),
-                                    });
-                                    targets.push(ClickTarget {
-                                        rect: controls[1],
-                                        kind: ClickTargetKind::SettingsEdit(
-                                            TuiSettingsTextTarget::Config(key),
-                                        ),
-                                    });
-                                }
-                                TuiSettingsControl::SponsorCategory {
-                                    key,
-                                    label,
-                                    enabled,
-                                    ..
-                                } => {
-                                    let checkbox = if *enabled { "[x]" } else { "[ ]" };
-                                    frame.render_widget(
-                                        Paragraph::new(format!("{checkbox} {label}"))
-                                            .style(Style::default().fg(theme.text))
-                                            .alignment(Alignment::Center),
-                                        columns[1],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: columns[1],
-                                        kind: ClickTargetKind::SettingsSponsorCategory(key),
-                                    });
-                                }
-                                TuiSettingsControl::StorageRoot { value, placeholder } => {
-                                    let current_value = match &self.settings_text_edit {
-                                        Some(edit)
-                                            if matches!(
-                                                edit.target,
-                                                TuiSettingsTextTarget::StorageRoot
-                                            ) =>
-                                        {
-                                            edit.buffer.clone()
-                                        }
-                                        _ => value.clone(),
-                                    };
-                                    let controls = Layout::default()
-                                        .direction(Direction::Horizontal)
-                                        .constraints([
-                                            Constraint::Min(8),
-                                            Constraint::Length(8),
-                                            Constraint::Length(11),
-                                        ])
-                                        .split(columns[1]);
-                                    let display_value = if current_value.is_empty() {
-                                        placeholder.clone()
-                                    } else {
-                                        current_value
-                                    };
-                                    frame.render_widget(
-                                        Paragraph::new(format!(
-                                            "[ {} ]",
-                                            shorten(
-                                                &display_value,
-                                                controls[0].width.saturating_sub(4) as usize,
-                                            )
-                                        ))
-                                        .style(
-                                            Style::default().fg(if value.is_empty() {
-                                                theme.muted
-                                            } else {
-                                                theme.text
-                                            }),
-                                        ),
-                                        controls[0],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new("[Edit]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[1],
-                                    );
-                                    frame.render_widget(
-                                        Paragraph::new("[Default]")
-                                            .style(Style::default().fg(theme.accent))
-                                            .alignment(Alignment::Center),
-                                        controls[2],
-                                    );
-                                    targets.push(ClickTarget {
-                                        rect: controls[0],
-                                        kind: ClickTargetKind::SettingsEdit(
-                                            TuiSettingsTextTarget::StorageRoot,
-                                        ),
-                                    });
-                                    targets.push(ClickTarget {
-                                        rect: controls[1],
-                                        kind: ClickTargetKind::SettingsEdit(
-                                            TuiSettingsTextTarget::StorageRoot,
-                                        ),
-                                    });
-                                    targets.push(ClickTarget {
-                                        rect: controls[2],
-                                        kind: ClickTargetKind::SettingsStorageRootDefault,
-                                    });
-                                }
-                                TuiSettingsControl::ReadOnly { value } => {
-                                    frame.render_widget(
-                                        Paragraph::new(format!(
-                                            "[ {} ]",
-                                            shorten(
-                                                value,
-                                                columns[1].width.saturating_sub(4) as usize
-                                            ),
-                                        ))
-                                        .style(Style::default().fg(theme.muted))
-                                        .alignment(Alignment::Left),
-                                        columns[1],
-                                    );
-                                }
+                                    "[ ] Disabled"
+                                };
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(label)
+                                        .style(Style::default().fg(theme.text))
+                                        .alignment(Alignment::Center),
+                                    columns[1],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    columns[1],
+                                    visible_top,
+                                    ClickTargetKind::SettingsToggle(key),
+                                );
                             }
-
-                            targets.push(ClickTarget {
-                                rect: row_rect,
-                                kind: ClickTargetKind::SettingsField(field_index),
-                            });
+                            TuiSettingsControl::Dropdown { key, value } => {
+                                let controls = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints([
+                                        Constraint::Length(5),
+                                        Constraint::Min(8),
+                                        Constraint::Length(5),
+                                    ])
+                                    .split(columns[1]);
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[<]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[0],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(format!("< {} >", value))
+                                        .style(Style::default().fg(theme.text))
+                                        .alignment(Alignment::Center),
+                                    controls[1],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[>]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[2],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[0],
+                                    visible_top,
+                                    ClickTargetKind::SettingsCycle(key, -1),
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[2],
+                                    visible_top,
+                                    ClickTargetKind::SettingsCycle(key, 1),
+                                );
+                            }
+                            TuiSettingsControl::Stepper { key, value } => {
+                                let controls = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints([
+                                        Constraint::Length(5),
+                                        Constraint::Min(6),
+                                        Constraint::Length(5),
+                                    ])
+                                    .split(columns[1]);
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[-]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[0],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(value.clone())
+                                        .style(Style::default().fg(theme.text))
+                                        .alignment(Alignment::Center),
+                                    controls[1],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[+]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[2],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[0],
+                                    visible_top,
+                                    ClickTargetKind::SettingsAdjust(key, -1),
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[2],
+                                    visible_top,
+                                    ClickTargetKind::SettingsAdjust(key, 1),
+                                );
+                            }
+                            TuiSettingsControl::TextInput {
+                                key,
+                                value,
+                                placeholder,
+                            } => {
+                                let current_value = match &self.settings_text_edit {
+                                    Some(edit)
+                                        if matches!(
+                                            edit.target,
+                                            TuiSettingsTextTarget::Config(target_key) if target_key == *key
+                                        ) =>
+                                    {
+                                        edit.buffer.clone()
+                                    }
+                                    _ => value.clone(),
+                                };
+                                let controls = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints([Constraint::Min(8), Constraint::Length(8)])
+                                    .split(columns[1]);
+                                let display_value = if current_value.is_empty() {
+                                    placeholder.clone()
+                                } else {
+                                    current_value
+                                };
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(format!(
+                                        "[ {} ]",
+                                        shorten(
+                                            &display_value,
+                                            controls[0].width.saturating_sub(4) as usize
+                                        )
+                                    ))
+                                    .style(
+                                        Style::default().fg(if value.is_empty() {
+                                            theme.muted
+                                        } else {
+                                            theme.text
+                                        }),
+                                    ),
+                                    controls[0],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[Edit]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[1],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[0],
+                                    visible_top,
+                                    ClickTargetKind::SettingsEdit(TuiSettingsTextTarget::Config(
+                                        key,
+                                    )),
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[1],
+                                    visible_top,
+                                    ClickTargetKind::SettingsEdit(TuiSettingsTextTarget::Config(
+                                        key,
+                                    )),
+                                );
+                            }
+                            TuiSettingsControl::SponsorCategory {
+                                key,
+                                label,
+                                enabled,
+                                ..
+                            } => {
+                                let checkbox = if *enabled { "[x]" } else { "[ ]" };
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(format!("{checkbox} {label}"))
+                                        .style(Style::default().fg(theme.text))
+                                        .alignment(Alignment::Center),
+                                    columns[1],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    columns[1],
+                                    visible_top,
+                                    ClickTargetKind::SettingsSponsorCategory(key),
+                                );
+                            }
+                            TuiSettingsControl::StorageRoot { value, placeholder } => {
+                                let current_value = match &self.settings_text_edit {
+                                    Some(edit)
+                                        if matches!(
+                                            edit.target,
+                                            TuiSettingsTextTarget::StorageRoot
+                                        ) =>
+                                    {
+                                        edit.buffer.clone()
+                                    }
+                                    _ => value.clone(),
+                                };
+                                let controls = Layout::default()
+                                    .direction(Direction::Horizontal)
+                                    .constraints([
+                                        Constraint::Min(8),
+                                        Constraint::Length(8),
+                                        Constraint::Length(11),
+                                    ])
+                                    .split(columns[1]);
+                                let display_value = if current_value.is_empty() {
+                                    placeholder.clone()
+                                } else {
+                                    current_value
+                                };
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(format!(
+                                        "[ {} ]",
+                                        shorten(
+                                            &display_value,
+                                            controls[0].width.saturating_sub(4) as usize,
+                                        )
+                                    ))
+                                    .style(
+                                        Style::default().fg(if value.is_empty() {
+                                            theme.muted
+                                        } else {
+                                            theme.text
+                                        }),
+                                    ),
+                                    controls[0],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[Edit]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[1],
+                                );
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new("[Default]")
+                                        .style(Style::default().fg(theme.accent))
+                                        .alignment(Alignment::Center),
+                                    controls[2],
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[0],
+                                    visible_top,
+                                    ClickTargetKind::SettingsEdit(
+                                        TuiSettingsTextTarget::StorageRoot,
+                                    ),
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[1],
+                                    visible_top,
+                                    ClickTargetKind::SettingsEdit(
+                                        TuiSettingsTextTarget::StorageRoot,
+                                    ),
+                                );
+                                push_settings_target(
+                                    &mut targets,
+                                    area,
+                                    controls[2],
+                                    visible_top,
+                                    ClickTargetKind::SettingsStorageRootDefault,
+                                );
+                            }
+                            TuiSettingsControl::ReadOnly { value } => {
+                                render_buffer_widget(
+                                    &mut doc_buf,
+                                    Paragraph::new(format!(
+                                        "[ {} ]",
+                                        shorten(value, columns[1].width.saturating_sub(4) as usize),
+                                    ))
+                                    .style(Style::default().fg(theme.muted))
+                                    .alignment(Alignment::Left),
+                                    columns[1],
+                                );
+                            }
                         }
+
+                        push_settings_target(
+                            &mut targets,
+                            area,
+                            row_rect,
+                            visible_top,
+                            ClickTargetKind::SettingsField(field_index),
+                        );
 
                         y = y.saturating_add(row_height + row_gap);
                         field_index += 1;
@@ -443,13 +503,7 @@ impl InteractiveTui {
                     y = y.saturating_add(section_gap);
                 }
 
-                self.settings_total_height = y.max(area.height as usize);
-                if field_index > 0 {
-                    self.home_selected = self.home_selected.min(field_index.saturating_sub(1));
-                } else {
-                    self.home_selected = 0;
-                }
-                self.clamp_home_scroll_offset();
+                copy_buffer_viewport(&doc_buf, frame.buffer_mut(), area, visible_top);
 
                 let mut scrollbar_state = ScrollbarState::new(self.settings_total_height)
                     .position(self.home_scroll_offset);
@@ -678,6 +732,77 @@ impl InteractiveTui {
             TuiSettingsControl::ReadOnly { value } => {
                 self.status_line = shorten(&value, 96);
                 Ok(())
+            }
+        }
+    }
+}
+
+fn settings_document_height(
+    page: &TuiSettingsPageData,
+    hero_height: usize,
+    row_height: usize,
+    row_gap: usize,
+    section_gap: usize,
+    section_height: usize,
+) -> usize {
+    let mut y = hero_height.saturating_add(section_gap);
+    for section in &page.sections {
+        y = y.saturating_add(section_height);
+        for _ in &section.fields {
+            y = y.saturating_add(row_height + row_gap);
+        }
+        y = y.saturating_add(section_gap);
+    }
+    y
+}
+
+fn settings_field_count(page: &TuiSettingsPageData) -> usize {
+    page.sections
+        .iter()
+        .map(|section| section.fields.len())
+        .sum()
+}
+
+fn render_buffer_widget<W: Widget>(buf: &mut Buffer, widget: W, area: Rect) {
+    widget.render(area, buf);
+}
+
+fn push_settings_target(
+    targets: &mut Vec<ClickTarget>,
+    viewport: Rect,
+    logical_rect: Rect,
+    scroll_offset: usize,
+    kind: ClickTargetKind,
+) {
+    if let Some(rect) = scrolled_visible_rect(viewport, logical_rect, scroll_offset) {
+        targets.push(ClickTarget { rect, kind });
+    }
+}
+
+fn copy_buffer_viewport(
+    source: &Buffer,
+    target: &mut Buffer,
+    viewport: Rect,
+    scroll_offset: usize,
+) {
+    let available_rows = source
+        .area
+        .height
+        .saturating_sub(scroll_offset.min(source.area.height as usize) as u16);
+    let rows = viewport.height.min(available_rows);
+    let columns = viewport.width.min(source.area.width);
+
+    for row in 0..rows {
+        let source_y = scroll_offset as u16 + row;
+        let target_y = viewport.y + row;
+        for column in 0..columns {
+            let source_x = source.area.x + column;
+            let target_x = viewport.x + column;
+            let Some(source_cell) = source.cell((source_x, source_y)).cloned() else {
+                continue;
+            };
+            if let Some(target_cell) = target.cell_mut((target_x, target_y)) {
+                *target_cell = source_cell;
             }
         }
     }

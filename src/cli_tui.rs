@@ -923,4 +923,19 @@ mod tests {
 
         assert_eq!(merge_radio_chip_update(&existing, Vec::new()), existing);
     }
+
+    #[test]
+    fn scrolled_rect_preserves_negative_viewport_offset() {
+        let viewport = Rect::new(10, 5, 50, 10);
+        let logical = Rect::new(2, 1, 20, 5);
+
+        assert_eq!(
+            widgets::scrolled_rect(viewport, logical, 3),
+            Some(Rect::new(12, 3, 20, 5))
+        );
+        assert_eq!(
+            widgets::scrolled_visible_rect(viewport, logical, 3),
+            Some(Rect::new(12, 5, 20, 3))
+        );
+    }
 }

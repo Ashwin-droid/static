@@ -897,6 +897,57 @@ pub(in crate::cli_tui) fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
 
+pub(in crate::cli_tui) fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
+    let left = a.x.max(b.x);
+    let top = a.y.max(b.y);
+    let right = a.right().min(b.right());
+    let bottom = a.bottom().min(b.bottom());
+    if left >= right || top >= bottom {
+        return None;
+    }
+
+    Some(Rect::new(left, top, right - left, bottom - top))
+}
+
+pub(in crate::cli_tui) fn scrolled_rect(
+    viewport: Rect,
+    logical_rect: Rect,
+    scroll_offset: usize,
+) -> Option<Rect> {
+    let left = viewport.x as i32 + logical_rect.x as i32;
+    let right = left + logical_rect.width as i32;
+    let top = viewport.y as i32 + logical_rect.y as i32 - scroll_offset as i32;
+    let bottom = top + logical_rect.height as i32;
+
+    if left >= u16::MAX as i32 || top >= u16::MAX as i32 || right <= 0 || bottom <= 0 {
+        return None;
+    }
+
+    let screen_left = left.max(0) as u16;
+    let screen_top = top.max(0) as u16;
+    let screen_right = right.min(u16::MAX as i32) as u16;
+    let screen_bottom = bottom.min(u16::MAX as i32) as u16;
+    if screen_left >= screen_right || screen_top >= screen_bottom {
+        return None;
+    }
+
+    Some(Rect::new(
+        screen_left,
+        screen_top,
+        screen_right - screen_left,
+        screen_bottom - screen_top,
+    ))
+}
+
+pub(in crate::cli_tui) fn scrolled_visible_rect(
+    viewport: Rect,
+    logical_rect: Rect,
+    scroll_offset: usize,
+) -> Option<Rect> {
+    scrolled_rect(viewport, logical_rect, scroll_offset)
+        .and_then(|screen_rect| intersect_rect(screen_rect, viewport))
+}
+
 pub(in crate::cli_tui) fn text_cell_width(value: &str) -> usize {
     value.chars().count()
 }

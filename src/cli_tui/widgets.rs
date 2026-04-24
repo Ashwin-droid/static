@@ -377,12 +377,7 @@ pub(in crate::cli_tui) fn draw_home_card(
         theme.border_subtle
     };
 
-    fill_clipped_area(
-        buf,
-        clip,
-        Rect::new(x, y.max(clip.y as i32) as u16, width, height),
-        Style::default().bg(bg),
-    );
+    fill_clipped_area_signed(buf, clip, x, y, width, height, Style::default().bg(bg));
     draw_box(buf, clip, x, y, width, height, border, bg);
 
     let inner_x = x + 1;
@@ -710,6 +705,30 @@ pub(in crate::cli_tui) fn fill_clipped_area(
             buf[(x, y)].set_style(style).set_symbol(" ");
         }
     }
+}
+
+pub(in crate::cli_tui) fn fill_clipped_area_signed(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: i32,
+    width: u16,
+    height: u16,
+    style: Style,
+) {
+    let bottom = y.saturating_add(height as i32);
+    let start_y = y.max(clip.y as i32);
+    let end_y = bottom.min(clip.bottom() as i32);
+    if start_y >= end_y {
+        return;
+    }
+
+    fill_clipped_area(
+        buf,
+        clip,
+        Rect::new(x, start_y as u16, width, (end_y - start_y) as u16),
+        style,
+    );
 }
 
 pub(in crate::cli_tui) fn write_clipped(

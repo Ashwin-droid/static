@@ -938,4 +938,23 @@ mod tests {
             Some(Rect::new(12, 5, 20, 3))
         );
     }
+
+    #[test]
+    fn signed_fill_does_not_extend_partially_clipped_cards() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 6));
+        let clip = Rect::new(0, 2, 10, 4);
+
+        widgets::fill_clipped_area_signed(
+            &mut buffer,
+            clip,
+            1,
+            0,
+            4,
+            3,
+            Style::default().bg(Color::Red),
+        );
+
+        assert_eq!(buffer[(1, 2)].bg, Color::Red);
+        assert_ne!(buffer[(1, 3)].bg, Color::Red);
+    }
 }

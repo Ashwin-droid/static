@@ -1,5 +1,6 @@
 use super::widgets::*;
 use super::*;
+use image::imageops::FilterType;
 
 impl InteractiveTui {
     pub(in crate::cli_tui) fn ensure_thumbnail_requested(&mut self, url: Option<&str>) {
@@ -95,23 +96,39 @@ impl InteractiveTui {
             return false;
         }
 
+        let Some(source) = self.thumbnail_source(url) else {
+            return false;
+        };
+        self.render_protocol_thumbnail_source(frame, area, slot, url, source, resize)
+    }
+
+    pub(in crate::cli_tui) fn render_protocol_thumbnail_source(
+        &mut self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        slot: ThumbnailSlot,
+        key: &str,
+        source: DynamicImage,
+        resize: Resize,
+    ) -> bool {
+        if area.width == 0 || area.height == 0 || !self.terminal_images_enabled() {
+            return false;
+        }
+
         let needs_init = self
             .thumbnail_slots
             .get(&slot)
-            .map(|state| state.url.as_str() != url)
+            .map(|state| state.key.as_str() != key)
             .unwrap_or(true);
 
         if needs_init {
-            let Some(source) = self.thumbnail_source(url) else {
-                return false;
-            };
             let Some(picker) = self.thumbnail_picker.clone() else {
                 return false;
             };
             self.thumbnail_slots.insert(
                 slot,
                 ThumbnailSlotState {
-                    url: url.to_string(),
+                    key: key.to_string(),
                     protocol: picker.new_resize_protocol(source),
                 },
             );
@@ -206,15 +223,19 @@ impl InteractiveTui {
         let failed = url.is_some_and(|url| self.thumbnail_failed(url));
         if let Some(url) = url {
             self.ensure_thumbnail_requested(Some(url));
-            let resize = thumbnail_resize_for_visible_rect(image_rect, visible_rect);
-            if self.render_protocol_thumbnail(
-                frame,
-                visible_rect,
-                ThumbnailSlot::HomeCard(index),
-                url,
-                resize,
-            ) {
-                return;
+            if let Some((source_key, source)) =
+                self.thumbnail_source_for_visible_rect(url, image_rect, visible_rect)
+            {
+                if self.render_protocol_thumbnail_source(
+                    frame,
+                    visible_rect,
+                    ThumbnailSlot::HomeCard(index),
+                    &source_key,
+                    source,
+                    Resize::Fit(None),
+                ) {
+                    return;
+                }
             }
         } else {
             self.thumbnail_slots.remove(&ThumbnailSlot::HomeCard(index));
@@ -227,6 +248,49 @@ impl InteractiveTui {
             theme,
             matches!(card.style, HomeCardStyle::Featured) && !failed,
         );
+    }
+
+    pub(in crate::cli_tui) fn thumbnail_source_for_visible_rect(
+        &self,
+        url: &str,
+        full_rect: Rect,
+        visible_rect: Rect,
+    ) -> Option<(String, DynamicImage)> {
+        let source = self.thumbnail_source(url)?;
+        if visible_rect == full_rect {
+            return Some((url.to_string(), source));
+        }
+
+        let (font_width, font_height) = self.thumbnail_font_size();
+        let full_width = (full_rect.width as u32).saturating_mul(font_width as u32);
+        let full_height = (full_rect.height as u32).saturating_mul(font_height as u32);
+        let visible_width = (visible_rect.width as u32).saturating_mul(font_width as u32);
+        let visible_height = (visible_rect.height as u32).saturating_mul(font_height as u32);
+        if full_width == 0 || full_height == 0 || visible_width == 0 || visible_height == 0 {
+            return None;
+        }
+
+        let x = visible_rect
+            .x
+            .saturating_sub(full_rect.x)
+            .saturating_mul(font_width) as u32;
+        let y = visible_rect
+            .y
+            .saturating_sub(full_rect.y)
+            .saturating_mul(font_height) as u32;
+
+        let scaled = source.resize_exact(full_width, full_height, FilterType::Nearest);
+        let crop_width = visible_width.min(scaled.width().saturating_sub(x));
+        let crop_height = visible_height.min(scaled.height().saturating_sub(y));
+        if crop_width == 0 || crop_height == 0 {
+            return None;
+        }
+
+        let key = format!(
+            "{url}#{}x{}@{},{}:{}x{}",
+            full_rect.width, full_rect.height, x, y, visible_rect.width, visible_rect.height
+        );
+        Some((key, scaled.crop_imm(x, y, crop_width, crop_height)))
     }
 }
 
@@ -258,18 +322,4 @@ pub(in crate::cli_tui) fn thumbnail_protocol_label(protocol: ProtocolType) -> &'
         ProtocolType::Kitty => "kitty",
         ProtocolType::Iterm2 => "iterm2",
     }
-}
-
-pub(in crate::cli_tui) fn thumbnail_resize_for_visible_rect(
-    full_rect: Rect,
-    visible_rect: Rect,
-) -> Resize {
-    if visible_rect == full_rect {
-        return Resize::Fit(None);
-    }
-
-    Resize::Crop(Some(CropOptions {
-        clip_top: visible_rect.y > full_rect.y,
-        clip_left: visible_rect.x > full_rect.x,
-    }))
 }

@@ -26,7 +26,7 @@ use ratatui::widgets::{
     ScrollbarOrientation, ScrollbarState, Widget, Wrap,
 };
 use ratatui_image::{
-    CropOptions, Resize, StatefulImage,
+    Resize, StatefulImage,
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
@@ -715,7 +715,7 @@ enum ThumbnailSlot {
 }
 
 struct ThumbnailSlotState {
-    url: String,
+    key: String,
     protocol: StatefulProtocol,
 }
 

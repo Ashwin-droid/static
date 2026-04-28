@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue};
+use rusqlite::{Connection as SqliteConnection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use url::Url;
@@ -27,17 +30,25 @@ const YTM_PARAMS: &str = "prettyPrint=false";
 const YTM_ORIGIN: &str = "https://music.youtube.com";
 const YTM_WEB_REMIX_HEADER_CLIENT_NAME: &str = "67";
 const YTM_WEB_REMIX_CLIENT_NAME: &str = "WEB_REMIX";
-const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20260331.01.00";
-const YTM_WEB_FALLBACK_HEADER_CLIENT_NAME: &str = "1";
-const YTM_WEB_FALLBACK_CLIENT_NAME: &str = "WEB";
-const YTM_WEB_FALLBACK_CLIENT_VERSION: &str = "2.20260403.01.00";
+const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20260426.12.00";
 const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
 const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
-const YTM_USER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0";
-const TRACKING_BROWSER_BRAND: &str = "Firefox";
-const TRACKING_BROWSER_VERSION: &str = "136.0";
+const YTM_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
+const TRACKING_BROWSER_BRAND: &str = "Edge Chromium";
+const TRACKING_BROWSER_VERSION: &str = "147.0.0.0";
+const TRACKING_BROWSER_ENGINE: &str = "WebKit";
+const TRACKING_BROWSER_ENGINE_VERSION: &str = "537.36";
+const TRACKING_OS_NAME: &str = "X11";
+const TRACKING_PLATFORM: &str = "DESKTOP";
+const TRACKING_SEC_CH_UA: &str =
+    "\"Microsoft Edge\";v=\"147\", \"Not.A/Brand\";v=\"8\", \"Chromium\";v=\"147\"";
+const TRACKING_SEC_CH_UA_MOBILE: &str = "?0";
+const TRACKING_SEC_CH_UA_PLATFORM: &str = "\"Linux\"";
 const ATR_REPORT_DELAY: Duration = Duration::from_secs(4);
+const YTM_WEB_PROFILE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
+const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
+const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -80,7 +91,6 @@ pub struct TrackingInfo {
     atr_url: Option<String>,
     cpn: String,
     referer_url: String,
-    visitor_id: Option<String>,
     audio_fmt: String,
     video_fmt: String,
     length_millis: u64,
@@ -90,7 +100,82 @@ pub struct TrackingInfo {
     last_activity_millis: AtomicU64,
     atr_reported: AtomicBool,
     session_started_at: Instant,
+    web_profile: YtmWebProfile,
     rt: *const tokio::runtime::Runtime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct YtmWebProfile {
+    client_name: String,
+    header_client_name: String,
+    client_version: String,
+    page_cl: Option<String>,
+    page_label: Option<String>,
+    visitor_data: Option<String>,
+    datasync_id: Option<String>,
+    identity_token: Option<String>,
+    hl: String,
+    gl: String,
+    user_agent: String,
+    browser_name: String,
+    browser_version: String,
+    browser_engine: String,
+    browser_engine_version: String,
+    os_name: String,
+    platform: String,
+    sec_ch_ua: String,
+    sec_ch_ua_mobile: String,
+    sec_ch_ua_platform: String,
+    time_zone: String,
+    utc_offset_minutes: String,
+    fetched_at_unix_millis: u64,
+}
+
+impl YtmWebProfile {
+    fn fallback() -> Self {
+        Self {
+            client_name: YTM_WEB_REMIX_CLIENT_NAME.to_string(),
+            header_client_name: YTM_WEB_REMIX_HEADER_CLIENT_NAME.to_string(),
+            client_version: YTM_WEB_REMIX_CLIENT_VERSION.to_string(),
+            page_cl: None,
+            page_label: None,
+            visitor_data: None,
+            datasync_id: None,
+            identity_token: None,
+            hl: "en".to_string(),
+            gl: "US".to_string(),
+            user_agent: YTM_USER_AGENT.to_string(),
+            browser_name: TRACKING_BROWSER_BRAND.to_string(),
+            browser_version: TRACKING_BROWSER_VERSION.to_string(),
+            browser_engine: TRACKING_BROWSER_ENGINE.to_string(),
+            browser_engine_version: TRACKING_BROWSER_ENGINE_VERSION.to_string(),
+            os_name: TRACKING_OS_NAME.to_string(),
+            platform: TRACKING_PLATFORM.to_string(),
+            sec_ch_ua: TRACKING_SEC_CH_UA.to_string(),
+            sec_ch_ua_mobile: TRACKING_SEC_CH_UA_MOBILE.to_string(),
+            sec_ch_ua_platform: TRACKING_SEC_CH_UA_PLATFORM.to_string(),
+            time_zone: "Asia/Calcutta".to_string(),
+            utc_offset_minutes: "330".to_string(),
+            fetched_at_unix_millis: unix_epoch_millis_u64(),
+        }
+    }
+
+    fn is_fresh(&self, now_unix_millis: u64) -> bool {
+        now_unix_millis.saturating_sub(self.fetched_at_unix_millis)
+            <= YTM_WEB_PROFILE_CACHE_TTL.as_millis() as u64
+    }
+
+    fn device_header(&self) -> String {
+        format!(
+            "cbr={}&cbrver={}&ceng={}&cengver={}&cos={}&cplatform={}",
+            self.browser_name.replace(' ', "+"),
+            self.browser_version,
+            self.browser_engine,
+            self.browser_engine_version,
+            self.os_name,
+            self.platform,
+        )
+    }
 }
 
 struct PendingWatchtimeRequest {
@@ -207,25 +292,25 @@ impl TrackingInfo {
 
     fn apply_default_client_params(&self, params: &mut HashMap<String, String>) {
         if !params.contains_key("c") {
-            Self::set_query_param(params, "c", YTM_WEB_REMIX_CLIENT_NAME);
+            Self::set_query_param(params, "c", self.web_profile.client_name.clone());
         }
         if !params.contains_key("cver") {
-            Self::set_query_param(params, "cver", YTM_WEB_REMIX_CLIENT_VERSION);
+            Self::set_query_param(params, "cver", self.web_profile.client_version.clone());
         }
         if !params.contains_key("cplayer") {
             Self::set_query_param(params, "cplayer", "UNIPLAYER");
         }
         if !params.contains_key("cos") {
-            Self::set_query_param(params, "cos", "X11");
+            Self::set_query_param(params, "cos", self.web_profile.os_name.clone());
         }
         if !params.contains_key("cplatform") {
-            Self::set_query_param(params, "cplatform", "DESKTOP");
+            Self::set_query_param(params, "cplatform", self.web_profile.platform.clone());
         }
         if !params.contains_key("cbr") {
-            Self::set_query_param(params, "cbr", TRACKING_BROWSER_BRAND);
+            Self::set_query_param(params, "cbr", self.web_profile.browser_name.clone());
         }
         if !params.contains_key("cbrver") {
-            Self::set_query_param(params, "cbrver", TRACKING_BROWSER_VERSION);
+            Self::set_query_param(params, "cbrver", self.web_profile.browser_version.clone());
         }
     }
 
@@ -424,7 +509,7 @@ impl TrackingInfo {
     fn build_request(
         http: &reqwest::Client,
         auth: Option<&String>,
-        visitor_id: Option<&String>,
+        web_profile: &YtmWebProfile,
         request_url: &str,
         referer: &str,
         event_time: &str,
@@ -432,15 +517,45 @@ impl TrackingInfo {
     ) -> reqwest::RequestBuilder {
         let mut req = http
             .get(request_url)
+            .header("user-agent", web_profile.user_agent.clone())
+            .header("sec-ch-ua", web_profile.sec_ch_ua.clone())
+            .header("sec-ch-ua-mobile", web_profile.sec_ch_ua_mobile.clone())
+            .header("sec-ch-ua-platform", web_profile.sec_ch_ua_platform.clone())
             .header("referer", referer)
             .header("x-goog-authuser", "0")
             .header("x-goog-event-time", event_time)
-            .header("x-goog-request-time", request_time);
+            .header("x-goog-request-time", request_time)
+            .header(
+                "x-youtube-client-name",
+                web_profile.header_client_name.clone(),
+            )
+            .header(
+                "x-youtube-client-version",
+                web_profile.client_version.clone(),
+            )
+            .header("x-youtube-device", web_profile.device_header())
+            .header("x-youtube-time-zone", web_profile.time_zone.clone())
+            .header(
+                "x-youtube-utc-offset",
+                web_profile.utc_offset_minutes.clone(),
+            );
         if let Some(auth) = auth {
             req = req.header("authorization", auth.clone());
         }
-        if let Some(visitor_id) = visitor_id {
+        if let Some(visitor_id) = web_profile.visitor_data.as_ref() {
             req = req.header("x-goog-visitor-id", visitor_id);
+        }
+        if let Some(datasync_id) = web_profile.datasync_id.as_ref() {
+            req = req.header("x-youtube-datasync-id", datasync_id);
+        }
+        if let Some(identity_token) = web_profile.identity_token.as_ref() {
+            req = req.header("x-youtube-identity-token", identity_token);
+        }
+        if let Some(page_cl) = web_profile.page_cl.as_ref() {
+            req = req.header("x-youtube-page-cl", page_cl);
+        }
+        if let Some(page_label) = web_profile.page_label.as_ref() {
+            req = req.header("x-youtube-page-label", page_label);
         }
         req
     }
@@ -449,12 +564,12 @@ impl TrackingInfo {
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
         let auth = self.auth.clone();
-        let visitor_id = self.visitor_id.clone();
+        let web_profile = self.web_profile.clone();
         rt.spawn(async move {
             let req = Self::build_request(
                 &http,
                 auth.as_ref(),
-                visitor_id.as_ref(),
+                &web_profile,
                 &request.url,
                 &request.referer,
                 &request.event_time,
@@ -478,12 +593,12 @@ impl TrackingInfo {
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
         let auth = self.auth.clone();
-        let visitor_id = self.visitor_id.clone();
+        let web_profile = self.web_profile.clone();
         rt.block_on(async move {
             let req = Self::build_request(
                 &http,
                 auth.as_ref(),
-                visitor_id.as_ref(),
+                &web_profile,
                 &request.url,
                 &request.referer,
                 &request.event_time,
@@ -507,12 +622,12 @@ impl TrackingInfo {
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
         let auth = self.auth.clone();
-        let visitor_id = self.visitor_id.clone();
+        let web_profile = self.web_profile.clone();
         rt.spawn(async move {
             let req = Self::build_request(
                 &http,
                 auth.as_ref(),
-                visitor_id.as_ref(),
+                &web_profile,
                 &request.url,
                 &request.referer,
                 &request.event_time,
@@ -602,13 +717,13 @@ impl TrackingInfo {
         let rt = unsafe { &*self.rt };
         let http = self.http.clone();
         let auth = self.auth.clone();
-        let visitor_id = self.visitor_id.clone();
+        let web_profile = self.web_profile.clone();
         rt.spawn(async move {
             for request in [paused_request, final_request].into_iter().flatten() {
                 let req = Self::build_request(
                     &http,
                     auth.as_ref(),
-                    visitor_id.as_ref(),
+                    &web_profile,
                     &request.url,
                     &request.referer,
                     &request.event_time,
@@ -651,6 +766,210 @@ fn unix_epoch_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn unix_epoch_millis_u64() -> u64 {
+    unix_epoch_millis().min(u64::MAX as u128) as u64
+}
+
+fn default_static_root() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join("Music/Static")
+}
+
+fn resolve_storage_root(raw: &str) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_static_root();
+    }
+
+    if trimmed == "~" {
+        return std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join(rest);
+    }
+
+    PathBuf::from(trimmed)
+}
+
+fn static_storage_root() -> PathBuf {
+    super::session_network::get_storage_root()
+        .map(|raw| resolve_storage_root(&raw))
+        .unwrap_or_else(default_static_root)
+}
+
+fn ytm_web_profile_database_path() -> PathBuf {
+    static_storage_root().join(YTM_WEB_PROFILE_DB_FILE_NAME)
+}
+
+fn open_ytm_web_profile_database() -> Result<SqliteConnection> {
+    let path = ytm_web_profile_database_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create YTM web profile database dir {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let db = SqliteConnection::open(&path)
+        .with_context(|| format!("Failed to open YTM web profile database {}", path.display()))?;
+    db.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {YTM_WEB_PROFILE_TABLE} (
+                id TEXT PRIMARY KEY,
+                profile_json TEXT NOT NULL,
+                updated_at_unix_millis INTEGER NOT NULL
+            )"
+        ),
+        [],
+    )
+    .context("Failed to initialize YTM web profile cache")?;
+    Ok(db)
+}
+
+fn load_cached_ytm_web_profile() -> Result<Option<YtmWebProfile>> {
+    let db = open_ytm_web_profile_database()?;
+    let profile_json: Option<String> = db
+        .query_row(
+            &format!("SELECT profile_json FROM {YTM_WEB_PROFILE_TABLE} WHERE id = ?1"),
+            params![YTM_WEB_PROFILE_ROW_ID],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to read YTM web profile cache")?;
+
+    profile_json
+        .map(|json| {
+            serde_json::from_str::<YtmWebProfile>(&json)
+                .context("Failed to parse cached YTM web profile")
+        })
+        .transpose()
+}
+
+fn store_cached_ytm_web_profile(profile: &YtmWebProfile) -> Result<()> {
+    let db = open_ytm_web_profile_database()?;
+    let profile_json =
+        serde_json::to_string(profile).context("Failed to encode YTM web profile")?;
+    db.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {YTM_WEB_PROFILE_TABLE}
+             (id, profile_json, updated_at_unix_millis)
+             VALUES (?1, ?2, ?3)"
+        ),
+        params![
+            YTM_WEB_PROFILE_ROW_ID,
+            profile_json,
+            profile.fetched_at_unix_millis as i64
+        ],
+    )
+    .context("Failed to store YTM web profile cache")?;
+    Ok(())
+}
+
+fn extract_balanced_json_object(input: &str, start: usize) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let object_start = bytes
+        .get(start..)?
+        .iter()
+        .position(|byte| *byte == b'{')
+        .map(|offset| start + offset)?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for idx in object_start..bytes.len() {
+        let byte = bytes[idx];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth = depth.saturating_add(1),
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return input.get(object_start..=idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn ytcfg_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    map.get(key)
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+                .or_else(|| value.as_u64().map(|number| number.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn ytm_web_profile_from_html(html: &str, fetched_at_unix_millis: u64) -> Result<YtmWebProfile> {
+    let re = Regex::new(r"ytcfg\.set\s*\(").expect("ytcfg regex should compile");
+    let mut config = serde_json::Map::<String, Value>::new();
+
+    for mat in re.find_iter(html) {
+        let Some(raw_object) = extract_balanced_json_object(html, mat.end()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(raw_object) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        for (key, value) in object {
+            config.insert(key.clone(), value.clone());
+        }
+    }
+
+    let mut profile = YtmWebProfile::fallback();
+    profile.fetched_at_unix_millis = fetched_at_unix_millis;
+    profile.header_client_name = ytcfg_string(&config, "INNERTUBE_CONTEXT_CLIENT_NAME")
+        .unwrap_or_else(|| YTM_WEB_REMIX_HEADER_CLIENT_NAME.to_string());
+    profile.client_name = YTM_WEB_REMIX_CLIENT_NAME.to_string();
+    profile.client_version = ytcfg_string(&config, "INNERTUBE_CONTEXT_CLIENT_VERSION")
+        .unwrap_or_else(|| YTM_WEB_REMIX_CLIENT_VERSION.to_string());
+    profile.page_cl =
+        ytcfg_string(&config, "PAGE_CL").or_else(|| ytcfg_string(&config, "PAGE_BUILD_CL"));
+    profile.page_label = ytcfg_string(&config, "PAGE_BUILD_LABEL");
+    profile.visitor_data = ytcfg_string(&config, "VISITOR_DATA");
+    profile.datasync_id = ytcfg_string(&config, "DATASYNC_ID")
+        .or_else(|| ytcfg_string(&config, "DELEGATED_SESSION_ID"));
+    profile.identity_token = ytcfg_string(&config, "ID_TOKEN");
+    profile.hl = ytcfg_string(&config, "INNERTUBE_CONTEXT_HL").unwrap_or(profile.hl);
+    profile.gl = ytcfg_string(&config, "INNERTUBE_CONTEXT_GL").unwrap_or(profile.gl);
+
+    if profile.client_version.trim().is_empty() {
+        bail!("YTM web profile did not include a client version");
+    }
+
+    Ok(profile)
 }
 
 fn parse_secs_to_millis(value: Option<&str>) -> Option<u64> {
@@ -884,6 +1203,103 @@ impl YtMusicClient {
         req
     }
 
+    fn apply_ytm_web_profile_headers(
+        &self,
+        req: reqwest::RequestBuilder,
+        profile: &YtmWebProfile,
+    ) -> reqwest::RequestBuilder {
+        let mut req = req
+            .header("user-agent", profile.user_agent.clone())
+            .header("sec-ch-ua", profile.sec_ch_ua.clone())
+            .header("sec-ch-ua-mobile", profile.sec_ch_ua_mobile.clone())
+            .header("sec-ch-ua-platform", profile.sec_ch_ua_platform.clone())
+            .header("x-youtube-client-name", profile.header_client_name.clone())
+            .header("x-youtube-client-version", profile.client_version.clone())
+            .header("x-youtube-device", profile.device_header())
+            .header("x-youtube-time-zone", profile.time_zone.clone())
+            .header("x-youtube-utc-offset", profile.utc_offset_minutes.clone());
+
+        if let Some(visitor_data) = profile.visitor_data.as_ref() {
+            req = req.header("x-goog-visitor-id", visitor_data);
+        }
+        if let Some(datasync_id) = profile.datasync_id.as_ref() {
+            req = req.header("x-youtube-datasync-id", datasync_id);
+        }
+        if let Some(identity_token) = profile.identity_token.as_ref() {
+            req = req.header("x-youtube-identity-token", identity_token);
+        }
+        if let Some(page_cl) = profile.page_cl.as_ref() {
+            req = req.header("x-youtube-page-cl", page_cl);
+        }
+        if let Some(page_label) = profile.page_label.as_ref() {
+            req = req.header("x-youtube-page-label", page_label);
+        }
+
+        req
+    }
+
+    async fn fetch_ytm_web_profile(&self) -> Result<YtmWebProfile> {
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .context("Failed to build YTM web profile HTTP client")?;
+        let req = http
+            .get(YTM_ORIGIN)
+            .header("cookie", self.cookie.clone())
+            .header("user-agent", YTM_USER_AGENT)
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("accept-language", "en-US,en;q=0.9,en-IN;q=0.8")
+            .header("referer", format!("{YTM_ORIGIN}/"))
+            .header("sec-ch-ua", TRACKING_SEC_CH_UA)
+            .header("sec-ch-ua-mobile", TRACKING_SEC_CH_UA_MOBILE)
+            .header("sec-ch-ua-platform", TRACKING_SEC_CH_UA_PLATFORM);
+
+        let html = req
+            .send()
+            .await
+            .context("Failed to fetch YouTube Music web shell")?
+            .error_for_status()
+            .context("YouTube Music rejected web shell request")?
+            .text()
+            .await
+            .context("Failed to read YouTube Music web shell")?;
+        ytm_web_profile_from_html(&html, unix_epoch_millis_u64())
+    }
+
+    async fn ytm_web_profile(&self, force_refresh: bool) -> YtmWebProfile {
+        let cached = match load_cached_ytm_web_profile() {
+            Ok(cached) => cached,
+            Err(err) => {
+                eprintln!("[TRACKING] failed to read cached YTM WEB_REMIX profile: {err}");
+                None
+            }
+        };
+
+        if !force_refresh {
+            if let Some(profile) = cached.as_ref() {
+                if profile.is_fresh(unix_epoch_millis_u64()) {
+                    return profile.clone();
+                }
+            }
+        }
+
+        match self.fetch_ytm_web_profile().await {
+            Ok(profile) => {
+                if let Err(err) = store_cached_ytm_web_profile(&profile) {
+                    eprintln!("[TRACKING] failed to store YTM WEB_REMIX profile: {err}");
+                }
+                profile
+            }
+            Err(err) => {
+                eprintln!("[TRACKING] failed to refresh YTM WEB_REMIX profile: {err}");
+                cached.unwrap_or_else(YtmWebProfile::fallback)
+            }
+        }
+    }
+
     fn client_context() -> Value {
         Self::client_context_with(YTM_WEB_REMIX_CLIENT_NAME, YTM_WEB_REMIX_CLIENT_VERSION)
     }
@@ -903,13 +1319,19 @@ impl YtMusicClient {
 
     fn tracking_player_body(
         video_id: &str,
-        client_name: &str,
-        client_version: &str,
+        profile: &YtmWebProfile,
         cpn: &str,
         playlist_id: Option<&str>,
         params: Option<&str>,
     ) -> Value {
-        let mut body = Self::client_context_with(client_name, client_version);
+        let mut body = Self::client_context_with(&profile.client_name, &profile.client_version);
+        body["context"]["client"]["hl"] = json!(profile.hl);
+        body["context"]["client"]["gl"] = json!(profile.gl);
+        body["context"]["client"]["userAgent"] = json!(profile.user_agent);
+        body["context"]["client"]["browserName"] = json!(profile.browser_name);
+        body["context"]["client"]["browserVersion"] = json!(profile.browser_version);
+        body["context"]["client"]["osName"] = json!(profile.os_name);
+        body["context"]["client"]["platform"] = json!(profile.platform);
         body["videoId"] = json!(video_id);
         body["cpn"] = json!(cpn);
         body["playbackContext"] = json!({
@@ -1303,6 +1725,131 @@ impl YtMusicClient {
         })
     }
 
+    async fn tracking_player_response(
+        &self,
+        video_id: &str,
+        cpn: &str,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
+        profile: &YtmWebProfile,
+    ) -> Result<Value> {
+        let body = Self::tracking_player_body(video_id, profile, cpn, playlist_id, params);
+        let req = self
+            .apply_ytm_web_profile_headers(
+                self.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}")),
+                profile,
+            )
+            .json(&body);
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("WEB_REMIX player bootstrap request failed for {video_id}"))?;
+        resp.json().await.with_context(|| {
+            format!("WEB_REMIX player bootstrap response was not JSON for {video_id}")
+        })
+    }
+
+    fn tracking_urls_from_player_response(
+        json: &Value,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let tracking = &json["playbackTracking"];
+        let playback_url = tracking
+            .get("videostatsPlaybackUrl")
+            .and_then(|url| url.get("baseUrl"))
+            .and_then(|url| url.as_str())
+            .map(rewrite_tracking_base_url);
+        let watchtime_url = tracking
+            .get("videostatsWatchtimeUrl")
+            .and_then(|url| url.get("baseUrl"))
+            .and_then(|url| url.as_str())
+            .map(rewrite_tracking_base_url);
+        let atr_url = tracking
+            .get("atrUrl")
+            .and_then(|url| url.get("baseUrl"))
+            .and_then(|url| url.as_str())
+            .map(rewrite_tracking_base_url);
+
+        (playback_url, watchtime_url, atr_url)
+    }
+
+    fn collect_player_error_texts(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(text) = map.get("simpleText").and_then(|value| value.as_str()) {
+                    out.push(text.to_string());
+                }
+                if let Some(runs) = map.get("runs").and_then(|value| value.as_array()) {
+                    for run in runs {
+                        if let Some(text) = run.get("text").and_then(|value| value.as_str()) {
+                            out.push(text.to_string());
+                        }
+                    }
+                }
+                for value in map.values() {
+                    Self::collect_player_error_texts(value, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    Self::collect_player_error_texts(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn player_error_texts(json: &Value) -> Vec<String> {
+        let mut texts = Vec::new();
+        Self::collect_player_error_texts(&json["playabilityStatus"]["errorScreen"], &mut texts);
+        let mut seen = std::collections::HashSet::new();
+        texts
+            .into_iter()
+            .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|text| !text.is_empty() && seen.insert(text.clone()))
+            .collect()
+    }
+
+    fn player_response_requests_reload(json: &Value) -> bool {
+        let status = json
+            .pointer("/playabilityStatus/status")
+            .and_then(|value| value.as_str());
+        let reason = json
+            .pointer("/playabilityStatus/reason")
+            .and_then(|value| value.as_str());
+        if status != Some("UNPLAYABLE") || reason != Some("Video unavailable") {
+            return false;
+        }
+
+        Self::player_error_texts(json)
+            .iter()
+            .any(|text| text.eq_ignore_ascii_case("The page needs to be reloaded."))
+            || json["playabilityStatus"]
+                .to_string()
+                .contains("RELOAD_PAGE")
+    }
+
+    fn log_tracking_bootstrap_missing(video_id: &str, json: &Value) {
+        let status = json
+            .pointer("/playabilityStatus/status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("missing");
+        let reason = json
+            .pointer("/playabilityStatus/reason")
+            .and_then(|value| value.as_str())
+            .unwrap_or("missing");
+        let texts = Self::player_error_texts(json);
+        if texts.is_empty() {
+            eprintln!(
+                "[TRACKING] WEB_REMIX player bootstrap for {video_id} returned no tracking URLs (playability status={status}, reason={reason})"
+            );
+        } else {
+            eprintln!(
+                "[TRACKING] WEB_REMIX player bootstrap for {video_id} returned no tracking URLs (playability status={status}, reason={reason}, message={})",
+                texts.join(" | ")
+            );
+        }
+    }
+
     /// Report playback start to YouTube and return a TrackingInfo for deferred watchtime reporting.
     /// Fires the playback URL immediately; the caller fires watchtime later via TrackingInfo.
     /// NOTE: Must be called from an async context running on self.rt (e.g. inside block_on).
@@ -1325,94 +1872,72 @@ impl YtMusicClient {
                 );
             }
 
-            // WEB_REMIX no longer reliably returns playbackTracking on music.youtube.com.
-            // Fall back to the WEB client on the same Music origin so we recover tracking
-            // URLs without switching the request surface over to www.youtube.com.
-            let mut tracking_bootstrap = None;
-            for (profile_name, header_client_name, client_name, client_version) in [
-                (
-                    YTM_WEB_REMIX_CLIENT_NAME,
-                    YTM_WEB_REMIX_HEADER_CLIENT_NAME,
-                    YTM_WEB_REMIX_CLIENT_NAME,
-                    YTM_WEB_REMIX_CLIENT_VERSION,
-                ),
-                (
-                    YTM_WEB_FALLBACK_CLIENT_NAME,
-                    YTM_WEB_FALLBACK_HEADER_CLIENT_NAME,
-                    YTM_WEB_FALLBACK_CLIENT_NAME,
-                    YTM_WEB_FALLBACK_CLIENT_VERSION,
-                ),
-            ] {
-                let body = Self::tracking_player_body(
-                    &video_id,
-                    client_name,
-                    client_version,
-                    &cpn,
-                    playlist_id,
-                    params,
-                );
-
-                let resp = match self
-                    .post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}"))
-                    .header("x-youtube-client-name", header_client_name)
-                    .header("x-youtube-client-version", client_version)
-                    .json(&body)
-                    .send()
-                    .await
-                {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        eprintln!(
-                            "[TRACKING] {profile_name} player bootstrap request failed for {video_id}: {err}"
-                        );
-                        continue;
+            let mut web_profile = self.ytm_web_profile(false).await;
+            let mut json = match self
+                .tracking_player_response(&video_id, &cpn, playlist_id, params, &web_profile)
+                .await
+            {
+                Ok(json) => json,
+                Err(err) => {
+                    eprintln!("[TRACKING] WEB_REMIX player bootstrap failed for {video_id}: {err}");
+                    web_profile = self.ytm_web_profile(true).await;
+                    match self
+                        .tracking_player_response(
+                            &video_id,
+                            &cpn,
+                            playlist_id,
+                            params,
+                            &web_profile,
+                        )
+                        .await
+                    {
+                        Ok(json) => json,
+                        Err(err) => {
+                            eprintln!(
+                                "[TRACKING] WEB_REMIX player bootstrap still failed after profile refresh for {video_id}: {err}"
+                            );
+                            return None;
+                        }
                     }
-                };
-                let json: Value = match resp.json().await {
-                    Ok(json) => json,
-                    Err(err) => {
-                        eprintln!(
-                            "[TRACKING] {profile_name} player bootstrap response was not valid JSON for {video_id}: {err}"
-                        );
-                        continue;
-                    }
-                };
-
-                let tracking = &json["playbackTracking"];
-                let playback_url = tracking
-                    .get("videostatsPlaybackUrl")
-                    .and_then(|url| url.get("baseUrl"))
-                    .and_then(|url| url.as_str())
-                    .map(rewrite_tracking_base_url);
-                let watchtime_url = tracking
-                    .get("videostatsWatchtimeUrl")
-                    .and_then(|url| url.get("baseUrl"))
-                    .and_then(|url| url.as_str())
-                    .map(rewrite_tracking_base_url);
-                let atr_url = tracking
-                    .get("atrUrl")
-                    .and_then(|url| url.get("baseUrl"))
-                    .and_then(|url| url.as_str())
-                    .map(rewrite_tracking_base_url);
-
-                if playback_url.is_some() || watchtime_url.is_some() || atr_url.is_some() {
-                    if profile_name == YTM_WEB_FALLBACK_CLIENT_NAME {
-                        eprintln!(
-                            "[TRACKING] recovered playbackTracking for {video_id} via WEB on music.youtube.com"
-                        );
-                    }
-                    tracking_bootstrap = Some((json, playback_url, watchtime_url, atr_url));
-                    break;
                 }
+            };
 
-                if profile_name == YTM_WEB_REMIX_CLIENT_NAME {
+            let (mut playback_url, mut watchtime_url, mut atr_url) =
+                Self::tracking_urls_from_player_response(&json);
+            if playback_url.is_none() && watchtime_url.is_none() && atr_url.is_none() {
+                Self::log_tracking_bootstrap_missing(&video_id, &json);
+                if Self::player_response_requests_reload(&json) {
                     eprintln!(
-                        "[TRACKING] WEB_REMIX bootstrap returned no tracking URLs for {video_id}; retrying with WEB on music.youtube.com"
+                        "[TRACKING] refreshing YTM WEB_REMIX profile after reload-page response for {video_id}"
                     );
+                    web_profile = self.ytm_web_profile(true).await;
+                    match self
+                        .tracking_player_response(
+                            &video_id,
+                            &cpn,
+                            playlist_id,
+                            params,
+                            &web_profile,
+                        )
+                        .await
+                    {
+                        Ok(retry_json) => {
+                            json = retry_json;
+                            (playback_url, watchtime_url, atr_url) =
+                                Self::tracking_urls_from_player_response(&json);
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[TRACKING] WEB_REMIX retry failed after profile refresh for {video_id}: {err}"
+                            );
+                            return None;
+                        }
+                    }
                 }
             }
 
-            let Some((json, playback_url, watchtime_url, atr_url)) = tracking_bootstrap else {
+            if playback_url.is_none() && watchtime_url.is_none() && atr_url.is_none() {
+                Self::log_tracking_bootstrap_missing(&video_id, &json);
                 eprintln!("[TRACKING] playbackTracking block missing for {video_id}");
                 eprintln!("[TRACKING] playback bootstrap URL missing for {video_id}");
                 eprintln!("[TRACKING] watchtime URL missing for {video_id}");
@@ -1452,10 +1977,6 @@ impl YtMusicClient {
                 .unwrap_or(141)
                 .to_string();
             let video_fmt = "0".to_string();
-            let visitor_id = json
-                .pointer("/responseContext/visitorData")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
             let referer_url = playback_url
                 .as_deref()
                 .and_then(|url| TrackingInfo::build_query_map(url))
@@ -1486,7 +2007,6 @@ impl YtMusicClient {
                 atr_url,
                 cpn,
                 referer_url,
-                visitor_id,
                 audio_fmt,
                 video_fmt,
                 length_millis,
@@ -1496,6 +2016,7 @@ impl YtMusicClient {
                 last_activity_millis: AtomicU64::new(0),
                 atr_reported: AtomicBool::new(false),
                 session_started_at,
+                web_profile,
                 rt: rt_ptr,
             };
 
@@ -1525,10 +2046,7 @@ impl YtMusicClient {
             .unwrap();
         let page = clean
             .get("https://www.youtube.com")
-            .header(
-                "user-agent",
-                "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
-            )
+            .header("user-agent", YTM_USER_AGENT)
             .send()
             .await
             .context("Failed to fetch youtube.com")?
@@ -2131,8 +2649,9 @@ pub fn extract_video_id_from_input(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptionTrack, TrackingInfo, YtMusicClient, finalize_synced_lyric_lines, generate_cpn,
-        lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
+        CaptionTrack, TrackingInfo, YtMusicClient, YtmWebProfile, finalize_synced_lyric_lines,
+        generate_cpn, lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
+        ytm_web_profile_from_html,
     };
     use crate::models::{SyncedLyricLine, SyncedLyricsSource};
     use serde_json::json;
@@ -2154,7 +2673,6 @@ mod tests {
             atr_url: atr_url.map(str::to_string),
             cpn: "_Z3q2CnOA6jEC31l".to_string(),
             referer_url: "https://music.youtube.com/".to_string(),
-            visitor_id: None,
             audio_fmt: audio_fmt.to_string(),
             video_fmt: video_fmt.to_string(),
             length_millis,
@@ -2164,6 +2682,7 @@ mod tests {
             last_activity_millis: AtomicU64::new(0),
             atr_reported: AtomicBool::new(false),
             session_started_at: Instant::now() - elapsed,
+            web_profile: YtmWebProfile::fallback(),
             rt: std::ptr::null(),
         }
     }
@@ -2426,11 +2945,11 @@ mod tests {
         assert_eq!(params.get("afmt").map(String::as_str), Some("140"));
         assert_eq!(params.get("vis").map(String::as_str), Some("10"));
         assert_eq!(params.get("mos").map(String::as_str), Some("0"));
-        assert_eq!(params.get("cbr").map(String::as_str), Some("Firefox"));
-        assert_eq!(params.get("cbrver").map(String::as_str), Some("136.0"));
+        assert_eq!(params.get("cbr").map(String::as_str), Some("Edge Chromium"));
+        assert_eq!(params.get("cbrver").map(String::as_str), Some("147.0.0.0"));
         assert_eq!(
             params.get("cver").map(String::as_str),
-            Some("1.20260331.01.00")
+            Some("1.20260426.12.00")
         );
     }
 
@@ -2467,11 +2986,75 @@ mod tests {
     }
 
     #[test]
+    fn ytm_web_profile_parses_page_bootstrap_config() {
+        let html = r#"
+            <script>
+            ytcfg.set({"INNERTUBE_CONTEXT_CLIENT_NAME":67,
+                "INNERTUBE_CONTEXT_CLIENT_VERSION":"1.20260426.12.00",
+                "PAGE_CL":906031756,
+                "PAGE_BUILD_LABEL":"youtube.music.web.client_20260426_12_RC00"});
+            ytcfg.set({"VISITOR_DATA":"visitor-data",
+                "DATASYNC_ID":"103628638237885667007||",
+                "ID_TOKEN":"QUFFLUhqtoken",
+                "INNERTUBE_CONTEXT_HL":"en-IN",
+                "INNERTUBE_CONTEXT_GL":"IN"});
+            </script>
+        "#;
+
+        let profile =
+            ytm_web_profile_from_html(html, 123_456).expect("profile should parse from ytcfg");
+
+        assert_eq!(profile.header_client_name, "67");
+        assert_eq!(profile.client_name, "WEB_REMIX");
+        assert_eq!(profile.client_version, "1.20260426.12.00");
+        assert_eq!(profile.page_cl.as_deref(), Some("906031756"));
+        assert_eq!(
+            profile.page_label.as_deref(),
+            Some("youtube.music.web.client_20260426_12_RC00")
+        );
+        assert_eq!(profile.visitor_data.as_deref(), Some("visitor-data"));
+        assert_eq!(
+            profile.datasync_id.as_deref(),
+            Some("103628638237885667007||")
+        );
+        assert_eq!(profile.identity_token.as_deref(), Some("QUFFLUhqtoken"));
+        assert_eq!(profile.hl, "en-IN");
+        assert_eq!(profile.gl, "IN");
+        assert_eq!(profile.fetched_at_unix_millis, 123_456);
+    }
+
+    #[test]
+    fn reload_page_player_response_is_detected() {
+        let json = json!({
+            "playabilityStatus": {
+                "status": "UNPLAYABLE",
+                "reason": "Video unavailable",
+                "errorScreen": {
+                    "playerErrorMessageRenderer": {
+                        "reason": {
+                            "runs": [
+                                { "text": "The page needs to be reloaded." }
+                            ]
+                        },
+                        "command": {
+                            "signalAction": {
+                                "signal": "RELOAD_PAGE"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        assert!(YtMusicClient::player_response_requests_reload(&json));
+    }
+
+    #[test]
     fn tracking_player_body_carries_playlist_identity_and_cpn() {
+        let profile = YtmWebProfile::fallback();
         let body = YtMusicClient::tracking_player_body(
             "Dx69Ut6Wyuk",
-            "WEB_REMIX",
-            "1.20260331.01.00",
+            &profile,
             "_Z3q2CnOA6jEC31l",
             Some("PLSeq4utvoqwBO9ZHP3ZN-JyGU9wbmphgv"),
             Some("opaque-item-token"),

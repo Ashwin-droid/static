@@ -1364,9 +1364,8 @@ fn start_probe_playback(
         track.video_id,
         playback_source.label(),
     );
+    state.player.set_volume(steady_output_volume(state));
     state.player.play_uri(&prepared_uri);
-    state.player.set_volume(0.0);
-    start_playback_volume_ramp(state, steady_output_volume(state));
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -2090,9 +2089,8 @@ fn play_index_with_startup_retries(
         playback_source.label(),
         playback_start_attempt_total(),
     );
+    state.player.set_volume(steady_output_volume(state));
     state.player.play_uri(&prepared_uri);
-    state.player.set_volume(0.0);
-    start_playback_volume_ramp(state, steady_output_volume(state));
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {

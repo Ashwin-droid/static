@@ -308,6 +308,12 @@ impl InteractiveTui {
                         Ok(results) => {
                             let total = search_results_total(&results);
                             view.status = TuiSearchStatus::Ready(results);
+                            if self.submitted_search_query_to_clear.as_deref()
+                                == Some(query.as_str())
+                            {
+                                self.completed_search_query_to_clear = Some(query.clone());
+                                self.submitted_search_query_to_clear = None;
+                            }
                             self.home_selected = 0;
                             self.home_scroll_offset = 0;
                             self.status_line = format!("Search returned {total} results.");

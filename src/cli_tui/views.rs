@@ -32,6 +32,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_browse_detail(&mut self, card: HomeBrowseCard) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         self.content_view = TuiContentView::Browse(TuiBrowseView {
             card: card.clone(),
@@ -45,6 +46,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_likes(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         self.content_view = TuiContentView::Likes(TuiTrackPageView {
             kind: TuiTrackPageKind::Likes,
@@ -61,6 +63,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_playlists(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         self.content_view = TuiContentView::Playlists(TuiCollectionPageView {
             title: "Your Playlists".to_string(),
@@ -74,6 +77,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_playlist_detail(&mut self, playlist: TuiPlaylistCard) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         let kind = match playlist.source {
             TuiPlaylistSource::Remote => TuiTrackPageKind::RemotePlaylist,
@@ -98,6 +102,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_offline(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         self.content_view = TuiContentView::Offline(TuiOfflineView {
             status: TuiOfflineStatus::Loading,
@@ -125,6 +130,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn open_settings(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         self.push_content_snapshot();
         self.content_view = TuiContentView::Settings(TuiSettingsView {
             status: TuiSettingsStatus::Loading,
@@ -258,6 +264,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn go_back_content(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         if let Some(snapshot) = self.content_backstack.pop() {
             self.restore_content_snapshot(snapshot);
             self.status_line = "Returned to the previous page.".to_string();
@@ -270,6 +277,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn return_home_content(&mut self) {
+        self.clear_completed_search_query_if_leaving_search();
         while let Some(snapshot) = self.content_backstack.pop() {
             if matches!(snapshot.view, TuiContentView::Home) {
                 self.restore_content_snapshot(snapshot);

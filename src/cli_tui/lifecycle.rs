@@ -36,6 +36,8 @@ impl InteractiveTui {
             search_suggestion_request_id: 0,
             search_suggestion_debounce_started_at: None,
             search_suggestion_inflight: None,
+            submitted_search_query_to_clear: None,
+            completed_search_query_to_clear: None,
             radio_chip_scroll_offset: 0,
             remembered_radio_chips: HashMap::new(),
             settings_field_offsets: Vec::new(),

@@ -49,6 +49,7 @@ const YTM_WEB_PROFILE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
 const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
+const YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK: u64 = 20_572;
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -104,11 +105,19 @@ pub struct TrackingInfo {
     rt: *const tokio::runtime::Runtime,
 }
 
+fn default_signature_timestamp() -> u64 {
+    YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct YtmWebProfile {
     client_name: String,
     header_client_name: String,
     client_version: String,
+    #[serde(default)]
+    player_js_url: Option<String>,
+    #[serde(default = "default_signature_timestamp")]
+    signature_timestamp: u64,
     page_cl: Option<String>,
     page_label: Option<String>,
     visitor_data: Option<String>,
@@ -137,6 +146,8 @@ impl YtmWebProfile {
             client_name: YTM_WEB_REMIX_CLIENT_NAME.to_string(),
             header_client_name: YTM_WEB_REMIX_HEADER_CLIENT_NAME.to_string(),
             client_version: YTM_WEB_REMIX_CLIENT_VERSION.to_string(),
+            player_js_url: None,
+            signature_timestamp: YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK,
             page_cl: None,
             page_label: None,
             visitor_data: None,
@@ -929,6 +940,40 @@ fn ytcfg_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<Strin
         .filter(|value| !value.trim().is_empty())
 }
 
+fn ytm_web_player_js_url(map: &serde_json::Map<String, Value>) -> Option<String> {
+    let configs = map
+        .get("WEB_PLAYER_CONTEXT_CONFIGS")
+        .and_then(|value| value.as_object())?;
+    let config = configs
+        .get("WEB_PLAYER_CONTEXT_CONFIG_ID_MUSIC_WATCH")
+        .or_else(|| configs.values().next())?;
+    config
+        .get("jsUrl")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn absolute_ytm_url(path_or_url: &str) -> Option<String> {
+    let trimmed = path_or_url.trim();
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Some(trimmed.to_string());
+    }
+    if trimmed.starts_with('/') {
+        return Some(format!("{YTM_ORIGIN}{trimmed}"));
+    }
+    None
+}
+
+fn signature_timestamp_from_player_js(js: &str) -> Option<u64> {
+    let re = Regex::new(r"signatureTimestamp\s*:\s*(\d+)")
+        .expect("signature timestamp regex should compile");
+    re.captures(js)
+        .and_then(|captures| captures.get(1))
+        .and_then(|capture| capture.as_str().parse::<u64>().ok())
+}
+
 fn ytm_web_profile_from_html(html: &str, fetched_at_unix_millis: u64) -> Result<YtmWebProfile> {
     let re = Regex::new(r"ytcfg\.set\s*\(").expect("ytcfg regex should compile");
     let mut config = serde_json::Map::<String, Value>::new();
@@ -955,6 +1000,7 @@ fn ytm_web_profile_from_html(html: &str, fetched_at_unix_millis: u64) -> Result<
     profile.client_name = YTM_WEB_REMIX_CLIENT_NAME.to_string();
     profile.client_version = ytcfg_string(&config, "INNERTUBE_CONTEXT_CLIENT_VERSION")
         .unwrap_or_else(|| YTM_WEB_REMIX_CLIENT_VERSION.to_string());
+    profile.player_js_url = ytm_web_player_js_url(&config);
     profile.page_cl =
         ytcfg_string(&config, "PAGE_CL").or_else(|| ytcfg_string(&config, "PAGE_BUILD_CL"));
     profile.page_label = ytcfg_string(&config, "PAGE_BUILD_LABEL");
@@ -1266,7 +1312,51 @@ impl YtMusicClient {
             .text()
             .await
             .context("Failed to read YouTube Music web shell")?;
-        ytm_web_profile_from_html(&html, unix_epoch_millis_u64())
+        let mut profile = ytm_web_profile_from_html(&html, unix_epoch_millis_u64())?;
+
+        if let Some(player_js_url) = profile.player_js_url.as_deref().and_then(absolute_ytm_url) {
+            match http
+                .get(&player_js_url)
+                .header("user-agent", YTM_USER_AGENT)
+                .header("referer", format!("{YTM_ORIGIN}/"))
+                .send()
+                .await
+            {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.text().await {
+                        Ok(js) => {
+                            if let Some(signature_timestamp) =
+                                signature_timestamp_from_player_js(&js)
+                            {
+                                profile.signature_timestamp = signature_timestamp;
+                            } else {
+                                eprintln!(
+                                    "[TRACKING] YTM player JS did not expose signatureTimestamp; using {}",
+                                    profile.signature_timestamp
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[TRACKING] failed to read YTM player JS for signatureTimestamp: {err}"
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        eprintln!(
+                            "[TRACKING] YTM player JS request for signatureTimestamp was rejected: {err}"
+                        );
+                    }
+                },
+                Err(err) => {
+                    eprintln!(
+                        "[TRACKING] failed to fetch YTM player JS for signatureTimestamp: {err}"
+                    );
+                }
+            }
+        }
+
+        Ok(profile)
     }
 
     async fn ytm_web_profile(&self, force_refresh: bool) -> YtmWebProfile {
@@ -1339,6 +1429,7 @@ impl YtMusicClient {
                 "html5Preference": "HTML5_PREF_WANTS",
                 "lactMilliseconds": "0",
                 "referer": format!("{YTM_ORIGIN}/"),
+                "signatureTimestamp": profile.signature_timestamp,
                 "autonavState": "STATE_OFF",
                 "autoCaptionsDefaultOn": false,
                 "vis": 1
@@ -2649,9 +2740,10 @@ pub fn extract_video_id_from_input(input: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptionTrack, TrackingInfo, YtMusicClient, YtmWebProfile, finalize_synced_lyric_lines,
-        generate_cpn, lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
-        ytm_web_profile_from_html,
+        CaptionTrack, TrackingInfo, YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK, YtMusicClient,
+        YtmWebProfile, finalize_synced_lyric_lines, generate_cpn,
+        lyrics_browse_id_from_next_response, prepare_cookie_for_sapisid_auth,
+        signature_timestamp_from_player_js, ytm_web_profile_from_html,
     };
     use crate::models::{SyncedLyricLine, SyncedLyricsSource};
     use serde_json::json;
@@ -2992,7 +3084,12 @@ mod tests {
             ytcfg.set({"INNERTUBE_CONTEXT_CLIENT_NAME":67,
                 "INNERTUBE_CONTEXT_CLIENT_VERSION":"1.20260426.12.00",
                 "PAGE_CL":906031756,
-                "PAGE_BUILD_LABEL":"youtube.music.web.client_20260426_12_RC00"});
+                "PAGE_BUILD_LABEL":"youtube.music.web.client_20260426_12_RC00",
+                "WEB_PLAYER_CONTEXT_CONFIGS": {
+                    "WEB_PLAYER_CONTEXT_CONFIG_ID_MUSIC_WATCH": {
+                        "jsUrl": "/s/player/5afa7c36/player_es6.vflset/en_GB/base.js"
+                    }
+                }});
             ytcfg.set({"VISITOR_DATA":"visitor-data",
                 "DATASYNC_ID":"103628638237885667007||",
                 "ID_TOKEN":"QUFFLUhqtoken",
@@ -3007,6 +3104,14 @@ mod tests {
         assert_eq!(profile.header_client_name, "67");
         assert_eq!(profile.client_name, "WEB_REMIX");
         assert_eq!(profile.client_version, "1.20260426.12.00");
+        assert_eq!(
+            profile.player_js_url.as_deref(),
+            Some("/s/player/5afa7c36/player_es6.vflset/en_GB/base.js")
+        );
+        assert_eq!(
+            profile.signature_timestamp,
+            YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK
+        );
         assert_eq!(profile.page_cl.as_deref(), Some("906031756"));
         assert_eq!(
             profile.page_label.as_deref(),
@@ -3021,6 +3126,13 @@ mod tests {
         assert_eq!(profile.hl, "en-IN");
         assert_eq!(profile.gl, "IN");
         assert_eq!(profile.fetched_at_unix_millis, 123_456);
+    }
+
+    #[test]
+    fn player_js_signature_timestamp_is_extracted() {
+        let js = r#"x={splay:!1,lactMilliseconds:"0",signatureTimestamp:20572,vis:1};"#;
+
+        assert_eq!(signature_timestamp_from_player_js(js), Some(20_572));
     }
 
     #[test]
@@ -3065,6 +3177,11 @@ mod tests {
         assert_eq!(body["playlistId"], "PLSeq4utvoqwBO9ZHP3ZN-JyGU9wbmphgv");
         assert_eq!(body["params"], "opaque-item-token");
         assert_eq!(body["captionParams"], json!({}));
+        assert_eq!(
+            body.pointer("/playbackContext/contentPlaybackContext/signatureTimestamp")
+                .and_then(|value| value.as_u64()),
+            Some(YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK)
+        );
         assert_eq!(
             body.pointer("/playbackContext/contentPlaybackContext/referer")
                 .and_then(|value| value.as_str()),

@@ -31,7 +31,8 @@ impl InteractiveTui {
             .constraints([
                 Constraint::Length(12),
                 Constraint::Length(12),
-                Constraint::Min(6),
+                Constraint::Min(0),
+                Constraint::Length(15),
             ])
             .split(rows[0]);
         for (area, tab, label) in [
@@ -75,6 +76,34 @@ impl InteractiveTui {
             targets.push(ClickTarget {
                 rect: area,
                 kind: ClickTargetKind::DetailTab(tab),
+            });
+        }
+
+        let can_dismiss = can_dismiss_queue(&self.snapshot);
+        let dismiss_area = tab_columns[3];
+        let dismiss_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(if can_dismiss {
+                theme.border_focus
+            } else {
+                theme.border_subtle
+            }))
+            .style(Style::default().bg(theme.elevated_bg));
+        let dismiss_inner = dismiss_block.inner(dismiss_area);
+        frame.render_widget(dismiss_block, dismiss_area);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Dismiss Queue",
+                Style::default().fg(if can_dismiss { theme.text } else { theme.muted }),
+            )))
+            .alignment(Alignment::Center),
+            dismiss_inner,
+        );
+        if can_dismiss {
+            targets.push(ClickTarget {
+                rect: dismiss_area,
+                kind: ClickTargetKind::Action(TuiAction::DismissQueue),
             });
         }
 

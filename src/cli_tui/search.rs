@@ -11,6 +11,21 @@ impl InteractiveTui {
                 .to_string();
     }
 
+    pub(in crate::cli_tui) fn clear_completed_search_query_if_leaving_search(&mut self) {
+        let Some(query) = self.completed_search_query_to_clear.take() else {
+            return;
+        };
+
+        let leaving_completed_search = matches!(
+            &self.content_view,
+            TuiContentView::Search(view)
+                if view.query == query && matches!(view.status, TuiSearchStatus::Ready(_))
+        );
+        if leaving_completed_search && self.search_query.trim() == query {
+            self.search_query.clear();
+        }
+    }
+
     pub(in crate::cli_tui) fn clear_search_suggestions(&mut self) {
         self.search_suggestions.clear();
         self.search_suggestions_loading = false;
@@ -20,8 +35,7 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn schedule_search_suggestions(&mut self) {
-        let query = self.search_query.trim();
-        if !self.search_input_active || query.is_empty() {
+        if !self.search_input_active {
             self.clear_search_suggestions();
             return;
         }
@@ -43,7 +57,7 @@ impl InteractiveTui {
         let query = self.search_query.trim().to_string();
         self.search_suggestion_debounce_started_at = None;
 
-        if !self.search_input_active || query.is_empty() {
+        if !self.search_input_active {
             self.clear_search_suggestions();
             return;
         }
@@ -105,6 +119,8 @@ impl InteractiveTui {
             return;
         }
 
+        self.submitted_search_query_to_clear = Some(query.clone());
+        self.completed_search_query_to_clear = None;
         self.search_query = query.clone();
         self.open_search(query);
     }

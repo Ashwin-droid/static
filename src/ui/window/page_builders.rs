@@ -334,6 +334,20 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         next
     }
 
+    fn clear_completed_sidebar_search(
+        search_entry: &Entry,
+        completed_search_query_to_clear: &Rc<RefCell<Option<String>>>,
+        suppress_search_suggestions: &Rc<Cell<bool>>,
+    ) {
+        let Some(query) = completed_search_query_to_clear.borrow_mut().take() else {
+            return;
+        };
+        if search_entry.text().trim() == query {
+            suppress_search_suggestions.set(true);
+            search_entry.set_text("");
+        }
+    }
+
     fn run_sidebar_search(
         state: &Arc<Mutex<AppState>>,
         content_box: &GtkBox,
@@ -343,12 +357,14 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         ps: &Rc<PlayerState>,
         recent_list: &GtkBox,
         search_request_serial: &Rc<Cell<u64>>,
+        completed_search_query_to_clear: &Rc<RefCell<Option<String>>>,
     ) {
         let query = query.trim().to_string();
         if query.is_empty() {
             return;
         }
 
+        completed_search_query_to_clear.borrow_mut().take();
         let request_id = next_search_request_id(search_request_serial);
         if let Some(target) = parse_direct_music_url(&query) {
             autoplay_direct_music_url(
@@ -371,6 +387,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                 ps,
                 recent_list,
                 Some((search_request_serial.clone(), request_id)),
+                Some(completed_search_query_to_clear.clone()),
             );
         }
     }
@@ -1227,6 +1244,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     let search_suggestion_request_serial = Rc::new(Cell::new(0_u64));
     let search_suggestion_debounce = Rc::new(RefCell::new(None::<glib::SourceId>));
     let suppress_search_suggestions = Rc::new(Cell::new(false));
+    let completed_search_query_to_clear = Rc::new(RefCell::new(None::<String>));
 
     {
         let state_for_value = state.clone();
@@ -1277,8 +1295,16 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
+        let search_entry = search_entry.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
 
         home_btn.connect_clicked(move |btn| {
+            clear_completed_sidebar_search(
+                &search_entry,
+                &completed_search_query_to_clear,
+                &suppress_search_suggestions,
+            );
             set_active_nav(btn, &nav);
             load_home(
                 &state,
@@ -1299,8 +1325,16 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
+        let search_entry = search_entry.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
 
         likes_btn.connect_clicked(move |btn| {
+            clear_completed_sidebar_search(
+                &search_entry,
+                &completed_search_query_to_clear,
+                &suppress_search_suggestions,
+            );
             set_active_nav(btn, &nav);
             load_likes(&state, &content_box, &ps, &recent_list);
         });
@@ -1313,8 +1347,16 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
+        let search_entry = search_entry.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
 
         playlists_btn.connect_clicked(move |btn| {
+            clear_completed_sidebar_search(
+                &search_entry,
+                &completed_search_query_to_clear,
+                &suppress_search_suggestions,
+            );
             set_active_nav(btn, &nav);
             load_playlists(&state, &content_box, &ps, &recent_list);
         });
@@ -1328,8 +1370,16 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let ps = ps.clone();
         let recent_list = recent_list.clone();
         let nav = nav_buttons.clone();
+        let search_entry = search_entry.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
 
         offline_btn.connect_clicked(move |btn| {
+            clear_completed_sidebar_search(
+                &search_entry,
+                &completed_search_query_to_clear,
+                &suppress_search_suggestions,
+            );
             set_active_nav(btn, &nav);
             load_offline(&state, &content_box, &content_scroll, &ps, &recent_list);
         });
@@ -1342,8 +1392,16 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let content_box = content_box.clone();
         let ps = ps.clone();
         let nav = nav_buttons.clone();
+        let search_entry = search_entry.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
+        let suppress_search_suggestions = suppress_search_suggestions.clone();
 
         settings_btn.connect_clicked(move |btn| {
+            clear_completed_sidebar_search(
+                &search_entry,
+                &completed_search_query_to_clear,
+                &suppress_search_suggestions,
+            );
             set_active_nav(btn, &nav);
             load_settings_page(&state, &stack, &content_box, &ps);
         });
@@ -1362,6 +1420,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let search_suggestion_debounce = search_suggestion_debounce.clone();
         let search_suggestions_panel = search_suggestions_panel.clone();
         let search_suggestions_box = search_suggestions_box.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
 
         search_entry.connect_activate(move |entry| {
             if let Some(source) = search_suggestion_debounce.borrow_mut().take() {
@@ -1379,6 +1438,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                 &ps,
                 &recent_list,
                 &search_request_serial,
+                &completed_search_query_to_clear,
             );
         });
     }
@@ -1397,9 +1457,14 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         let search_suggestions_box = search_suggestions_box.clone();
         let search_entry_for_suggestions = search_entry.clone();
         let suppress_search_suggestions = suppress_search_suggestions.clone();
+        let completed_search_query_to_clear = completed_search_query_to_clear.clone();
 
         search_entry.connect_changed(move |entry| {
             if suppress_search_suggestions.replace(false) {
+                return;
+            }
+
+            if !entry.has_focus() {
                 return;
             }
 
@@ -1412,7 +1477,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
             clear_box(&search_suggestions_box);
             search_suggestions_panel.set_visible(false);
 
-            if query.is_empty() || parse_direct_music_url(&query).is_some() {
+            if parse_direct_music_url(&query).is_some() {
                 return;
             }
 
@@ -1429,6 +1494,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
             let search_suggestions_box = search_suggestions_box.clone();
             let search_entry = search_entry_for_suggestions.clone();
             let suppress_search_suggestions = suppress_search_suggestions.clone();
+            let completed_search_query_to_clear = completed_search_query_to_clear.clone();
 
             let source =
                 glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
@@ -1446,6 +1512,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                     let search_suggestions_box = search_suggestions_box.clone();
                     let search_entry = search_entry.clone();
                     let suppress_search_suggestions = suppress_search_suggestions.clone();
+                    let completed_search_query_to_clear = completed_search_query_to_clear.clone();
                     let query = query.clone();
 
                     glib::spawn_future_local(async move {
@@ -1498,6 +1565,8 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                                     let search_entry = search_entry.clone();
                                     let suppress_search_suggestions =
                                         suppress_search_suggestions.clone();
+                                    let completed_search_query_to_clear =
+                                        completed_search_query_to_clear.clone();
                                     let suggestion_text = suggestion.clone();
 
                                     suggestion_btn.connect_clicked(move |_| {
@@ -1516,6 +1585,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                                             &ps,
                                             &recent_list,
                                             &search_request_serial,
+                                            &completed_search_query_to_clear,
                                         );
                                     });
 
@@ -1544,12 +1614,19 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     }
 
     {
+        let search_suggestion_request_serial = search_suggestion_request_serial.clone();
+        let search_suggestion_debounce = search_suggestion_debounce.clone();
         let search_suggestions_panel = search_suggestions_panel.clone();
         let search_suggestions_box = search_suggestions_box.clone();
         search_entry.connect_has_focus_notify(move |entry| {
             if entry.has_focus() {
+                entry.emit_by_name::<()>("changed", &[]);
                 return;
             }
+            if let Some(source) = search_suggestion_debounce.borrow_mut().take() {
+                source.remove();
+            }
+            next_search_request_id(&search_suggestion_request_serial);
             clear_box(&search_suggestions_box);
             search_suggestions_panel.set_visible(false);
         });

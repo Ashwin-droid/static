@@ -192,6 +192,7 @@ enum TuiAction {
     CycleRepeat,
     VolumeDown,
     VolumeUp,
+    DismissQueue,
 }
 
 const VOLUME_STEP: f64 = 0.05;
@@ -745,6 +746,8 @@ struct InteractiveTui {
     search_suggestion_request_id: u64,
     search_suggestion_debounce_started_at: Option<Instant>,
     search_suggestion_inflight: Option<(u64, String)>,
+    submitted_search_query_to_clear: Option<String>,
+    completed_search_query_to_clear: Option<String>,
     radio_chip_scroll_offset: usize,
     remembered_radio_chips: HashMap<String, Vec<RadioChip>>,
     settings_field_offsets: Vec<(usize, usize)>,

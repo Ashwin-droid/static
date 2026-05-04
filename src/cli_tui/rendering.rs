@@ -312,14 +312,29 @@ impl InteractiveTui {
                     suggestions_inner,
                 );
             } else {
-                for (index, suggestion) in self.search_suggestions.iter().take(6).enumerate() {
+                let visible_count = suggestions_inner
+                    .height
+                    .min(self.search_suggestions.len() as u16)
+                    as usize;
+                let max_start = self.search_suggestions.len().saturating_sub(visible_count);
+                let first_visible = self
+                    .search_suggestion_selected
+                    .saturating_add(1)
+                    .saturating_sub(visible_count)
+                    .min(max_start);
+
+                for (row_index, suggestion_index) in (first_visible..self.search_suggestions.len())
+                    .take(visible_count)
+                    .enumerate()
+                {
+                    let suggestion = &self.search_suggestions[suggestion_index];
                     let row = Rect::new(
                         suggestions_inner.x,
-                        suggestions_inner.y + index as u16,
+                        suggestions_inner.y + row_index as u16,
                         suggestions_inner.width,
                         1,
                     );
-                    let selected = index == self.search_suggestion_selected;
+                    let selected = suggestion_index == self.search_suggestion_selected;
                     frame.render_widget(
                         Block::default().style(Style::default().bg(if selected {
                             theme.accent_fill
@@ -354,7 +369,7 @@ impl InteractiveTui {
                     );
                     targets.push(ClickTarget {
                         rect: row,
-                        kind: ClickTargetKind::SearchSuggestion(index),
+                        kind: ClickTargetKind::SearchSuggestion(suggestion_index),
                     });
                 }
             }

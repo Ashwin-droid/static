@@ -434,6 +434,23 @@ impl InteractiveTui {
                 let next = (self.snapshot.volume + VOLUME_STEP).clamp(0.0, 1.0);
                 self.client.set_volume(next)
             }
+            TuiAction::DismissQueue => {
+                if !can_dismiss_queue(&self.snapshot) {
+                    anyhow::bail!("No queued tail to dismiss");
+                }
+
+                let keep_len = self.snapshot.queue_index.saturating_add(1);
+                let mut queue = self.snapshot.queue.clone();
+                queue.truncate(keep_len);
+                let current_index = self.snapshot.queue_index.min(queue.len().saturating_sub(1));
+                self.client.replace_queue(
+                    queue,
+                    current_index,
+                    self.snapshot.playlist_context.clone(),
+                    None,
+                    self.snapshot.repeat_mode,
+                )
+            }
         }
     }
 
@@ -710,5 +727,10 @@ pub(in crate::cli_tui) fn action_label(action: TuiAction) -> &'static str {
         TuiAction::CycleRepeat => "Repeat",
         TuiAction::VolumeDown => "Volume down",
         TuiAction::VolumeUp => "Volume up",
+        TuiAction::DismissQueue => "Dismiss queue",
     }
+}
+
+pub(in crate::cli_tui) fn can_dismiss_queue(snapshot: &PlaybackSnapshot) -> bool {
+    snapshot.queue_index.saturating_add(1) < snapshot.queue.len()
 }

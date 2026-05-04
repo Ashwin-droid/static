@@ -588,6 +588,7 @@ pub(super) fn load_search(
     ps: &Rc<PlayerState>,
     recent_list: &GtkBox,
     request_serial: Option<(Rc<Cell<u64>>, u64)>,
+    completed_search_query_to_clear: Option<Rc<RefCell<Option<String>>>>,
 ) {
     clear_box(content_box);
     let loading = Label::new(Some(&format!("Searching \"{query}\"...")));
@@ -603,6 +604,7 @@ pub(super) fn load_search(
     let ps = ps.clone();
     let recent_list = recent_list.clone();
     let request_serial = request_serial.clone();
+    let completed_search_query_to_clear = completed_search_query_to_clear.clone();
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
@@ -620,6 +622,9 @@ pub(super) fn load_search(
 
         match result {
             Ok(Some(Ok(results))) => {
+                if let Some(completed) = completed_search_query_to_clear.as_ref() {
+                    completed.replace(Some(query.clone()));
+                }
                 let cache = SearchPageCache {
                     query: query.clone(),
                     results,

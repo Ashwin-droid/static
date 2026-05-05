@@ -176,6 +176,16 @@ impl YtmWebProfile {
             <= YTM_WEB_PROFILE_CACHE_TTL.as_millis() as u64
     }
 
+    fn has_page_identity(&self) -> bool {
+        self.identity_token
+            .as_ref()
+            .is_some_and(|token| !token.trim().is_empty())
+    }
+
+    fn is_fresh_for_tracking(&self, now_unix_millis: u64) -> bool {
+        self.is_fresh(now_unix_millis) && self.has_page_identity()
+    }
+
     fn device_header(&self) -> String {
         format!(
             "cbr={}&cbrver={}&ceng={}&cengver={}&cos={}&cplatform={}",
@@ -1370,8 +1380,13 @@ impl YtMusicClient {
 
         if !force_refresh {
             if let Some(profile) = cached.as_ref() {
-                if profile.is_fresh(unix_epoch_millis_u64()) {
+                if profile.is_fresh_for_tracking(unix_epoch_millis_u64()) {
                     return profile.clone();
+                }
+                if profile.is_fresh(unix_epoch_millis_u64()) && !profile.has_page_identity() {
+                    eprintln!(
+                        "[TRACKING] cached YTM WEB_REMIX profile is missing page identity; refreshing"
+                    );
                 }
             }
         }
@@ -3126,6 +3141,19 @@ mod tests {
         assert_eq!(profile.hl, "en-IN");
         assert_eq!(profile.gl, "IN");
         assert_eq!(profile.fetched_at_unix_millis, 123_456);
+    }
+
+    #[test]
+    fn cached_tracking_profile_needs_page_identity() {
+        let now = 1_000_000;
+        let mut profile = YtmWebProfile::fallback();
+        profile.fetched_at_unix_millis = now;
+
+        assert!(profile.is_fresh(now));
+        assert!(!profile.is_fresh_for_tracking(now));
+
+        profile.identity_token = Some("QUFFLUhqtoken".to_string());
+        assert!(profile.is_fresh_for_tracking(now));
     }
 
     #[test]

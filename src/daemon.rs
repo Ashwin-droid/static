@@ -1903,13 +1903,30 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
             playback_start_attempt_total(),
         );
 
-        if playback_source == PlaybackSource::TempPrefetch {
-            eprintln!(
-                "[DAEMON] stopping stalled {} playback and evicting prefetched temp audio for {video_id} before startup retry",
-                playback_source.label()
-            );
+        if should_evict_cache_after_startup_stall(playback_source) {
+            let preserved_track_repeat_loops_left = state.track_repeat_loops_left;
             stop_playback(state, false);
-            state.cache.remove_temp_audio(&video_id);
+            state.track_repeat_loops_left = preserved_track_repeat_loops_left;
+
+            match playback_source {
+                PlaybackSource::TempPrefetch => {
+                    eprintln!(
+                        "[DAEMON] evicting prefetched temp audio for {video_id} before startup retry"
+                    );
+                    state.cache.remove_temp_audio(&video_id);
+                }
+                PlaybackSource::OfflineCache => {
+                    eprintln!(
+                        "[DAEMON] evicting cached offline audio for {video_id} after startup stall before retry"
+                    );
+                    if let Err(err) = state.cache.remove_cached(&video_id) {
+                        eprintln!(
+                            "[DAEMON] failed to evict stalled offline cache for {video_id}: {err}"
+                        );
+                    }
+                }
+                PlaybackSource::RemoteStream => {}
+            }
         }
 
         if let Err(err) = play_index_with_startup_retries(
@@ -2202,6 +2219,13 @@ fn should_retry_after_offline_cache_failure(
     awaiting_fresh_position: bool,
 ) -> bool {
     playback_source == PlaybackSource::OfflineCache && awaiting_fresh_position
+}
+
+fn should_evict_cache_after_startup_stall(playback_source: PlaybackSource) -> bool {
+    matches!(
+        playback_source,
+        PlaybackSource::OfflineCache | PlaybackSource::TempPrefetch
+    )
 }
 
 fn handle_playback_failure(state: &mut DaemonState, error: String) {
@@ -3965,9 +3989,10 @@ mod tests {
         pause_previous_threshold_clock_for_track, playback_position_confirms_start,
         playback_start_stalled, previous_action, previous_threshold_millis,
         rearm_track_repeat_loops_for_snapshot, reset_previous_threshold_clock_for_track,
-        should_emit_live_mpris_seeked_hint, should_resume_after_external_mpris_pause,
-        should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-        should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
+        should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
+        should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
+        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+        should_wait_for_radio_extension_at_natural_end,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
@@ -4238,6 +4263,19 @@ mod tests {
         assert!(!should_retry_after_offline_cache_failure(
             PlaybackSource::RemoteStream,
             true
+        ));
+    }
+
+    #[test]
+    fn startup_stalls_evict_local_cache_sources_before_retrying() {
+        assert!(should_evict_cache_after_startup_stall(
+            PlaybackSource::OfflineCache
+        ));
+        assert!(should_evict_cache_after_startup_stall(
+            PlaybackSource::TempPrefetch
+        ));
+        assert!(!should_evict_cache_after_startup_stall(
+            PlaybackSource::RemoteStream
         ));
     }
 

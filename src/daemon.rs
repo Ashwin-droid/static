@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{
     Arc,
@@ -150,6 +151,7 @@ struct DaemonState {
     cache: MusicCache,
     settings: AppSettings,
     client: Option<Rc<NetworkState>>,
+    client_cookie_fingerprint: Option<u64>,
     queue: Vec<Track>,
     queue_index: usize,
     playlist_context: Option<PlaylistContext>,
@@ -756,6 +758,7 @@ pub fn run() -> Result<()> {
         cache,
         settings,
         client: None,
+        client_cookie_fingerprint: None,
         queue: Vec::new(),
         queue_index: 0,
         playlist_context: None,
@@ -2320,13 +2323,29 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
     stop_playback(state, false);
 }
 
+fn cookie_fingerprint(cookie: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    cookie.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<NetworkState>> {
+    let cookie = get_cookie().ok_or_else(|| anyhow!("No saved cookie available"))?;
+    let fingerprint = cookie_fingerprint(&cookie);
+
     if let Some(client) = state.client.as_ref() {
-        return Ok(client.clone());
+        if state.client_cookie_fingerprint == Some(fingerprint) {
+            return Ok(client.clone());
+        }
+
+        eprintln!("[AUTH] saved cookie changed; refreshing daemon auth client");
+        state.client = None;
+        state.client_cookie_fingerprint = None;
     }
 
-    let client = Rc::new(NetworkState::from_saved_session()?);
+    let client = Rc::new(NetworkState::from_cookie(&cookie)?);
     state.client = Some(client.clone());
+    state.client_cookie_fingerprint = Some(fingerprint);
     Ok(client)
 }
 
@@ -2686,17 +2705,15 @@ fn start_playback_tracking_with_retry(
         .map(|track| track.started_at)
         .unwrap_or_else(Instant::now);
 
-    if state.client.is_none() {
-        match ensure_client_loaded(state) {
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!(
-                    "[TRACKING] attempt {current_attempt} for {video_id} could not load auth client: {err}"
-                );
-                return None;
-            }
+    let client = match ensure_client_loaded(state) {
+        Ok(client) => client,
+        Err(err) => {
+            eprintln!(
+                "[TRACKING] attempt {current_attempt} for {video_id} could not load auth client: {err}"
+            );
+            return None;
         }
-    }
+    };
 
     let queued_track = state
         .queue
@@ -2713,14 +2730,12 @@ fn start_playback_tracking_with_retry(
         });
     let playback_params = queued_track.and_then(|track| track.playback_params.clone());
 
-    if let Some(tracking) = state.client.as_ref().and_then(|client| {
-        client.start_playback_tracking(
-            video_id,
-            session_started_at,
-            playback_playlist_id.as_deref(),
-            playback_params.as_deref(),
-        )
-    }) {
+    if let Some(tracking) = client.start_playback_tracking(
+        video_id,
+        session_started_at,
+        playback_playlist_id.as_deref(),
+        playback_params.as_deref(),
+    ) {
         if current_attempt > 1 {
             eprintln!(
                 "[TRACKING] recovered telemetry bootstrap for {video_id} on attempt {current_attempt}"
@@ -2733,6 +2748,7 @@ fn start_playback_tracking_with_retry(
         "[TRACKING] attempt {current_attempt} for {video_id} returned no watchtime tracker; refreshing auth client"
     );
     state.client = None;
+    state.client_cookie_fingerprint = None;
 
     let refreshed_client = match ensure_client_loaded(state) {
         Ok(client) => client,

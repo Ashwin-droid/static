@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -102,7 +105,7 @@ pub struct TrackingInfo {
     atr_reported: AtomicBool,
     session_started_at: Instant,
     web_profile: YtmWebProfile,
-    rt: *const tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
 }
 
 fn default_signature_timestamp() -> u64 {
@@ -265,12 +268,6 @@ fn lyrics_browse_id_from_next_response(value: &Value) -> Option<String> {
         .and_then(|browse_id| browse_id.as_str())
         .map(str::to_string)
 }
-
-// TrackingInfo contains a raw pointer to the runtime which lives in YtMusicClient
-// (always alive while AppState exists). We only use it from background threads via
-// report_watchtime which is called from gio::spawn_blocking.
-unsafe impl Send for TrackingInfo {}
-unsafe impl Sync for TrackingInfo {}
 
 impl TrackingInfo {
     fn next_flush_after(&self, last_reported_millis: u64) -> Option<u64> {
@@ -582,7 +579,7 @@ impl TrackingInfo {
     }
 
     fn dispatch_watchtime_request(&self, request: PendingWatchtimeRequest) {
-        let rt = unsafe { &*self.rt };
+        let rt = self.rt.clone();
         let http = self.http.clone();
         let auth = self.auth.clone();
         let web_profile = self.web_profile.clone();
@@ -611,7 +608,7 @@ impl TrackingInfo {
     }
 
     fn dispatch_watchtime_request_blocking(&self, request: PendingWatchtimeRequest) {
-        let rt = unsafe { &*self.rt };
+        let rt = self.rt.clone();
         let http = self.http.clone();
         let auth = self.auth.clone();
         let web_profile = self.web_profile.clone();
@@ -640,7 +637,7 @@ impl TrackingInfo {
     }
 
     fn dispatch_tracking_request(&self, request: PendingTrackingRequest) {
-        let rt = unsafe { &*self.rt };
+        let rt = self.rt.clone();
         let http = self.http.clone();
         let auth = self.auth.clone();
         let web_profile = self.web_profile.clone();
@@ -735,7 +732,7 @@ impl TrackingInfo {
 
         let final_request = self.build_watchtime_request(watched, watched, "paused", true);
 
-        let rt = unsafe { &*self.rt };
+        let rt = self.rt.clone();
         let http = self.http.clone();
         let auth = self.auth.clone();
         let web_profile = self.web_profile.clone();
@@ -1120,7 +1117,7 @@ pub struct YtMusicClient {
     http: reqwest::Client,
     #[allow(dead_code)]
     cookie: String,
-    rt: tokio::runtime::Runtime,
+    rt: Arc<tokio::runtime::Runtime>,
     sapisid: Option<String>,
     visitor_data: std::sync::Mutex<Option<String>>,
     /// OAuth refresh token for Android VR (premium content)
@@ -1218,10 +1215,12 @@ impl YtMusicClient {
             .build()
             .context("Failed to build HTTP client")?;
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .context("Failed to create tokio runtime")?;
+        let rt = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("Failed to create tokio runtime")?,
+        );
 
         if let Some(source) = sapisid_source.filter(|source| *source != "SAPISID") {
             eprintln!("[AUTH] using {source} as a SAPISID fallback for authenticated requests");
@@ -1967,7 +1966,7 @@ impl YtMusicClient {
         params: Option<&str>,
     ) -> Option<TrackingInfo> {
         let video_id = video_id.to_string();
-        let rt_ptr: *const tokio::runtime::Runtime = &self.rt;
+        let rt = self.rt.clone();
         let auth = self.auth_header();
         let cpn = generate_cpn();
 
@@ -2123,7 +2122,7 @@ impl YtMusicClient {
                 atr_reported: AtomicBool::new(false),
                 session_started_at,
                 web_profile,
-                rt: rt_ptr,
+                rt,
             };
 
             if let Some(url) = playback_url.as_deref() {
@@ -2762,6 +2761,7 @@ mod tests {
     };
     use crate::models::{SyncedLyricLine, SyncedLyricsSource};
     use serde_json::json;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::time::{Duration, Instant};
 
@@ -2790,7 +2790,12 @@ mod tests {
             atr_reported: AtomicBool::new(false),
             session_started_at: Instant::now() - elapsed,
             web_profile: YtmWebProfile::fallback(),
-            rt: std::ptr::null(),
+            rt: Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime"),
+            ),
         }
     }
 

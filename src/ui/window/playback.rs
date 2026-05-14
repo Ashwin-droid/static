@@ -52,6 +52,7 @@ pub(super) fn active_track_snapshot_from_track(track: &Track) -> ActiveTrackSnap
 
 pub(super) fn playback_snapshot_from_ui_state(ps: &PlayerState) -> PlaybackSnapshot {
     let mut snapshot = ps.player.snapshot();
+    snapshot.halt_auto_resume_pending = false;
     let use_live_ui_queue = !ps.queue.borrow().is_empty();
     let queue = if use_live_ui_queue {
         ps.queue.borrow().clone()
@@ -287,6 +288,15 @@ pub(super) fn apply_remote_snapshot(
         update_repeat_button_ui(&ps.repeat_btn, snapshot.repeat_mode);
     }
 
+    ps.halt_auto_cancel_btn
+        .set_visible(snapshot.halt_auto_resume_pending);
+    ps.halt_auto_resume_btn
+        .set_visible(snapshot.halt_auto_resume_pending);
+    ps.halt_auto_cancel_btn
+        .set_sensitive(snapshot.halt_auto_resume_pending);
+    ps.halt_auto_resume_btn
+        .set_sensitive(snapshot.halt_auto_resume_pending);
+
     if let Some(loops_left) = snapshot
         .track_repeat_loops_left
         .filter(|_| snapshot.current_track.is_some())
@@ -389,6 +399,10 @@ pub(super) fn apply_remote_snapshot(
             ps.play_pause_btn.set_sensitive(false);
             ps.prev_btn.set_sensitive(false);
             ps.next_btn.set_sensitive(false);
+            ps.halt_auto_cancel_btn.set_visible(false);
+            ps.halt_auto_resume_btn.set_visible(false);
+            ps.halt_auto_cancel_btn.set_sensitive(false);
+            ps.halt_auto_resume_btn.set_sensitive(false);
             ps.like_btn.set_sensitive(false);
             ps.dislike_btn.set_sensitive(false);
             ps.menu_btn.set_sensitive(false);

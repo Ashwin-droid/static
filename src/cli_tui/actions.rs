@@ -120,7 +120,7 @@ impl InteractiveTui {
             TuiFocus::Queue => self.activate_queue_selection(),
             TuiFocus::Recent => self.activate_recent_selection(),
             TuiFocus::Player => {
-                let action = PLAYER_ACTIONS
+                let action = player_actions(&self.snapshot)
                     .get(self.player_selected)
                     .copied()
                     .unwrap_or(TuiAction::TogglePause);

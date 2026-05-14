@@ -599,6 +599,17 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     next_btn.set_sensitive(false);
     transport_box.append(&next_btn);
 
+    let halt_auto_cancel_btn = Button::with_label("Cancel");
+    halt_auto_cancel_btn.add_css_class("np-halt-auto-btn");
+    halt_auto_cancel_btn.set_visible(false);
+    transport_box.append(&halt_auto_cancel_btn);
+
+    let halt_auto_resume_btn = Button::with_label("Resume");
+    halt_auto_resume_btn.add_css_class("np-halt-auto-btn");
+    halt_auto_resume_btn.add_css_class("np-halt-auto-resume-btn");
+    halt_auto_resume_btn.set_visible(false);
+    transport_box.append(&halt_auto_resume_btn);
+
     controls_box.append(&transport_box);
 
     // -- Time --
@@ -880,6 +891,8 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         prev_btn: prev_btn.clone(),
         play_pause_btn: play_pause_btn.clone(),
         next_btn: next_btn.clone(),
+        halt_auto_cancel_btn: halt_auto_cancel_btn.clone(),
+        halt_auto_resume_btn: halt_auto_resume_btn.clone(),
         time_label: time_label.clone(),
         np_thumb: np_thumb.clone(),
         np_title: np_title.clone(),
@@ -1021,6 +1034,38 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                 set_button_icon(btn, if paused { ICON_PLAY } else { ICON_PAUSE }, 28);
             }
             sync_mpris_transport(&ps, &state);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        halt_auto_cancel_btn.connect_clicked(move |_| {
+            let client = ps.player.daemon_client();
+            let ps = ps.clone();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || client.cancel_halt_auto_resume()).await;
+                if let Ok(Ok(snapshot)) = result {
+                    apply_remote_snapshot(&ps, &state, snapshot);
+                }
+            });
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        halt_auto_resume_btn.connect_clicked(move |_| {
+            let client = ps.player.daemon_client();
+            let ps = ps.clone();
+            let state = state.clone();
+            glib::spawn_future_local(async move {
+                let result = gio::spawn_blocking(move || client.resume_halt_auto()).await;
+                if let Ok(Ok(snapshot)) = result {
+                    apply_remote_snapshot(&ps, &state, snapshot);
+                }
+            });
         });
     }
 
@@ -1846,24 +1891,22 @@ pub(super) fn load_settings_page(
     mpris_label.set_halign(Align::Start);
     mpris_copy.append(&mpris_label);
     let mpris_hint = Label::new(Some(
-        "Choose whether Static should auto-resume, stay halted, or wait a few seconds after other media apps stop.",
+        "Choose whether Static should ignore peer media apps, stay halted, or auto-resume after they stop.",
     ));
     mpris_hint.add_css_class("settings-row-copy");
     mpris_hint.set_wrap(true);
     mpris_hint.set_halign(Align::Start);
     mpris_copy.append(&mpris_hint);
     mpris_row.append(&mpris_copy);
-    let coordination_mode_labels = [
-        CoordinationMode::Off.label(),
-        CoordinationMode::Respect.label(),
-        CoordinationMode::Halt.label(),
-        CoordinationMode::HaltAuto.label(),
-    ];
+    let coordination_mode_labels: Vec<&str> = CoordinationMode::ALL
+        .iter()
+        .map(|mode| mode.label())
+        .collect();
     let mpris_dropdown = DropDown::from_strings(&coordination_mode_labels);
     let selected_mode_index = CoordinationMode::ALL
         .iter()
         .position(|mode| *mode == settings.other_mpris_mode)
-        .unwrap_or(1);
+        .unwrap_or(0);
     mpris_dropdown.set_selected(selected_mode_index as u32);
     mpris_dropdown.set_valign(Align::Center);
     mpris_row.append(&mpris_dropdown);
@@ -1878,7 +1921,7 @@ pub(super) fn load_settings_page(
     mpris_halt_auto_label.set_halign(Align::Start);
     mpris_halt_auto_copy.append(&mpris_halt_auto_label);
     let mpris_halt_auto_hint = Label::new(Some(
-        "When Halt Auto is selected, wait this long after peer players go quiet before Static starts again.",
+        "When Halt Auto is selected, wait this long after peer players go quiet before Static starts again. Use 0 for immediate resume.",
     ));
     mpris_halt_auto_hint.add_css_class("settings-row-copy");
     mpris_halt_auto_hint.set_wrap(true);
@@ -1930,7 +1973,7 @@ to keep an advanced value, or move it back into the UI range to re-enable this c
             let mode = CoordinationMode::ALL
                 .get(selected)
                 .copied()
-                .unwrap_or(CoordinationMode::Respect);
+                .unwrap_or(CoordinationMode::Off);
             if mode == app_settings(&state).other_mpris_mode {
                 (refresh_mpris_halt_auto_control.as_ref())();
                 return;
@@ -1986,7 +2029,7 @@ to keep an advanced value, or move it back into the UI range to re-enable this c
     pipewire_pause_label.set_halign(Align::Start);
     pipewire_pause_copy.append(&pipewire_pause_label);
     let pipewire_pause_hint = Label::new(Some(
-        "Choose whether PipeWire activity should duck Static, pause and resume, or halt until you restart playback.",
+        "Choose whether PipeWire activity should duck Static, halt until you restart playback, or auto-resume after it stops.",
     ));
     pipewire_pause_hint.add_css_class("settings-row-copy");
     pipewire_pause_hint.set_wrap(true);
@@ -2013,7 +2056,7 @@ to keep an advanced value, or move it back into the UI range to re-enable this c
     pipewire_pause_halt_auto_label.set_halign(Align::Start);
     pipewire_pause_halt_auto_copy.append(&pipewire_pause_halt_auto_label);
     let pipewire_pause_halt_auto_hint = Label::new(Some(
-        "When PipeWire coordination is set to Halt Auto, wait this long after other audio stops before Static comes back.",
+        "When PipeWire coordination is set to Halt Auto, wait this long after other audio stops before Static comes back. Use 0 for immediate resume.",
     ));
     pipewire_pause_halt_auto_hint.add_css_class("settings-row-copy");
     pipewire_pause_halt_auto_hint.set_wrap(true);

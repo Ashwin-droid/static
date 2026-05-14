@@ -972,13 +972,13 @@ pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSetti
             integer: true,
         }),
         "other_mpris_halt_auto_resume_secs" => Some(NumericSettingMeta {
-            min: 1.0,
+            min: 0.0,
             max: 60.0,
             step: 1.0,
             integer: true,
         }),
         "pipewire_pause_halt_auto_resume_secs" => Some(NumericSettingMeta {
-            min: 1.0,
+            min: 0.0,
             max: 60.0,
             step: 1.0,
             integer: true,
@@ -1101,7 +1101,7 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     settings,
                     "other_mpris_mode",
                     "MPRIS coordination",
-                    "Choose whether Static respects, halts for, or ignores peer players.",
+                    "Choose whether Static halts, auto-resumes, or ignores peer players.",
                 ),
                 stepper_setting_field(
                     settings,

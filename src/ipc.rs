@@ -67,6 +67,8 @@ pub struct PlaybackSnapshot {
     pub duration_millis: Option<u64>,
     pub buffered_fraction: f64,
     #[serde(default)]
+    pub halt_auto_resume_pending: bool,
+    #[serde(default)]
     pub probe_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_restore_position_millis: Option<u64>,
@@ -129,6 +131,7 @@ impl Default for PlaybackSnapshot {
             position_millis: None,
             duration_millis: None,
             buffered_fraction: 0.0,
+            halt_auto_resume_pending: false,
             probe_active: false,
             probe_restore_position_millis: None,
         }
@@ -164,6 +167,8 @@ pub enum DaemonRequest {
     TogglePause,
     Pause,
     Resume,
+    CancelHaltAutoResume,
+    ResumeHaltAutoResume,
     Stop,
     Next,
     Previous,
@@ -523,6 +528,14 @@ impl DaemonClient {
         self.transport_request(DaemonRequest::Resume)
     }
 
+    pub fn cancel_halt_auto_resume(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::CancelHaltAutoResume)
+    }
+
+    pub fn resume_halt_auto(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::ResumeHaltAutoResume)
+    }
+
     pub fn stop(&self) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::Stop)
     }
@@ -625,6 +638,7 @@ mod tests {
             position_millis: Some(12_345),
             duration_millis: Some(67_890),
             buffered_fraction: 0.5,
+            halt_auto_resume_pending: false,
             probe_active: false,
             probe_restore_position_millis: None,
         };

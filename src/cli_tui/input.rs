@@ -347,6 +347,13 @@ impl InteractiveTui {
         matches!(self.focus, TuiFocus::Player) && self.player_selected == index
     }
 
+    pub(in crate::cli_tui) fn player_action_focused_action(&self, action: TuiAction) -> bool {
+        player_actions(&self.snapshot)
+            .iter()
+            .position(|candidate| *candidate == action)
+            .is_some_and(|index| self.player_action_focused(index))
+    }
+
     pub(in crate::cli_tui) fn cycle_focus(&mut self) {
         self.focus = match self.focus {
             TuiFocus::Recent => TuiFocus::Home,
@@ -417,8 +424,11 @@ impl InteractiveTui {
                     NavigationDirection::Left | NavigationDirection::Up => -1,
                     NavigationDirection::Right | NavigationDirection::Down => 1,
                 };
-                self.player_selected =
-                    move_index(self.player_selected, PLAYER_ACTIONS.len(), delta);
+                self.player_selected = move_index(
+                    self.player_selected,
+                    player_actions(&self.snapshot).len(),
+                    delta,
+                );
             }
         }
     }
@@ -508,8 +518,11 @@ impl InteractiveTui {
                 self.ensure_recent_visible();
             }
             TuiFocus::Player => {
-                self.player_selected =
-                    move_index(self.player_selected, PLAYER_ACTIONS.len(), direction);
+                self.player_selected = move_index(
+                    self.player_selected,
+                    player_actions(&self.snapshot).len(),
+                    direction,
+                );
             }
         }
     }
@@ -553,7 +566,7 @@ impl InteractiveTui {
                 self.ensure_recent_visible();
             }
             TuiFocus::Player => {
-                self.player_selected = PLAYER_ACTIONS.len().saturating_sub(1);
+                self.player_selected = player_actions(&self.snapshot).len().saturating_sub(1);
             }
         }
     }

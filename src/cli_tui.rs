@@ -169,7 +169,7 @@ enum TuiFocus {
     Player,
 }
 
-const PLAYER_ACTIONS: &[TuiAction] = &[
+const BASE_PLAYER_ACTIONS: &[TuiAction] = &[
     TuiAction::Previous,
     TuiAction::TogglePause,
     TuiAction::Next,
@@ -180,10 +180,23 @@ const PLAYER_ACTIONS: &[TuiAction] = &[
     TuiAction::VolumeUp,
 ];
 
-#[derive(Clone, Copy)]
+fn player_actions(snapshot: &PlaybackSnapshot) -> Vec<TuiAction> {
+    let mut actions = Vec::with_capacity(BASE_PLAYER_ACTIONS.len() + 2);
+    actions.extend_from_slice(&BASE_PLAYER_ACTIONS[..3]);
+    if snapshot.halt_auto_resume_pending {
+        actions.push(TuiAction::CancelHaltAutoResume);
+        actions.push(TuiAction::ResumeHaltAutoResume);
+    }
+    actions.extend_from_slice(&BASE_PLAYER_ACTIONS[3..]);
+    actions
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TuiAction {
     ResumeSaved,
     TogglePause,
+    CancelHaltAutoResume,
+    ResumeHaltAutoResume,
     Previous,
     Next,
     Like,

@@ -59,6 +59,7 @@ const PREVIOUS_TRACK_THRESHOLD_MILLIS: u64 = 3_000;
 const MPRIS_POSITION_SYNC_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const EXTERNAL_MPRIS_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const MPRIS_PENDING_POSITION_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
@@ -146,6 +147,50 @@ enum TrackRepeatBudgetMode {
     PreserveCurrent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MprisHaltAutoResumeState {
+    Idle,
+    Pending,
+}
+
+impl MprisHaltAutoResumeState {
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PendingMprisTransportIntent {
+    Cancel(&'static str),
+    ResumeWithoutApplying(&'static str),
+}
+
+impl PendingMprisTransportIntent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cancel(reason) | Self::ResumeWithoutApplying(reason) => reason,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingMprisTransportDecision {
+    Ignore,
+    Cancel,
+    ResumeWithoutApplying,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MprisHaltAutoPeerTransition {
+    Ignore,
+    DeactivateCoordination,
+    ReturnToPeerBlock,
+    ClearPending,
+    ActivatePending,
+    Resume,
+    Wait,
+}
+
 struct DaemonState {
     player: PlaybackEngine,
     cache: MusicCache,
@@ -175,6 +220,7 @@ struct DaemonState {
     last_mpris_position_sync_at: Cell<Option<Instant>>,
     mpris: RefCell<Option<Rc<DaemonMprisBridge>>>,
     peer_mpris: ExternalMprisCoordinator,
+    mpris_halt_auto_resume: MprisHaltAutoResumeState,
     pipewire_monitor: PipeWireMonitor,
     pipewire_trigger_active: bool,
     pipewire_quiet_since: Option<Instant>,
@@ -514,6 +560,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_play_pause(move |_| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::Cancel("MPRIS PlayPause"),
+                ) {
+                    return;
+                }
                 if state.probe_context.is_some() && !is_logically_paused(&state) {
                     if let Err(err) = restore_after_probe(&mut state, false) {
                         eprintln!("[MPRIS] failed to restore queue after probe PlayPause: {err}");
@@ -530,6 +582,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_play(move |_| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::ResumeWithoutApplying("Play"),
+                ) {
+                    return;
+                }
                 if state.active_track.is_some() && is_logically_paused(&state) {
                     resume_for_user_action(&mut state);
                 }
@@ -540,6 +598,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_pause(move |_| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::Cancel("MPRIS Pause"),
+                ) {
+                    return;
+                }
                 if state.active_track.is_some() && !is_logically_paused(&state) {
                     if state.probe_context.is_some() {
                         if let Err(err) = restore_after_probe(&mut state, false) {
@@ -566,7 +630,14 @@ impl DaemonMprisBridge {
         {
             let state = state.clone();
             player.connect_next(move |_| {
-                let _ = advance_queue(&mut state.borrow_mut(), true);
+                let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::ResumeWithoutApplying("Next"),
+                ) {
+                    return;
+                }
+                let _ = advance_queue(&mut state, true);
             });
         }
 
@@ -574,6 +645,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_previous(move |_| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::ResumeWithoutApplying("Previous"),
+                ) {
+                    return;
+                }
                 let _ = handle_previous(&mut state);
             });
         }
@@ -582,6 +659,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_seek(move |_, offset| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::ResumeWithoutApplying("Seek"),
+                ) {
+                    return;
+                }
                 let Some(current) = state.player.position() else {
                     return;
                 };
@@ -596,6 +679,12 @@ impl DaemonMprisBridge {
             let state = state.clone();
             player.connect_set_position(move |_, _, position| {
                 let mut state = state.borrow_mut();
+                if handle_pending_mpris_halt_auto_transport_intent(
+                    &mut state,
+                    PendingMprisTransportIntent::ResumeWithoutApplying("SetPosition"),
+                ) {
+                    return;
+                }
                 let target = ClockTime::from_useconds(position.as_micros().max(0) as u64);
                 seek_to_position(&mut state, target);
             });
@@ -657,6 +746,8 @@ impl DaemonMprisBridge {
         let snapshot = state_snapshot(state);
         let playback_status = if snapshot.current_track.is_none() {
             MprisPlaybackStatus::Stopped
+        } else if mpris_halt_auto_resume_sidechannel_active(state) {
+            MprisPlaybackStatus::Playing
         } else if snapshot.paused {
             MprisPlaybackStatus::Paused
         } else {
@@ -782,6 +873,7 @@ pub fn run() -> Result<()> {
         last_mpris_position_sync_at: Cell::new(None),
         mpris: RefCell::new(None),
         peer_mpris: ExternalMprisCoordinator::new(),
+        mpris_halt_auto_resume: MprisHaltAutoResumeState::Idle,
         pipewire_monitor: PipeWireMonitor::new(),
         pipewire_trigger_active: false,
         pipewire_quiet_since: Some(Instant::now()),
@@ -989,8 +1081,11 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         DaemonRequest::Pause => {
             let result = if state.probe_context.is_some() {
                 restore_after_probe(state, false)
+            } else if cancel_pending_mpris_halt_auto_resume(state, "user pause") {
+                Ok(())
             } else {
                 state.peer_mpris.clear_waiting();
+                clear_mpris_halt_auto_resume_pending(state);
                 pause_local_playback(state, PlaybackTransition::Immediate);
                 sync_mpris(state);
                 Ok(())
@@ -1004,7 +1099,25 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             }
         }
         DaemonRequest::Resume => {
-            resume_for_user_action(state);
+            if mpris_halt_auto_resume_is_pending(state) {
+                resume_pending_mpris_halt_auto(state, PlaybackTransition::Immediate, "user resume");
+            } else {
+                resume_for_user_action(state);
+            }
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::CancelHaltAutoResume => {
+            cancel_pending_mpris_halt_auto_resume(state, "UI request");
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::ResumeHaltAutoResume => {
+            if mpris_halt_auto_resume_is_pending(state) {
+                resume_pending_mpris_halt_auto(state, PlaybackTransition::Immediate, "UI request");
+            } else {
+                resume_for_user_action(state);
+            }
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -1212,6 +1325,7 @@ fn maintain_playback(state: &mut DaemonState) {
 
     maybe_flush_watchtime_progress(state);
     maybe_sync_live_mpris_position(state);
+    maybe_sync_pending_mpris_halt_auto_position(state);
     maybe_apply_sponsorblock_skip(state);
     maybe_run_deferred_action(state);
     maybe_extend_radio_queue(state);
@@ -1342,6 +1456,7 @@ fn resolve_probe_restore_index(state: &DaemonState, probe: &ProbeRestoreState) -
 }
 
 fn suspend_playback_for_probe(state: &mut DaemonState) {
+    clear_mpris_halt_auto_resume_pending(state);
     state.player.stop();
     state.volume_ramp = None;
     state.player = PlaybackEngine::new();
@@ -1672,6 +1787,35 @@ fn maybe_sync_live_mpris_position(state: &DaemonState) {
         if let Some(position_millis) = next_position_millis {
             bridge.emit_seeked((position_millis * 1_000) as i64);
         }
+    }
+    note_mpris_position_sync(state, next_position_millis, now);
+}
+
+fn maybe_sync_pending_mpris_halt_auto_position(state: &DaemonState) {
+    if !mpris_halt_auto_resume_sidechannel_active(state) {
+        return;
+    }
+
+    let now = Instant::now();
+    if state
+        .last_mpris_position_sync_at
+        .get()
+        .is_some_and(|last_synced_at| {
+            now.duration_since(last_synced_at) < MPRIS_PENDING_POSITION_SYNC_INTERVAL
+        })
+    {
+        return;
+    }
+
+    let next_position_millis = mpris_position_millis(state);
+    let mpris = state.mpris.borrow();
+    let Some(bridge) = mpris.as_ref() else {
+        return;
+    };
+
+    bridge.sync_position(state);
+    if let Some(position_millis) = next_position_millis {
+        bridge.emit_seeked((position_millis * 1_000) as i64);
     }
     note_mpris_position_sync(state, next_position_millis, now);
 }
@@ -2039,10 +2183,15 @@ fn handle_previous_for_user_action(state: &mut DaemonState) -> Result<()> {
 }
 
 fn toggle_pause_for_user_action(state: &mut DaemonState) {
+    if resume_pending_mpris_halt_auto(state, PlaybackTransition::Immediate, "UI play/pause") {
+        return;
+    }
+
     if is_logically_paused(state) && state.active_track.is_some() {
         pause_other_mpris_players(state);
     } else {
         state.peer_mpris.clear_waiting();
+        clear_mpris_halt_auto_resume_pending(state);
     }
     if is_logically_paused(state) {
         resume_local_playback(state, PlaybackTransition::Immediate);
@@ -2053,7 +2202,12 @@ fn toggle_pause_for_user_action(state: &mut DaemonState) {
 }
 
 fn resume_for_user_action(state: &mut DaemonState) {
+    if resume_pending_mpris_halt_auto(state, PlaybackTransition::Immediate, "user resume") {
+        return;
+    }
+
     state.peer_mpris.clear_waiting();
+    clear_mpris_halt_auto_resume_pending(state);
     if state.active_track.is_some() {
         pause_other_mpris_players(state);
     }
@@ -2175,6 +2329,7 @@ fn mark_radio_touched_through(state: &mut DaemonState, index: usize) {
 
 fn stop_playback(state: &mut DaemonState, exiting: bool) {
     maybe_persist_playback_state(state, true);
+    clear_mpris_halt_auto_resume_pending(state);
     if let Some(track) = state.active_track.take() {
         let current_position_millis = pending_pause_position_millis(state).or_else(|| {
             state
@@ -3270,6 +3425,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
                     .unwrap_or(0.0),
             )
             .unwrap_or(0.0),
+        halt_auto_resume_pending: false,
         probe_active: false,
         probe_restore_position_millis: None,
     };
@@ -3311,6 +3467,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             .then(|| visible_duration_millis(state))
             .flatten(),
         buffered_fraction: state.player.buffered_fraction(),
+        halt_auto_resume_pending: mpris_halt_auto_resume_is_pending(state),
         probe_active,
         probe_restore_position_millis: state
             .probe_context
@@ -3392,6 +3549,202 @@ fn sync_mpris(state: &DaemonState) {
 fn note_mpris_position_sync(state: &DaemonState, position_millis: Option<u64>, synced_at: Instant) {
     state.last_mpris_position_millis.set(position_millis);
     state.last_mpris_position_sync_at.set(Some(synced_at));
+}
+
+fn mpris_halt_auto_resume_is_pending(state: &DaemonState) -> bool {
+    state.mpris_halt_auto_resume.is_pending()
+}
+
+fn mpris_halt_auto_resume_sidechannel_active(state: &DaemonState) -> bool {
+    should_expose_mpris_halt_auto_sidechannel(
+        mpris_halt_auto_resume_is_pending(state),
+        state.settings.other_mpris_mode,
+        state.settings.other_mpris_halt_auto_resume_secs,
+        state.active_track.is_some(),
+        is_logically_paused(state),
+        state.peer_mpris.is_waiting_for_peer_pause(),
+        !state.peer_mpris.playing_services().is_empty(),
+    )
+}
+
+fn should_expose_mpris_halt_auto_sidechannel(
+    pending: bool,
+    mode: CoordinationMode,
+    delay_secs: u32,
+    has_active_track: bool,
+    logically_paused: bool,
+    waiting_for_peer: bool,
+    peer_playing: bool,
+) -> bool {
+    pending
+        && mode == CoordinationMode::HaltAuto
+        && delay_secs > 0
+        && has_active_track
+        && logically_paused
+        && waiting_for_peer
+        && !peer_playing
+}
+
+fn clear_mpris_halt_auto_resume_pending(state: &mut DaemonState) -> bool {
+    let was_pending = mpris_halt_auto_resume_is_pending(state);
+    state.mpris_halt_auto_resume = MprisHaltAutoResumeState::Idle;
+    was_pending
+}
+
+fn freeze_local_playback_for_mpris_halt_auto(state: &mut DaemonState) {
+    let Some(position_millis) = pause_anchor_position_millis(state) else {
+        return;
+    };
+
+    if let Some(track) = state.active_track.as_mut() {
+        pause_previous_threshold_clock_for_track(track);
+        track.last_position_millis = position_millis;
+    }
+
+    state.volume_ramp = None;
+    state.player.set_volume(0.0);
+    state.player.pause();
+    state.player.seek(ClockTime::from_mseconds(position_millis));
+}
+
+fn activate_mpris_halt_auto_resume_pending(state: &mut DaemonState) {
+    if mpris_halt_auto_resume_is_pending(state) {
+        return;
+    }
+
+    freeze_local_playback_for_mpris_halt_auto(state);
+    state.mpris_halt_auto_resume = MprisHaltAutoResumeState::Pending;
+    let waited_for = state.peer_mpris.waiting_for_services().join(", ");
+    eprintln!(
+        "[MPRIS] peer player(s) went quiet; holding Static in pending halt-auto resume: {waited_for}"
+    );
+    sync_mpris(state);
+}
+
+fn cancel_pending_mpris_halt_auto_resume(state: &mut DaemonState, reason: &str) -> bool {
+    if !mpris_halt_auto_resume_is_pending(state) {
+        return false;
+    }
+
+    freeze_local_playback_for_mpris_halt_auto(state);
+    state.peer_mpris.clear_waiting();
+    clear_mpris_halt_auto_resume_pending(state);
+    eprintln!("[MPRIS] cancelled pending halt-auto resume from {reason}");
+    sync_mpris(state);
+    maybe_persist_playback_state(state, true);
+    true
+}
+
+fn resume_pending_mpris_halt_auto(
+    state: &mut DaemonState,
+    transition: PlaybackTransition,
+    reason: &str,
+) -> bool {
+    if !mpris_halt_auto_resume_is_pending(state) {
+        return false;
+    }
+
+    state.peer_mpris.clear_waiting();
+    clear_mpris_halt_auto_resume_pending(state);
+    eprintln!("[MPRIS] resuming pending halt-auto playback from {reason}");
+    resume_local_playback(state, transition);
+    sync_mpris(state);
+    maybe_persist_playback_state(state, true);
+    true
+}
+
+fn handle_pending_mpris_halt_auto_transport_intent(
+    state: &mut DaemonState,
+    intent: PendingMprisTransportIntent,
+) -> bool {
+    match pending_mpris_transport_decision(mpris_halt_auto_resume_is_pending(state), intent) {
+        PendingMprisTransportDecision::Ignore => false,
+        PendingMprisTransportDecision::Cancel => {
+            cancel_pending_mpris_halt_auto_resume(state, intent.label())
+        }
+        PendingMprisTransportDecision::ResumeWithoutApplying => {
+            let command = intent.label();
+            eprintln!(
+                "[MPRIS] {command} received during pending halt-auto resume; resuming without applying it"
+            );
+            resume_pending_mpris_halt_auto(state, PlaybackTransition::Immediate, command)
+        }
+    }
+}
+
+fn pending_mpris_transport_decision(
+    pending: bool,
+    intent: PendingMprisTransportIntent,
+) -> PendingMprisTransportDecision {
+    if !pending {
+        return PendingMprisTransportDecision::Ignore;
+    }
+
+    match intent {
+        PendingMprisTransportIntent::Cancel(_) => PendingMprisTransportDecision::Cancel,
+        PendingMprisTransportIntent::ResumeWithoutApplying(_) => {
+            PendingMprisTransportDecision::ResumeWithoutApplying
+        }
+    }
+}
+
+fn return_pending_mpris_halt_auto_resume_to_peer_block(
+    state: &mut DaemonState,
+    playing_services: &[String],
+) {
+    state.peer_mpris.set_waiting_for_services(playing_services);
+    if clear_mpris_halt_auto_resume_pending(state) {
+        eprintln!(
+            "[MPRIS] peer player(s) became active again; cancelling pending halt-auto resume: {}",
+            playing_services.join(", ")
+        );
+        sync_mpris(state);
+    }
+}
+
+fn mpris_halt_auto_peer_transition(
+    mode: CoordinationMode,
+    has_active_track: bool,
+    logically_paused: bool,
+    waiting_for_peer: bool,
+    peer_playing: bool,
+    pending: bool,
+    delay_secs: u32,
+    quiet_for: Option<Duration>,
+) -> MprisHaltAutoPeerTransition {
+    if !mode.coordinates_peers() {
+        return MprisHaltAutoPeerTransition::DeactivateCoordination;
+    }
+
+    if !has_active_track || !logically_paused || !waiting_for_peer {
+        return MprisHaltAutoPeerTransition::Ignore;
+    }
+
+    if peer_playing {
+        return MprisHaltAutoPeerTransition::ReturnToPeerBlock;
+    }
+
+    if mode != CoordinationMode::HaltAuto {
+        return if pending {
+            MprisHaltAutoPeerTransition::ClearPending
+        } else {
+            MprisHaltAutoPeerTransition::Wait
+        };
+    }
+
+    if delay_secs > 0 && !pending {
+        return MprisHaltAutoPeerTransition::ActivatePending;
+    }
+
+    if should_resume_after_external_mpris_pause(
+        mode,
+        quiet_for,
+        Duration::from_secs(delay_secs as u64),
+    ) {
+        MprisHaltAutoPeerTransition::Resume
+    } else {
+        MprisHaltAutoPeerTransition::Wait
+    }
 }
 
 fn logical_volume(state: &DaemonState) -> f64 {
@@ -3624,9 +3977,7 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
                 state
                     .pipewire_quiet_since
                     .map(|quiet_since| quiet_since.elapsed()),
-                Duration::from_secs(
-                    state.settings.pipewire_pause_halt_auto_resume_secs.max(1) as u64
-                ),
+                Duration::from_secs(state.settings.pipewire_pause_halt_auto_resume_secs as u64),
             );
         let should_clear_without_resuming = desired == PipeWireSuppressionMode::None
             && !peer_mpris_pause_active
@@ -3721,32 +4072,41 @@ fn pause_other_mpris_players(state: &mut DaemonState) {
 
 fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
     let other_mpris_mode = state.settings.other_mpris_mode;
-    if !other_mpris_mode.coordinates_peers() {
-        state.peer_mpris.clear_waiting();
-        return;
-    }
-
-    if state.active_track.is_none()
-        || !is_logically_paused(state)
-        || !state.peer_mpris.is_waiting_for_peer_pause()
-    {
-        return;
-    }
-
     let playing_services = state.peer_mpris.playing_services().to_vec();
-    if !playing_services.is_empty() {
-        state.peer_mpris.set_waiting_for_services(&playing_services);
-        return;
-    }
-
-    let halt_auto_resume_after =
-        Duration::from_secs(state.settings.other_mpris_halt_auto_resume_secs.max(1) as u64);
-    if !should_resume_after_external_mpris_pause(
+    let transition = mpris_halt_auto_peer_transition(
         other_mpris_mode,
+        state.active_track.is_some(),
+        is_logically_paused(state),
+        state.peer_mpris.is_waiting_for_peer_pause(),
+        !playing_services.is_empty(),
+        mpris_halt_auto_resume_is_pending(state),
+        state.settings.other_mpris_halt_auto_resume_secs,
         state.peer_mpris.no_playing_services_for(),
-        halt_auto_resume_after,
-    ) {
-        return;
+    );
+
+    match transition {
+        MprisHaltAutoPeerTransition::DeactivateCoordination => {
+            if clear_mpris_halt_auto_resume_pending(state) {
+                sync_mpris(state);
+            }
+            state.peer_mpris.clear_waiting();
+            return;
+        }
+        MprisHaltAutoPeerTransition::Ignore | MprisHaltAutoPeerTransition::Wait => return,
+        MprisHaltAutoPeerTransition::ReturnToPeerBlock => {
+            return_pending_mpris_halt_auto_resume_to_peer_block(state, &playing_services);
+            return;
+        }
+        MprisHaltAutoPeerTransition::ClearPending => {
+            clear_mpris_halt_auto_resume_pending(state);
+            sync_mpris(state);
+            return;
+        }
+        MprisHaltAutoPeerTransition::ActivatePending => {
+            activate_mpris_halt_auto_resume_pending(state);
+            return;
+        }
+        MprisHaltAutoPeerTransition::Resume => {}
     }
 
     let waited_for = state.peer_mpris.waiting_for_services().join(", ");
@@ -3757,12 +4117,9 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
     }
 
     match other_mpris_mode {
-        CoordinationMode::Respect => eprintln!(
-            "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
-        ),
         CoordinationMode::HaltAuto => eprintln!(
             "[MPRIS] resuming local playback after peer player(s) stayed paused or stopped for {}s: {waited_for}",
-            state.settings.other_mpris_halt_auto_resume_secs.max(1)
+            state.settings.other_mpris_halt_auto_resume_secs
         ),
         CoordinationMode::Off | CoordinationMode::Halt => return,
     }
@@ -3789,7 +4146,6 @@ fn should_resume_after_external_mpris_pause(
     halt_auto_resume_after: Duration,
 ) -> bool {
     match mode {
-        CoordinationMode::Respect => true,
         CoordinationMode::HaltAuto => {
             quiet_for.is_some_and(|quiet_for| quiet_for >= halt_auto_resume_after)
         }
@@ -3807,7 +4163,7 @@ fn should_resume_after_pipewire_pause(
         PipeWireSuppressionMode::Duck => true,
         PipeWireSuppressionMode::Pause => false,
         PipeWireSuppressionMode::None => match mode {
-            CoordinationMode::Off | CoordinationMode::Respect => true,
+            CoordinationMode::Off => true,
             CoordinationMode::Halt => false,
             CoordinationMode::HaltAuto => {
                 quiet_for.is_some_and(|quiet_for| quiet_for >= halt_auto_resume_after)
@@ -4047,18 +4403,21 @@ fn get_storage_root() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
-        PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
-        current_listened_millis, effective_queue_len, hide_timing_for_track,
-        mpris_position_millis_for_track, natural_end_target_index,
-        next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
+        ActiveTrack, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition, PLAYBACK_START_TIMEOUT,
+        PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision,
+        PendingMprisTransportIntent, PipeWireSuppressionMode, PlaybackSource, PreviousAction,
+        VolumeRamp, VolumeRampCompletion, current_listened_millis, effective_queue_len,
+        hide_timing_for_track, mpris_halt_auto_peer_transition, mpris_position_millis_for_track,
+        natural_end_target_index, next_repeat_state_after_natural_end,
+        pause_previous_threshold_clock_for_track, pending_mpris_transport_decision,
         pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
         playback_start_stalled, previous_action, previous_threshold_millis,
         rearm_track_repeat_loops_for_snapshot, reset_previous_threshold_clock_for_track,
         resolve_pipewire_suppression_mode, should_emit_live_mpris_seeked_hint,
-        should_evict_cache_after_startup_stall, should_resume_after_external_mpris_pause,
-        should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-        should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
+        should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
+        should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
+        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+        should_wait_for_radio_extension_at_natural_end,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
@@ -4397,12 +4756,237 @@ mod tests {
     }
 
     #[test]
-    fn respect_mode_resumes_immediately_after_peer_quiet() {
+    fn halt_auto_zero_delay_resumes_immediately_after_peer_quiet() {
         assert!(should_resume_after_external_mpris_pause(
-            CoordinationMode::Respect,
-            None,
-            Duration::from_secs(5)
+            CoordinationMode::HaltAuto,
+            Some(Duration::ZERO),
+            Duration::ZERO
         ));
+    }
+
+    #[test]
+    fn mpris_halt_auto_sidechannel_only_advertises_while_peer_is_quiet() {
+        assert!(should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            5,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            5,
+            true,
+            true,
+            true,
+            true
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            false,
+            CoordinationMode::HaltAuto,
+            5,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::Halt,
+            5,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            0,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            5,
+            false,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            5,
+            true,
+            false,
+            true,
+            false
+        ));
+        assert!(!should_expose_mpris_halt_auto_sidechannel(
+            true,
+            CoordinationMode::HaltAuto,
+            5,
+            true,
+            true,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn pending_mpris_transport_policy_cancels_pause_like_intents() {
+        for intent in [
+            PendingMprisTransportIntent::Cancel("MPRIS Pause"),
+            PendingMprisTransportIntent::Cancel("MPRIS PlayPause"),
+        ] {
+            assert_eq!(
+                pending_mpris_transport_decision(true, intent),
+                PendingMprisTransportDecision::Cancel
+            );
+        }
+    }
+
+    #[test]
+    fn pending_mpris_transport_policy_resumes_without_applying_transport_intents() {
+        for intent in [
+            PendingMprisTransportIntent::ResumeWithoutApplying("Play"),
+            PendingMprisTransportIntent::ResumeWithoutApplying("Next"),
+            PendingMprisTransportIntent::ResumeWithoutApplying("Previous"),
+            PendingMprisTransportIntent::ResumeWithoutApplying("Seek"),
+            PendingMprisTransportIntent::ResumeWithoutApplying("SetPosition"),
+        ] {
+            assert_eq!(
+                pending_mpris_transport_decision(true, intent),
+                PendingMprisTransportDecision::ResumeWithoutApplying
+            );
+        }
+    }
+
+    #[test]
+    fn mpris_transport_policy_ignores_commands_when_resume_is_not_pending() {
+        for intent in [
+            PendingMprisTransportIntent::Cancel("MPRIS Pause"),
+            PendingMprisTransportIntent::ResumeWithoutApplying("Seek"),
+        ] {
+            assert_eq!(
+                pending_mpris_transport_decision(false, intent),
+                PendingMprisTransportDecision::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn mpris_peer_transition_returns_to_peer_block_when_peer_restarts() {
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::HaltAuto,
+                true,
+                true,
+                true,
+                true,
+                true,
+                30,
+                Some(Duration::from_secs(2)),
+            ),
+            MprisHaltAutoPeerTransition::ReturnToPeerBlock
+        );
+    }
+
+    #[test]
+    fn mpris_peer_transition_arms_sidechannel_only_for_delayed_halt_auto() {
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::HaltAuto,
+                true,
+                true,
+                true,
+                false,
+                false,
+                30,
+                Some(Duration::ZERO),
+            ),
+            MprisHaltAutoPeerTransition::ActivatePending
+        );
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::HaltAuto,
+                true,
+                true,
+                true,
+                false,
+                false,
+                0,
+                Some(Duration::ZERO),
+            ),
+            MprisHaltAutoPeerTransition::Resume
+        );
+    }
+
+    #[test]
+    fn mpris_peer_transition_waits_then_resumes_pending_halt_auto() {
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::HaltAuto,
+                true,
+                true,
+                true,
+                false,
+                true,
+                30,
+                Some(Duration::from_secs(29)),
+            ),
+            MprisHaltAutoPeerTransition::Wait
+        );
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::HaltAuto,
+                true,
+                true,
+                true,
+                false,
+                true,
+                30,
+                Some(Duration::from_secs(30)),
+            ),
+            MprisHaltAutoPeerTransition::Resume
+        );
+    }
+
+    #[test]
+    fn mpris_peer_transition_clears_pending_when_auto_resume_no_longer_applies() {
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::Halt,
+                true,
+                true,
+                true,
+                false,
+                true,
+                30,
+                Some(Duration::from_secs(30)),
+            ),
+            MprisHaltAutoPeerTransition::ClearPending
+        );
+        assert_eq!(
+            mpris_halt_auto_peer_transition(
+                CoordinationMode::Off,
+                false,
+                false,
+                false,
+                false,
+                true,
+                30,
+                None,
+            ),
+            MprisHaltAutoPeerTransition::DeactivateCoordination
+        );
     }
 
     #[test]
@@ -4477,7 +5061,7 @@ mod tests {
                 true,
                 true,
                 true,
-                CoordinationMode::Respect,
+                CoordinationMode::HaltAuto,
                 false,
                 true,
                 true,
@@ -4493,7 +5077,7 @@ mod tests {
                 true,
                 true,
                 true,
-                CoordinationMode::Respect,
+                CoordinationMode::HaltAuto,
                 false,
                 true,
                 false,

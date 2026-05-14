@@ -241,6 +241,8 @@ struct PlayerState {
     prev_btn: Button,
     play_pause_btn: Button,
     next_btn: Button,
+    halt_auto_cancel_btn: Button,
+    halt_auto_resume_btn: Button,
     // Time
     time_label: Label,
     // Track info
@@ -939,6 +941,10 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     ps.play_pause_btn.set_sensitive(false);
     ps.prev_btn.set_sensitive(false);
     ps.next_btn.set_sensitive(false);
+    ps.halt_auto_cancel_btn.set_visible(false);
+    ps.halt_auto_resume_btn.set_visible(false);
+    ps.halt_auto_cancel_btn.set_sensitive(false);
+    ps.halt_auto_resume_btn.set_sensitive(false);
     ps.like_btn.set_sensitive(false);
     ps.dislike_btn.set_sensitive(false);
     update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);

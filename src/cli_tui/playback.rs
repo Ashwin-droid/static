@@ -48,12 +48,17 @@ impl InteractiveTui {
             rows[0],
         );
 
+        let action_column_width = if self.snapshot.halt_auto_resume_pending {
+            44
+        } else {
+            28
+        };
         let control_columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(16),
-                Constraint::Min(26),
-                Constraint::Length(28),
+                Constraint::Min(18),
+                Constraint::Length(action_column_width),
             ])
             .split(rows[1]);
 
@@ -73,7 +78,7 @@ impl InteractiveTui {
             theme,
             false,
             false,
-            self.player_action_focused(0),
+            self.player_action_focused_action(TuiAction::Previous),
         ));
         targets.push(render_action_button(
             frame,
@@ -83,7 +88,7 @@ impl InteractiveTui {
             theme,
             true,
             true,
-            self.player_action_focused(1),
+            self.player_action_focused_action(TuiAction::TogglePause),
         ));
         targets.push(render_action_button(
             frame,
@@ -93,7 +98,7 @@ impl InteractiveTui {
             theme,
             false,
             false,
-            self.player_action_focused(2),
+            self.player_action_focused_action(TuiAction::Next),
         ));
 
         let track_info = Layout::default()
@@ -150,21 +155,64 @@ impl InteractiveTui {
             track_info[1],
         );
 
-        let actions = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Length(4),
-                Constraint::Length(5),
-                Constraint::Length(4),
-            ])
-            .split(control_columns[2]);
+        let actions = if self.snapshot.halt_auto_resume_pending {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(8),
+                    Constraint::Length(8),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(4),
+                    Constraint::Length(5),
+                    Constraint::Length(4),
+                ])
+                .split(control_columns[2])
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(5),
+                    Constraint::Length(4),
+                    Constraint::Length(5),
+                    Constraint::Length(4),
+                ])
+                .split(control_columns[2])
+        };
+
+        let mut action_index = 0;
+
+        if self.snapshot.halt_auto_resume_pending {
+            targets.push(render_action_button(
+                frame,
+                actions[action_index],
+                "cancel",
+                TuiAction::CancelHaltAutoResume,
+                theme,
+                false,
+                true,
+                self.player_action_focused_action(TuiAction::CancelHaltAutoResume),
+            ));
+            action_index += 1;
+            targets.push(render_action_button(
+                frame,
+                actions[action_index],
+                "resume",
+                TuiAction::ResumeHaltAutoResume,
+                theme,
+                true,
+                true,
+                self.player_action_focused_action(TuiAction::ResumeHaltAutoResume),
+            ));
+            action_index += 1;
+        }
 
         targets.push(render_action_button(
             frame,
-            actions[0],
+            actions[action_index],
             "👎",
             TuiAction::Dislike,
             theme,
@@ -173,11 +221,12 @@ impl InteractiveTui {
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Dislike),
-            self.player_action_focused(3),
+            self.player_action_focused_action(TuiAction::Dislike),
         ));
+        action_index += 1;
         targets.push(render_action_button(
             frame,
-            actions[1],
+            actions[action_index],
             "👍",
             TuiAction::Like,
             theme,
@@ -186,28 +235,31 @@ impl InteractiveTui {
                 .current_track
                 .as_ref()
                 .is_some_and(|track| track.rating == SongRating::Like),
-            self.player_action_focused(4),
+            self.player_action_focused_action(TuiAction::Like),
         ));
+        action_index += 1;
         targets.push(render_action_button(
             frame,
-            actions[2],
+            actions[action_index],
             repeat_button_emoji(self.snapshot.repeat_mode),
             TuiAction::CycleRepeat,
             theme,
             false,
             self.snapshot.repeat_mode != RepeatMode::Off,
-            self.player_action_focused(5),
+            self.player_action_focused_action(TuiAction::CycleRepeat),
         ));
+        action_index += 1;
         targets.push(render_action_button(
             frame,
-            actions[3],
+            actions[action_index],
             "−",
             TuiAction::VolumeDown,
             theme,
             false,
             false,
-            self.player_action_focused(6),
+            self.player_action_focused_action(TuiAction::VolumeDown),
         ));
+        action_index += 1;
 
         frame.render_widget(
             Paragraph::new(vec![
@@ -218,18 +270,19 @@ impl InteractiveTui {
                 Line::from(Span::styled("vol", Style::default().fg(theme.muted))),
             ])
             .alignment(Alignment::Center),
-            actions[4],
+            actions[action_index],
         );
+        action_index += 1;
 
         targets.push(render_action_button(
             frame,
-            actions[5],
+            actions[action_index],
             "+",
             TuiAction::VolumeUp,
             theme,
             false,
             false,
-            self.player_action_focused(7),
+            self.player_action_focused_action(TuiAction::VolumeUp),
         ));
 
         targets
@@ -278,6 +331,7 @@ impl InteractiveTui {
 
     pub(in crate::cli_tui) fn playback_snapshot_from_tui_state(&self) -> PlaybackSnapshot {
         let mut snapshot = self.snapshot.clone();
+        snapshot.halt_auto_resume_pending = false;
         snapshot.queue_index = snapshot
             .queue_index
             .min(snapshot.queue.len().saturating_sub(1));
@@ -414,6 +468,8 @@ impl InteractiveTui {
                 restore_playback_snapshot_via_daemon(persisted.snapshot, true)
             }
             TuiAction::TogglePause => self.client.toggle_pause(),
+            TuiAction::CancelHaltAutoResume => self.client.cancel_halt_auto_resume(),
+            TuiAction::ResumeHaltAutoResume => self.client.resume_halt_auto(),
             TuiAction::Previous => self.client.previous(),
             TuiAction::Next => self.client.next(),
             TuiAction::Like => self.client.rate_current_track(SongRating::Like),
@@ -719,6 +775,8 @@ pub(in crate::cli_tui) fn action_label(action: TuiAction) -> &'static str {
     match action {
         TuiAction::ResumeSaved => "Resume",
         TuiAction::TogglePause => "Toggle",
+        TuiAction::CancelHaltAutoResume => "Cancel resume",
+        TuiAction::ResumeHaltAutoResume => "Resume now",
         TuiAction::Previous => "Previous",
         TuiAction::Next => "Next",
         TuiAction::Like => "Like",

@@ -927,14 +927,14 @@ the same track exists locally.\n{}",
             )
         ),
         "other_mpris_mode" => "Controls how Static reacts when another MPRIS player is active.\n\
-Values:\n  - `off`: ignore peer MPRIS players entirely.\n  - `respect`: pause for the other \
-player and resume as soon as it goes quiet.\n  - `halt`: pause for the other player and stay \
-halted until you resume manually.\n  - `halt_auto`: pause for the other player, then auto-resume \
-after `other_mpris_halt_auto_resume_secs` once peers stay quiet."
+Values:\n  - `off`: ignore peer MPRIS players entirely.\n  - `halt`: pause for the other \
+player and stay halted until you resume manually.\n  - `halt_auto`: pause for the other player, \
+then auto-resume after `other_mpris_halt_auto_resume_secs` once peers stay quiet. A delay of `0` \
+resumes as soon as the peer goes quiet."
             .to_string(),
         "other_mpris_halt_auto_resume_secs" => format!(
             "Quiet window used only when `other_mpris_mode=halt_auto`.\n`5` means resume 5 \
-seconds after peer players stop; `300` means wait 5 minutes before coming back.\n{}",
+seconds after peer players stop; `0` means resume immediately after they stop.\n{}",
             advanced_cli_range_note(
                 &format!(
                     "{}-{} seconds",
@@ -958,14 +958,13 @@ ducks volume or pauses depending on `pipewire_pause_mode`.\n{}",
         ),
         "pipewire_pause_mode" => "Chooses what Static does after PipeWire detects another audio \
 stream staying active long enough to matter.\nValues:\n  - `off`: keep playback running and use \
-ducking volume instead.\n  - `respect`: pause while the foreign stream is active and resume as \
-soon as it goes quiet.\n  - `halt`: pause and stay halted until you resume manually.\n  - \
+ducking volume instead.\n  - `halt`: pause and stay halted until you resume manually.\n  - \
 `halt_auto`: pause, then auto-resume after `pipewire_pause_halt_auto_resume_secs` once the other \
-audio stays quiet."
+audio stays quiet. A delay of `0` resumes as soon as it goes quiet."
             .to_string(),
         "pipewire_pause_halt_auto_resume_secs" => format!(
             "Quiet window used only when `pipewire_pause_mode=halt_auto`.\n`5` means Static \
-comes back 5 seconds after other audio stops; `300` means wait 5 minutes before auto-resuming.\n\
+comes back 5 seconds after other audio stops; `0` means resume immediately after it stops.\n\
 {}",
             advanced_cli_range_note(
                 &format!(
@@ -1036,12 +1035,6 @@ fn config_kind_label(kind: ConfigKind) -> &'static str {
 }
 
 fn config_spec(name: &str) -> Result<&'static ConfigSpec> {
-    if name == "respect_other_mpris_players" || name == "pipewire_duck_pause" {
-        return Err(anyhow::anyhow!(
-            "This key is now a legacy alias. Use the corresponding coordination mode key instead."
-        ));
-    }
-
     CONFIG_SPECS
         .iter()
         .find(|spec| spec.name == name)
@@ -1049,25 +1042,6 @@ fn config_spec(name: &str) -> Result<&'static ConfigSpec> {
 }
 
 fn print_config_description(name: &str) -> Result<()> {
-    if name == "respect_other_mpris_players" {
-        println!("respect_other_mpris_players [bool]");
-        println!(
-            "Legacy alias for `other_mpris_mode`.\nAccepted values: `yes` maps to `respect`; \
-`no` maps to `off`. This key is kept for backwards compatibility, but new automation or scripts \
-should use `other_mpris_mode` directly."
-        );
-        return Ok(());
-    }
-    if name == "pipewire_duck_pause" {
-        println!("pipewire_duck_pause [bool]");
-        println!(
-            "Legacy alias for `pipewire_pause_mode`.\nAccepted values: `yes` maps to `respect`; \
-`no` maps to `off`. This key is kept for backwards compatibility, but new automation or scripts \
-should use `pipewire_pause_mode` directly."
-        );
-        return Ok(());
-    }
-
     let spec = config_spec(name)?;
     println!("{} [{}]", spec.name, config_kind_label(spec.kind));
     println!("{}", config_description(spec.name));
@@ -1094,13 +1068,11 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "other_mpris_halt_auto_resume_secs" => {
             settings.other_mpris_halt_auto_resume_secs.to_string()
         }
-        "respect_other_mpris_players" => yes_no_bool(settings.other_mpris_mode.coordinates_peers()),
         "pipewire_ducking_enabled" => yes_no_bool(settings.pipewire_ducking_enabled),
         "pipewire_pause_mode" => settings.pipewire_pause_mode.as_str().to_string(),
         "pipewire_pause_halt_auto_resume_secs" => {
             settings.pipewire_pause_halt_auto_resume_secs.to_string()
         }
-        "pipewire_duck_pause" => yes_no_bool(settings.pipewire_pause_mode.is_enabled()),
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
         "pipewire_ducking_volume" => settings.pipewire_ducking_volume.to_string(),
         "sponsorblock_enabled" => yes_no_bool(settings.sponsorblock_enabled),
@@ -1147,25 +1119,11 @@ pub(crate) fn apply_config_value(
             settings.other_mpris_halt_auto_resume_secs =
                 parse_u32(trimmed)?.max(OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS)
         }
-        "respect_other_mpris_players" => {
-            settings.other_mpris_mode = if parse_bool(trimmed)? {
-                CoordinationMode::Respect
-            } else {
-                CoordinationMode::Off
-            }
-        }
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled = parse_bool(trimmed)?,
         "pipewire_pause_mode" => settings.pipewire_pause_mode = parse_coordination_mode(trimmed)?,
         "pipewire_pause_halt_auto_resume_secs" => {
             settings.pipewire_pause_halt_auto_resume_secs =
                 parse_u32(trimmed)?.max(PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS)
-        }
-        "pipewire_duck_pause" => {
-            settings.pipewire_pause_mode = if parse_bool(trimmed)? {
-                CoordinationMode::Respect
-            } else {
-                CoordinationMode::Off
-            }
         }
         "pipewire_ducking_threshold_secs" => {
             settings.pipewire_ducking_threshold_secs =
@@ -1203,7 +1161,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn parse_coordination_mode(value: &str) -> Result<CoordinationMode> {
     CoordinationMode::from_str(value).ok_or_else(|| {
-        anyhow::anyhow!("Expected one of `off`, `respect`, `halt`, or `halt_auto`, got `{value}`")
+        anyhow::anyhow!("Expected one of `off`, `halt`, or `halt_auto`, got `{value}`")
     })
 }
 

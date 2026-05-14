@@ -78,7 +78,7 @@ impl InteractiveTui {
             },
             ContextMenuItem {
                 label: "Add to queue".to_string(),
-                hint: "respect radio tail".to_string(),
+                hint: "keep radio tail".to_string(),
                 tone: ContextMenuTone::Default,
                 action: ContextMenuAction::QueueTrackLast {
                     track: track.clone(),

@@ -547,6 +547,29 @@ popover > contents {
     padding: 4px;
 }
 
+.np-halt-auto-btn {
+    min-height: 28px;
+    padding: 4px 10px;
+    margin-left: 4px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    background-color: rgba(255, 255, 255, 0.06);
+    color: rgba(255, 255, 255, 0.78);
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.np-halt-auto-btn:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+.np-halt-auto-resume-btn {
+    border-color: rgba(130, 160, 255, 0.38);
+    background-color: rgba(130, 160, 255, 0.2);
+    color: #e8efff;
+}
+
 /* =============================================
    TRACK INFO IN BAR
    ============================================= */

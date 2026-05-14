@@ -7,18 +7,16 @@ use super::store_offline::MusicCache;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoordinationMode {
     Off,
-    Respect,
     Halt,
     HaltAuto,
 }
 
 impl CoordinationMode {
-    pub const ALL: [Self; 4] = [Self::Off, Self::Respect, Self::Halt, Self::HaltAuto];
+    pub const ALL: [Self; 3] = [Self::Off, Self::Halt, Self::HaltAuto];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Respect => "respect",
             Self::Halt => "halt",
             Self::HaltAuto => "halt_auto",
         }
@@ -27,7 +25,6 @@ impl CoordinationMode {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
-            Self::Respect => "Respect",
             Self::Halt => "Halt",
             Self::HaltAuto => "Halt Auto",
         }
@@ -36,7 +33,6 @@ impl CoordinationMode {
     pub fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" | "ignore" | "disabled" => Some(Self::Off),
-            "respect" | "true" | "1" | "yes" | "on" => Some(Self::Respect),
             "halt" | "manual" => Some(Self::Halt),
             "halt_auto" | "halt-auto" | "haltauto" => Some(Self::HaltAuto),
             _ => None,
@@ -56,9 +52,9 @@ impl CoordinationMode {
     }
 }
 
-pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 1;
+pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 0;
 pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
-pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 1;
+pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 0;
 pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
 pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS: u32 = 1;
 pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS: u32 = 30;
@@ -110,8 +106,8 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
-            other_mpris_mode: CoordinationMode::Respect,
-            other_mpris_halt_auto_resume_secs: 5,
+            other_mpris_mode: CoordinationMode::HaltAuto,
+            other_mpris_halt_auto_resume_secs: 0,
             pipewire_ducking_enabled: false,
             pipewire_pause_mode: CoordinationMode::Off,
             pipewire_pause_halt_auto_resume_secs: 5,
@@ -127,9 +123,7 @@ impl MusicCache {
     pub fn load_settings(&self) -> Result<AppSettings> {
         let mut settings = AppSettings::default();
         let mut loaded_other_mpris_mode = None;
-        let mut legacy_respect_other_mpris_players = None;
         let mut loaded_pipewire_pause_mode = None;
-        let mut legacy_pipewire_duck_pause = None;
         let mut stmt = self.db.prepare("SELECT key, value FROM app_settings")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -230,12 +224,6 @@ impl MusicCache {
                         OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
                     );
                 }
-                "respect_other_mpris_players" => {
-                    legacy_respect_other_mpris_players = Some(parse_bool_setting(
-                        &row.1,
-                        settings.other_mpris_mode.coordinates_peers(),
-                    ));
-                }
                 "pipewire_ducking_enabled" => {
                     settings.pipewire_ducking_enabled =
                         parse_bool_setting(&row.1, settings.pipewire_ducking_enabled);
@@ -249,12 +237,6 @@ impl MusicCache {
                         settings.pipewire_pause_halt_auto_resume_secs,
                         PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
                     );
-                }
-                "pipewire_duck_pause" => {
-                    legacy_pipewire_duck_pause = Some(parse_bool_setting(
-                        &row.1,
-                        settings.pipewire_pause_mode.is_enabled(),
-                    ));
                 }
                 "pipewire_ducking_threshold_secs" => {
                     settings.pipewire_ducking_threshold_secs = parse_u32_setting_at_least(
@@ -284,23 +266,9 @@ impl MusicCache {
             }
         }
 
-        settings.other_mpris_mode = loaded_other_mpris_mode.unwrap_or_else(|| {
-            if legacy_respect_other_mpris_players
-                .unwrap_or(settings.other_mpris_mode.coordinates_peers())
-            {
-                CoordinationMode::Respect
-            } else {
-                CoordinationMode::Off
-            }
-        });
-
-        settings.pipewire_pause_mode = loaded_pipewire_pause_mode.unwrap_or_else(|| {
-            if legacy_pipewire_duck_pause.unwrap_or(settings.pipewire_pause_mode.is_enabled()) {
-                CoordinationMode::Respect
-            } else {
-                CoordinationMode::Off
-            }
-        });
+        settings.other_mpris_mode = loaded_other_mpris_mode.unwrap_or(settings.other_mpris_mode);
+        settings.pipewire_pause_mode =
+            loaded_pipewire_pause_mode.unwrap_or(settings.pipewire_pause_mode);
 
         Ok(settings)
     }
@@ -369,10 +337,6 @@ impl MusicCache {
                 settings.other_mpris_halt_auto_resume_secs.to_string(),
             ),
             (
-                "respect_other_mpris_players",
-                bool_setting(settings.other_mpris_mode.coordinates_peers()),
-            ),
-            (
                 "pipewire_ducking_enabled",
                 bool_setting(settings.pipewire_ducking_enabled),
             ),
@@ -383,10 +347,6 @@ impl MusicCache {
             (
                 "pipewire_pause_halt_auto_resume_secs",
                 settings.pipewire_pause_halt_auto_resume_secs.to_string(),
-            ),
-            (
-                "pipewire_duck_pause",
-                bool_setting(settings.pipewire_pause_mode.is_enabled()),
             ),
             (
                 "pipewire_ducking_threshold_secs",
@@ -450,10 +410,6 @@ mod tests {
             Some(CoordinationMode::Off)
         );
         assert_eq!(
-            CoordinationMode::from_str("true"),
-            Some(CoordinationMode::Respect)
-        );
-        assert_eq!(
             CoordinationMode::from_str("manual"),
             Some(CoordinationMode::Halt)
         );
@@ -461,6 +417,7 @@ mod tests {
             CoordinationMode::from_str("halt-auto"),
             Some(CoordinationMode::HaltAuto)
         );
+        assert_eq!(CoordinationMode::from_str("respect"), None);
     }
 
     #[test]

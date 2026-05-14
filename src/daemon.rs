@@ -4106,13 +4106,16 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
             activate_mpris_halt_auto_resume_pending(state);
             return;
         }
-        MprisHaltAutoPeerTransition::Resume => {}
+        MprisHaltAutoPeerTransition::Resume => {
+            clear_mpris_halt_auto_resume_pending(state);
+        }
     }
 
     let waited_for = state.peer_mpris.waiting_for_services().join(", ");
     state.peer_mpris.clear_waiting();
     if pipewire_pause_is_requested(state) {
         state.pipewire_pause_active = true;
+        sync_mpris(state);
         return;
     }
 

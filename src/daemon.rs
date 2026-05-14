@@ -3526,24 +3526,57 @@ fn volumes_match(left: f64, right: f64) -> bool {
 }
 
 fn desired_pipewire_suppression_mode(state: &DaemonState) -> PipeWireSuppressionMode {
-    if !state.settings.pipewire_ducking_enabled
-        || !state.pipewire_trigger_active
-        || state.active_track.is_none()
-    {
+    resolve_pipewire_suppression_mode(
+        state.settings.pipewire_ducking_enabled,
+        state.pipewire_trigger_active,
+        state.active_track.is_some(),
+        state.settings.pipewire_pause_mode,
+        state.pipewire_pause_active,
+        is_logically_paused(state),
+        state.peer_mpris.is_waiting_for_peer_pause(),
+    )
+}
+
+fn resolve_pipewire_suppression_mode(
+    pipewire_ducking_enabled: bool,
+    pipewire_trigger_active: bool,
+    has_active_track: bool,
+    pipewire_pause_mode: CoordinationMode,
+    pipewire_pause_active: bool,
+    logically_paused: bool,
+    peer_mpris_pause_active: bool,
+) -> PipeWireSuppressionMode {
+    if !pipewire_ducking_enabled || !pipewire_trigger_active || !has_active_track {
         return PipeWireSuppressionMode::None;
     }
 
-    if state.settings.pipewire_pause_mode.is_enabled() {
-        if state.pipewire_pause_active || !is_logically_paused(state) {
+    if pipewire_pause_mode.is_enabled() {
+        if pipewire_pause_active || !logically_paused || peer_mpris_pause_active {
             PipeWireSuppressionMode::Pause
         } else {
             PipeWireSuppressionMode::None
         }
-    } else if is_logically_paused(state) {
+    } else if peer_mpris_pause_active || logically_paused {
         PipeWireSuppressionMode::None
     } else {
         PipeWireSuppressionMode::Duck
     }
+}
+
+fn pipewire_pause_is_requested(state: &DaemonState) -> bool {
+    state.settings.pipewire_ducking_enabled
+        && state.pipewire_trigger_active
+        && state.active_track.is_some()
+        && state.settings.pipewire_pause_mode.is_enabled()
+}
+
+fn pipewire_unduck_can_replace_volume_ramp(volume_ramp: Option<VolumeRamp>) -> bool {
+    !volume_ramp.is_some_and(|ramp| {
+        matches!(
+            ramp.completion,
+            VolumeRampCompletion::PauseAtPosition { .. }
+        )
+    })
 }
 
 fn poll_pipewire_streams(state: &mut DaemonState) {
@@ -3575,13 +3608,16 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
 
     if state.ducked && desired != PipeWireSuppressionMode::Duck {
         state.ducked = false;
-        start_volume_ramp(state, state.pre_duck_volume);
+        if pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
+            start_volume_ramp(state, state.pre_duck_volume);
+        }
     }
 
     if state.pipewire_pause_active && desired != PipeWireSuppressionMode::Pause {
+        let peer_mpris_pause_active = state.peer_mpris.is_waiting_for_peer_pause();
         let should_resume = state.active_track.is_some()
             && is_logically_paused(state)
-            && !state.peer_mpris.is_waiting_for_peer_pause()
+            && !peer_mpris_pause_active
             && should_resume_after_pipewire_pause(
                 state.settings.pipewire_pause_mode,
                 desired,
@@ -3593,6 +3629,7 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
                 ),
             );
         let should_clear_without_resuming = desired == PipeWireSuppressionMode::None
+            && !peer_mpris_pause_active
             && matches!(state.settings.pipewire_pause_mode, CoordinationMode::Halt);
 
         if should_resume {
@@ -3640,12 +3677,19 @@ fn maybe_pause_for_external_mpris(state: &mut DaemonState) {
         return;
     }
 
-    if state.active_track.is_none() || is_logically_paused(state) {
+    if state.active_track.is_none() {
         return;
     }
 
     let playing_services = state.peer_mpris.playing_services().to_vec();
     if playing_services.is_empty() {
+        return;
+    }
+
+    if is_logically_paused(state) {
+        if state.pipewire_pause_active || state.peer_mpris.is_waiting_for_peer_pause() {
+            state.peer_mpris.set_waiting_for_services(&playing_services);
+        }
         return;
     }
 
@@ -3707,6 +3751,11 @@ fn maybe_resume_after_external_mpris(state: &mut DaemonState) {
 
     let waited_for = state.peer_mpris.waiting_for_services().join(", ");
     state.peer_mpris.clear_waiting();
+    if pipewire_pause_is_requested(state) {
+        state.pipewire_pause_active = true;
+        return;
+    }
+
     match other_mpris_mode {
         CoordinationMode::Respect => eprintln!(
             "[MPRIS] resuming local playback because peer player(s) paused or stopped: {waited_for}"
@@ -3999,16 +4048,17 @@ fn get_storage_root() -> Option<String> {
 mod tests {
     use super::{
         ActiveTrack, MIN_LISTEN_SECS, PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS,
-        PipeWireSuppressionMode, PlaybackSource, PreviousAction, current_listened_millis,
-        effective_queue_len, hide_timing_for_track, mpris_position_millis_for_track,
-        natural_end_target_index, next_repeat_state_after_natural_end,
-        pause_previous_threshold_clock_for_track, playback_position_confirms_start,
+        PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
+        current_listened_millis, effective_queue_len, hide_timing_for_track,
+        mpris_position_millis_for_track, natural_end_target_index,
+        next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
+        pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
         playback_start_stalled, previous_action, previous_threshold_millis,
         rearm_track_repeat_loops_for_snapshot, reset_previous_threshold_clock_for_track,
-        should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
-        should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
-        should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
-        should_wait_for_radio_extension_at_natural_end,
+        resolve_pipewire_suppression_mode, should_emit_live_mpris_seeked_hint,
+        should_evict_cache_after_startup_stall, should_resume_after_external_mpris_pause,
+        should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
+        should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
     };
     use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
     use crate::network::SongRating;
@@ -4402,6 +4452,75 @@ mod tests {
             Some(Duration::from_secs(5)),
             Duration::from_secs(5)
         ));
+    }
+
+    #[test]
+    fn mpris_pause_suppresses_pipewire_duck() {
+        assert_eq!(
+            resolve_pipewire_suppression_mode(
+                true,
+                true,
+                true,
+                CoordinationMode::Off,
+                false,
+                true,
+                true,
+            ),
+            PipeWireSuppressionMode::None
+        );
+    }
+
+    #[test]
+    fn mpris_pause_allows_pipewire_pause_to_take_over_next() {
+        assert_eq!(
+            resolve_pipewire_suppression_mode(
+                true,
+                true,
+                true,
+                CoordinationMode::Respect,
+                false,
+                true,
+                true,
+            ),
+            PipeWireSuppressionMode::Pause
+        );
+    }
+
+    #[test]
+    fn manual_pause_does_not_arm_pipewire_pause() {
+        assert_eq!(
+            resolve_pipewire_suppression_mode(
+                true,
+                true,
+                true,
+                CoordinationMode::Respect,
+                false,
+                true,
+                false,
+            ),
+            PipeWireSuppressionMode::None
+        );
+    }
+
+    #[test]
+    fn pipewire_unduck_keeps_pending_pause_ramp() {
+        let pause_ramp = VolumeRamp {
+            started_at: Instant::now(),
+            start_volume: 0.3,
+            target_volume: 0.0,
+            duration: Duration::from_millis(250),
+            completion: VolumeRampCompletion::PauseAtPosition {
+                position_millis: 12_345,
+            },
+        };
+        let duck_ramp = VolumeRamp {
+            completion: VolumeRampCompletion::None,
+            ..pause_ramp
+        };
+
+        assert!(!pipewire_unduck_can_replace_volume_ramp(Some(pause_ramp)));
+        assert!(pipewire_unduck_can_replace_volume_ramp(Some(duck_ramp)));
+        assert!(pipewire_unduck_can_replace_volume_ramp(None));
     }
 
     #[test]

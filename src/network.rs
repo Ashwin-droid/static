@@ -20,4 +20,5 @@ pub(crate) use ytm_api_network::YtMusicClient;
 pub use ytm_api_network::{SongRating, extract_video_id_from_input};
 
 #[cfg(test)]
+#[path = "tests/network_architecture_guard.rs"]
 mod architecture_guard;

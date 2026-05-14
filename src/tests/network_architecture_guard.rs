@@ -31,7 +31,10 @@ fn internet_and_keyring_stay_inside_network() {
         };
         let relative = relative.to_string_lossy().replace('\\', "/");
 
-        if relative == "src/network.rs" || relative.starts_with("src/network/") {
+        if relative == "src/network.rs"
+            || relative.starts_with("src/network/")
+            || relative.starts_with("src/tests/")
+        {
             continue;
         }
 

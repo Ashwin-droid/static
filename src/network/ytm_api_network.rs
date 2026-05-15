@@ -1304,9 +1304,6 @@ pub struct YtMusicClient {
     vr_access_token: std::sync::Mutex<Option<(String, u64)>>,
 }
 
-unsafe impl Send for YtMusicClient {}
-unsafe impl Sync for YtMusicClient {}
-
 fn cookie_value(cookie: &str, name: &str) -> Option<String> {
     cookie.split(';').map(|s| s.trim()).find_map(|cookie| {
         let (cookie_name, value) = cookie.split_once('=')?;

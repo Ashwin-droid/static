@@ -1,13 +1,20 @@
+use super::super::session_network::get_cookie;
 use super::{
     CaptionTrack, TrackingInfo, YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK, YtMusicClient, YtmWebProfile,
     finalize_synced_lyric_lines, generate_cpn, lyrics_browse_id_from_next_response,
     prepare_cookie_for_sapisid_auth, signature_timestamp_from_player_js, ytm_web_profile_from_html,
 };
 use crate::models::{SyncedLyricLine, SyncedLyricsSource};
+use anyhow::Context;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+const WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID: &str = "qSU560anReg";
+const WEB_REMIX_HIGH_AUDIO_MIN_BITRATE: u64 = 240_000;
 
 fn test_tracking_info(
     watchtime_url: Option<&str>,
@@ -67,6 +74,184 @@ fn sorted_audio_formats_prefer_direct_urls_over_non_url_entries() {
         YtMusicClient::format_direct_url(formats[0]),
         Some("https://example.com/direct")
     );
+}
+
+#[test]
+fn web_remix_audio_formats_prefer_high_ciphered_bitrate() {
+    let json = json!({
+        "streamingData": {
+            "adaptiveFormats": [
+                {
+                    "itag": 251,
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "averageBitrate": 139000,
+                    "bitrate": 160000,
+                    "url": "https://example.com/low"
+                },
+                {
+                    "itag": 774,
+                    "mimeType": "audio/webm; codecs=\"opus\"",
+                    "averageBitrate": 267000,
+                    "signatureCipher": "s=abc&sp=sig&url=https%3A%2F%2Fexample.com%2Fhigh%3Fn%3Draw"
+                },
+                {
+                    "itag": 141,
+                    "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                    "averageBitrate": 257000,
+                    "signatureCipher": "s=def&sp=sig&url=https%3A%2F%2Fexample.com%2Fm4a%3Fn%3Draw"
+                }
+            ]
+        }
+    });
+
+    let format = YtMusicClient::best_web_remix_audio_format(&json).expect("best format");
+    assert_eq!(format.get("itag").and_then(|itag| itag.as_u64()), Some(774));
+}
+
+#[test]
+fn web_remix_stream_url_from_signature_cipher_parses_parts() {
+    let format = json!({
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "signatureCipher": "s=encrypted_sig&sp=sig&url=https%3A%2F%2Frr.example.com%2Fvideoplayback%3Fn%3Draw_n"
+    });
+
+    let stream =
+        YtMusicClient::web_remix_stream_url_from_format(&format).expect("stream url parts");
+    assert!(stream.ciphered);
+    assert_eq!(stream.sp, "sig");
+    assert_eq!(stream.signature.as_deref(), Some("encrypted_sig"));
+    assert_eq!(stream.url, "https://rr.example.com/videoplayback?n=raw_n");
+}
+
+#[test]
+fn web_remix_stream_url_from_signature_cipher_defaults_signature_param() {
+    let format = json!({
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "signatureCipher": "url=https%3A%2F%2Frr.example.com%2Fvideoplayback&s=encrypted_sig"
+    });
+
+    let stream =
+        YtMusicClient::web_remix_stream_url_from_format(&format).expect("stream url parts");
+    assert_eq!(stream.sp, "signature");
+    assert_eq!(stream.signature.as_deref(), Some("encrypted_sig"));
+}
+
+#[test]
+fn node_binary_candidates_include_nvm_versions_when_path_is_plain() {
+    let root = std::env::temp_dir().join(format!("static-node-test-{}", Uuid::new_v4()));
+    let nvm_node = root.join(".nvm/versions/node/v24.13.0").join("bin/node");
+    std::fs::create_dir_all(nvm_node.parent().expect("node parent")).expect("create nvm node dir");
+    std::fs::write(&nvm_node, b"#!/bin/sh\n").expect("write fake node");
+
+    let candidates = super::node_binary_candidates(Some(&root), None);
+
+    assert_eq!(candidates.first(), Some(&PathBuf::from("node")));
+    assert!(
+        candidates.iter().any(|candidate| candidate == &nvm_node),
+        "expected candidates to include NVM node path, got {candidates:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn live_test_cookie() -> Option<String> {
+    std::env::var("STATIC_YTM_TEST_COOKIE")
+        .ok()
+        .map(|cookie| cookie.trim().to_string())
+        .filter(|cookie| !cookie.is_empty())
+        .or_else(get_cookie)
+}
+
+fn live_test_client() -> anyhow::Result<YtMusicClient> {
+    let cookie = live_test_cookie().context(
+        "set STATIC_YTM_TEST_COOKIE or save a YouTube Music cookie in Static's keyring first",
+    )?;
+    YtMusicClient::new(&cookie)
+}
+
+#[test]
+#[ignore = "requires authenticated YouTube Music cookies and live network access"]
+fn web_remix_live_hardcoded_ytm_id_has_high_quality_audio() -> anyhow::Result<()> {
+    let client = live_test_client()?;
+
+    client.rt.block_on(async {
+        let mut profile = client.ytm_web_profile(false).await;
+        let cpn = generate_cpn();
+        let mut json = client
+            .tracking_player_response(
+                WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID,
+                &cpn,
+                None,
+                None,
+                &profile,
+            )
+            .await?;
+
+        if YtMusicClient::player_response_requests_reload(&json) {
+            profile = client.ytm_web_profile(true).await;
+            json = client
+                .tracking_player_response(
+                    WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID,
+                    &cpn,
+                    None,
+                    None,
+                    &profile,
+                )
+                .await?;
+        }
+
+        let format = YtMusicClient::best_web_remix_audio_format(&json)?;
+        let bitrate = YtMusicClient::format_effective_bitrate(format);
+        let itag = format
+            .get("itag")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let audio_quality = format
+            .get("audioQuality")
+            .and_then(|value| value.as_str())
+            .unwrap_or("missing");
+
+        assert!(
+            bitrate >= WEB_REMIX_HIGH_AUDIO_MIN_BITRATE,
+            "expected WEB_REMIX high audio for {WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID}; got itag {itag}, audioQuality {audio_quality}, bitrate {bitrate}"
+        );
+        assert!(
+            YtMusicClient::format_signature_cipher(format).is_some()
+                || YtMusicClient::format_direct_url(format).is_some(),
+            "selected high audio format has no playable URL material"
+        );
+
+        Ok::<(), anyhow::Error>(())
+    })
+}
+
+#[test]
+#[ignore = "requires authenticated YouTube Music cookies, Node.js, and live network access"]
+fn web_remix_live_hardcoded_ytm_id_resolves_high_quality_url() -> anyhow::Result<()> {
+    let client = live_test_client()?;
+    let url = client.rt.block_on(async {
+        client
+            .try_web_remix_audio(WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID)
+            .await
+    })?;
+    let parsed = url::Url::parse(&url)?;
+    let itag = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "itag").then(|| value.into_owned()))
+        .unwrap_or_else(|| "missing".to_string());
+
+    assert!(
+        matches!(itag.as_str(), "774" | "141"),
+        "expected a high WEB_REMIX audio itag for {WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID}; got {itag}"
+    );
+    assert!(
+        parsed
+            .query_pairs()
+            .any(|(key, _)| key == "sig" || key == "signature"),
+        "resolved WEB_REMIX URL is missing a deciphered signature parameter"
+    );
+
+    Ok(())
 }
 
 #[test]

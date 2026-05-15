@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -53,6 +55,86 @@ const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
 const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
 const YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK: u64 = 20_572;
+const WEB_REMIX_NODE_CIPHER_SOLVER: &str = r#"
+const fs = require("fs");
+const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
+
+function installBrowserStubs() {
+  const loc = new URL("https://music.youtube.com/");
+  globalThis.window = globalThis;
+  globalThis.self = globalThis;
+  globalThis.location = loc;
+  try {
+    Object.defineProperty(globalThis, "navigator", {
+      value: { userAgent: "Mozilla/5.0", cookieEnabled: true },
+      configurable: true
+    });
+  } catch (_) {}
+  globalThis.XMLHttpRequest = function XMLHttpRequest() {};
+  const storage = {
+    getItem() { return null; },
+    setItem() {},
+    removeItem() {}
+  };
+  globalThis.localStorage = globalThis.localStorage || storage;
+  globalThis.sessionStorage = globalThis.sessionStorage || storage;
+  globalThis.CustomEvent = globalThis.CustomEvent || function CustomEvent() {};
+  globalThis.addEventListener = globalThis.addEventListener || function addEventListener() {};
+  globalThis.removeEventListener = globalThis.removeEventListener || function removeEventListener() {};
+  globalThis.dispatchEvent = globalThis.dispatchEvent || function dispatchEvent() {};
+  globalThis.matchMedia = globalThis.matchMedia || function matchMedia() {
+    return { matches: false, addEventListener() {}, removeEventListener() {} };
+  };
+  globalThis.document = globalThis.document || {
+    location: loc,
+    createElement() {
+      return {
+        style: {},
+        setAttribute() {},
+        appendChild() {},
+        getElementsByTagName() { return []; }
+      };
+    },
+    querySelector() { return null; },
+    addEventListener() {}
+  };
+}
+
+function findUrlCipherHelperName(playerJs) {
+  const helperRe = /([A-Za-z_$][\w$]*)=function\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=""(?:,([A-Za-z_$][\w$]*)="")?\)\{\2=new g\.bB\(\2,!0\);\2\.set\("alr","yes"\);/g;
+  for (const match of playerJs.matchAll(helperRe)) {
+    if (!match[4] || playerJs.slice(match.index, match.index + 220).includes(`${match[4]}&&`)) {
+      return match[1];
+    }
+  }
+  throw new Error("WEB_REMIX URL cipher helper was not found in player JS");
+}
+
+function exportUrlCipherHelper(playerJs, helperName) {
+  const end = "})(_yt_player);";
+  const injection = `;globalThis.__staticYtCipher = { helper: typeof ${helperName} !== "undefined" ? ${helperName} : null };`;
+  if (!playerJs.includes(end)) {
+    throw new Error("WEB_REMIX player JS wrapper was not recognized");
+  }
+  return playerJs.replace(end, `${injection}${end}`);
+}
+
+function renderedUrl(value) {
+  if (value && typeof value.Ws === "function") {
+    return String(value.Ws());
+  }
+  return String(value);
+}
+
+installBrowserStubs();
+const helperName = findUrlCipherHelperName(input.playerJs || "");
+eval(exportUrlCipherHelper(input.playerJs || "", helperName));
+if (!globalThis.__staticYtCipher || typeof globalThis.__staticYtCipher.helper !== "function") {
+  throw new Error("WEB_REMIX URL cipher helper did not export");
+}
+const solved = globalThis.__staticYtCipher.helper(input.url || "", input.sp || "signature", input.s || "");
+process.stdout.write(JSON.stringify({ url: renderedUrl(solved) }));
+"#;
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -211,6 +293,14 @@ struct PendingWatchtimeRequest {
     watched_millis: u64,
     state: String,
     final_ping: bool,
+}
+
+#[derive(Debug, Clone)]
+struct WebRemixStreamUrl {
+    url: String,
+    sp: String,
+    signature: Option<String>,
+    ciphered: bool,
 }
 
 struct PendingTrackingRequest {
@@ -973,6 +1063,93 @@ fn absolute_ytm_url(path_or_url: &str) -> Option<String> {
     None
 }
 
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn append_versioned_node_binaries(root: &Path, candidates: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+
+    let mut binaries = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let binary = entry.path().join("bin/node");
+            binary.exists().then_some(binary)
+        })
+        .collect::<Vec<_>>();
+    binaries.sort();
+    binaries.reverse();
+
+    for binary in binaries {
+        push_unique_path(candidates, binary);
+    }
+}
+
+fn node_binary_candidates(home: Option<&Path>, explicit_node: Option<String>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(explicit_node) = explicit_node
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        push_unique_path(&mut candidates, PathBuf::from(explicit_node));
+    }
+
+    push_unique_path(&mut candidates, PathBuf::from("node"));
+
+    if let Some(home) = home {
+        append_versioned_node_binaries(&home.join(".nvm/versions/node"), &mut candidates);
+        append_versioned_node_binaries(
+            &home.join(".local/share/fnm/node-versions"),
+            &mut candidates,
+        );
+    }
+
+    for path in [
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+        "/bin/node",
+        "/usr/local/bin/nodejs",
+        "/usr/bin/nodejs",
+    ] {
+        push_unique_path(&mut candidates, PathBuf::from(path));
+    }
+
+    candidates
+}
+
+fn executable_node_binary() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let candidates = node_binary_candidates(home.as_deref(), std::env::var("STATIC_NODE").ok());
+    for candidate in &candidates {
+        if Command::new(candidate)
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Ok(candidate.clone());
+        }
+    }
+
+    bail!(
+        "Node.js is not available for WEB_REMIX URL solving; tried {}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 fn signature_timestamp_from_player_js(js: &str) -> Option<u64> {
     let re = Regex::new(r"signatureTimestamp\s*:\s*(\d+)")
         .expect("signature timestamp regex should compile");
@@ -1120,6 +1297,7 @@ pub struct YtMusicClient {
     rt: Arc<tokio::runtime::Runtime>,
     sapisid: Option<String>,
     visitor_data: std::sync::Mutex<Option<String>>,
+    web_player_js: std::sync::Mutex<Option<(String, String)>>,
     /// OAuth refresh token for Android VR (premium content)
     vr_refresh_token: std::sync::Mutex<Option<String>>,
     /// Cached VR access token + expiry (epoch secs)
@@ -1232,6 +1410,7 @@ impl YtMusicClient {
             rt,
             sapisid,
             visitor_data: std::sync::Mutex::new(None),
+            web_player_js: std::sync::Mutex::new(None),
             vr_refresh_token: std::sync::Mutex::new(None),
             vr_access_token: std::sync::Mutex::new(None),
         })
@@ -1800,33 +1979,30 @@ impl YtMusicClient {
     /// Use this for cache downloads and other non-playback fetches.
     pub fn get_audio_url_no_track(&self, video_id: &str) -> Result<String> {
         self.rt.block_on(async {
-            // Try Android VR client first — this is the primary path for playable URLs.
-            eprintln!("[PLAYER] trying Android VR client for {video_id}...");
-            let vr_err = match self.try_android_vr_audio(video_id).await {
+            eprintln!("[PLAYER] trying WEB_REMIX client for {video_id}...");
+            let web_remix_err = match self.try_web_remix_audio(video_id).await {
                 Ok(url) => {
-                    eprintln!("[PLAYER] got direct URL via Android VR");
+                    eprintln!("[PLAYER] got URL via WEB_REMIX");
                     return Ok(url);
                 }
                 Err(e) => {
-                    eprintln!("[PLAYER] Android VR failed: {e}, trying web client...");
+                    eprintln!("[PLAYER] WEB_REMIX failed: {e}, trying Android VR fallback...");
                     e
                 }
             };
 
-            // Fallback: web client (may return direct URL without cipher)
-            let mut body = Self::client_context();
-            body["videoId"] = json!(video_id);
-
-            let json = self.player_request(&body).await?;
-            let formats = Self::sorted_audio_formats(&json)?;
-            for audio in &formats {
-                if let Some(url) = Self::format_direct_url(audio) {
-                    eprintln!("[PLAYER] got direct URL via web client");
-                    return Ok(url.to_string());
+            // Android VR stays as the last-ditch playable URL path for offline/cache reliability.
+            match self.try_android_vr_audio(video_id).await {
+                Ok(url) => {
+                    eprintln!("[PLAYER] got direct URL via Android VR fallback");
+                    Ok(url)
+                }
+                Err(vr_err) => {
+                    bail!(
+                        "Could not get audio URL via WEB_REMIX or Android VR: WEB_REMIX: {web_remix_err}; Android VR: {vr_err}"
+                    )
                 }
             }
-
-            bail!("Could not get audio URL: {vr_err}; web client returned no direct audio URL")
         })
     }
 
@@ -1852,6 +2028,196 @@ impl YtMusicClient {
         resp.json().await.with_context(|| {
             format!("WEB_REMIX player bootstrap response was not JSON for {video_id}")
         })
+    }
+
+    async fn try_web_remix_audio(&self, video_id: &str) -> Result<String> {
+        let cpn = generate_cpn();
+        let mut profile = self.ytm_web_profile(false).await;
+        let mut json = match self
+            .tracking_player_response(video_id, &cpn, None, None, &profile)
+            .await
+        {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!(
+                    "[PLAYER] WEB_REMIX player request failed for {video_id}: {err}; refreshing profile"
+                );
+                profile = self.ytm_web_profile(true).await;
+                self.tracking_player_response(video_id, &cpn, None, None, &profile)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "WEB_REMIX player request still failed after profile refresh for {video_id}"
+                        )
+                    })?
+            }
+        };
+
+        if Self::player_response_requests_reload(&json) {
+            eprintln!(
+                "[PLAYER] WEB_REMIX requested a page reload for {video_id}; refreshing profile"
+            );
+            profile = self.ytm_web_profile(true).await;
+            json = self
+                .tracking_player_response(video_id, &cpn, None, None, &profile)
+                .await
+                .with_context(|| {
+                    format!("WEB_REMIX retry failed after profile refresh for {video_id}")
+                })?;
+        }
+
+        if json.pointer("/streamingData/adaptiveFormats").is_none() {
+            let status = json
+                .pointer("/playabilityStatus/status")
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing");
+            let reason = json
+                .pointer("/playabilityStatus/reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or("missing");
+            bail!(
+                "WEB_REMIX player response has no streaming data (status={status}, reason={reason})"
+            );
+        }
+
+        let format = Self::best_web_remix_audio_format(&json)?;
+        let itag = format
+            .get("itag")
+            .and_then(|value| parse_json_u64(Some(value)))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let bitrate = Self::format_effective_bitrate(format);
+        let url = self
+            .resolve_web_remix_audio_format(format, &profile)
+            .await?;
+        eprintln!("[PLAYER] selected WEB_REMIX itag {itag} audio at ~{bitrate} bps");
+        Ok(url)
+    }
+
+    async fn web_remix_player_js(&self, profile: &YtmWebProfile) -> Result<String> {
+        let player_js_url = profile
+            .player_js_url
+            .as_deref()
+            .and_then(absolute_ytm_url)
+            .context("YTM WEB_REMIX profile does not include a player JS URL")?;
+
+        {
+            let cached = self.web_player_js.lock().unwrap();
+            if let Some((cached_url, cached_js)) = cached.as_ref() {
+                if cached_url == &player_js_url {
+                    return Ok(cached_js.clone());
+                }
+            }
+        }
+
+        let js = self
+            .http
+            .get(&player_js_url)
+            .header("user-agent", profile.user_agent.clone())
+            .header("referer", format!("{YTM_ORIGIN}/"))
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch WEB_REMIX player JS from {player_js_url}"))?
+            .error_for_status()
+            .with_context(|| {
+                format!("WEB_REMIX player JS request was rejected for {player_js_url}")
+            })?
+            .text()
+            .await
+            .context("Failed to read WEB_REMIX player JS")?;
+
+        let mut cached = self.web_player_js.lock().unwrap();
+        *cached = Some((player_js_url, js.clone()));
+        Ok(js)
+    }
+
+    async fn resolve_web_remix_audio_format(
+        &self,
+        format: &Value,
+        profile: &YtmWebProfile,
+    ) -> Result<String> {
+        let stream = Self::web_remix_stream_url_from_format(format)?;
+        let player_js = self.web_remix_player_js(profile).await?;
+        let solver_stream = stream.clone();
+
+        let resolved = tokio::task::spawn_blocking(move || {
+            Self::solve_web_remix_stream_url_with_node(&player_js, &solver_stream)
+        })
+        .await
+        .context("WEB_REMIX URL solver task failed")?;
+
+        match resolved {
+            Ok(url) => Ok(url),
+            Err(err) if !stream.ciphered => {
+                eprintln!(
+                    "[PLAYER] WEB_REMIX direct URL transform failed ({err}); using direct URL"
+                );
+                Ok(stream.url)
+            }
+            Err(err) => Err(err).context("Failed to solve WEB_REMIX ciphered audio URL"),
+        }
+    }
+
+    fn solve_web_remix_stream_url_with_node(
+        player_js: &str,
+        stream: &WebRemixStreamUrl,
+    ) -> Result<String> {
+        let input = serde_json::to_vec(&json!({
+            "playerJs": player_js,
+            "url": stream.url,
+            "sp": stream.sp,
+            "s": stream.signature.as_deref().unwrap_or(""),
+        }))
+        .context("Failed to encode WEB_REMIX URL solver input")?;
+
+        let node = executable_node_binary()?;
+        let mut child = Command::new(&node)
+            .arg("-e")
+            .arg(WEB_REMIX_NODE_CIPHER_SOLVER)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Node.js is not available for WEB_REMIX URL solving")?;
+
+        child
+            .stdin
+            .as_mut()
+            .context("WEB_REMIX URL solver stdin was not available")?
+            .write_all(&input)
+            .context("Failed to write WEB_REMIX URL solver input")?;
+
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for WEB_REMIX URL solver")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let message = stderr
+                .lines()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim()
+                .to_string();
+            bail!(
+                "node WEB_REMIX URL solver failed: {}",
+                if message.is_empty() {
+                    "no stderr".to_string()
+                } else {
+                    message
+                }
+            );
+        }
+
+        let output_json: Value = serde_json::from_slice(&output.stdout)
+            .context("WEB_REMIX URL solver response was not JSON")?;
+        let url = output_json
+            .get("url")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .context("WEB_REMIX URL solver returned no URL")?;
+        Url::parse(url).context("WEB_REMIX URL solver returned an invalid URL")?;
+        Ok(url.to_string())
     }
 
     fn tracking_urls_from_player_response(
@@ -2505,6 +2871,86 @@ impl YtMusicClient {
 
     fn format_direct_url(format: &Value) -> Option<&str> {
         format.get("url").and_then(|u| u.as_str())
+    }
+
+    fn format_signature_cipher(format: &Value) -> Option<&str> {
+        format
+            .get("signatureCipher")
+            .or_else(|| format.get("cipher"))
+            .and_then(|value| value.as_str())
+    }
+
+    fn format_effective_bitrate(format: &Value) -> u64 {
+        parse_json_u64(format.get("averageBitrate"))
+            .or_else(|| parse_json_u64(format.get("bitrate")))
+            .unwrap_or(0)
+    }
+
+    fn web_remix_audio_format_score(format: &Value) -> (u64, u8, u64) {
+        let bitrate = Self::format_effective_bitrate(format);
+        let codec_rank = format
+            .get("mimeType")
+            .and_then(|value| value.as_str())
+            .map(|mime| {
+                if mime.contains("opus") {
+                    2
+                } else if mime.contains("mp4a") {
+                    1
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        let itag = parse_json_u64(format.get("itag")).unwrap_or(0);
+        (bitrate, codec_rank, itag)
+    }
+
+    fn best_web_remix_audio_format(json: &Value) -> Result<&Value> {
+        Self::audio_formats(json)?
+            .into_iter()
+            .filter(|format| {
+                Self::format_direct_url(format).is_some()
+                    || Self::format_signature_cipher(format).is_some()
+            })
+            .max_by_key(|format| Self::web_remix_audio_format_score(format))
+            .context("WEB_REMIX stream has no playable audio URL entries")
+    }
+
+    fn web_remix_stream_url_from_format(format: &Value) -> Result<WebRemixStreamUrl> {
+        if let Some(url) = Self::format_direct_url(format) {
+            return Ok(WebRemixStreamUrl {
+                url: url.to_string(),
+                sp: "signature".to_string(),
+                signature: None,
+                ciphered: false,
+            });
+        }
+
+        let cipher = Self::format_signature_cipher(format)
+            .context("WEB_REMIX audio format has neither url nor signatureCipher")?;
+        let mut params = url::form_urlencoded::parse(cipher.as_bytes())
+            .into_owned()
+            .collect::<HashMap<String, String>>();
+        let url = params
+            .remove("url")
+            .filter(|value| !value.trim().is_empty())
+            .context("WEB_REMIX signatureCipher did not include a stream URL")?;
+        let signature = params.remove("s").filter(|value| !value.trim().is_empty());
+        let sp = params
+            .remove("sp")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "signature".to_string());
+
+        if signature.is_none() {
+            bail!("WEB_REMIX signatureCipher did not include a signature");
+        }
+
+        Ok(WebRemixStreamUrl {
+            url,
+            sp,
+            signature,
+            ciphered: true,
+        })
     }
 
     fn audio_format_score(format: &Value) -> (u8, u64) {

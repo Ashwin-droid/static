@@ -795,7 +795,7 @@ impl InteractiveTui {
                 if let Some(visible_rect) = intersect_rect(screen_rect, feed_inner) {
                     targets.push(ClickTarget {
                         rect: visible_rect,
-                        kind: ClickTargetKind::Action(TuiAction::ResumeSaved),
+                        kind: ClickTargetKind::Action(TuiAction::ResumeSuggested),
                     });
                 }
             }

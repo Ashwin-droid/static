@@ -293,71 +293,54 @@ impl InteractiveTui {
     }
 }
 
-pub(in crate::cli_tui) fn load_resume_card_data() -> Option<ResumeCardData> {
-    let persisted = load_persisted_playback_state().ok().flatten()?;
-    if persisted.snapshot.queue.is_empty() {
-        return None;
+pub(in crate::cli_tui) fn load_resume_card_data(
+    queue: Option<CrossDeviceQueue>,
+) -> Option<ResumeCardData> {
+    let local_resume = match load_local_resume_state() {
+        Ok(resume) => resume,
+        Err(err) => {
+            tracing::debug!("Local resume unavailable: {err}");
+            None
+        }
+    };
+
+    if should_use_local_resume_for_cross_device(queue.as_ref(), local_resume.as_ref()) {
+        if let Some(resume) = local_resume {
+            return local_resume_card_data(resume);
+        }
     }
 
-    let track = resume_snapshot_track(&persisted.snapshot)?;
+    if let Some(queue) = queue {
+        return cross_device_resume_card_data(queue);
+    }
+
+    local_resume_card_data(local_resume?)
+}
+
+fn local_resume_card_data(resume: PersistedPlaybackState) -> Option<ResumeCardData> {
+    let snapshot = resume.snapshot;
+    let track = resume_snapshot_track(&snapshot)?;
     Some(ResumeCardData {
+        meta: resume_snapshot_meta(&snapshot),
+        source: ResumeCardSource::Local(snapshot),
         track,
-        meta: resume_snapshot_meta(&persisted.snapshot),
     })
 }
 
-pub(in crate::cli_tui) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track> {
-    snapshot
-        .queue
-        .get(
-            snapshot
-                .queue_index
-                .min(snapshot.queue.len().saturating_sub(1)),
-        )
-        .cloned()
-        .or_else(|| {
-            snapshot.current_track.as_ref().map(|track| Track {
-                video_id: track.video_id.clone(),
-                title: track.title.clone(),
-                artists: vec![crate::models::Artist {
-                    name: track.artist.clone(),
-                    id: None,
-                }],
-                album: None,
-                duration: None,
-                thumbnail_url: track.thumb_url.clone(),
-                playback_playlist_id: None,
-                playback_params: None,
-                not_interested_feedback_token: None,
-                undo_feedback_token: None,
-            })
-        })
-}
-
-pub(in crate::cli_tui) fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
-    let queue_label = if snapshot.radio_virtual_playlist.is_some() {
-        "Radio queue"
-    } else if snapshot.playlist_context.is_some() {
-        "Playlist"
-    } else if snapshot.queue.len() > 1 {
-        "Queue"
-    } else {
-        "Track"
-    };
-    match snapshot.position_millis {
-        Some(position_millis) if position_millis > 0 => {
-            let action = if snapshot.paused {
-                "Paused at"
-            } else {
-                "Resume at"
-            };
-            format!(
-                "{queue_label} • {action} {}",
-                format_millis(position_millis)
-            )
+fn cross_device_resume_card_data(queue: CrossDeviceQueue) -> Option<ResumeCardData> {
+    let track = queue.tracks.get(queue.selected_index)?.clone();
+    let meta = queue.source_label.clone().unwrap_or_else(|| {
+        if queue.playlist_id.is_some() {
+            "From another device playlist".to_string()
+        } else {
+            "From another device".to_string()
         }
-        _ => queue_label.to_string(),
-    }
+    });
+    Some(ResumeCardData {
+        source: ResumeCardSource::CrossDevice(queue),
+        track,
+        meta,
+    })
 }
 
 pub(in crate::cli_tui) fn playlist_source_label(source: TuiPlaylistSource) -> &'static str {

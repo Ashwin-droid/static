@@ -4,8 +4,8 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::models::{
-    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    HomeSection, PlaylistSummary, RadioChip, RadioQueue, SearchResult, Track,
+    Artist, BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem,
+    HomePage, HomeSection, PlaylistSummary, RadioChip, RadioQueue, SearchResult, Track,
 };
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
@@ -881,16 +881,20 @@ pub fn parse_search_suggestions(json: &Value) -> Vec<String> {
         .collect()
 }
 
+fn music_queue_renderer(json: &Value) -> Option<&Value> {
+    json.pointer(
+        "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer\
+         /watchNextTabbedResultsRenderer/tabs/0/tabRenderer/content/musicQueueRenderer",
+    )
+}
+
 #[cfg(test)]
 #[path = "../tests/network_parser_shared_parser.rs"]
 mod tests;
 
 /// Parse the `/next` response into a RadioQueue with tracks, chips, and continuation token.
 pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
-    let mqr = json.pointer(
-        "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer\
-         /watchNextTabbedResultsRenderer/tabs/0/tabRenderer/content/musicQueueRenderer",
-    );
+    let mqr = music_queue_renderer(json);
 
     let playlist = mqr.and_then(|m| m.pointer("/content/playlistPanelRenderer"));
 
@@ -994,6 +998,157 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
         tracks,
         chips,
         continuation,
+    })
+}
+
+pub fn parse_cross_device_queue(json: &Value) -> Result<Option<CrossDeviceQueue>> {
+    let Some(mqr) = music_queue_renderer(json) else {
+        return Ok(None);
+    };
+    let Some(restoration) = mqr.pointer("/musicQueueConfig/musicQueueRestorationInfo") else {
+        return Ok(None);
+    };
+    if !restoration
+        .get("isCrossDeviceQueue")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+
+    let playlist = mqr.pointer("/content/playlistPanelRenderer");
+    let playlist_id = playlist
+        .and_then(|value| value.get("playlistId"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let source_label = restoration
+        .pointer(
+            "/onQueueRestoredCommand/miniplayerAnnouncementCommand/miniPlayerBylineRenderer/miniPlayerBylineRenderer/text/runs",
+        )
+        .and_then(|runs| runs.as_array())
+        .map(|runs| {
+            runs.iter()
+                .filter_map(|run| run.get("text").and_then(|value| value.as_str()))
+                .collect::<String>()
+        })
+        .filter(|label| !label.trim().is_empty());
+    let last_watch_timestamp_millis = parse_last_watch_timestamp_millis(restoration);
+
+    let mut tracks = Vec::new();
+    let mut selected_index = None;
+    if let Some(items) = playlist
+        .and_then(|value| value.get("contents"))
+        .and_then(|value| value.as_array())
+    {
+        for item in items {
+            let Some(renderer) = primary_playlist_panel_video_renderer(item) else {
+                continue;
+            };
+            let is_selected = renderer
+                .get("selected")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            if let Some(track) = parse_playlist_panel_track(renderer, playlist_id.as_deref()) {
+                if is_selected {
+                    selected_index = Some(tracks.len());
+                }
+                tracks.push(track);
+            }
+        }
+    }
+
+    if tracks.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(CrossDeviceQueue {
+        source_label,
+        last_watch_timestamp_millis,
+        playlist_id,
+        selected_index: selected_index
+            .unwrap_or(0)
+            .min(tracks.len().saturating_sub(1)),
+        tracks,
+    }))
+}
+
+fn parse_last_watch_timestamp_millis(restoration: &Value) -> Option<u64> {
+    let timestamp = restoration.get("lastWatchTimestamp")?;
+    let seconds = timestamp
+        .get("seconds")
+        .and_then(|value| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        .or_else(|| timestamp.get("seconds").and_then(|value| value.as_u64()))?;
+    let nanos = timestamp
+        .get("nanos")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    Some(
+        seconds
+            .saturating_mul(1_000)
+            .saturating_add(nanos / 1_000_000),
+    )
+}
+
+fn primary_playlist_panel_video_renderer(item: &Value) -> Option<&Value> {
+    item.get("playlistPanelVideoRenderer").or_else(|| {
+        item.pointer(
+            "/playlistPanelVideoWrapperRenderer/primaryRenderer/playlistPanelVideoRenderer",
+        )
+    })
+}
+
+fn parse_playlist_panel_track(
+    renderer: &Value,
+    fallback_playlist_id: Option<&str>,
+) -> Option<Track> {
+    let video_id = renderer.get("videoId").and_then(|value| value.as_str())?;
+    let title = renderer
+        .pointer("/title/runs/0/text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Unknown")
+        .to_string();
+    let artists = renderer
+        .pointer("/shortBylineText/runs")
+        .or_else(|| renderer.pointer("/longBylineText/runs"))
+        .and_then(|runs| runs.as_array())
+        .map(|runs| extract_artists_from_runs(runs))
+        .unwrap_or_default();
+    let endpoint = renderer.pointer("/navigationEndpoint/watchEndpoint");
+    let playback_playlist_id = endpoint
+        .and_then(|value| value.get("playlistId"))
+        .and_then(|value| value.as_str())
+        .or(fallback_playlist_id)
+        .map(str::to_string);
+    let playback_params = endpoint
+        .and_then(|value| value.get("playerParams"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            endpoint
+                .and_then(|value| value.get("params"))
+                .and_then(|value| value.as_str())
+        })
+        .map(str::to_string);
+
+    Some(Track {
+        video_id: video_id.to_string(),
+        title,
+        artists,
+        album: None,
+        duration: renderer
+            .pointer("/lengthText/runs/0/text")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        thumbnail_url: renderer
+            .pointer("/thumbnail/thumbnails")
+            .and_then(|value| value.as_array())
+            .and_then(|thumbnails| thumbnails.last())
+            .and_then(|thumbnail| thumbnail.get("url"))
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        playback_playlist_id,
+        playback_params,
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
     })
 }
 

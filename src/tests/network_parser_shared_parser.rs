@@ -3,7 +3,8 @@ use serde_json::json;
 use crate::models::{HomeBrowsePageType, HomeItem};
 
 use super::{
-    parse_home_item, parse_search_results, parse_search_suggestions, parse_track_from_renderer,
+    parse_cross_device_queue, parse_home_item, parse_search_results, parse_search_suggestions,
+    parse_track_from_renderer,
 };
 
 #[test]
@@ -665,6 +666,147 @@ fn track_parser_extracts_not_interested_and_undo_tokens_from_menu() {
         Some("not-token-123")
     );
     assert_eq!(track.undo_feedback_token.as_deref(), Some("undo-token-456"));
+}
+
+#[test]
+#[ignore = "cross-device queue restoration is only exposed to YouTube Premium accounts"]
+fn cross_device_queue_preserves_playlist_position_and_source_label() {
+    let json = json!({
+        "contents": {
+            "singleColumnMusicWatchNextResultsRenderer": {
+                "tabbedRenderer": {
+                    "watchNextTabbedResultsRenderer": {
+                        "tabs": [{
+                            "tabRenderer": {
+                                "content": {
+                                    "musicQueueRenderer": {
+                                        "musicQueueConfig": {
+                                            "musicQueueRestorationInfo": {
+                                                "isCrossDeviceQueue": true,
+                                                "lastWatchTimestamp": {
+                                                    "seconds": "1778899379",
+                                                    "nanos": 308288000
+                                                },
+                                                "onQueueRestoredCommand": {
+                                                    "clickTrackingParams": "opaque",
+                                                    "miniplayerAnnouncementCommand": {
+                                                        "miniPlayerBylineRenderer": {
+                                                            "miniPlayerBylineRenderer": {
+                                                                "text": {
+                                                                    "runs": [{
+                                                                        "text": "From your Android device"
+                                                                    }]
+                                                                },
+                                                                "durationMs": "10000"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "content": {
+                                            "playlistPanelRenderer": {
+                                                "playlistId": "PLplaylist",
+                                                "contents": [
+                                                    {
+                                                        "playlistPanelVideoRenderer": {
+                                                            "title": { "runs": [{ "text": "One" }] },
+                                                            "shortBylineText": {
+                                                                "runs": [{ "text": "Artist One" }]
+                                                            },
+                                                            "videoId": "video1",
+                                                            "navigationEndpoint": {
+                                                                "watchEndpoint": {
+                                                                    "videoId": "video1",
+                                                                    "playlistId": "PLplaylist",
+                                                                    "index": 0,
+                                                                    "params": "watch-params-1",
+                                                                    "playerParams": "player-params-1"
+                                                                }
+                                                            }
+                                                        }
+                                                    },
+                                                    {
+                                                        "playlistPanelVideoWrapperRenderer": {
+                                                            "primaryRenderer": {
+                                                                "playlistPanelVideoRenderer": {
+                                                                    "title": { "runs": [{ "text": "Two" }] },
+                                                                    "shortBylineText": {
+                                                                        "runs": [{ "text": "Artist Two" }]
+                                                                    },
+                                                                    "videoId": "video2",
+                                                                    "selected": true,
+                                                                    "thumbnail": {
+                                                                        "thumbnails": [{
+                                                                            "url": "https://i.example/two.jpg"
+                                                                        }]
+                                                                    },
+                                                                    "navigationEndpoint": {
+                                                                        "watchEndpoint": {
+                                                                            "videoId": "video2",
+                                                                            "playlistId": "PLplaylist",
+                                                                            "index": 1,
+                                                                            "params": "watch-params-2",
+                                                                            "playerParams": "player-params-2",
+                                                                            "playlistSetVideoId": "set-video-2"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            },
+                                                            "counterpart": {
+                                                                "playlistPanelVideoRenderer": {
+                                                                    "title": { "runs": [{ "text": "Two alt" }] },
+                                                                    "videoId": "video2-alt",
+                                                                    "selected": true,
+                                                                    "navigationEndpoint": {
+                                                                        "watchEndpoint": {
+                                                                            "videoId": "video2-alt",
+                                                                            "playlistId": "PLplaylist",
+                                                                            "params": "alt-params"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }
+            }
+        }
+    });
+
+    let queue = parse_cross_device_queue(&json)
+        .expect("parse should succeed")
+        .expect("cross-device queue should parse");
+
+    assert_eq!(
+        queue.source_label.as_deref(),
+        Some("From your Android device")
+    );
+    assert_eq!(queue.last_watch_timestamp_millis, Some(1_778_899_379_308));
+    assert_eq!(queue.playlist_id.as_deref(), Some("PLplaylist"));
+    assert_eq!(queue.selected_index, 1);
+    assert_eq!(queue.tracks.len(), 2);
+    assert_eq!(queue.tracks[1].video_id, "video2");
+    assert_eq!(
+        queue.tracks[1].playback_playlist_id.as_deref(),
+        Some("PLplaylist")
+    );
+    assert_eq!(
+        queue.tracks[1].playback_params.as_deref(),
+        Some("player-params-2")
+    );
+    assert_eq!(
+        queue.tracks[1].thumbnail_url.as_deref(),
+        Some("https://i.example/two.jpg")
+    );
 }
 
 #[test]

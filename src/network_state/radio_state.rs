@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::models::RadioQueue;
+use crate::models::{CrossDeviceQueue, RadioQueue};
 
 use super::session_state::NetworkState;
 
@@ -21,5 +21,9 @@ impl NetworkState {
         params: Option<&str>,
     ) -> Result<RadioQueue> {
         self.radio(video_id, playlist_id, params)
+    }
+
+    pub fn get_cross_device_queue(&self) -> Result<Option<CrossDeviceQueue>> {
+        self.client.get_cross_device_queue()
     }
 }

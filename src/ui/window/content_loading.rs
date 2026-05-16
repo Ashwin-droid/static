@@ -62,6 +62,21 @@ async fn apply_loaded_home_page(
     );
 }
 
+fn fetch_home_and_cross_device(
+    state: &Arc<Mutex<AppState>>,
+) -> Option<(anyhow::Result<HomePage>, Option<CrossDeviceQueue>)> {
+    app_client(state).map(|ytm| {
+        let cross_device_queue = match ytm.get_cross_device_queue() {
+            Ok(queue) => queue,
+            Err(err) => {
+                eprintln!("[HOME] failed to fetch cross-device queue: {err}");
+                None
+            }
+        };
+        (ytm.get_home_page(None), cross_device_queue)
+    })
+}
+
 pub(super) fn load_home(
     state: &Arc<Mutex<AppState>>,
     content_box: &GtkBox,
@@ -127,16 +142,15 @@ pub(super) fn load_home(
 
     glib::spawn_future_local(async move {
         let state_bg = state.clone();
-        let result =
-            gio::spawn_blocking(move || app_client(&state_bg).map(|ytm| ytm.get_home_page(None)))
-                .await;
+        let result = gio::spawn_blocking(move || fetch_home_and_cross_device(&state_bg)).await;
 
         home_pagination.loading.set(false);
         clear_box(&content_box);
         content_box.add_css_class("home-view-active");
 
         match result {
-            Ok(Some(Ok(page))) => {
+            Ok(Some((Ok(page), cross_device_queue))) => {
+                store_cross_device_queue(&state, cross_device_queue);
                 apply_loaded_home_page(
                     page,
                     &state,
@@ -149,7 +163,8 @@ pub(super) fn load_home(
                 )
                 .await;
             }
-            Ok(Some(Err(e))) => {
+            Ok(Some((Err(e), cross_device_queue))) => {
+                store_cross_device_queue(&state, cross_device_queue);
                 home_pagination.continuation.replace(None);
                 content_box.append(&Label::new(Some(&format!("Error: {e}"))));
             }
@@ -236,13 +251,11 @@ pub(super) fn load_home_with_offline_fallback(
             }
 
             let state_bg = state.clone();
-            let result = gio::spawn_blocking(move || {
-                app_client(&state_bg).map(|ytm| ytm.get_home_page(None))
-            })
-            .await;
+            let result = gio::spawn_blocking(move || fetch_home_and_cross_device(&state_bg)).await;
 
             match result {
-                Ok(Some(Ok(page))) => {
+                Ok(Some((Ok(page), cross_device_queue))) => {
+                    store_cross_device_queue(&state, cross_device_queue);
                     home_pagination.loading.set(false);
                     clear_box(&content_box);
                     content_box.add_css_class("home-view-active");
@@ -259,7 +272,8 @@ pub(super) fn load_home_with_offline_fallback(
                     .await;
                     return;
                 }
-                Ok(Some(Err(err))) => {
+                Ok(Some((Err(err), cross_device_queue))) => {
+                    store_cross_device_queue(&state, cross_device_queue);
                     last_error = err.to_string();
                 }
                 Ok(None) => {

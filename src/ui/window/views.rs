@@ -38,67 +38,73 @@ pub(super) fn load_sidebar_history(
 // RENDERING
 // ============================================================
 
-pub(super) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track> {
-    snapshot
-        .queue
-        .get(
-            snapshot
-                .queue_index
-                .min(snapshot.queue.len().saturating_sub(1)),
-        )
-        .cloned()
-        .or_else(|| {
-            snapshot.current_track.as_ref().map(|track| Track {
-                video_id: track.video_id.clone(),
-                title: track.title.clone(),
-                artists: vec![Artist {
-                    name: track.artist.clone(),
-                    id: None,
-                }],
-                album: None,
-                duration: None,
-                thumbnail_url: track.thumb_url.clone(),
-                playback_playlist_id: None,
-                playback_params: None,
-                not_interested_feedback_token: None,
-                undo_feedback_token: None,
-            })
-        })
+#[derive(Clone)]
+enum HomeResumeSource {
+    Local(PlaybackSnapshot),
+    CrossDevice(CrossDeviceQueue),
 }
 
-pub(super) fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
-    let queue_label = if snapshot.radio_virtual_playlist.is_some() {
-        "Radio queue"
-    } else if snapshot.playlist_context.is_some() {
-        "Playlist"
-    } else if snapshot.queue.len() > 1 {
-        "Queue"
-    } else {
-        "Track"
-    };
-    let queue_copy = if snapshot.queue.len() > 1 {
-        format!("{queue_label} \u{2022} {} songs", snapshot.queue.len())
-    } else {
-        queue_label.to_string()
-    };
+struct HomeResumeData {
+    source: HomeResumeSource,
+    track: Track,
+    meta: String,
+}
 
-    match snapshot.position_millis {
-        Some(position_millis) if position_millis > 0 => {
-            let action = if snapshot.paused {
-                "Paused at"
-            } else {
-                "Resume at"
-            };
-            format!(
-                "{queue_copy} \u{2022} {action} {}",
-                format_clock_time(ClockTime::from_mseconds(position_millis))
-            )
+impl HomeResumeData {
+    fn header(&self) -> &'static str {
+        match self.source {
+            HomeResumeSource::Local(_) => "Resume dropped",
+            HomeResumeSource::CrossDevice(_) => "From another device",
         }
-        _ => queue_copy,
     }
 }
 
-pub(super) fn render_resume_dropped_section(
+fn load_home_resume_data(state: &Arc<Mutex<AppState>>) -> Option<HomeResumeData> {
+    let cross_device_queue = cached_cross_device_queue(state);
+    let local_resume = match crate::cli::load_local_resume_state() {
+        Ok(resume) => resume,
+        Err(err) => {
+            eprintln!("[UI] failed to read local resume state: {err}");
+            None
+        }
+    };
+
+    if crate::cli::should_use_local_resume_for_cross_device(
+        cross_device_queue.as_ref(),
+        local_resume.as_ref(),
+    ) {
+        if let Some(resume) = local_resume {
+            return local_home_resume_data(resume);
+        }
+    }
+
+    if let Some(queue) = cross_device_queue {
+        let track = crate::cli::cross_device_selected_track(&queue)?.clone();
+        let meta = queue
+            .source_label
+            .clone()
+            .unwrap_or_else(|| "YouTube Music cross-device queue".to_string());
+        return Some(HomeResumeData {
+            source: HomeResumeSource::CrossDevice(queue),
+            track,
+            meta,
+        });
+    }
+
+    local_home_resume_data(local_resume?)
+}
+
+fn local_home_resume_data(resume: PersistedPlaybackState) -> Option<HomeResumeData> {
+    let snapshot = resume.snapshot;
+    let track = crate::cli::resume_snapshot_track(&snapshot)?;
+    Some(HomeResumeData {
+        meta: crate::cli::resume_snapshot_meta(&snapshot),
+        source: HomeResumeSource::Local(snapshot),
+        track,
+    })
+}
+
+pub(super) fn render_resume_section(
     content_box: &GtkBox,
     state: &Arc<Mutex<AppState>>,
     content_scroll: &ScrolledWindow,
@@ -110,20 +116,12 @@ pub(super) fn render_resume_dropped_section(
         return false;
     }
 
-    let persisted = match load_persisted_playback_state() {
-        Ok(Some(persisted)) if !persisted.snapshot.queue.is_empty() => persisted,
-        Ok(_) => return false,
-        Err(err) => {
-            eprintln!("[UI] failed to read dropped playback state: {err}");
-            return false;
-        }
-    };
-
-    let Some(track) = resume_snapshot_track(&persisted.snapshot) else {
+    let Some(resume_data) = load_home_resume_data(state) else {
         return false;
     };
+    let track = resume_data.track.clone();
 
-    let header = Label::new(Some("Resume dropped"));
+    let header = Label::new(Some(resume_data.header()));
     header.add_css_class("section-header");
     header.set_halign(Align::Start);
     content_box.append(&header);
@@ -181,7 +179,7 @@ pub(super) fn render_resume_dropped_section(
     subtitle.set_ellipsize(gtk::pango::EllipsizeMode::End);
     info.append(&subtitle);
 
-    let meta = Label::new(Some(&resume_snapshot_meta(&persisted.snapshot)));
+    let meta = Label::new(Some(&resume_data.meta));
     meta.add_css_class("resume-drop-meta");
     meta.set_halign(Align::Start);
     meta.set_ellipsize(gtk::pango::EllipsizeMode::End);
@@ -205,7 +203,7 @@ pub(super) fn render_resume_dropped_section(
         let home_pagination = home_pagination.clone();
         let ps = ps.clone();
         let recent_list = recent_list.clone();
-        let resume_snapshot = persisted.snapshot.clone();
+        let resume_source = resume_data.source.clone();
 
         resume_btn.connect_clicked(move |_| {
             resume_btn_for_handler.set_sensitive(false);
@@ -216,16 +214,22 @@ pub(super) fn render_resume_dropped_section(
             let ps = ps.clone();
             let recent_list = recent_list.clone();
             let resume_btn = resume_btn_for_handler.clone();
-            let resume_snapshot = resume_snapshot.clone();
+            let resume_source = resume_source.clone();
 
             glib::spawn_future_local(async move {
-                let result = gio::spawn_blocking(move || {
-                    restore_playback_snapshot_via_daemon(resume_snapshot, true)
+                let result = gio::spawn_blocking(move || match resume_source {
+                    HomeResumeSource::Local(snapshot) => {
+                        restore_playback_snapshot_via_daemon(snapshot, true)
+                    }
+                    HomeResumeSource::CrossDevice(queue) => {
+                        crate::cli::restore_cross_device_queue_via_daemon(queue)
+                    }
                 })
                 .await;
 
                 match result {
                     Ok(Ok(snapshot)) => {
+                        store_cross_device_queue(&state, None);
                         apply_remote_snapshot(&ps, &state, snapshot);
                         load_home(
                             &state,
@@ -238,11 +242,11 @@ pub(super) fn render_resume_dropped_section(
                         );
                     }
                     Ok(Err(err)) => {
-                        eprintln!("[UI] failed to resume dropped playback: {err}");
+                        eprintln!("[UI] failed to resume playback: {err}");
                         resume_btn.set_sensitive(true);
                     }
                     Err(err) => {
-                        eprintln!("[UI] dropped playback resume worker failed: {err:?}");
+                        eprintln!("[UI] resume worker failed: {err:?}");
                         resume_btn.set_sensitive(true);
                     }
                 }
@@ -263,10 +267,10 @@ pub(super) fn render_home_view(
     recent_list: &GtkBox,
     prepend_separator: bool,
 ) {
-    let rendered_resume_dropped = if prepend_separator {
+    let rendered_cross_device_resume = if prepend_separator {
         false
     } else {
-        render_resume_dropped_section(
+        render_resume_section(
             content_box,
             state,
             content_scroll,
@@ -289,7 +293,9 @@ pub(super) fn render_home_view(
     // First section -> horizontal cover art cards
     if let Some(first) = sections.first() {
         let first_tracks = home_section_tracks(first);
-        if rendered_resume_dropped || (prepend_separator && content_box.first_child().is_some()) {
+        if rendered_cross_device_resume
+            || (prepend_separator && content_box.first_child().is_some())
+        {
             content_box.append(&Separator::new(Orientation::Horizontal));
         }
         let header = Label::new(Some(&first.title));

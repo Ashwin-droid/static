@@ -50,6 +50,13 @@ impl InteractiveTui {
                     self.home_scroll_offset = 0;
                     self.status_line = err;
                 }
+                TuiBackgroundEvent::CrossDeviceQueueLoaded(Ok(queue)) => {
+                    self.resume_card = load_resume_card_data(queue);
+                }
+                TuiBackgroundEvent::CrossDeviceQueueLoaded(Err(err)) => {
+                    self.resume_card = load_resume_card_data(None);
+                    tracing::debug!("Cross-device resume unavailable: {err}");
+                }
                 TuiBackgroundEvent::HomeAppended {
                     continuation,
                     result,
@@ -431,11 +438,18 @@ pub(in crate::cli_tui) fn spawn_home_bootstrap(tx: mpsc::Sender<TuiBackgroundEve
     std::thread::spawn(move || match saved_network_state() {
         Ok(network) => {
             let home = network.get_home_page(None).map_err(|err| err.to_string());
-            let history = network.get_history().map_err(|err| err.to_string());
             let _ = tx.send(TuiBackgroundEvent::HomeLoaded(home));
+            let cross_device_queue = network
+                .get_cross_device_queue()
+                .map_err(|err| err.to_string());
+            let _ = tx.send(TuiBackgroundEvent::CrossDeviceQueueLoaded(
+                cross_device_queue,
+            ));
+            let history = network.get_history().map_err(|err| err.to_string());
             let _ = tx.send(TuiBackgroundEvent::HistoryLoaded(history));
         }
         Err(_) => {
+            let _ = tx.send(TuiBackgroundEvent::CrossDeviceQueueLoaded(Ok(None)));
             let _ = tx.send(TuiBackgroundEvent::HomeLoaded(Err(
                 "Connect YouTube Music in the GTK app to load the full Home feed.".to_string(),
             )));

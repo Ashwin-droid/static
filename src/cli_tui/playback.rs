@@ -461,11 +461,20 @@ impl InteractiveTui {
         action: TuiAction,
     ) -> Result<PlaybackSnapshot> {
         match action {
-            TuiAction::ResumeSaved => {
-                let persisted = load_persisted_playback_state()?
-                    .filter(|persisted| !persisted.snapshot.queue.is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("No saved playback state is available"))?;
-                restore_playback_snapshot_via_daemon(persisted.snapshot, true)
+            TuiAction::ResumeSuggested => {
+                let source = self
+                    .resume_card
+                    .as_ref()
+                    .map(|card| card.source.clone())
+                    .ok_or_else(|| anyhow::anyhow!("No resume state is available"))?;
+                match source {
+                    ResumeCardSource::Local(snapshot) => {
+                        restore_playback_snapshot_via_daemon(snapshot, true)
+                    }
+                    ResumeCardSource::CrossDevice(queue) => {
+                        restore_cross_device_queue_via_daemon(queue)
+                    }
+                }
             }
             TuiAction::TogglePause => self.client.toggle_pause(),
             TuiAction::CancelHaltAutoResume => self.client.cancel_halt_auto_resume(),
@@ -547,7 +556,7 @@ impl InteractiveTui {
         match result {
             Ok(snapshot) => {
                 self.apply_snapshot(snapshot);
-                if matches!(effective_action, TuiAction::ResumeSaved) {
+                if matches!(effective_action, TuiAction::ResumeSuggested) {
                     self.resume_card = None;
                 }
                 self.status_line = format!("{} applied.", action_label(effective_action));
@@ -773,7 +782,7 @@ pub(in crate::cli_tui) fn help_shortcut_sections()
 
 pub(in crate::cli_tui) fn action_label(action: TuiAction) -> &'static str {
     match action {
-        TuiAction::ResumeSaved => "Resume",
+        TuiAction::ResumeSuggested => "Resume",
         TuiAction::TogglePause => "Toggle",
         TuiAction::CancelHaltAutoResume => "Cancel resume",
         TuiAction::ResumeHaltAutoResume => "Resume now",

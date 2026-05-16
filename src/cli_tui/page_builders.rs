@@ -444,11 +444,11 @@ pub(in crate::cli_tui) fn build_home_document(
     if let Some(resume_card) = resume_card {
         doc.banners.push(HomeBanner {
             rect: Rect::new(0, y as u16, usable_width, HOME_BANNER_HEIGHT),
-            eyebrow: "RESUME".to_string(),
-            title: format!("Resume {}", resume_card.track.title),
+            eyebrow: resume_card.eyebrow().to_string(),
+            title: resume_card.title(),
             subtitle: artist_string(&resume_card.track),
             meta: resume_card.meta.clone(),
-            hint: Some("Press r or click here to restore".to_string()),
+            hint: Some(resume_card.hint().to_string()),
             thumbnail_url: resume_card.track.thumbnail_url.clone(),
             accent: true,
         });

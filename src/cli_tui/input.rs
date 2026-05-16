@@ -758,6 +758,6 @@ impl InteractiveTui {
     pub(in crate::cli_tui) fn visible_resume_card(&self) -> Option<&ResumeCardData> {
         self.resume_card
             .as_ref()
-            .filter(|_| self.snapshot.current_track.is_none())
+            .filter(|_| self.snapshot.current_track.is_none() && self.snapshot.queue.is_empty())
     }
 }

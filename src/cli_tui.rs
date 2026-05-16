@@ -33,15 +33,17 @@ use ratatui_image::{
 
 use crate::cli::{
     apply_config_value, artist_string, format_config_value, format_millis, format_track_summary,
-    play_track_with_radio, restore_playback_snapshot_via_daemon, saved_network_state,
+    load_local_resume_state, play_track_with_radio, restore_cross_device_queue_via_daemon,
+    restore_playback_snapshot_via_daemon, resume_snapshot_meta, resume_snapshot_track,
+    saved_network_state, should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{
-    ActiveTrackSnapshot, DaemonClient, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
-    RepeatMode, load_persisted_playback_state,
+    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
+    PlaylistContextSource, RepeatMode,
 };
 use crate::models::{
-    BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage, PlaylistSummary,
-    RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
+    BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
+    PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
 };
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
@@ -193,7 +195,7 @@ fn player_actions(snapshot: &PlaybackSnapshot) -> Vec<TuiAction> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TuiAction {
-    ResumeSaved,
+    ResumeSuggested,
     TogglePause,
     CancelHaltAutoResume,
     ResumeHaltAutoResume,
@@ -520,6 +522,7 @@ struct TuiSettingsTextEdit {
 
 enum TuiBackgroundEvent {
     HomeLoaded(Result<HomePage, String>),
+    CrossDeviceQueueLoaded(Result<Option<CrossDeviceQueue>, String>),
     HomeAppended {
         continuation: String,
         result: Result<HomePage, String>,
@@ -691,8 +694,39 @@ struct RenderedLayout {
 
 #[derive(Clone)]
 struct ResumeCardData {
+    source: ResumeCardSource,
     track: Track,
     meta: String,
+}
+
+#[derive(Clone)]
+enum ResumeCardSource {
+    Local(PlaybackSnapshot),
+    CrossDevice(CrossDeviceQueue),
+}
+
+impl ResumeCardData {
+    fn eyebrow(&self) -> &'static str {
+        match self.source {
+            ResumeCardSource::Local(_) => "RESUME",
+            ResumeCardSource::CrossDevice(_) => "FROM ANOTHER DEVICE",
+        }
+    }
+
+    fn title(&self) -> String {
+        let verb = match self.source {
+            ResumeCardSource::Local(_) => "Resume",
+            ResumeCardSource::CrossDevice(_) => "Continue",
+        };
+        format!("{verb} {}", self.track.title)
+    }
+
+    fn hint(&self) -> &'static str {
+        match self.source {
+            ResumeCardSource::Local(_) => "Click here to restore",
+            ResumeCardSource::CrossDevice(_) => "Click here to resume the YouTube Music queue",
+        }
+    }
 }
 
 enum LyricsState {

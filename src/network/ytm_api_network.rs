@@ -24,8 +24,8 @@ macro_rules! eprintln {
 }
 
 use crate::models::{
-    BrowseSectionsPage, HomeItem, HomePage, PlaylistSummary, RadioQueue, SearchResult,
-    SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
+    BrowseSectionsPage, CrossDeviceQueue, HomeItem, HomePage, PlaylistSummary, RadioQueue,
+    SearchResult, SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
 };
 
 use crate::network_parser as parsers;
@@ -1597,13 +1597,7 @@ impl YtMusicClient {
         })
     }
 
-    fn tracking_player_body(
-        video_id: &str,
-        profile: &YtmWebProfile,
-        cpn: &str,
-        playlist_id: Option<&str>,
-        params: Option<&str>,
-    ) -> Value {
+    fn web_profile_client_context(profile: &YtmWebProfile) -> Value {
         let mut body = Self::client_context_with(&profile.client_name, &profile.client_version);
         body["context"]["client"]["hl"] = json!(profile.hl);
         body["context"]["client"]["gl"] = json!(profile.gl);
@@ -1612,6 +1606,20 @@ impl YtMusicClient {
         body["context"]["client"]["browserVersion"] = json!(profile.browser_version);
         body["context"]["client"]["osName"] = json!(profile.os_name);
         body["context"]["client"]["platform"] = json!(profile.platform);
+        if let Some(visitor_data) = profile.visitor_data.as_ref() {
+            body["context"]["client"]["visitorData"] = json!(visitor_data);
+        }
+        body
+    }
+
+    fn tracking_player_body(
+        video_id: &str,
+        profile: &YtmWebProfile,
+        cpn: &str,
+        playlist_id: Option<&str>,
+        params: Option<&str>,
+    ) -> Value {
+        let mut body = Self::web_profile_client_context(profile);
         body["videoId"] = json!(video_id);
         body["cpn"] = json!(cpn);
         body["playbackContext"] = json!({
@@ -1635,6 +1643,13 @@ impl YtMusicClient {
         if let Some(params) = params {
             body["params"] = json!(params);
         }
+        body
+    }
+
+    fn cross_device_queue_body(profile: &YtmWebProfile) -> Value {
+        let mut body = Self::web_profile_client_context(profile);
+        body["watchNextType"] = json!("WATCH_NEXT_TYPE_GET_QUEUE");
+        body["queueContextParams"] = json!("");
         body
     }
 
@@ -1952,6 +1967,28 @@ impl YtMusicClient {
                 .await
                 .context("Failed to parse radio response")?;
             parsers::parse_radio(&json)
+        })
+    }
+
+    pub fn get_cross_device_queue(&self) -> Result<Option<CrossDeviceQueue>> {
+        self.rt.block_on(async {
+            let profile = self.ytm_web_profile(false).await;
+            let body = Self::cross_device_queue_body(&profile);
+
+            let req = self
+                .post(&format!("{YTM_BASE_URL}/next?{YTM_PARAMS}"))
+                .json(&body);
+            let resp = self
+                .apply_ytm_web_profile_headers(req, &profile)
+                .send()
+                .await
+                .context("Failed to fetch cross-device queue")?;
+
+            let json: Value = resp
+                .json()
+                .await
+                .context("Failed to parse cross-device queue response")?;
+            parsers::parse_cross_device_queue(&json)
         })
     }
 

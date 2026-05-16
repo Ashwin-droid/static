@@ -111,6 +111,15 @@ pub struct RadioQueue {
     pub continuation: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossDeviceQueue {
+    pub source_label: Option<String>,
+    pub last_watch_timestamp_millis: Option<u64>,
+    pub playlist_id: Option<String>,
+    pub tracks: Vec<Track>,
+    pub selected_index: usize,
+}
+
 /// The locally-managed virtual-playlist state for a radio queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RadioVirtualPlaylist {

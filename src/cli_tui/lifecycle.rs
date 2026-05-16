@@ -1,12 +1,11 @@
 use super::*;
-use super::{content_loading::*, playback::*, thumbnails::*, views::*};
+use super::{content_loading::*, playback::*, thumbnails::*};
 
 impl InteractiveTui {
     pub(in crate::cli_tui) fn new(client: DaemonClient) -> Result<Self> {
         let snapshot = client.state()?;
         let (background_tx, background_rx) = mpsc::channel();
         spawn_home_bootstrap(background_tx.clone());
-        let resume_card = load_resume_card_data();
 
         let mut app = Self {
             client,
@@ -46,7 +45,7 @@ impl InteractiveTui {
             focus: TuiFocus::Home,
             player_selected: 1,
             detail_tab: DetailTab::Queue,
-            resume_card,
+            resume_card: None,
             lyrics_state: LyricsState::Idle,
             status_line: "Use / or click Search to query YouTube Music. Home stays cached now."
                 .to_string(),

@@ -39,13 +39,13 @@ const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::ipc::{
     ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
-    PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playback_state,
-    load_persisted_playlist_state, store_persisted_playback_state, store_persisted_playlist_state,
+    PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playlist_state,
+    store_persisted_playback_state, store_persisted_playlist_state,
 };
 use crate::models::{
-    Artist, BrowseSectionsPage, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyricLine,
-    SyncedLyrics, SyncedLyricsSource, Track,
+    Artist, BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem,
+    HomePage, HomeSection, PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult,
+    SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
 };
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, SponsorBlockClient, SponsorSegment,
@@ -95,6 +95,7 @@ struct AppState {
     cache: MusicCache,
     settings: AppSettings,
     home_cache: Option<HomePage>,
+    cross_device_queue: Option<CrossDeviceQueue>,
     home_scroll_position: f64,
     search_cache: Option<SearchPageCache>,
     content_view: ContentViewKind,
@@ -156,8 +157,18 @@ fn store_home_cache(state: &Arc<Mutex<AppState>>, page: &HomePage) {
     state.lock().unwrap().home_cache = Some(page.clone());
 }
 
+fn cached_cross_device_queue(state: &Arc<Mutex<AppState>>) -> Option<CrossDeviceQueue> {
+    state.lock().unwrap().cross_device_queue.clone()
+}
+
+fn store_cross_device_queue(state: &Arc<Mutex<AppState>>, queue: Option<CrossDeviceQueue>) {
+    state.lock().unwrap().cross_device_queue = queue;
+}
+
 fn invalidate_home_cache(state: &Arc<Mutex<AppState>>) {
-    state.lock().unwrap().home_cache = None;
+    let mut guard = state.lock().unwrap();
+    guard.home_cache = None;
+    guard.cross_device_queue = None;
 }
 
 fn cached_home_scroll_position(state: &Arc<Mutex<AppState>>) -> f64 {
@@ -415,6 +426,7 @@ pub fn build_window(app: &Application) {
         cache,
         settings,
         home_cache: None,
+        cross_device_queue: None,
         home_scroll_position: 0.0,
         search_cache: None,
         content_view: ContentViewKind::Home,

@@ -32,6 +32,7 @@ pub(super) async fn stage_restored_client(client: Arc<NetworkState>, state: &Arc
     let mut guard = state.lock().unwrap();
     guard.client = Some(client);
     guard.home_cache = None;
+    guard.cross_device_queue = None;
 }
 
 pub(super) async fn activate_authenticated_client(

@@ -4,9 +4,12 @@ use std::sync::Once;
 use anyhow::{Context, Result, bail};
 
 use crate::ipc::{
-    DaemonClient, PlaybackSnapshot, RepeatMode, daemon_is_running, load_persisted_playback_state,
+    DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
+    RepeatMode, daemon_is_running, load_persisted_playback_state,
 };
-use crate::models::{HomeItem, RadioVirtualPlaylist, SearchResult, Track};
+use crate::models::{
+    Artist, CrossDeviceQueue, HomeItem, RadioVirtualPlaylist, SearchResult, Track,
+};
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, extract_video_id_from_input,
     get_cookie, get_storage_root, load_cookie_from_chromium_profile, sanitize_categories,
@@ -96,10 +99,9 @@ fn run_rate_current_track(rating: SongRating) -> Result<()> {
 }
 
 fn run_resume() -> Result<()> {
-    let persisted = load_persisted_playback_state()?
-        .filter(|persisted| !persisted.snapshot.queue.is_empty())
+    let snapshot = load_local_resume_snapshot()?
         .ok_or_else(|| anyhow::anyhow!("No saved playback state is available"))?;
-    let restored = restore_playback_snapshot_via_daemon(persisted.snapshot, true)?;
+    let restored = restore_playback_snapshot_via_daemon(snapshot, true)?;
     println!("Resumed {}", current_track_label(&restored));
     Ok(())
 }
@@ -485,6 +487,152 @@ pub(crate) fn restore_playback_snapshot_via_daemon(
     }
 
     Ok(restored)
+}
+
+pub(crate) fn restore_cross_device_queue_via_daemon(
+    queue: CrossDeviceQueue,
+) -> Result<PlaybackSnapshot> {
+    if queue.tracks.is_empty() {
+        bail!("No cross-device queue is available");
+    }
+
+    let playlist_context = queue
+        .playlist_id
+        .as_ref()
+        .map(|playlist_id| PlaylistContext {
+            playlist_id: playlist_id.clone(),
+            title: queue
+                .source_label
+                .clone()
+                .unwrap_or_else(|| "Cross-device queue".to_string()),
+            thumbnail_url: queue
+                .tracks
+                .get(queue.selected_index)
+                .and_then(|track| track.thumbnail_url.clone()),
+            subtitle: Some("YouTube Music cross-device resume".to_string()),
+            source: PlaylistContextSource::Remote,
+        });
+
+    DaemonClient::new()?.play_queue_at(
+        queue.tracks.clone(),
+        queue.selected_index,
+        playlist_context,
+        None,
+        RepeatMode::Off,
+    )
+}
+
+pub(crate) fn load_local_resume_snapshot() -> Result<Option<PlaybackSnapshot>> {
+    Ok(load_local_resume_state()?.map(|persisted| persisted.snapshot))
+}
+
+pub(crate) fn load_local_resume_state() -> Result<Option<PersistedPlaybackState>> {
+    Ok(load_persisted_playback_state()?.filter(|persisted| !persisted.snapshot.queue.is_empty()))
+}
+
+pub(crate) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track> {
+    snapshot
+        .queue
+        .get(
+            snapshot
+                .queue_index
+                .min(snapshot.queue.len().saturating_sub(1)),
+        )
+        .cloned()
+        .or_else(|| {
+            snapshot.current_track.as_ref().map(|track| Track {
+                video_id: track.video_id.clone(),
+                title: track.title.clone(),
+                artists: vec![Artist {
+                    name: track.artist.clone(),
+                    id: None,
+                }],
+                album: None,
+                duration: None,
+                thumbnail_url: track.thumb_url.clone(),
+                playback_playlist_id: None,
+                playback_params: None,
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
+            })
+        })
+}
+
+pub(crate) fn resume_snapshot_meta(snapshot: &PlaybackSnapshot) -> String {
+    let queue_label = if snapshot.radio_virtual_playlist.is_some() {
+        "Radio queue"
+    } else if snapshot.playlist_context.is_some() {
+        "Playlist"
+    } else if snapshot.queue.len() > 1 {
+        "Queue"
+    } else {
+        "Track"
+    };
+    match snapshot.position_millis {
+        Some(position_millis) if position_millis > 0 => {
+            let action = if snapshot.paused {
+                "Paused at"
+            } else {
+                "Stopped at"
+            };
+            format!(
+                "{queue_label} - {action} {}",
+                format_millis(position_millis)
+            )
+        }
+        _ => queue_label.to_string(),
+    }
+}
+
+pub(crate) fn cross_device_selected_track(queue: &CrossDeviceQueue) -> Option<&Track> {
+    queue.tracks.get(queue.selected_index)
+}
+
+pub(crate) fn cross_device_queue_is_singleton_seed(queue: &CrossDeviceQueue) -> bool {
+    let Some(track) = cross_device_selected_track(queue) else {
+        return false;
+    };
+    queue.selected_index == 0
+        && queue
+            .playlist_id
+            .as_deref()
+            .and_then(|playlist_id| playlist_id.strip_prefix("RDAMVM"))
+            .is_some_and(|seed_video_id| seed_video_id == track.video_id)
+}
+
+pub(crate) fn cross_device_singleton_matches_local_resume(
+    queue: &CrossDeviceQueue,
+    snapshot: &PlaybackSnapshot,
+) -> bool {
+    cross_device_queue_is_singleton_seed(queue)
+        && cross_device_selected_track(queue)
+            .zip(resume_snapshot_track(snapshot))
+            .is_some_and(|(remote_track, local_track)| {
+                remote_track.video_id == local_track.video_id
+            })
+}
+
+pub(crate) fn local_resume_is_newer_than_cross_device(
+    queue: &CrossDeviceQueue,
+    local_resume: &PersistedPlaybackState,
+) -> bool {
+    queue
+        .last_watch_timestamp_millis
+        .is_some_and(|remote_timestamp| local_resume.saved_at_unix_millis > remote_timestamp)
+}
+
+pub(crate) fn should_use_local_resume_for_cross_device(
+    queue: Option<&CrossDeviceQueue>,
+    local_resume: Option<&PersistedPlaybackState>,
+) -> bool {
+    match (queue, local_resume) {
+        (None, Some(_)) => true,
+        (Some(queue), Some(local_resume)) => {
+            local_resume_is_newer_than_cross_device(queue, local_resume)
+                || cross_device_singleton_matches_local_resume(queue, &local_resume.snapshot)
+        }
+        _ => false,
+    }
 }
 
 fn resolve_track_input(

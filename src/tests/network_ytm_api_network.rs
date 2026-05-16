@@ -170,7 +170,7 @@ fn live_test_client() -> anyhow::Result<YtMusicClient> {
 }
 
 #[test]
-#[ignore = "requires authenticated YouTube Music cookies and live network access"]
+#[ignore = "requires YouTube Premium, authenticated YouTube Music cookies, and live network access"]
 fn web_remix_live_hardcoded_ytm_id_has_high_quality_audio() -> anyhow::Result<()> {
     let client = live_test_client()?;
 
@@ -226,7 +226,7 @@ fn web_remix_live_hardcoded_ytm_id_has_high_quality_audio() -> anyhow::Result<()
 }
 
 #[test]
-#[ignore = "requires authenticated YouTube Music cookies, Node.js, and live network access"]
+#[ignore = "requires YouTube Premium, authenticated YouTube Music cookies, Node.js, and live network access"]
 fn web_remix_live_hardcoded_ytm_id_resolves_high_quality_url() -> anyhow::Result<()> {
     let client = live_test_client()?;
     let url = client.rt.block_on(async {
@@ -646,5 +646,25 @@ fn tracking_player_body_carries_playlist_identity_and_cpn() {
         body.pointer("/playbackContext/contentPlaybackContext/referer")
             .and_then(|value| value.as_str()),
         Some("https://music.youtube.com/")
+    );
+}
+
+#[test]
+fn cross_device_queue_body_requests_server_queue_restore() {
+    let profile = YtmWebProfile::fallback();
+    let body = YtMusicClient::cross_device_queue_body(&profile);
+
+    assert_eq!(body["watchNextType"], "WATCH_NEXT_TYPE_GET_QUEUE");
+    assert_eq!(body["queueContextParams"], "");
+    assert!(body.get("fetchLiveState").is_none());
+    assert_eq!(
+        body.pointer("/context/client/clientName")
+            .and_then(|value| value.as_str()),
+        Some(profile.client_name.as_str())
+    );
+    assert_eq!(
+        body.pointer("/context/client/clientVersion")
+            .and_then(|value| value.as_str()),
+        Some(profile.client_version.as_str())
     );
 }

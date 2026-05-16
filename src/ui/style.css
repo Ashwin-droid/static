@@ -725,6 +725,10 @@ popover > contents {
     background-color: rgba(255, 255, 255, 0.2);
     color: #ffffff;
 }
+.queue-chip-selected {
+    background-color: rgba(119, 154, 255, 0.28);
+    color: #ffffff;
+}
 
 .queue-row-btn {
     background: transparent;

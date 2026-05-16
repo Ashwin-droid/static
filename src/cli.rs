@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
@@ -7,9 +6,7 @@ use crate::ipc::{
     DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
     RepeatMode, daemon_is_running, load_persisted_playback_state,
 };
-use crate::models::{
-    Artist, CrossDeviceQueue, HomeItem, RadioVirtualPlaylist, SearchResult, Track,
-};
+use crate::models::{Artist, CrossDeviceQueue, HomeItem, SearchResult, Track};
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, extract_video_id_from_input,
     get_cookie, get_storage_root, load_cookie_from_chromium_profile, sanitize_categories,
@@ -118,12 +115,9 @@ fn run_exec(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    play_track_with_radio(&client, track.clone())?;
+    let snapshot = play_track_with_radio(&client, track.clone())?;
 
-    if saved_network_state()
-        .and_then(|network| network.get_radio(&track.video_id, None, None))
-        .is_ok()
-    {
+    if snapshot.queue.len() > 1 {
         println!("Playing {} with radio", format_track_summary(&track));
     } else {
         println!("Playing {}", format_track_summary(&track));
@@ -136,43 +130,7 @@ pub(crate) fn play_track_with_radio(
     client: &DaemonClient,
     track: Track,
 ) -> Result<PlaybackSnapshot> {
-    client.play_queue_at(
-        vec![track.clone()],
-        0,
-        None,
-        Some(RadioVirtualPlaylist {
-            source_video_id: track.video_id.clone(),
-            touched_len: 1,
-            chips: Vec::new(),
-        }),
-        RepeatMode::Off,
-    )?;
-
-    match saved_network_state().and_then(|network| network.get_radio(&track.video_id, None, None)) {
-        Ok(mut radio) => {
-            let queue_seed = radio
-                .tracks
-                .iter()
-                .position(|queued| queued.video_id == track.video_id)
-                .map(|index| radio.tracks.remove(index))
-                .unwrap_or_else(|| track.clone());
-            let mut queue = vec![queue_seed];
-            queue.extend(dedupe_radio_recommendations(&queue, radio.tracks));
-            let radio_virtual_playlist = RadioVirtualPlaylist {
-                source_video_id: track.video_id.clone(),
-                touched_len: 1,
-                chips: radio.chips,
-            };
-            client.replace_queue(
-                queue,
-                0,
-                None,
-                Some(radio_virtual_playlist),
-                RepeatMode::Off,
-            )
-        }
-        Err(_) => client.state(),
-    }
+    client.start_radio_from_seed(vec![track], 0, 0, 1, None, RepeatMode::Off, true)
 }
 
 fn run_queue(args: &[String]) -> Result<()> {
@@ -717,22 +675,6 @@ fn first_search_track(results: &SearchResult) -> Option<Track> {
     })
 }
 
-fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
-    let mut seen_ids = prefix
-        .iter()
-        .map(|track| track.video_id.clone())
-        .collect::<HashSet<_>>();
-    let mut deduped = Vec::with_capacity(tracks.len());
-
-    for track in tracks {
-        if seen_ids.insert(track.video_id.clone()) {
-            deduped.push(track);
-        }
-    }
-
-    deduped
-}
-
 #[derive(Clone, Copy)]
 enum QueueInsertMode {
     Next,
@@ -745,63 +687,25 @@ fn apply_queue_insert(
     track: Track,
     mode: QueueInsertMode,
 ) -> Result<PlaybackSnapshot> {
-    let mut queue = snapshot.queue.clone();
-    let mut radio_virtual_playlist = snapshot.radio_virtual_playlist.clone();
-
     let insert_at = match mode {
         QueueInsertMode::Next => {
-            if queue.is_empty() {
+            if snapshot.queue.is_empty() {
                 0
             } else {
-                snapshot.queue_index.saturating_add(1).min(queue.len())
+                snapshot
+                    .queue_index
+                    .saturating_add(1)
+                    .min(snapshot.queue.len())
             }
         }
-        QueueInsertMode::Last => radio_virtual_playlist
+        QueueInsertMode::Last => snapshot
+            .radio_virtual_playlist
             .as_ref()
-            .map(|radio| radio.touched_len.min(queue.len()))
-            .unwrap_or(queue.len()),
+            .map(|radio| radio.touched_len.min(snapshot.queue.len()))
+            .unwrap_or(snapshot.queue.len()),
     };
 
-    if insert_at >= queue.len() {
-        queue.push(track);
-    } else {
-        queue.insert(insert_at, track);
-        extend_radio_touched_for_insert(&mut radio_virtual_playlist, insert_at, 1);
-    }
-
-    let queue_index = if queue.is_empty() {
-        0
-    } else {
-        snapshot.queue_index.min(queue.len().saturating_sub(1))
-    };
-
-    client.replace_queue(
-        queue,
-        queue_index,
-        snapshot.playlist_context.clone(),
-        radio_virtual_playlist,
-        snapshot.repeat_mode,
-    )
-}
-
-fn extend_radio_touched_for_insert(
-    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
-    insert_at: usize,
-    added: usize,
-) {
-    if added == 0 {
-        return;
-    }
-
-    if let Some(radio) = radio_virtual_playlist.as_mut() {
-        let touched_len = radio.touched_len;
-        let inserted_end = insert_at + added;
-        if insert_at < touched_len {
-            radio.touched_len = touched_len + added;
-        } else {
-            radio.touched_len = touched_len.max(inserted_end);
-        }
-    }
+    client.insert_into_queue(vec![track], insert_at)
 }
 
 fn print_queue(snapshot: &PlaybackSnapshot) {

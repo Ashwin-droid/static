@@ -126,6 +126,8 @@ pub struct RadioVirtualPlaylist {
     pub source_video_id: String,
     pub touched_len: usize,
     pub chips: Vec<RadioChip>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_chip_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

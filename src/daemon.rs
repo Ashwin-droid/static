@@ -9,7 +9,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use dbus::ffidisp::{BusType as DbusBusType, Connection as DbusConnection};
 use gstreamer::ClockTime;
 use gstreamer::glib;
@@ -29,7 +29,7 @@ use crate::ipc::{
     clear_persisted_playback_state, current_unix_millis, store_persisted_playback_state,
     store_persisted_playlist_state,
 };
-use crate::models::{RadioVirtualPlaylist, Track};
+use crate::models::{RadioChip, RadioVirtualPlaylist, Track};
 use crate::network::{
     SongRating, SponsorBlockClient, SponsorSegment, TrackingInfo, default_skip_categories,
     download_media_bytes, fetch_thumbnail_bytes, filter_segments_for_categories,
@@ -973,6 +973,444 @@ fn request_daemon_shutdown(state: &mut DaemonState, exiting: bool) {
     state.shutting_down.set(true);
 }
 
+fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
+    let mut seen_ids = prefix
+        .iter()
+        .map(|track| track.video_id.clone())
+        .collect::<HashSet<_>>();
+    let mut deduped = Vec::with_capacity(tracks.len());
+
+    for track in tracks {
+        if seen_ids.insert(track.video_id.clone()) {
+            deduped.push(track);
+        }
+    }
+
+    deduped
+}
+
+fn normalize_radio_chip_selection(radio: &mut RadioVirtualPlaylist) -> bool {
+    let previous = radio.selected_chip_index;
+    radio.selected_chip_index = radio
+        .selected_chip_index
+        .filter(|index| *index < radio.chips.len());
+    if radio.selected_chip_index.is_none() && !radio.chips.is_empty() {
+        radio.selected_chip_index = Some(0);
+    }
+    previous != radio.selected_chip_index
+}
+
+fn daemon_owned_radio_virtual_playlist(
+    state: &mut DaemonState,
+    incoming: Option<RadioVirtualPlaylist>,
+    queue_len: usize,
+) -> Option<RadioVirtualPlaylist> {
+    let mut radio = incoming?;
+    let source_video_id = radio.source_video_id.clone();
+    let incoming_selected_chip_index = radio.selected_chip_index;
+    let current_chip_state = state
+        .radio_virtual_playlist
+        .as_ref()
+        .filter(|current| current.source_video_id == source_video_id && !current.chips.is_empty())
+        .map(|current| (current.chips.clone(), current.selected_chip_index));
+
+    radio.chips.clear();
+    radio.selected_chip_index = None;
+
+    if let Some((chips, selected_chip_index)) = current_chip_state {
+        radio.chips = chips;
+        radio.selected_chip_index = selected_chip_index;
+        normalize_radio_chip_selection(&mut radio);
+        return Some(radio);
+    }
+
+    if queue_len > 1 {
+        match ensure_client_loaded(state).and_then(|client| {
+            client
+                .get_radio(&source_video_id, None, None)
+                .map(|radio| radio.chips)
+        }) {
+            Ok(chips) => {
+                radio.chips = chips;
+                radio.selected_chip_index = incoming_selected_chip_index;
+                normalize_radio_chip_selection(&mut radio);
+            }
+            Err(err) => {
+                eprintln!("[RADIO] failed to load daemon-owned chips for {source_video_id}: {err}");
+            }
+        }
+    }
+
+    Some(radio)
+}
+
+fn radio_chips_with_replacement(
+    existing: &[RadioChip],
+    replacement: Vec<RadioChip>,
+) -> Vec<RadioChip> {
+    if replacement.is_empty() {
+        existing.to_vec()
+    } else {
+        replacement
+    }
+}
+
+fn apply_radio_chips_from_refresh(
+    radio: &mut RadioVirtualPlaylist,
+    replacement: Vec<RadioChip>,
+) -> bool {
+    let selected_playlist_id = radio
+        .selected_chip_index
+        .and_then(|index| radio.chips.get(index))
+        .map(|chip| chip.playlist_id.clone());
+    let next = radio_chips_with_replacement(&radio.chips, replacement);
+    let mut changed = false;
+    if next != radio.chips {
+        radio.chips = next;
+        radio.selected_chip_index = selected_playlist_id.and_then(|playlist_id| {
+            radio
+                .chips
+                .iter()
+                .position(|chip| chip.playlist_id == playlist_id)
+        });
+        changed = true;
+    }
+    normalize_radio_chip_selection(radio) || changed
+}
+
+fn activate_radio_chip(state: &mut DaemonState, chip_index: usize) -> Result<()> {
+    let radio = state
+        .radio_virtual_playlist
+        .clone()
+        .ok_or_else(|| anyhow!("Radio chips only appear for radio queues"))?;
+    let chip = radio
+        .chips
+        .get(chip_index)
+        .cloned()
+        .ok_or_else(|| anyhow!("That radio filter is no longer available"))?;
+    let source_video_id = radio.source_video_id;
+    let chips = radio.chips;
+    let prefix_len = radio.touched_len.max(1).min(state.queue.len().max(1));
+    let source_track = state
+        .queue
+        .iter()
+        .find(|track| track.video_id == source_video_id)
+        .cloned()
+        .or_else(|| state.queue.first().cloned());
+
+    let client = ensure_client_loaded(state)?;
+    let mut refreshed = client.get_radio(
+        &source_video_id,
+        Some(&chip.playlist_id),
+        chip.params.as_deref(),
+    )?;
+
+    if let Some(source_index) = refreshed
+        .tracks
+        .iter()
+        .position(|track| track.video_id == source_video_id)
+    {
+        if source_index > 0 {
+            let track = refreshed.tracks.remove(source_index);
+            refreshed.tracks.insert(0, track);
+        }
+    } else if let Some(source_track) = source_track {
+        refreshed.tracks.insert(0, source_track);
+    }
+
+    let mut queue = state.queue.clone();
+    queue.truncate(prefix_len.min(queue.len()));
+    queue.extend(dedupe_radio_recommendations(
+        queue.as_slice(),
+        refreshed.tracks,
+    ));
+    if queue.is_empty() {
+        bail!("Radio filter returned no playable tracks");
+    }
+
+    state.queue = queue;
+    state.queue_index = state.queue_index.min(state.queue.len().saturating_sub(1));
+    state.radio_virtual_playlist = Some(RadioVirtualPlaylist {
+        source_video_id,
+        touched_len: prefix_len.min(state.queue.len()),
+        // Chip activation responses may omit the original chip cloud. The daemon owns
+        // the current chip set, so activating a chip preserves the existing controls.
+        chips,
+        selected_chip_index: Some(chip_index),
+    });
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    prefetch_upcoming(state);
+    sync_mpris(state);
+    Ok(())
+}
+
+fn radio_queue_from_seed(
+    state: &mut DaemonState,
+    mut queue: Vec<Track>,
+    seed_index: usize,
+    prefix_len: usize,
+) -> Result<(Vec<Track>, RadioVirtualPlaylist)> {
+    if queue.is_empty() {
+        bail!("Radio needs at least one queued track");
+    }
+    let seed_track = queue
+        .get(seed_index)
+        .cloned()
+        .ok_or_else(|| anyhow!("Radio seed index {seed_index} is out of bounds"))?;
+    let source_video_id = seed_track.video_id.clone();
+    let prefix_len = prefix_len
+        .max(seed_index.saturating_add(1))
+        .min(queue.len());
+    let mut chips = Vec::new();
+
+    match ensure_client_loaded(state)
+        .and_then(|client| client.get_radio(&source_video_id, None, None))
+    {
+        Ok(mut radio) => {
+            if let Some(source_index) = radio
+                .tracks
+                .iter()
+                .position(|track| track.video_id == source_video_id)
+            {
+                if source_index > 0 {
+                    let track = radio.tracks.remove(source_index);
+                    radio.tracks.insert(0, track);
+                }
+            } else {
+                radio.tracks.insert(0, seed_track);
+            }
+
+            queue.truncate(prefix_len);
+            queue.extend(dedupe_radio_recommendations(queue.as_slice(), radio.tracks));
+            chips = radio.chips;
+        }
+        Err(err) => {
+            eprintln!("[RADIO] failed to start radio from {source_video_id}: {err}");
+        }
+    }
+
+    let mut radio_virtual_playlist = RadioVirtualPlaylist {
+        source_video_id,
+        touched_len: prefix_len.min(queue.len()),
+        chips,
+        selected_chip_index: None,
+    };
+    normalize_radio_chip_selection(&mut radio_virtual_playlist);
+    Ok((queue, radio_virtual_playlist))
+}
+
+fn start_radio_from_seed(
+    state: &mut DaemonState,
+    queue: Vec<Track>,
+    index: usize,
+    seed_index: usize,
+    prefix_len: usize,
+    playlist_context: Option<PlaylistContext>,
+    repeat_mode: RepeatMode,
+    play: bool,
+    suppress_reporting: bool,
+) -> Result<()> {
+    let (queue, radio_virtual_playlist) =
+        radio_queue_from_seed(state, queue, seed_index, prefix_len)?;
+    let index = index.min(queue.len().saturating_sub(1));
+
+    if play {
+        pause_other_mpris_players(state);
+        return play_queue_at(
+            state,
+            queue,
+            index,
+            playlist_context,
+            Some(radio_virtual_playlist),
+            repeat_mode,
+            suppress_reporting,
+        );
+    }
+
+    state.queue = queue;
+    state.queue_index = index;
+    state.playlist_context = playlist_context;
+    state.radio_virtual_playlist = Some(radio_virtual_playlist);
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    let repeat_mode_changed = state.repeat_mode != repeat_mode;
+    state.repeat_mode = repeat_mode;
+    if repeat_mode_changed {
+        reset_track_repeat_budget_for_current_track(state);
+    }
+    prefetch_upcoming(state);
+    sync_mpris(state);
+    Ok(())
+}
+
+fn extend_radio_touched_for_insert(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    insert_at: usize,
+    added: usize,
+) {
+    if added == 0 {
+        return;
+    }
+
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        let touched_len = radio.touched_len;
+        let inserted_end = insert_at + added;
+        if insert_at < touched_len {
+            radio.touched_len = touched_len + added;
+        } else {
+            radio.touched_len = touched_len.max(inserted_end);
+        }
+    }
+}
+
+fn radio_touched_len_after_reorder(touched_len: usize, from: usize, insert_at: usize) -> usize {
+    let mut touched_len = touched_len;
+
+    if from < touched_len {
+        touched_len = touched_len.saturating_sub(1);
+    }
+
+    if insert_at < touched_len {
+        touched_len + 1
+    } else {
+        touched_len.max(insert_at.saturating_add(1))
+    }
+}
+
+fn update_radio_touched_for_reorder(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    from: usize,
+    insert_at: usize,
+) {
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        radio.touched_len = radio_touched_len_after_reorder(radio.touched_len, from, insert_at);
+    }
+}
+
+fn shrink_radio_touched_for_remove(
+    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
+    remove_at: usize,
+) {
+    if let Some(radio) = radio_virtual_playlist.as_mut() {
+        if radio.touched_len == 0 {
+            return;
+        }
+
+        if remove_at < radio.touched_len {
+            radio.touched_len = radio.touched_len.saturating_sub(1);
+        }
+    }
+}
+
+fn adjusted_reorder_index(current: usize, from: usize, insert_at: usize) -> usize {
+    if from == current {
+        insert_at
+    } else if from < current && insert_at >= current {
+        current.saturating_sub(1)
+    } else if from > current && insert_at <= current {
+        current.saturating_add(1)
+    } else {
+        current
+    }
+}
+
+fn insert_into_queue(state: &mut DaemonState, tracks: Vec<Track>, index: usize) {
+    if tracks.is_empty() {
+        return;
+    }
+
+    let had_queue = !state.queue.is_empty();
+    let insert_at = index.min(state.queue.len());
+    let added = tracks.len();
+    for (offset, track) in tracks.into_iter().enumerate() {
+        state.queue.insert(insert_at + offset, track);
+    }
+
+    if had_queue && insert_at <= state.queue_index {
+        state.queue_index = state.queue_index.saturating_add(added);
+    } else {
+        state.queue_index = state.queue_index.min(state.queue.len().saturating_sub(1));
+    }
+
+    extend_radio_touched_for_insert(&mut state.radio_virtual_playlist, insert_at, added);
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    prefetch_upcoming(state);
+    sync_mpris(state);
+}
+
+fn remove_from_queue(state: &mut DaemonState, index: usize) -> Result<Track> {
+    if index >= state.queue.len() {
+        bail!("Queue row is gone");
+    }
+    if index == state.queue_index {
+        bail!("Remove a non-playing row or move the queue around it");
+    }
+
+    let removed = state.queue.remove(index);
+    if index < state.queue_index {
+        state.queue_index = state.queue_index.saturating_sub(1);
+    } else {
+        state.queue_index = state.queue_index.min(state.queue.len().saturating_sub(1));
+    }
+    shrink_radio_touched_for_remove(&mut state.radio_virtual_playlist, index);
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    prefetch_upcoming(state);
+    sync_mpris(state);
+    Ok(removed)
+}
+
+fn move_queue_item(state: &mut DaemonState, from: usize, raw_slot: usize) -> Result<Track> {
+    let insert_at = if from < raw_slot {
+        raw_slot.saturating_sub(1)
+    } else {
+        raw_slot
+    };
+    if from >= state.queue.len() || raw_slot > state.queue.len() {
+        bail!("Queue row is gone");
+    }
+    if insert_at == from {
+        return Ok(state.queue[from].clone());
+    }
+
+    let moved = state.queue.remove(from);
+    state.queue.insert(insert_at, moved.clone());
+    state.queue_index = adjusted_reorder_index(state.queue_index, from, insert_at)
+        .min(state.queue.len().saturating_sub(1));
+    update_radio_touched_for_reorder(&mut state.radio_virtual_playlist, from, insert_at);
+    state.radio_append_in_flight = false;
+    state.last_radio_append_anchor = None;
+    prefetch_upcoming(state);
+    sync_mpris(state);
+    Ok(moved)
+}
+
+fn dismiss_queue_after_current(state: &mut DaemonState) -> bool {
+    let keep_len = state.queue_index.saturating_add(1).min(state.queue.len());
+    let mut changed = false;
+
+    if state.queue.len() > keep_len {
+        state.queue.truncate(keep_len);
+        changed = true;
+    }
+
+    if state.radio_virtual_playlist.take().is_some() {
+        changed = true;
+    }
+
+    if changed {
+        state.queue_index = state.queue_index.min(state.queue.len().saturating_sub(1));
+        state.radio_append_in_flight = false;
+        state.last_radio_append_anchor = None;
+        prefetch_upcoming(state);
+        sync_mpris(state);
+    }
+
+    changed
+}
+
 fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
     match request {
         DaemonRequest::Ping => DaemonResponse::Pong,
@@ -1012,6 +1450,8 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             if !queue.is_empty() {
                 pause_other_mpris_players(state);
             }
+            let radio_virtual_playlist =
+                daemon_owned_radio_virtual_playlist(state, radio_virtual_playlist, queue.len());
             match play_queue_at(
                 state,
                 queue,
@@ -1035,6 +1475,8 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             radio_virtual_playlist,
             repeat_mode,
         } => {
+            let radio_virtual_playlist =
+                daemon_owned_radio_virtual_playlist(state, radio_virtual_playlist, queue.len());
             state.queue = queue;
             state.queue_index = index.min(state.queue.len().saturating_sub(1));
             state.playlist_context = playlist_context;
@@ -1048,6 +1490,58 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             }
             prefetch_upcoming(state);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::StartRadioFromSeed {
+            queue,
+            index,
+            seed_index,
+            prefix_len,
+            playlist_context,
+            repeat_mode,
+            play,
+            suppress_reporting,
+        } => match start_radio_from_seed(
+            state,
+            queue,
+            index,
+            seed_index,
+            prefix_len,
+            playlist_context,
+            repeat_mode,
+            play,
+            suppress_reporting,
+        ) {
+            Ok(()) => {
+                maybe_persist_playback_state(state, true);
+                DaemonResponse::State(state_snapshot(state))
+            }
+            Err(err) => DaemonResponse::Error(err.to_string()),
+        },
+        DaemonRequest::InsertIntoQueue { tracks, index } => {
+            insert_into_queue(state, tracks, index);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::RemoveFromQueue { index } => match remove_from_queue(state, index) {
+            Ok(_) => {
+                maybe_persist_playback_state(state, true);
+                DaemonResponse::State(state_snapshot(state))
+            }
+            Err(err) => DaemonResponse::Error(err.to_string()),
+        },
+        DaemonRequest::MoveQueueItem { from, raw_slot } => {
+            match move_queue_item(state, from, raw_slot) {
+                Ok(_) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
+        DaemonRequest::DismissQueueAfterCurrent => {
+            dismiss_queue_after_current(state);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -1160,6 +1654,15 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
+        DaemonRequest::ActivateRadioChip { chip_index } => {
+            match activate_radio_chip(state, chip_index) {
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
         DaemonRequest::LogMessage { source, message } => {
             match crate::logging::append_log(source, &message) {
                 Ok(()) => DaemonResponse::Ok,
@@ -1246,13 +1749,12 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
                 }
             }
 
-            if let Some(radio) = state.radio_virtual_playlist.as_mut() {
-                if !chips.is_empty() {
-                    radio.chips = chips;
-                }
-            }
+            let chips_changed = state
+                .radio_virtual_playlist
+                .as_mut()
+                .is_some_and(|radio| apply_radio_chips_from_refresh(radio, chips));
 
-            if added > 0 {
+            if added > 0 || chips_changed {
                 sync_mpris(state);
                 maybe_persist_playback_state(state, true);
             }

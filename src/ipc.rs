@@ -161,6 +161,29 @@ pub enum DaemonRequest {
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     },
+    StartRadioFromSeed {
+        queue: Vec<Track>,
+        index: usize,
+        seed_index: usize,
+        prefix_len: usize,
+        playlist_context: Option<PlaylistContext>,
+        repeat_mode: RepeatMode,
+        play: bool,
+        #[serde(default)]
+        suppress_reporting: bool,
+    },
+    InsertIntoQueue {
+        tracks: Vec<Track>,
+        index: usize,
+    },
+    RemoveFromQueue {
+        index: usize,
+    },
+    MoveQueueItem {
+        from: usize,
+        raw_slot: usize,
+    },
+    DismissQueueAfterCurrent,
     ProbeTrack {
         track: Track,
     },
@@ -180,6 +203,9 @@ pub enum DaemonRequest {
     },
     SetRepeatMode {
         repeat_mode: RepeatMode,
+    },
+    ActivateRadioChip {
+        chip_index: usize,
     },
     LogMessage {
         source: LogSource,
@@ -508,6 +534,44 @@ impl DaemonClient {
         }
     }
 
+    pub fn start_radio_from_seed(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        seed_index: usize,
+        prefix_len: usize,
+        playlist_context: Option<PlaylistContext>,
+        repeat_mode: RepeatMode,
+        play: bool,
+    ) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::StartRadioFromSeed {
+            queue,
+            index,
+            seed_index,
+            prefix_len,
+            playlist_context,
+            repeat_mode,
+            play,
+            suppress_reporting: false,
+        })
+    }
+
+    pub fn insert_into_queue(&self, tracks: Vec<Track>, index: usize) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::InsertIntoQueue { tracks, index })
+    }
+
+    pub fn remove_from_queue(&self, index: usize) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::RemoveFromQueue { index })
+    }
+
+    pub fn move_queue_item(&self, from: usize, raw_slot: usize) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::MoveQueueItem { from, raw_slot })
+    }
+
+    pub fn dismiss_queue_after_current(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::DismissQueueAfterCurrent)
+    }
+
     pub fn probe_track(&self, track: Track) -> Result<PlaybackSnapshot> {
         match self.request(&DaemonRequest::ProbeTrack { track })? {
             DaemonResponse::State(state) => Ok(state),
@@ -558,6 +622,10 @@ impl DaemonClient {
 
     pub fn set_repeat_mode(&self, repeat_mode: RepeatMode) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::SetRepeatMode { repeat_mode })
+    }
+
+    pub fn activate_radio_chip(&self, chip_index: usize) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::ActivateRadioChip { chip_index })
     }
 
     pub fn reload_settings(&self) -> Result<PlaybackSnapshot> {

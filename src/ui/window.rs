@@ -289,8 +289,6 @@ struct PlayerState {
     queue_drop_indicator_title: Label,
     queue_drop_indicator_subtitle: Label,
     queue_drop_indicator_duration: Label,
-    sponsor_segments: RefCell<Vec<SponsorSegment>>,
-    sponsor_segments_reported: RefCell<HashSet<String>>,
     daemon_refresh_in_flight: Cell<bool>,
     daemon_refresh_started_at: Cell<Option<Instant>>,
     daemon_refresh_serial: Cell<u64>,
@@ -707,11 +705,11 @@ fn radio_chips(ps: &PlayerState) -> Vec<RadioChip> {
         .unwrap_or_default()
 }
 
-fn radio_source_video_id(ps: &PlayerState) -> Option<String> {
+fn selected_radio_chip_index(ps: &PlayerState) -> Option<usize> {
     ps.radio_virtual_playlist
         .borrow()
         .as_ref()
-        .map(|radio| radio.source_video_id.clone())
+        .and_then(|radio| radio.selected_chip_index)
 }
 
 fn playlist_context(
@@ -749,22 +747,7 @@ fn mark_radio_touched_through(ps: &PlayerState, index: usize) {
     }
 }
 
-fn extend_radio_touched_for_insert(ps: &PlayerState, insert_at: usize, added: usize) {
-    if added == 0 {
-        return;
-    }
-
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        let touched_len = radio.touched_len;
-        let inserted_end = insert_at + added;
-        if insert_at < touched_len {
-            radio.touched_len = touched_len + added;
-        } else {
-            radio.touched_len = touched_len.max(inserted_end);
-        }
-    }
-}
-
+#[cfg(test)]
 fn radio_touched_len_after_reorder(touched_len: usize, from: usize, insert_at: usize) -> usize {
     let mut touched_len = touched_len;
 
@@ -779,145 +762,11 @@ fn radio_touched_len_after_reorder(touched_len: usize, from: usize, insert_at: u
     }
 }
 
-fn update_radio_touched_for_reorder(ps: &PlayerState, from: usize, insert_at: usize) {
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.touched_len = radio_touched_len_after_reorder(radio.touched_len, from, insert_at);
-    }
-}
-
-fn shrink_radio_touched_for_remove(ps: &PlayerState, remove_at: usize) {
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        if radio.touched_len == 0 {
-            return;
-        }
-
-        if remove_at < radio.touched_len {
-            radio.touched_len = radio.touched_len.saturating_sub(1);
-        }
-    }
-}
-
 fn radio_touched_len(ps: &PlayerState) -> Option<usize> {
     ps.radio_virtual_playlist
         .borrow()
         .as_ref()
         .map(|radio| radio.touched_len)
-}
-
-fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
-    let mut seen_ids = prefix
-        .iter()
-        .map(|track| track.video_id.clone())
-        .collect::<HashSet<_>>();
-    let mut deduped = Vec::with_capacity(tracks.len());
-
-    for track in tracks {
-        if seen_ids.insert(track.video_id.clone()) {
-            deduped.push(track);
-        }
-    }
-
-    deduped
-}
-
-fn apply_radio_chip_update(radio: &mut RadioVirtualPlaylist, chips: Option<Vec<RadioChip>>) {
-    if let Some(chips) = chips {
-        radio.chips = chips;
-    }
-}
-
-fn replace_radio_tail(
-    ps: &PlayerState,
-    prefix_len: usize,
-    tracks: Vec<Track>,
-    chips: Option<Vec<RadioChip>>,
-) {
-    let prefix_len = prefix_len.min(ps.queue.borrow().len());
-    {
-        let mut queue = ps.queue.borrow_mut();
-        queue.truncate(prefix_len);
-        let deduped_tracks = dedupe_radio_recommendations(queue.as_slice(), tracks);
-        queue.extend(deduped_tracks);
-    }
-
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.touched_len = radio.touched_len.min(prefix_len);
-        apply_radio_chip_update(radio, chips);
-    }
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-}
-
-fn append_radio_recommendations(ps: &PlayerState, tracks: Vec<Track>) -> usize {
-    let mut queue = ps.queue.borrow_mut();
-    let deduped_tracks = dedupe_radio_recommendations(queue.as_slice(), tracks);
-    let added = deduped_tracks.len();
-    queue.extend(deduped_tracks);
-    added
-}
-
-fn maybe_extend_radio_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
-    if !is_radio_queue(ps)
-        || ps.radio_append_in_flight.get()
-        || ps.repeat_mode.get() == RepeatMode::All
-    {
-        return;
-    }
-
-    let last_video_id = {
-        let queue = ps.queue.borrow();
-        let idx = ps.queue_index.get();
-        if queue.is_empty() || idx + 1 != queue.len() {
-            return;
-        }
-        queue.last().map(|track| track.video_id.clone())
-    };
-    let Some(last_video_id) = last_video_id else {
-        return;
-    };
-
-    if ps.last_radio_append_anchor.borrow().as_deref() == Some(last_video_id.as_str()) {
-        return;
-    }
-
-    *ps.last_radio_append_anchor.borrow_mut() = Some(last_video_id.clone());
-    ps.radio_append_in_flight.set(true);
-
-    let state = state.clone();
-    let ps = ps.clone();
-    glib::spawn_future_local(async move {
-        let state_bg = state.clone();
-        let vid = last_video_id.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
-        })
-        .await;
-
-        let should_apply = is_radio_queue(&ps)
-            && ps.repeat_mode.get() != RepeatMode::All
-            && ps.last_radio_append_anchor.borrow().as_deref() == Some(last_video_id.as_str())
-            && ps
-                .queue
-                .borrow()
-                .last()
-                .is_some_and(|track| track.video_id == last_video_id);
-        if !should_apply {
-            if ps.last_radio_append_anchor.borrow().as_deref() == Some(last_video_id.as_str()) {
-                *ps.last_radio_append_anchor.borrow_mut() = None;
-            }
-            ps.radio_append_in_flight.set(false);
-            return;
-        }
-
-        if let Ok(Some(Ok(radio))) = result {
-            if append_radio_recommendations(&ps, radio.tracks) > 0 {
-                render_queue_panel(&ps, &state);
-                sync_remote_queue(&ps);
-                sync_mpris_transport(&ps, &state);
-            }
-        }
-
-        ps.radio_append_in_flight.set(false);
-    });
 }
 
 /// Set the queue from a track list context and play from the given index.
@@ -937,7 +786,6 @@ fn play_from_context(
 fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     let _ = state;
     let _ = ps.player.stop();
-    clear_sponsorblock_state(ps);
     ps.playlist_like_queue.set(false);
     ps.last_mpris_length_micros.set(None);
     ps.lyrics_request_serial
@@ -970,7 +818,7 @@ fn format_clock_time(t: ClockTime) -> String {
     format!("{mins}:{secs:02}")
 }
 
-fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime, state: &Arc<Mutex<AppState>>) {
+fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime, _state: &Arc<Mutex<AppState>>) {
     let clamped_target = ps
         .player
         .duration()
@@ -996,12 +844,6 @@ fn apply_seek_position(ps: &Rc<PlayerState>, target: ClockTime, state: &Arc<Mute
 
     ps.is_seeking.set(false);
     update_active_lyric_line(ps, Some(clamped_target.nseconds() / 1_000_000));
-    maybe_apply_sponsorblock_skip(state, ps, clamped_target);
-}
-
-fn clear_sponsorblock_state(ps: &PlayerState) {
-    ps.sponsor_segments.borrow_mut().clear();
-    ps.sponsor_segments_reported.borrow_mut().clear();
 }
 
 fn ensure_offline_sponsorblock_cache(
@@ -1046,16 +888,8 @@ fn ensure_offline_sponsorblock_cache(
 
 fn refresh_sponsorblock_for_current_track(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>) {
     let _ = state;
-    clear_sponsorblock_state(ps);
+    let _ = ps;
     crate::player::notify_daemon_settings_changed();
-}
-
-fn maybe_apply_sponsorblock_skip(
-    state: &Arc<Mutex<AppState>>,
-    ps: &Rc<PlayerState>,
-    position: ClockTime,
-) {
-    let _ = (state, ps, position);
 }
 
 fn apply_song_rating(ps: &Rc<PlayerState>, session_id: u64, rating: SongRating) {
@@ -1161,15 +995,6 @@ fn spawn_synced_lyrics_sync(
             }
         }
     });
-}
-
-fn spawn_sponsorblock_sync(
-    state: &Arc<Mutex<AppState>>,
-    ps: &Rc<PlayerState>,
-    video_id: &str,
-    session_id: u64,
-) {
-    let _ = (state, ps, video_id, session_id);
 }
 
 fn submit_song_rating(

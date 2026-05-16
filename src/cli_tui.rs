@@ -43,7 +43,7 @@ use crate::ipc::{
 };
 use crate::models::{
     BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    PlaylistSummary, RadioChip, RadioVirtualPlaylist, SearchResult, SyncedLyrics, Track,
+    PlaylistSummary, RadioChip, SearchResult, SyncedLyrics, Track,
 };
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
@@ -796,7 +796,6 @@ struct InteractiveTui {
     submitted_search_query_to_clear: Option<String>,
     completed_search_query_to_clear: Option<String>,
     radio_chip_scroll_offset: usize,
-    remembered_radio_chips: HashMap<String, Vec<RadioChip>>,
     settings_field_offsets: Vec<(usize, usize)>,
     settings_total_height: usize,
     settings_text_edit: Option<TuiSettingsTextEdit>,

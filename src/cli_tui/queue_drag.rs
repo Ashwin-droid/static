@@ -245,22 +245,10 @@ impl InteractiveTui {
             return Ok(());
         }
 
-        let mut queue = self.snapshot.queue.clone();
-        let moved_track = queue.remove(from);
-        queue.insert(insert_at, moved_track.clone());
-
-        let current_index = adjusted_reorder_index(self.snapshot.queue_index, from, insert_at);
+        let moved_track = self.snapshot.queue[from].clone();
         let selected_index = adjusted_reorder_index(self.queue_selected, from, insert_at);
-        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
-        update_radio_touched_for_reorder(&mut radio_virtual_playlist, from, insert_at);
 
-        let snapshot = self.client.replace_queue(
-            queue,
-            current_index,
-            self.snapshot.playlist_context.clone(),
-            radio_virtual_playlist,
-            self.snapshot.repeat_mode,
-        )?;
+        let snapshot = self.client.move_queue_item(from, raw_slot)?;
         self.apply_snapshot(snapshot);
         self.focus = TuiFocus::Queue;
         self.detail_tab = DetailTab::Queue;
@@ -284,33 +272,13 @@ impl InteractiveTui {
             return Ok(());
         }
 
-        let had_queue = !self.snapshot.queue.is_empty();
         let insert_at = raw_slot.min(self.snapshot.queue.len());
         let added = tracks.len();
         let first_title = tracks
             .first()
             .map(|track| shorten(&track.title, 28))
             .unwrap_or_else(|| "tracks".to_string());
-        let mut queue = self.snapshot.queue.clone();
-        for (offset, track) in tracks.into_iter().enumerate() {
-            queue.insert(insert_at + offset, track);
-        }
-
-        let current_index = if had_queue && insert_at <= self.snapshot.queue_index {
-            self.snapshot.queue_index.saturating_add(added)
-        } else {
-            self.snapshot.queue_index
-        };
-        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
-        extend_radio_touched_for_insert(&mut radio_virtual_playlist, insert_at, added);
-
-        let snapshot = self.client.replace_queue(
-            queue,
-            current_index,
-            self.snapshot.playlist_context.clone(),
-            radio_virtual_playlist,
-            self.snapshot.repeat_mode,
-        )?;
+        let snapshot = self.client.insert_into_queue(tracks, insert_at)?;
         self.apply_snapshot(snapshot);
         self.focus = TuiFocus::Queue;
         self.detail_tab = DetailTab::Queue;
@@ -362,68 +330,5 @@ pub(in crate::cli_tui) fn adjusted_reorder_index(
         current.saturating_add(1)
     } else {
         current
-    }
-}
-
-pub(in crate::cli_tui) fn extend_radio_touched_for_insert(
-    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
-    insert_at: usize,
-    added: usize,
-) {
-    if added == 0 {
-        return;
-    }
-
-    if let Some(radio) = radio_virtual_playlist.as_mut() {
-        let touched_len = radio.touched_len;
-        let inserted_end = insert_at + added;
-        if insert_at < touched_len {
-            radio.touched_len = touched_len + added;
-        } else {
-            radio.touched_len = touched_len.max(inserted_end);
-        }
-    }
-}
-
-pub(in crate::cli_tui) fn radio_touched_len_after_reorder(
-    touched_len: usize,
-    from: usize,
-    insert_at: usize,
-) -> usize {
-    let mut touched_len = touched_len;
-
-    if from < touched_len {
-        touched_len = touched_len.saturating_sub(1);
-    }
-
-    if insert_at < touched_len {
-        touched_len + 1
-    } else {
-        touched_len.max(insert_at.saturating_add(1))
-    }
-}
-
-pub(in crate::cli_tui) fn update_radio_touched_for_reorder(
-    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
-    from: usize,
-    insert_at: usize,
-) {
-    if let Some(radio) = radio_virtual_playlist.as_mut() {
-        radio.touched_len = radio_touched_len_after_reorder(radio.touched_len, from, insert_at);
-    }
-}
-
-pub(in crate::cli_tui) fn shrink_radio_touched_for_remove(
-    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
-    remove_at: usize,
-) {
-    if let Some(radio) = radio_virtual_playlist.as_mut() {
-        if radio.touched_len == 0 {
-            return;
-        }
-
-        if remove_at < radio.touched_len {
-            radio.touched_len = radio.touched_len.saturating_sub(1);
-        }
     }
 }

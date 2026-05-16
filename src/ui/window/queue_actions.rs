@@ -24,23 +24,6 @@ pub(super) fn play_track(
         undo_feedback_token: None,
     };
 
-    *ps.queue.borrow_mut() = vec![seed_track.clone()];
-    ps.queue_index.set(0);
-    set_queue_context(
-        ps,
-        None,
-        Some(RadioVirtualPlaylist {
-            source_video_id: seed_track.video_id.clone(),
-            touched_len: 1,
-            chips: Vec::new(),
-        }),
-        false,
-    );
-    ps.radio_append_in_flight.set(true);
-    render_queue_panel(ps, state);
-    sync_mpris_transport(ps, state);
-
-    clear_sponsorblock_state(ps);
     ps.lyrics_request_serial
         .set(ps.lyrics_request_serial.get().wrapping_add(1));
     show_lyrics_loading(ps);
@@ -62,17 +45,14 @@ pub(super) fn play_track(
     }
 
     let state = state.clone();
-    let video_id = video_id.to_string();
     let ps = ps.clone();
     let request_serial = next_play_request_serial(&ps);
     let client = ps.player.daemon_client();
-    let queue = ps.queue.borrow().clone();
-    let radio_virtual_playlist = ps.radio_virtual_playlist.borrow().clone();
     let repeat_mode = ps.repeat_mode.get();
 
     glib::spawn_future_local(async move {
         let playback_result = gio::spawn_blocking(move || {
-            client.play_queue_at(queue, 0, None, radio_virtual_playlist, repeat_mode)
+            client.start_radio_from_seed(vec![seed_track], 0, 0, 1, None, repeat_mode, true)
         })
         .await;
 
@@ -81,61 +61,20 @@ pub(super) fn play_track(
         }
 
         match playback_result {
-            Ok(Ok(snapshot)) => apply_remote_snapshot(&ps, &state, snapshot),
+            Ok(Ok(snapshot)) => {
+                apply_remote_snapshot(&ps, &state, snapshot);
+                render_queue_panel(&ps, &state);
+            }
             Ok(Err(err)) => {
                 ps.np_title.set_text(&err.to_string());
                 ps.np_artist.set_text("");
-                return;
             }
             Err(err) => {
                 ps.np_title
                     .set_text(&format!("Playback start failed: {err:?}"));
                 ps.np_artist.set_text("");
-                return;
             }
         }
-
-        // Fetch radio queue in background
-        let state_bg = state.clone();
-        let vid = video_id.clone();
-        let radio_result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, None, None))
-        })
-        .await;
-
-        if !is_current_play_request(&ps, request_serial) {
-            return;
-        }
-
-        if let Ok(Some(Ok(mut radio))) = radio_result {
-            // Keep the touched prefix authoritative and silently drop any
-            // recommended tracks that duplicate the seed or each other.
-            let queue_seed = radio
-                .tracks
-                .iter()
-                .position(|track| track.video_id == video_id)
-                .map(|index| radio.tracks.remove(index))
-                .unwrap_or(seed_track);
-            let mut queue = vec![queue_seed.clone()];
-            queue.extend(dedupe_radio_recommendations(&queue, radio.tracks));
-
-            *ps.queue.borrow_mut() = queue;
-            ps.queue_index.set(0);
-            set_queue_context(
-                &ps,
-                None,
-                Some(RadioVirtualPlaylist {
-                    source_video_id: video_id.clone(),
-                    touched_len: 1,
-                    chips: radio.chips,
-                }),
-                false,
-            );
-            render_queue_panel(&ps, &state);
-            sync_remote_queue(&ps);
-            sync_mpris_transport(&ps, &state);
-        }
-        ps.radio_append_in_flight.set(false);
     });
 }
 
@@ -144,7 +83,6 @@ pub(super) fn probe_track(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<
     let artist = artist_string(&track);
     let thumb_url = track.thumbnail_url.clone();
 
-    clear_sponsorblock_state(ps);
     ps.lyrics_request_serial
         .set(ps.lyrics_request_serial.get().wrapping_add(1));
     show_lyrics_loading(ps);
@@ -189,112 +127,67 @@ pub(super) fn probe_track(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<
     });
 }
 
-fn spawn_jump_to_radio_seed_tail_refresh(
-    expected_index: usize,
+fn start_radio_from_seed_queue(
+    queue: Vec<Track>,
+    seed_index: usize,
     prefix_len: usize,
-    seed_track: Track,
     ps: &Rc<PlayerState>,
     state: &Arc<Mutex<AppState>>,
 ) {
     let state = state.clone();
     let ps = ps.clone();
-    let seed_video_id = seed_track.video_id.clone();
+    let client = ps.player.daemon_client();
+    let current_index = ps.queue_index.get().min(queue.len().saturating_sub(1));
+    let playlist_context = ps.playlist_context.borrow().clone();
+    let repeat_mode = ps.repeat_mode.get();
+    ps.playlist_like_queue.set(false);
+
     glib::spawn_future_local(async move {
-        let state_bg = state.clone();
-        let seed_track = seed_track.clone();
-        let seed_video_id_for_request = seed_video_id.clone();
         let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_radio(&seed_video_id_for_request, None, None))
+            client.start_radio_from_seed(
+                queue,
+                current_index,
+                seed_index,
+                prefix_len,
+                playlist_context,
+                repeat_mode,
+                false,
+            )
         })
         .await;
 
-        let still_current_seed = is_radio_queue(&ps)
-            && radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str())
-            && ps
-                .queue
-                .borrow()
-                .get(expected_index)
-                .is_some_and(|track| track.video_id == seed_video_id);
-        if !still_current_seed {
-            if radio_source_video_id(&ps).as_deref() == Some(seed_video_id.as_str()) {
-                ps.radio_append_in_flight.set(false);
-            }
-            return;
-        }
-
-        if let Ok(Some(Ok(mut radio))) = result {
-            let idx = radio
-                .tracks
-                .iter()
-                .position(|track| track.video_id == seed_video_id);
-            if let Some(i) = idx {
-                if i > 0 {
-                    let track = radio.tracks.remove(i);
-                    radio.tracks.insert(0, track);
-                }
-            } else {
-                radio.tracks.insert(0, seed_track);
-            }
-
-            replace_radio_tail(&ps, prefix_len, radio.tracks, Some(radio.chips));
+        if let Ok(Ok(snapshot)) = result {
+            apply_remote_snapshot(&ps, &state, snapshot);
             render_queue_panel(&ps, &state);
-            sync_remote_queue(&ps);
-            sync_mpris_transport(&ps, &state);
         }
-
-        ps.radio_append_in_flight.set(false);
     });
-}
-
-fn start_radio_after_playlist_seed(
-    expected_index: usize,
-    prefix_len: usize,
-    seed_track: Track,
-    ps: &Rc<PlayerState>,
-    state: &Arc<Mutex<AppState>>,
-) {
-    ps.playlist_like_queue.set(false);
-    *ps.radio_virtual_playlist.borrow_mut() = Some(RadioVirtualPlaylist {
-        source_video_id: seed_track.video_id.clone(),
-        touched_len: prefix_len,
-        chips: Vec::new(),
-    });
-    ps.radio_append_in_flight.set(true);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
-    spawn_jump_to_radio_seed_tail_refresh(expected_index, prefix_len, seed_track, ps, state);
 }
 
 pub(super) fn jump_to_radio_seed(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     if !is_radio_queue(ps) {
-        let (Some(seed_track), queue_len) = ({
+        let (queue, seed_index, prefix_len) = {
             let queue = ps.queue.borrow();
-            (queue.get(index).cloned(), queue.len())
-        }) else {
-            return;
+            if index >= queue.len() {
+                return;
+            }
+            (queue.clone(), index, queue.len())
         };
-        start_radio_after_playlist_seed(index, queue_len, seed_track, ps, state);
+        start_radio_from_seed_queue(queue, seed_index, prefix_len, ps, state);
         return;
     }
 
-    let Some(seed_track) = ps.queue.borrow().get(index).cloned() else {
-        return;
+    let (queue, prefix_len) = {
+        let queue = ps.queue.borrow();
+        if index >= queue.len() {
+            return;
+        }
+        let prefix_len = radio_touched_len(ps)
+            .unwrap_or_else(|| index.saturating_add(1))
+            .max(index.saturating_add(1))
+            .min(queue.len());
+        (queue.clone(), prefix_len)
     };
-
-    mark_radio_touched_through(ps, index);
-    let prefix_len = radio_touched_len(ps).unwrap_or_else(|| index.saturating_add(1));
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.source_video_id = seed_track.video_id.clone();
-        radio.chips.clear();
-    }
-    ps.radio_append_in_flight.set(true);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
-    spawn_jump_to_radio_seed_tail_refresh(index, prefix_len, seed_track, ps, state);
+    start_radio_from_seed_queue(queue, index, prefix_len, ps, state);
 }
 
 pub(super) fn jump_to_radio_seed_from_track(
@@ -303,72 +196,67 @@ pub(super) fn jump_to_radio_seed_from_track(
     state: &Arc<Mutex<AppState>>,
 ) {
     if !is_radio_queue(ps) {
-        let existing_index = {
-            let queue = ps.queue.borrow();
-            queue
-                .iter()
-                .position(|queued| queued.video_id == track.video_id)
-        };
+        let mut queue = ps.queue.borrow().clone();
+        let existing_index = queue
+            .iter()
+            .position(|queued| queued.video_id == track.video_id);
         if let Some(index) = existing_index {
-            let prefix_len = ps.queue.borrow().len();
-            start_radio_after_playlist_seed(index, prefix_len, track, ps, state);
+            let prefix_len = queue.len();
+            start_radio_from_seed_queue(queue, index, prefix_len, ps, state);
             return;
         }
 
-        let (insert_at, prefix_len) = {
-            let mut queue = ps.queue.borrow_mut();
-            queue.push(track.clone());
-            let insert_at = queue.len().saturating_sub(1);
-            (insert_at, queue.len())
-        };
-        start_radio_after_playlist_seed(insert_at, prefix_len, track, ps, state);
+        queue.push(track);
+        let insert_at = queue.len().saturating_sub(1);
+        let prefix_len = queue.len();
+        start_radio_from_seed_queue(queue, insert_at, prefix_len, ps, state);
         return;
     }
 
-    let queue_len = ps.queue.borrow().len();
+    let mut queue = ps.queue.borrow().clone();
+    let queue_len = queue.len();
     let insert_at = radio_touched_len(ps).unwrap_or(queue_len).min(queue_len);
-    ps.queue.borrow_mut().insert(insert_at, track.clone());
-    extend_radio_touched_for_insert(ps, insert_at, 1);
-    let prefix_len = radio_touched_len(ps).unwrap_or_else(|| insert_at.saturating_add(1));
-    if let Some(radio) = ps.radio_virtual_playlist.borrow_mut().as_mut() {
-        radio.source_video_id = track.video_id.clone();
-        radio.chips.clear();
-    }
-    ps.radio_append_in_flight.set(true);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
-    spawn_jump_to_radio_seed_tail_refresh(insert_at, prefix_len, track, ps, state);
+    queue.insert(insert_at, track);
+    let prefix_len = radio_touched_len(ps)
+        .unwrap_or(queue_len)
+        .max(insert_at.saturating_add(1))
+        .min(queue.len());
+    start_radio_from_seed_queue(queue, insert_at, prefix_len, ps, state);
 }
 
 /// Insert a track right after the currently-playing position.
 pub(super) fn queue_play_next(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
-    let insert_at = ps.queue_index.get() + 1;
-    ps.queue.borrow_mut().insert(insert_at, track);
-    extend_radio_touched_for_insert(ps, insert_at, 1);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
+    let insert_at = ps.queue_index.get().saturating_add(1);
+    queue_insert_tracks(vec![track], insert_at, ps, state);
 }
 
 /// Append a track to the queue, or to the virtual-playlist boundary for radio.
 pub(super) fn queue_add_to_end(track: Track, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
     let queue_len = ps.queue.borrow().len();
     let insert_at = radio_touched_len(ps).unwrap_or(queue_len).min(queue_len);
-    if insert_at == queue_len {
-        ps.queue.borrow_mut().push(track);
-    } else {
-        ps.queue.borrow_mut().insert(insert_at, track);
-        extend_radio_touched_for_insert(ps, insert_at, 1);
-    }
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
+    queue_insert_tracks(vec![track], insert_at, ps, state);
 }
 
+fn queue_insert_tracks(
+    tracks: Vec<Track>,
+    insert_at: usize,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    let state = state.clone();
+    let ps = ps.clone();
+    let client = ps.player.daemon_client();
+
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || client.insert_into_queue(tracks, insert_at)).await;
+        if let Ok(Ok(snapshot)) = result {
+            apply_remote_snapshot(&ps, &state, snapshot);
+            render_queue_panel(&ps, &state);
+        }
+    });
+}
+
+#[cfg(test)]
 fn dismiss_queue_after_current_state(
     queue: &mut Vec<Track>,
     keep_len: usize,
@@ -389,46 +277,33 @@ fn dismiss_queue_after_current_state(
 }
 
 pub(super) fn dismiss_queue_after_current(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
-    let keep_len = ps.queue_index.get().saturating_add(1);
-    let changed = dismiss_queue_after_current_state(
-        &mut ps.queue.borrow_mut(),
-        keep_len,
-        &mut ps.radio_virtual_playlist.borrow_mut(),
-    );
+    let state = state.clone();
+    let ps = ps.clone();
+    let client = ps.player.daemon_client();
 
-    if !changed {
-        return;
-    }
-
-    ps.radio_append_in_flight.set(false);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || client.dismiss_queue_after_current()).await;
+        if let Ok(Ok(snapshot)) = result {
+            apply_remote_snapshot(&ps, &state, snapshot);
+            render_queue_panel(&ps, &state);
+        }
+    });
 }
 
 /// Remove a track from the queue by index, adjusting queue_index if needed.
 pub(super) fn queue_remove(index: usize, ps: &Rc<PlayerState>, state: &Arc<Mutex<AppState>>) {
-    {
-        let mut q = ps.queue.borrow_mut();
-        if index >= q.len() {
-            return;
-        }
-        q.remove(index);
-        let current = ps.queue_index.get();
-        if index < current {
-            ps.queue_index.set(current - 1);
-        }
-    }
-    shrink_radio_touched_for_remove(ps, index);
-    *ps.last_radio_append_anchor.borrow_mut() = None;
     // Defer re-render to avoid destroying widget while its click handler is running
     let ps = ps.clone();
     let state = state.clone();
     glib::idle_add_local_once(move || {
-        render_queue_panel(&ps, &state);
-        sync_remote_queue(&ps);
-        sync_mpris_transport(&ps, &state);
+        let client = ps.player.daemon_client();
+        glib::spawn_future_local(async move {
+            let result = gio::spawn_blocking(move || client.remove_from_queue(index)).await;
+            if let Ok(Ok(snapshot)) = result {
+                apply_remote_snapshot(&ps, &state, snapshot);
+                render_queue_panel(&ps, &state);
+            }
+        });
     });
 }
 
@@ -637,7 +512,6 @@ pub(super) fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>
     let thumb_url = track.thumbnail_url.clone();
     drop(queue);
 
-    clear_sponsorblock_state(ps);
     ps.lyrics_request_serial
         .set(ps.lyrics_request_serial.get().wrapping_add(1));
     show_lyrics_loading(ps);
@@ -659,7 +533,6 @@ pub(super) fn play_from_queue(state: &Arc<Mutex<AppState>>, ps: &Rc<PlayerState>
 
     // Re-render queue to highlight current track
     render_queue_panel(ps, state);
-    maybe_extend_radio_queue(state, ps);
     let state = state.clone();
     let ps = ps.clone();
     let request_serial = next_play_request_serial(&ps);
@@ -1042,17 +915,19 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
     // -- Chips --
     clear_box(&ps.chip_bar);
     let chips = radio_chips(ps);
-    for chip in &chips {
+    let selected_chip_index = selected_radio_chip_index(ps);
+    for (chip_index, chip) in chips.iter().enumerate() {
         let btn = Button::with_label(&chip.label);
         btn.add_css_class("queue-chip");
+        if selected_chip_index == Some(chip_index) {
+            btn.add_css_class("queue-chip-selected");
+        }
 
         let state_c = state.clone();
         let ps_c = ps.clone();
-        let playlist_id = chip.playlist_id.clone();
-        let params = chip.params.clone();
 
         btn.connect_clicked(move |_| {
-            load_radio_filter(&state_c, &ps_c, &playlist_id, params.as_deref());
+            load_radio_filter(&state_c, &ps_c, chip_index);
         });
         ps.chip_bar.append(&btn);
     }
@@ -1293,60 +1168,17 @@ pub(super) fn render_queue_panel(ps: &Rc<PlayerState>, state: &Arc<Mutex<AppStat
 pub(super) fn load_radio_filter(
     state: &Arc<Mutex<AppState>>,
     ps: &Rc<PlayerState>,
-    playlist_id: &str,
-    params: Option<&str>,
+    chip_index: usize,
 ) {
     let state = state.clone();
     let ps = ps.clone();
-    let source_video_id = radio_source_video_id(&ps).or_else(|| {
-        let q = ps.queue.borrow();
-        q.first().map(|track| track.video_id.clone())
-    });
-    let Some(source_video_id) = source_video_id else {
-        return;
-    };
-    let prefix_len = radio_touched_len(&ps)
-        .unwrap_or_else(|| ps.queue_index.get().saturating_add(1))
-        .max(1);
-    let source_track = {
-        let q = ps.queue.borrow();
-        q.iter()
-            .find(|track| track.video_id == source_video_id)
-            .cloned()
-            .or_else(|| q.first().cloned())
-    };
-    let playlist_id = playlist_id.to_string();
-    let params = params.map(String::from);
+    let client = ps.player.daemon_client();
 
     glib::spawn_future_local(async move {
-        let state_bg = state.clone();
-        let vid = source_video_id.clone();
-        let plid = playlist_id.clone();
-        let p = params.clone();
-        let result = gio::spawn_blocking(move || {
-            app_client(&state_bg).map(|ytm| ytm.get_radio(&vid, Some(&plid), p.as_deref()))
-        })
-        .await;
-
-        if let Ok(Some(Ok(mut radio))) = result {
-            // Ensure the source song is present if the API omits it.
-            let idx = radio
-                .tracks
-                .iter()
-                .position(|track| track.video_id == source_video_id);
-            if let Some(i) = idx {
-                if i > 0 {
-                    let t = radio.tracks.remove(i);
-                    radio.tracks.insert(0, t);
-                }
-            } else if let Some(t) = source_track {
-                radio.tracks.insert(0, t);
-            }
-
-            replace_radio_tail(&ps, prefix_len, radio.tracks, None);
+        let result = gio::spawn_blocking(move || client.activate_radio_chip(chip_index)).await;
+        if let Ok(Ok(snapshot)) = result {
+            apply_remote_snapshot(&ps, &state, snapshot);
             render_queue_panel(&ps, &state);
-            sync_remote_queue(&ps);
-            sync_mpris_transport(&ps, &state);
         }
     });
 }

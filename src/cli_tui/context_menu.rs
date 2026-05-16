@@ -1,5 +1,5 @@
 use super::*;
-use super::{page_builders::*, playback::*, queue_drag::*, views::*, widgets::*};
+use super::{page_builders::*, views::*, widgets::*};
 
 impl InteractiveTui {
     pub(in crate::cli_tui) fn close_context_menu(&mut self) {
@@ -348,129 +348,46 @@ impl InteractiveTui {
         seed_track: Track,
         selected_index: usize,
     ) -> Result<()> {
-        let mut final_queue = queue.clone();
-        let mut chips = Vec::new();
-        let mut tail_refreshed = false;
-
-        if let Ok(mut radio) = saved_network_state()
-            .and_then(|network| network.get_radio(&seed_track.video_id, None, None))
-        {
-            if let Some(seed_index) = radio
-                .tracks
-                .iter()
-                .position(|track| track.video_id == seed_track.video_id)
-            {
-                if seed_index > 0 {
-                    let track = radio.tracks.remove(seed_index);
-                    radio.tracks.insert(0, track);
-                }
-            } else {
-                radio.tracks.insert(0, seed_track.clone());
-            }
-
-            final_queue.truncate(prefix_len.min(final_queue.len()));
-            final_queue.extend(dedupe_radio_recommendations(
-                final_queue.as_slice(),
-                radio.tracks,
-            ));
-            chips = radio.chips;
-            tail_refreshed = true;
-        }
-
-        let current_index = if final_queue.is_empty() {
+        let current_index = if queue.is_empty() {
             0
         } else {
-            self.snapshot
-                .queue_index
-                .min(final_queue.len().saturating_sub(1))
+            self.snapshot.queue_index.min(queue.len().saturating_sub(1))
         };
-        let snapshot = self.client.replace_queue(
-            final_queue,
+        let snapshot = self.client.start_radio_from_seed(
+            queue,
             current_index,
+            selected_index,
+            prefix_len,
             self.snapshot.playlist_context.clone(),
-            Some(RadioVirtualPlaylist {
-                source_video_id: seed_track.video_id.clone(),
-                touched_len: prefix_len,
-                chips,
-            }),
             self.snapshot.repeat_mode,
+            false,
         )?;
         self.apply_snapshot(snapshot);
         self.focus = TuiFocus::Queue;
         self.detail_tab = DetailTab::Queue;
         self.queue_selected = selected_index.min(self.snapshot.queue.len().saturating_sub(1));
         self.ensure_queue_visible();
-        self.status_line = if tail_refreshed {
-            format!("Jumped radio to {}.", shorten(&seed_track.title, 28))
-        } else {
-            format!(
-                "Jumped radio to {}. Keeping the current tail for now.",
-                shorten(&seed_track.title, 28)
-            )
-        };
+        self.status_line = format!("Jumped radio to {}.", shorten(&seed_track.title, 28));
         Ok(())
     }
 
     pub(in crate::cli_tui) fn activate_radio_chip(&mut self, chip_index: usize) -> Result<()> {
-        let Some(radio) = self.snapshot.radio_virtual_playlist.clone() else {
+        if self.snapshot.radio_virtual_playlist.is_none() {
             self.status_line = "Radio chips only appear for radio queues.".to_string();
             return Ok(());
-        };
-        let current_chips = self.current_radio_chips();
-        let Some(chip) = current_chips.get(chip_index).cloned() else {
+        }
+        let Some(chip_label) = self
+            .current_radio_chips()
+            .get(chip_index)
+            .map(|chip| chip.label.clone())
+        else {
             self.status_line = "That radio filter is no longer available.".to_string();
             return Ok(());
         };
-        let source_video_id = radio.source_video_id;
-        let prefix_len = radio.touched_len.max(1);
-        let source_track = self
-            .snapshot
-            .queue
-            .iter()
-            .find(|track| track.video_id == source_video_id)
-            .cloned()
-            .or_else(|| self.snapshot.queue.first().cloned());
 
-        let mut refreshed = saved_network_state()?.get_radio(
-            &source_video_id,
-            Some(&chip.playlist_id),
-            chip.params.as_deref(),
-        )?;
-
-        if let Some(source_index) = refreshed
-            .tracks
-            .iter()
-            .position(|track| track.video_id == source_video_id)
-        {
-            if source_index > 0 {
-                let track = refreshed.tracks.remove(source_index);
-                refreshed.tracks.insert(0, track);
-            }
-        } else if let Some(source_track) = source_track {
-            refreshed.tracks.insert(0, source_track);
-        }
-
-        let mut queue = self.snapshot.queue.clone();
-        queue.truncate(prefix_len.min(queue.len()));
-        queue.extend(dedupe_radio_recommendations(
-            queue.as_slice(),
-            refreshed.tracks,
-        ));
-
-        let current_index = self.snapshot.queue_index.min(queue.len().saturating_sub(1));
-        let snapshot = self.client.replace_queue(
-            queue,
-            current_index,
-            self.snapshot.playlist_context.clone(),
-            Some(RadioVirtualPlaylist {
-                source_video_id,
-                touched_len: prefix_len,
-                chips: merge_radio_chip_update(&current_chips, refreshed.chips),
-            }),
-            self.snapshot.repeat_mode,
-        )?;
+        let snapshot = self.client.activate_radio_chip(chip_index)?;
         self.apply_snapshot(snapshot);
-        self.status_line = format!("Switched radio to {}.", shorten(&chip.label, 24));
+        self.status_line = format!("Switched radio to {}.", shorten(&chip_label, 24));
         Ok(())
     }
 
@@ -535,22 +452,8 @@ impl InteractiveTui {
             return Ok(());
         }
 
-        let mut queue = self.snapshot.queue.clone();
-        let removed = queue.remove(index);
-        let current_index = if index < self.snapshot.queue_index {
-            self.snapshot.queue_index.saturating_sub(1)
-        } else {
-            self.snapshot.queue_index.min(queue.len().saturating_sub(1))
-        };
-        let mut radio_virtual_playlist = self.snapshot.radio_virtual_playlist.clone();
-        shrink_radio_touched_for_remove(&mut radio_virtual_playlist, index);
-        let snapshot = self.client.replace_queue(
-            queue,
-            current_index,
-            self.snapshot.playlist_context.clone(),
-            radio_virtual_playlist,
-            self.snapshot.repeat_mode,
-        )?;
+        let removed = self.snapshot.queue[index].clone();
+        let snapshot = self.client.remove_from_queue(index)?;
         self.apply_snapshot(snapshot);
         self.queue_selected = index.min(self.snapshot.queue.len().saturating_sub(1));
         self.ensure_queue_visible();

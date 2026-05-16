@@ -30,6 +30,7 @@ fn dismiss_queue_after_current_truncates_tail_and_clears_radio_mode() {
         source_video_id: "seed".to_string(),
         touched_len: 1,
         chips: Vec::new(),
+        selected_chip_index: None,
     });
 
     let changed = dismiss_queue_after_current_state(&mut queue, 1, &mut radio_virtual_playlist);
@@ -46,6 +47,7 @@ fn dismiss_queue_after_current_clears_radio_mode_without_tail_tracks() {
         source_video_id: "seed".to_string(),
         touched_len: 1,
         chips: Vec::new(),
+        selected_chip_index: None,
     });
 
     let changed = dismiss_queue_after_current_state(&mut queue, 1, &mut radio_virtual_playlist);

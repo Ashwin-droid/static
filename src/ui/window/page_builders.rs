@@ -922,8 +922,6 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         queue_drop_indicator_title: queue_drop_indicator_title.clone(),
         queue_drop_indicator_subtitle: queue_drop_indicator_subtitle.clone(),
         queue_drop_indicator_duration: queue_drop_indicator_duration.clone(),
-        sponsor_segments: RefCell::new(Vec::new()),
-        sponsor_segments_reported: RefCell::new(HashSet::new()),
         daemon_refresh_in_flight: Cell::new(false),
         daemon_refresh_started_at: Cell::new(None),
         daemon_refresh_serial: Cell::new(0),
@@ -1255,8 +1253,6 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                     let position_millis = pos.nseconds() / 1_000_000;
                     note_playback_position(&ps_for_ui, position_millis);
                     update_active_lyric_line(&ps_for_ui, Some(position_millis));
-                    maybe_apply_sponsorblock_skip(&state_for_ui, &ps_for_ui, pos);
-                    maybe_extend_radio_queue(&state_for_ui, &ps_for_ui);
                     let dur_ns = dur.nseconds();
                     if dur_ns > 0 {
                         let frac = pos.nseconds() as f64 / dur_ns as f64;

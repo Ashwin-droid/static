@@ -2,12 +2,13 @@ use super::{
     ActiveTrack, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition, PLAYBACK_START_TIMEOUT,
     PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision, PendingMprisTransportIntent,
     PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
-    current_listened_millis, effective_queue_len, hide_timing_for_track,
+    apply_radio_chips_from_refresh, current_listened_millis, dedupe_radio_recommendations,
+    effective_queue_len, extend_radio_touched_for_insert, hide_timing_for_track,
     mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
     next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
     pending_mpris_transport_decision, pipewire_unduck_can_replace_volume_ramp,
     playback_position_confirms_start, playback_start_stalled, previous_action,
-    previous_threshold_millis, rearm_track_repeat_loops_for_snapshot,
+    previous_threshold_millis, radio_chips_with_replacement, rearm_track_repeat_loops_for_snapshot,
     reset_previous_threshold_clock_for_track, resolve_pipewire_suppression_mode,
     should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
     should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
@@ -15,6 +16,8 @@ use super::{
     should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
+use crate::models::{Artist, Track};
+use crate::models::{RadioChip, RadioVirtualPlaylist};
 use crate::network::SongRating;
 use crate::offline::{AppSettings, CoordinationMode};
 use std::time::{Duration, Instant};
@@ -44,6 +47,32 @@ fn test_repeat_settings(after: u32) -> AppSettings {
         auto_release_track_loops: true,
         auto_release_track_loops_after: after.max(1),
         ..AppSettings::default()
+    }
+}
+
+fn test_chip(label: &str, playlist_id: &str, params: Option<&str>) -> RadioChip {
+    RadioChip {
+        label: label.to_string(),
+        playlist_id: playlist_id.to_string(),
+        params: params.map(str::to_string),
+    }
+}
+
+fn test_track(video_id: &str) -> Track {
+    Track {
+        video_id: video_id.to_string(),
+        title: video_id.to_string(),
+        artists: vec![Artist {
+            name: "Artist".to_string(),
+            id: None,
+        }],
+        album: None,
+        duration: None,
+        thumbnail_url: None,
+        playback_playlist_id: None,
+        playback_params: None,
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
     }
 }
 
@@ -117,6 +146,99 @@ fn previous_threshold_resets_after_restarting_current_track() {
 fn repeat_all_radio_uses_touched_len_as_loop_boundary() {
     assert_eq!(effective_queue_len(5, RepeatMode::All, Some(1)), 1);
     assert_eq!(effective_queue_len(5, RepeatMode::All, Some(3)), 3);
+}
+
+#[test]
+fn radio_recommendations_drop_tracks_already_in_virtual_prefix() {
+    let prefix = vec![test_track("seed"), test_track("already-touched")];
+    let deduped = dedupe_radio_recommendations(
+        &prefix,
+        vec![
+            test_track("already-touched"),
+            test_track("fresh"),
+            test_track("fresh"),
+        ],
+    );
+
+    assert_eq!(deduped, vec![test_track("fresh")]);
+}
+
+#[test]
+fn queue_insert_extends_radio_touched_boundary_in_daemon_policy() {
+    let mut radio = Some(RadioVirtualPlaylist {
+        source_video_id: "seed".to_string(),
+        touched_len: 2,
+        chips: Vec::new(),
+        selected_chip_index: None,
+    });
+
+    extend_radio_touched_for_insert(&mut radio, 1, 2);
+
+    assert_eq!(radio.expect("radio queue").touched_len, 4);
+}
+
+#[test]
+fn radio_chip_refresh_preserves_existing_chips_when_refresh_is_empty() {
+    let existing = vec![test_chip("All", "RDseed", None)];
+
+    assert_eq!(
+        radio_chips_with_replacement(&existing, Vec::new()),
+        existing
+    );
+}
+
+#[test]
+fn radio_chip_refresh_replaces_chips_and_defaults_selection() {
+    let replacement = vec![
+        test_chip("All", "RDseed", None),
+        test_chip("Focus", "RDfocus", Some("focus-params")),
+    ];
+    let mut radio = RadioVirtualPlaylist {
+        source_video_id: "seed".to_string(),
+        touched_len: 1,
+        chips: Vec::new(),
+        selected_chip_index: None,
+    };
+
+    assert!(apply_radio_chips_from_refresh(
+        &mut radio,
+        replacement.clone()
+    ));
+    assert_eq!(radio.chips, replacement);
+    assert_eq!(radio.selected_chip_index, Some(0));
+}
+
+#[test]
+fn radio_chip_refresh_keeps_selected_playlist_when_reordered() {
+    let mut radio = RadioVirtualPlaylist {
+        source_video_id: "seed".to_string(),
+        touched_len: 1,
+        chips: vec![
+            test_chip("All", "RDseed", None),
+            test_chip("Focus", "RDfocus", Some("focus-params")),
+        ],
+        selected_chip_index: Some(1),
+    };
+    let replacement = vec![
+        test_chip("Focus", "RDfocus", Some("focus-params")),
+        test_chip("All", "RDseed", None),
+    ];
+
+    assert!(apply_radio_chips_from_refresh(&mut radio, replacement));
+    assert_eq!(radio.selected_chip_index, Some(0));
+}
+
+#[test]
+fn radio_chip_refresh_clamps_stale_selected_chip_index() {
+    let mut radio = RadioVirtualPlaylist {
+        source_video_id: "seed".to_string(),
+        touched_len: 1,
+        chips: vec![test_chip("All", "RDseed", None)],
+        selected_chip_index: Some(4),
+    };
+
+    assert!(apply_radio_chips_from_refresh(&mut radio, Vec::new()));
+    assert_eq!(radio.selected_chip_index, Some(0));
 }
 
 #[test]

@@ -294,21 +294,11 @@ impl InteractiveTui {
             .current_track
             .as_ref()
             .map(|track| track.video_id.clone());
-        let mut snapshot = snapshot;
         let next_video_id = snapshot
             .current_track
             .as_ref()
             .map(|track| track.video_id.clone());
 
-        hydrate_radio_virtual_playlist_chips(
-            &mut snapshot.radio_virtual_playlist,
-            self.snapshot.radio_virtual_playlist.as_ref(),
-            &self.remembered_radio_chips,
-        );
-        remember_radio_virtual_playlist_chips(
-            snapshot.radio_virtual_playlist.as_ref(),
-            &mut self.remembered_radio_chips,
-        );
         self.snapshot = snapshot;
         let now = Instant::now();
         self.last_snapshot_at = now;
@@ -323,10 +313,11 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn current_radio_chips(&self) -> Vec<RadioChip> {
-        effective_radio_chips(
-            self.snapshot.radio_virtual_playlist.as_ref(),
-            &self.remembered_radio_chips,
-        )
+        self.snapshot
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.chips.clone())
+            .unwrap_or_default()
     }
 
     pub(in crate::cli_tui) fn playback_snapshot_from_tui_state(&self) -> PlaybackSnapshot {
@@ -504,17 +495,7 @@ impl InteractiveTui {
                     anyhow::bail!("No queued tail to dismiss");
                 }
 
-                let keep_len = self.snapshot.queue_index.saturating_add(1);
-                let mut queue = self.snapshot.queue.clone();
-                queue.truncate(keep_len);
-                let current_index = self.snapshot.queue_index.min(queue.len().saturating_sub(1));
-                self.client.replace_queue(
-                    queue,
-                    current_index,
-                    self.snapshot.playlist_context.clone(),
-                    None,
-                    self.snapshot.repeat_mode,
-                )
+                self.client.dismiss_queue_after_current()
             }
         }
     }
@@ -567,91 +548,6 @@ impl InteractiveTui {
     }
 }
 
-pub(in crate::cli_tui) fn dedupe_radio_recommendations(
-    prefix: &[Track],
-    tracks: Vec<Track>,
-) -> Vec<Track> {
-    let mut seen_ids = prefix
-        .iter()
-        .map(|track| track.video_id.clone())
-        .collect::<HashSet<_>>();
-    let mut deduped = Vec::with_capacity(tracks.len());
-
-    for track in tracks {
-        if seen_ids.insert(track.video_id.clone()) {
-            deduped.push(track);
-        }
-    }
-
-    deduped
-}
-
-pub(in crate::cli_tui) fn effective_radio_chips(
-    radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
-    remembered_radio_chips: &HashMap<String, Vec<RadioChip>>,
-) -> Vec<RadioChip> {
-    let Some(radio) = radio_virtual_playlist else {
-        return Vec::new();
-    };
-
-    if !radio.chips.is_empty() {
-        return radio.chips.clone();
-    }
-
-    remembered_radio_chips
-        .get(&radio.source_video_id)
-        .cloned()
-        .unwrap_or_default()
-}
-
-pub(in crate::cli_tui) fn hydrate_radio_virtual_playlist_chips(
-    radio_virtual_playlist: &mut Option<RadioVirtualPlaylist>,
-    current_radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
-    remembered_radio_chips: &HashMap<String, Vec<RadioChip>>,
-) {
-    let Some(radio) = radio_virtual_playlist.as_mut() else {
-        return;
-    };
-    if !radio.chips.is_empty() {
-        return;
-    }
-
-    if let Some(current_radio) = current_radio_virtual_playlist.filter(|current_radio| {
-        current_radio.source_video_id == radio.source_video_id && !current_radio.chips.is_empty()
-    }) {
-        radio.chips = current_radio.chips.clone();
-        return;
-    }
-
-    if let Some(chips) = remembered_radio_chips.get(&radio.source_video_id) {
-        radio.chips = chips.clone();
-    }
-}
-
-pub(in crate::cli_tui) fn remember_radio_virtual_playlist_chips(
-    radio_virtual_playlist: Option<&RadioVirtualPlaylist>,
-    remembered_radio_chips: &mut HashMap<String, Vec<RadioChip>>,
-) {
-    let Some(radio) = radio_virtual_playlist else {
-        return;
-    };
-    if radio.chips.is_empty() {
-        return;
-    }
-
-    remembered_radio_chips.insert(radio.source_video_id.clone(), radio.chips.clone());
-}
-
-pub(in crate::cli_tui) fn merge_radio_chip_update(
-    existing: &[RadioChip],
-    replacement: Vec<RadioChip>,
-) -> Vec<RadioChip> {
-    if replacement.is_empty() {
-        existing.to_vec()
-    } else {
-        replacement
-    }
-}
 pub(in crate::cli_tui) fn active_track_snapshot_from_track(
     track: &Track,
     rating: SongRating,

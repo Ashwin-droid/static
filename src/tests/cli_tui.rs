@@ -1,7 +1,4 @@
 use super::page_builders::build_browse_document;
-use super::playback::{
-    effective_radio_chips, hydrate_radio_virtual_playlist_chips, merge_radio_chip_update,
-};
 use super::*;
 use crate::models::{Artist, HomeSection};
 
@@ -30,14 +27,6 @@ fn sample_browse_card(page_type: HomeBrowsePageType, title: &str) -> HomeBrowseC
         subtitle: Some(format!("{title} subtitle")),
         thumbnail_url: Some("card-thumb".to_string()),
         page_type,
-    }
-}
-
-fn sample_radio_chip(label: &str, playlist_id: &str, params: Option<&str>) -> RadioChip {
-    RadioChip {
-        label: label.to_string(),
-        playlist_id: playlist_id.to_string(),
-        params: params.map(str::to_string),
     }
 }
 
@@ -89,55 +78,6 @@ fn artist_browse_pages_surface_top_songs_first() {
     assert_eq!(doc.headers.len(), 2);
     assert_eq!(doc.headers[0].title, "TOP SONGS");
     assert!(doc.headers[0].show_play_controls);
-}
-
-#[test]
-fn effective_radio_chips_fall_back_to_memory_for_same_source() {
-    let remembered = vec![
-        sample_radio_chip("All", "RDseed", None),
-        sample_radio_chip("Discover", "RDdiscover", Some("discover")),
-    ];
-    let mut memory = HashMap::new();
-    memory.insert("seed-video".to_string(), remembered.clone());
-
-    let effective = effective_radio_chips(
-        Some(&RadioVirtualPlaylist {
-            source_video_id: "seed-video".to_string(),
-            touched_len: 1,
-            chips: Vec::new(),
-        }),
-        &memory,
-    );
-
-    assert_eq!(effective, remembered);
-}
-
-#[test]
-fn hydrate_radio_virtual_playlist_uses_previous_snapshot_chips() {
-    let previous_radio = RadioVirtualPlaylist {
-        source_video_id: "seed-video".to_string(),
-        touched_len: 1,
-        chips: vec![sample_radio_chip("All", "RDseed", None)],
-    };
-    let mut next_radio = Some(RadioVirtualPlaylist {
-        source_video_id: "seed-video".to_string(),
-        touched_len: 2,
-        chips: Vec::new(),
-    });
-
-    hydrate_radio_virtual_playlist_chips(&mut next_radio, Some(&previous_radio), &HashMap::new());
-
-    assert_eq!(
-        next_radio.expect("radio queue should still exist").chips,
-        previous_radio.chips
-    );
-}
-
-#[test]
-fn merge_radio_chip_update_preserves_existing_when_refresh_returns_empty() {
-    let existing = vec![sample_radio_chip("All", "RDseed", None)];
-
-    assert_eq!(merge_radio_chip_update(&existing, Vec::new()), existing);
 }
 
 #[test]

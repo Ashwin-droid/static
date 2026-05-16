@@ -1,5 +1,5 @@
 use super::*;
-use super::{content_loading::*, playback::*, thumbnails::*};
+use super::{content_loading::*, thumbnails::*};
 
 impl InteractiveTui {
     pub(in crate::cli_tui) fn new(client: DaemonClient) -> Result<Self> {
@@ -38,7 +38,6 @@ impl InteractiveTui {
             submitted_search_query_to_clear: None,
             completed_search_query_to_clear: None,
             radio_chip_scroll_offset: 0,
-            remembered_radio_chips: HashMap::new(),
             settings_field_offsets: Vec::new(),
             settings_total_height: 0,
             settings_text_edit: None,
@@ -68,10 +67,6 @@ impl InteractiveTui {
             help_visible: false,
             rendered_help_rect: None,
         };
-        remember_radio_virtual_playlist_chips(
-            app.snapshot.radio_virtual_playlist.as_ref(),
-            &mut app.remembered_radio_chips,
-        );
         app.maybe_request_lyrics();
         Ok(app)
     }

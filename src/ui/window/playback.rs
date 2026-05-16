@@ -20,16 +20,6 @@ pub(super) fn sync_mpris_volume(ps: &Rc<PlayerState>) {
     let _ = ps.player.set_volume(ps.volume_slider.value());
 }
 
-pub(super) fn sync_remote_queue(ps: &Rc<PlayerState>) {
-    let _ = ps.player.replace_queue(
-        ps.queue.borrow().clone(),
-        ps.queue_index.get(),
-        ps.playlist_context.borrow().clone(),
-        ps.radio_virtual_playlist.borrow().clone(),
-        ps.repeat_mode.get(),
-    );
-}
-
 pub(super) fn next_play_request_serial(ps: &PlayerState) -> u64 {
     let next = ps.play_request_serial.get().wrapping_add(1);
     ps.play_request_serial.set(next);
@@ -329,7 +319,6 @@ pub(super) fn apply_remote_snapshot(
             let session_id = if is_new_track {
                 let next = ps.playback_session_id.get().wrapping_add(1);
                 ps.playback_session_id.set(next);
-                clear_sponsorblock_state(ps);
                 next
             } else {
                 ps.now_playing_track
@@ -373,7 +362,6 @@ pub(super) fn apply_remote_snapshot(
             update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, persisted_rating);
 
             if is_new_track {
-                spawn_sponsorblock_sync(state, ps, &track.video_id, session_id);
                 spawn_song_rating_sync(state, ps, &track.video_id, session_id);
                 spawn_synced_lyrics_sync(state, ps, &track.video_id, session_id);
             }
@@ -382,7 +370,6 @@ pub(super) fn apply_remote_snapshot(
         }
         None => {
             ps.now_playing_track.borrow_mut().take();
-            clear_sponsorblock_state(ps);
             ps.last_mpris_length_micros.set(None);
             ps.lyrics_request_serial
                 .set(ps.lyrics_request_serial.get().wrapping_add(1));

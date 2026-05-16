@@ -132,6 +132,11 @@ impl InteractiveTui {
                         chip_inner,
                     );
                 } else {
+                    let selected_chip_index = self
+                        .snapshot
+                        .radio_virtual_playlist
+                        .as_ref()
+                        .and_then(|radio| radio.selected_chip_index);
                     let start = self
                         .radio_chip_scroll_offset
                         .min(chips.len().saturating_sub(1));
@@ -209,11 +214,12 @@ impl InteractiveTui {
                     }
 
                     for (index, label, rect) in visible_chips {
-                        frame.render_widget(
-                            Paragraph::new(label)
-                                .style(Style::default().fg(theme.text).bg(theme.elevated_bg)),
-                            rect,
-                        );
+                        let style = if selected_chip_index == Some(index) {
+                            Style::default().fg(theme.text).bg(theme.accent_fill)
+                        } else {
+                            Style::default().fg(theme.text).bg(theme.elevated_bg)
+                        };
+                        frame.render_widget(Paragraph::new(label).style(style), rect);
                         targets.push(ClickTarget {
                             rect,
                             kind: ClickTargetKind::RadioChip(index),

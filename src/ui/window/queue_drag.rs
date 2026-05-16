@@ -537,7 +537,7 @@ pub(super) fn attach_queue_drag_source(
 pub(super) fn insert_tracks_into_queue(
     tracks: Vec<Track>,
     insert_at: usize,
-    mark_as_touched: bool,
+    _mark_as_touched: bool,
     ps: &Rc<PlayerState>,
     state: &Arc<Mutex<AppState>>,
 ) {
@@ -545,26 +545,17 @@ pub(super) fn insert_tracks_into_queue(
         return;
     }
 
-    let added = tracks.len();
-    {
-        let mut queue = ps.queue.borrow_mut();
-        let had_queue = !queue.is_empty();
-        let insert_at = insert_at.min(queue.len());
-        for (offset, track) in tracks.into_iter().enumerate() {
-            queue.insert(insert_at + offset, track);
-        }
-        if had_queue && insert_at <= ps.queue_index.get() {
-            ps.queue_index.set(ps.queue_index.get() + added);
-        }
-    }
-    if mark_as_touched {
-        extend_radio_touched_for_insert(ps, insert_at, added);
-    }
-    *ps.last_radio_append_anchor.borrow_mut() = None;
+    let state = state.clone();
+    let ps = ps.clone();
+    let client = ps.player.daemon_client();
 
-    render_queue_panel(ps, state);
-    sync_remote_queue(ps);
-    sync_mpris_transport(ps, state);
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || client.insert_into_queue(tracks, insert_at)).await;
+        if let Ok(Ok(snapshot)) = result {
+            apply_remote_snapshot(&ps, &state, snapshot);
+            render_queue_panel(&ps, &state);
+        }
+    });
 }
 
 pub(super) fn resolve_dragged_collection_tracks(
@@ -613,29 +604,20 @@ pub(super) fn handle_queue_drop_payload(
             if insert_at == from {
                 return false;
             }
-            {
-                let mut q = ps.queue.borrow_mut();
-                if from >= q.len() || raw_slot > q.len() {
-                    return false;
-                }
-                let track = q.remove(from);
-                q.insert(insert_at, track);
-
-                let current = ps.queue_index.get();
-                if from == current {
-                    ps.queue_index.set(insert_at);
-                } else if from < current && insert_at >= current {
-                    ps.queue_index.set(current - 1);
-                } else if from > current && insert_at <= current {
-                    ps.queue_index.set(current + 1);
-                }
+            if from >= ps.queue.borrow().len() || raw_slot > ps.queue.borrow().len() {
+                return false;
             }
-            update_radio_touched_for_reorder(ps, from, insert_at);
-            *ps.last_radio_append_anchor.borrow_mut() = None;
-
-            render_queue_panel(ps, state);
-            sync_remote_queue(ps);
-            sync_mpris_transport(ps, state);
+            let ps = ps.clone();
+            let state = state.clone();
+            let client = ps.player.daemon_client();
+            glib::spawn_future_local(async move {
+                let result =
+                    gio::spawn_blocking(move || client.move_queue_item(from, raw_slot)).await;
+                if let Ok(Ok(snapshot)) = result {
+                    apply_remote_snapshot(&ps, &state, snapshot);
+                    render_queue_panel(&ps, &state);
+                }
+            });
             true
         }
         QueueDragPayload::Track { track } => {

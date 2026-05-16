@@ -51,6 +51,7 @@ const MIN_LISTEN_SECS: u64 = 10;
 const PAUSED_SHUTDOWN_AFTER: Duration = Duration::from_secs(20 * 60);
 const PLAYBACK_START_TIMEOUT: Duration = Duration::from_secs(12);
 const PLAYBACK_START_RETRY_LIMIT: u8 = 2;
+const CACHE_MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const PLAYBACK_START_MIN_CONFIRMED_POSITION_MILLIS: u64 = 250;
 const PLAYBACK_STARTED_POSITION_THRESHOLD_MILLIS: u64 = 1_000;
 const PLAYBACK_START_SEEK_CONFIRM_LEEWAY_MILLIS: u64 = 5_000;
@@ -3184,16 +3185,8 @@ fn sync_auto_offline_cache(
     };
 
     for video_id in to_download {
-        let url = match client.get_audio_url_no_track(&video_id) {
-            Ok(url) => url,
-            Err(err) => {
-                eprintln!("[CACHE] failed to get URL for {video_id}: {err}");
-                continue;
-            }
-        };
-
         eprintln!("[CACHE] downloading {video_id} for offline...");
-        let audio = match download_media_bytes(&url, Some("bytes=0-")) {
+        let audio = match download_audio_for_cache(client, &video_id, "CACHE") {
             Ok(bytes) => {
                 eprintln!("[CACHE] {video_id} downloaded {} KB", bytes.len() / 1024);
                 bytes
@@ -3238,15 +3231,7 @@ fn ensure_track_available_offline(
         0,
     );
 
-    let url = match client.get_audio_url_no_track(video_id) {
-        Ok(url) => url,
-        Err(err) => {
-            eprintln!("[{log_prefix}] failed URL for {video_id}: {err}");
-            return false;
-        }
-    };
-
-    let audio = match download_media_bytes(&url, Some("bytes=0-")) {
+    let audio = match download_audio_for_cache(client, video_id, log_prefix) {
         Ok(bytes) => bytes,
         Err(err) => {
             eprintln!("[{log_prefix}] download failed for {video_id}: {err}");
@@ -3265,6 +3250,71 @@ fn ensure_track_available_offline(
     }
     hydrate_offline_sponsorblock_cache(cache, video_id);
     true
+}
+
+fn cache_media_download_retry_delay(failed_attempt: usize) -> Duration {
+    match failed_attempt {
+        1 => Duration::from_millis(350),
+        _ => Duration::from_millis(1_000),
+    }
+}
+
+fn download_audio_for_cache(
+    client: &NetworkState,
+    video_id: &str,
+    log_prefix: &str,
+) -> Result<Vec<u8>> {
+    let mut last_error = None;
+    let mut saw_media_download_failure = false;
+
+    for attempt in 1..=CACHE_MEDIA_DOWNLOAD_ATTEMPTS {
+        let attempt_result = match client.get_audio_url_no_track(video_id) {
+            Ok(url) => download_media_bytes(&url, Some("bytes=0-"))
+                .with_context(|| format!("failed to download media for {video_id}")),
+            Err(err) => Err(err).with_context(|| format!("failed to get audio URL for {video_id}")),
+        };
+
+        match attempt_result {
+            Ok(audio) => return Ok(audio),
+            Err(err) => {
+                let message = format!("{err:#}");
+                if message.contains("failed to download media for") {
+                    saw_media_download_failure = true;
+                }
+                if attempt < CACHE_MEDIA_DOWNLOAD_ATTEMPTS {
+                    eprintln!(
+                        "[{log_prefix}] download attempt {attempt}/{CACHE_MEDIA_DOWNLOAD_ATTEMPTS} failed for {video_id}: {message}; retrying with a fresh URL"
+                    );
+                    std::thread::sleep(cache_media_download_retry_delay(attempt));
+                }
+                last_error = Some(err);
+            }
+        }
+    }
+
+    if saw_media_download_failure {
+        eprintln!(
+            "[{log_prefix}] WEB_REMIX media download failed for {video_id}; trying Android VR cache fallback"
+        );
+        return client
+            .android_vr_audio_stream_url(video_id)
+            .with_context(|| format!("failed to get Android VR audio URL for {video_id}"))
+            .and_then(|url| {
+                download_media_bytes(&url, Some("bytes=0-"))
+                    .with_context(|| format!("failed to download Android VR media for {video_id}"))
+            })
+            .or_else(|fallback_err| {
+                if let Some(original_err) = last_error {
+                    Err(original_err.context(format!(
+                        "Android VR fallback also failed for {video_id}: {fallback_err:#}"
+                    )))
+                } else {
+                    Err(fallback_err)
+                }
+            });
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("download attempts were not run for {video_id}")))
 }
 
 fn hydrate_offline_sponsorblock_cache(cache: &mut MusicCache, video_id: &str) {
@@ -3834,12 +3884,7 @@ fn prefetch_upcoming(state: &mut DaemonState) {
                 continue;
             }
 
-            let Ok(url) = client.get_audio_url_no_track(&video_id) else {
-                let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
-                continue;
-            };
-
-            let Ok(audio) = download_media_bytes(&url, Some("bytes=0-")) else {
+            let Ok(audio) = download_audio_for_cache(&client, &video_id, "PREFETCH") else {
                 let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             };

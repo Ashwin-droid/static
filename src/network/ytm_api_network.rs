@@ -2040,6 +2040,10 @@ impl YtMusicClient {
         })
     }
 
+    pub fn get_android_vr_audio_url_no_track(&self, video_id: &str) -> Result<String> {
+        self.rt.block_on(self.try_android_vr_audio(video_id))
+    }
+
     async fn tracking_player_response(
         &self,
         video_id: &str,

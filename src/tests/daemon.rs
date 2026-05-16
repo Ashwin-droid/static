@@ -2,13 +2,14 @@ use super::{
     ActiveTrack, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition, PLAYBACK_START_TIMEOUT,
     PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision, PendingMprisTransportIntent,
     PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
-    apply_radio_chips_from_refresh, current_listened_millis, dedupe_radio_recommendations,
-    effective_queue_len, extend_radio_touched_for_insert, hide_timing_for_track,
-    mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
-    next_repeat_state_after_natural_end, pause_previous_threshold_clock_for_track,
-    pending_mpris_transport_decision, pipewire_unduck_can_replace_volume_ramp,
-    playback_position_confirms_start, playback_start_stalled, previous_action,
-    previous_threshold_millis, radio_chips_with_replacement, rearm_track_repeat_loops_for_snapshot,
+    apply_radio_chips_from_refresh, cache_media_download_retry_delay, current_listened_millis,
+    dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
+    hide_timing_for_track, mpris_halt_auto_peer_transition, mpris_position_millis_for_track,
+    natural_end_target_index, next_repeat_state_after_natural_end,
+    pause_previous_threshold_clock_for_track, pending_mpris_transport_decision,
+    pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
+    playback_start_stalled, previous_action, previous_threshold_millis,
+    radio_chips_with_replacement, rearm_track_repeat_loops_for_snapshot,
     reset_previous_threshold_clock_for_track, resolve_pipewire_suppression_mode,
     should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
     should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
@@ -419,6 +420,18 @@ fn startup_stalls_evict_local_cache_sources_before_retrying() {
     assert!(!should_evict_cache_after_startup_stall(
         PlaybackSource::RemoteStream
     ));
+}
+
+#[test]
+fn cache_media_download_retries_back_off_after_failures() {
+    assert_eq!(
+        cache_media_download_retry_delay(1),
+        Duration::from_millis(350)
+    );
+    assert_eq!(
+        cache_media_download_retry_delay(2),
+        Duration::from_millis(1_000)
+    );
 }
 
 #[test]

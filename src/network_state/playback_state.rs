@@ -42,6 +42,10 @@ impl NetworkState {
         self.audio_stream_url(video_id)
     }
 
+    pub fn android_vr_audio_stream_url(&self, video_id: &str) -> Result<String> {
+        self.client.get_android_vr_audio_url_no_track(video_id)
+    }
+
     pub fn start_playback_tracking(
         &self,
         video_id: &str,

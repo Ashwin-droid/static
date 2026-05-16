@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use reqwest::blocking::Client as BlockingClient;
+use anyhow::{Context, Result, anyhow, bail};
+use reqwest::{
+    StatusCode,
+    blocking::{Client as BlockingClient, Response},
+    header::{CONTENT_RANGE, CONTENT_TYPE, RANGE},
+};
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -29,18 +33,238 @@ static THUMB_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+const MEDIA_CHUNK_BYTES: u64 = 1024 * 1024;
+const MEDIA_ALT_URL_FOLLOW_LIMIT: usize = 3;
+const TEXT_MEDIA_ERROR_LIMIT_BYTES: usize = 16 * 1024;
+
 pub fn download_media_bytes(url: &str, range_header: Option<&str>) -> Result<Vec<u8>> {
-    let mut request = DOWNLOAD_CLIENT.get(url);
-    if let Some(range_header) = range_header {
-        request = request.header("Range", range_header);
+    download_media_bytes_inner(url, range_header, 0)
+}
+
+fn download_media_bytes_inner(
+    url: &str,
+    range_header: Option<&str>,
+    follow_depth: usize,
+) -> Result<Vec<u8>> {
+    let response = send_media_request(url, range_header)?;
+    let status = response.status();
+    if !status.is_success() {
+        if status == StatusCode::FORBIDDEN && range_header == Some("bytes=0-") {
+            return download_media_bytes_chunked(url, follow_depth).with_context(|| {
+                format!(
+                    "media server rejected open-ended range for {}; chunked fallback failed",
+                    media_url_for_log(url)
+                )
+            });
+        }
+        return Err(media_status_error(response, url));
     }
 
-    request
-        .send()
-        .and_then(|response| response.error_for_status())
-        .and_then(|response| response.bytes())
-        .map(|bytes| bytes.to_vec())
-        .with_context(|| format!("Failed to download media bytes from {url}"))
+    let content_type = response_content_type(&response);
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("Failed to read media bytes from {}", media_url_for_log(url)))?
+        .to_vec();
+
+    if let Some(next_url) = alternate_media_url_from_bytes(&bytes) {
+        ensure_can_follow_alternate_url(follow_depth, url)?;
+        eprintln!(
+            "[MEDIA] following alternate media URL from {}",
+            media_url_for_log(url)
+        );
+        return download_media_bytes_chunked(&next_url, follow_depth + 1);
+    }
+
+    if text_media_response_without_alternate(&content_type, &bytes) {
+        bail!(
+            "media server returned text instead of audio for {}: {}",
+            media_url_for_log(url),
+            text_preview(&bytes)
+        );
+    }
+
+    Ok(bytes)
+}
+
+fn send_media_request(url: &str, range_header: Option<&str>) -> Result<Response> {
+    let mut request = DOWNLOAD_CLIENT.get(url);
+    if let Some(range_header) = range_header {
+        request = request.header(RANGE, range_header);
+    }
+
+    request.send().with_context(|| {
+        format!(
+            "Failed to request media bytes from {}",
+            media_url_for_log(url)
+        )
+    })
+}
+
+fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8>> {
+    let mut audio = Vec::new();
+    let mut total_len = None;
+
+    loop {
+        let start = audio.len() as u64;
+        let end = start.saturating_add(MEDIA_CHUNK_BYTES - 1);
+        let range_header = format!("bytes={start}-{end}");
+        let response = send_media_request(url, Some(&range_header))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(media_status_error(response, url));
+        }
+
+        let content_type = response_content_type(&response);
+        if status == StatusCode::PARTIAL_CONTENT {
+            total_len = response
+                .headers()
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(content_range_total);
+        }
+        let chunk = response
+            .bytes()
+            .with_context(|| {
+                format!(
+                    "Failed to read chunked media bytes from {}",
+                    media_url_for_log(url)
+                )
+            })?
+            .to_vec();
+
+        if start == 0 {
+            if let Some(next_url) = alternate_media_url_from_bytes(&chunk) {
+                ensure_can_follow_alternate_url(follow_depth, url)?;
+                eprintln!(
+                    "[MEDIA] following alternate media URL from {}",
+                    media_url_for_log(url)
+                );
+                return download_media_bytes_chunked(&next_url, follow_depth + 1);
+            }
+
+            if text_media_response_without_alternate(&content_type, &chunk) {
+                bail!(
+                    "media server returned text instead of audio for {}: {}",
+                    media_url_for_log(url),
+                    text_preview(&chunk)
+                );
+            }
+
+            if status != StatusCode::PARTIAL_CONTENT {
+                return Ok(chunk);
+            }
+        }
+
+        if chunk.is_empty() {
+            bail!(
+                "media server returned an empty chunk for {} at byte {start}",
+                media_url_for_log(url)
+            );
+        }
+        audio.extend_from_slice(&chunk);
+
+        if total_len.is_some_and(|len| audio.len() as u64 >= len) {
+            return Ok(audio);
+        }
+        if total_len.is_none() && chunk.len() < MEDIA_CHUNK_BYTES as usize {
+            return Ok(audio);
+        }
+    }
+}
+
+fn media_status_error(response: Response, url: &str) -> anyhow::Error {
+    let status = response.status();
+    let body_preview = response
+        .text()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect::<String>();
+    if body_preview.is_empty() {
+        return anyhow!(
+            "media server returned {status} for {}",
+            media_url_for_log(url)
+        );
+    }
+    anyhow!(
+        "media server returned {status} for {}: {body_preview}",
+        media_url_for_log(url)
+    )
+}
+
+fn ensure_can_follow_alternate_url(follow_depth: usize, url: &str) -> Result<()> {
+    if follow_depth >= MEDIA_ALT_URL_FOLLOW_LIMIT {
+        bail!(
+            "media server returned too many alternate URLs for {}",
+            media_url_for_log(url)
+        );
+    }
+    Ok(())
+}
+
+fn response_content_type(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn content_range_total(value: &str) -> Option<u64> {
+    let (_, total) = value.rsplit_once('/')?;
+    (total != "*").then(|| total.parse().ok()).flatten()
+}
+
+fn alternate_media_url_from_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > TEXT_MEDIA_ERROR_LIMIT_BYTES {
+        return None;
+    }
+    let value = std::str::from_utf8(bytes).ok()?.trim();
+    if !(value.starts_with("https://") || value.starts_with("http://")) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(value).ok()?;
+    let is_googlevideo = parsed
+        .host_str()
+        .is_some_and(|host| host.ends_with(".googlevideo.com") || host == "googlevideo.com");
+    (is_googlevideo && parsed.path().contains("/videoplayback")).then(|| value.to_string())
+}
+
+fn text_media_response_without_alternate(content_type: &Option<String>, bytes: &[u8]) -> bool {
+    bytes.len() <= TEXT_MEDIA_ERROR_LIMIT_BYTES
+        && content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("text/"))
+}
+
+fn text_preview(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .trim()
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn media_url_for_log(url: &str) -> String {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return "media URL".to_string();
+    };
+    let host = parsed.host_str().unwrap_or("media-host");
+    let mut safe_query = Vec::new();
+    for (key, value) in parsed.query_pairs() {
+        if matches!(
+            key.as_ref(),
+            "itag" | "mime" | "dur" | "clen" | "source" | "c"
+        ) {
+            safe_query.push(format!("{key}={value}"));
+        }
+    }
+    if safe_query.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}?{}", safe_query.join("&"))
+    }
 }
 
 pub fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
@@ -84,4 +308,43 @@ pub fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{alternate_media_url_from_bytes, content_range_total, media_url_for_log};
+
+    #[test]
+    fn media_log_url_keeps_shape_without_signed_params() {
+        let rendered = media_url_for_log(
+            "https://rr1---sn-ci5gup-2o9l.googlevideo.com/videoplayback?expire=1&ip=secret&itag=774&mime=audio%2Fwebm&sig=signed&clen=1234&c=WEB_REMIX",
+        );
+
+        assert_eq!(
+            rendered,
+            "rr1---sn-ci5gup-2o9l.googlevideo.com?itag=774&mime=audio/webm&clen=1234&c=WEB_REMIX"
+        );
+    }
+
+    #[test]
+    fn alternate_media_url_is_detected_from_text_body() {
+        let url = "https://rr2---sn-ci5gup-cvhee.googlevideo.com/videoplayback?expire=1&itag=141&sig=signed";
+
+        assert_eq!(
+            alternate_media_url_from_bytes(url.as_bytes()),
+            Some(url.to_string())
+        );
+        assert_eq!(
+            alternate_media_url_from_bytes(b"https://example.com/videoplayback?itag=141"),
+            None
+        );
+        assert_eq!(alternate_media_url_from_bytes(b"not a url"), None);
+    }
+
+    #[test]
+    fn content_range_total_parses_known_total() {
+        assert_eq!(content_range_total("bytes 0-1023/5027291"), Some(5027291));
+        assert_eq!(content_range_total("bytes 0-1023/*"), None);
+        assert_eq!(content_range_total("invalid"), None);
+    }
 }

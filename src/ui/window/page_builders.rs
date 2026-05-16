@@ -1996,6 +1996,23 @@ to keep an advanced value, or move it back into the UI range to re-enable this c
         });
     }
 
+    append_coordination_filter_mode_row(
+        &coordination_section,
+        state,
+        CoordinationFilterListKind::Mpris,
+        "MPRIS filter mode",
+        "Blacklist ignores listed peer media apps; whitelist coordinates only with listed apps.",
+    );
+    append_coordination_target_popup_row(
+        &coordination_section,
+        state,
+        CoordinationFilterListKind::Mpris,
+        "MPRIS player list",
+        "Choose apps from the live MPRIS target list.",
+        "MPRIS players",
+        "Start staticd to discover current MPRIS players.",
+    );
+
     let pipewire_row = GtkBox::new(Orientation::Horizontal, 12);
     pipewire_row.add_css_class("settings-row");
     let pipewire_copy = GtkBox::new(Orientation::Vertical, 2);
@@ -2281,6 +2298,23 @@ up to {:.1} here on purpose.",
             (refresh_pipewire_controls.as_ref())();
         });
     }
+
+    append_coordination_filter_mode_row(
+        &coordination_section,
+        state,
+        CoordinationFilterListKind::PipeWire,
+        "PipeWire filter mode",
+        "Blacklist ignores listed audio streams; whitelist coordinates only with listed streams.",
+    );
+    append_coordination_target_popup_row(
+        &coordination_section,
+        state,
+        CoordinationFilterListKind::PipeWire,
+        "PipeWire stream list",
+        "Choose streams from the live PipeWire target list.",
+        "PipeWire streams",
+        "Start staticd with PipeWire available to discover current streams.",
+    );
 
     let prefetch_row = GtkBox::new(Orientation::Horizontal, 12);
     prefetch_row.add_css_class("settings-row");
@@ -3387,6 +3421,234 @@ pub(super) fn settings_switch(active: bool) -> Switch {
     sw.set_valign(Align::Center);
     sw.set_halign(Align::End);
     sw
+}
+
+fn append_coordination_filter_mode_row(
+    section: &GtkBox,
+    state: &Arc<Mutex<AppState>>,
+    kind: CoordinationFilterListKind,
+    title: &str,
+    hint: &str,
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("settings-row");
+    let copy = GtkBox::new(Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    let label = Label::new(Some(title));
+    label.add_css_class("settings-row-title");
+    label.set_halign(Align::Start);
+    copy.append(&label);
+    let hint_label = Label::new(Some(hint));
+    hint_label.add_css_class("settings-row-copy");
+    hint_label.set_wrap(true);
+    hint_label.set_halign(Align::Start);
+    copy.append(&hint_label);
+    row.append(&copy);
+
+    let mode_labels = coordination_filter_mode_labels();
+    let dropdown = DropDown::from_strings(&mode_labels);
+    let selected = CoordinationFilterMode::ALL
+        .iter()
+        .position(|mode| *mode == coordination_filter_mode_for_settings(&app_settings(state), kind))
+        .unwrap_or(0);
+    dropdown.set_selected(selected as u32);
+    dropdown.set_valign(Align::Center);
+    row.append(&dropdown);
+    section.append(&row);
+
+    {
+        let state = state.clone();
+        dropdown.connect_selected_notify(move |dropdown| {
+            let mode = CoordinationFilterMode::ALL
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or(CoordinationFilterMode::Blacklist);
+            if mode == coordination_filter_mode_for_settings(&app_settings(&state), kind) {
+                return;
+            }
+            update_app_settings(&state, |settings| {
+                set_coordination_filter_mode_for_settings(settings, kind, mode);
+            });
+        });
+    }
+}
+
+fn append_coordination_target_popup_row(
+    section: &GtkBox,
+    state: &Arc<Mutex<AppState>>,
+    kind: CoordinationFilterListKind,
+    title: &str,
+    hint: &str,
+    popup_title: &str,
+    unavailable_text: &str,
+) {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("settings-row");
+    let copy = GtkBox::new(Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    let label = Label::new(Some(title));
+    label.add_css_class("settings-row-title");
+    label.set_halign(Align::Start);
+    copy.append(&label);
+    let hint_label = Label::new(Some(hint));
+    hint_label.add_css_class("settings-row-copy");
+    hint_label.set_wrap(true);
+    hint_label.set_halign(Align::Start);
+    copy.append(&hint_label);
+    row.append(&copy);
+
+    let button = Button::with_label("Choose...");
+    button.add_css_class("settings-secondary-btn");
+    row.append(&button);
+    section.append(&row);
+
+    let popover = Popover::new();
+    popover.set_parent(&button);
+    let popup = GtkBox::new(Orientation::Vertical, 10);
+    popup.set_margin_top(12);
+    popup.set_margin_bottom(12);
+    popup.set_margin_start(12);
+    popup.set_margin_end(12);
+    popup.set_size_request(460, 320);
+    let popup_header = Label::new(Some(popup_title));
+    popup_header.add_css_class("settings-row-title");
+    popup_header.set_halign(Align::Start);
+    popup.append(&popup_header);
+    let popup_hint = Label::new(Some(
+        "This list refreshes while it is open. Switches edit the current filter list.",
+    ));
+    popup_hint.add_css_class("settings-row-copy");
+    popup_hint.set_wrap(true);
+    popup_hint.set_halign(Align::Start);
+    popup.append(&popup_hint);
+    let list_box = GtkBox::new(Orientation::Vertical, 8);
+    popup.append(&list_box);
+    popover.set_child(Some(&popup));
+
+    {
+        let state = state.clone();
+        let popover = popover.clone();
+        let list_box = list_box.clone();
+        let unavailable_text = unavailable_text.to_string();
+        button.connect_clicked(move |_| {
+            refresh_coordination_target_popup(&list_box, &state, kind, &unavailable_text);
+            if !popover.is_visible() {
+                popover.popup();
+                let popover_for_timer = popover.clone();
+                let list_box_for_timer = list_box.clone();
+                let state_for_timer = state.clone();
+                let unavailable_text_for_timer = unavailable_text.clone();
+                glib::timeout_add_local(Duration::from_secs(1), move || {
+                    if !popover_for_timer.is_visible() {
+                        return glib::ControlFlow::Break;
+                    }
+                    refresh_coordination_target_popup(
+                        &list_box_for_timer,
+                        &state_for_timer,
+                        kind,
+                        &unavailable_text_for_timer,
+                    );
+                    glib::ControlFlow::Continue
+                });
+            }
+        });
+    }
+}
+
+fn refresh_coordination_target_popup(
+    list_box: &GtkBox,
+    state: &Arc<Mutex<AppState>>,
+    kind: CoordinationFilterListKind,
+    unavailable_text: &str,
+) {
+    clear_box(list_box);
+    let settings = app_settings(state);
+    match fetch_coordination_targets(kind) {
+        Ok(targets) if targets.is_empty() => list_box.append(&settings_read_only_row(
+            "No current targets found. Play audio in another app and this popup will refresh.",
+        )),
+        Ok(targets) => {
+            for target in targets {
+                list_box.append(&coordination_target_popup_row(
+                    state, &settings, kind, &target,
+                ));
+            }
+        }
+        Err(_) => list_box.append(&settings_read_only_row(unavailable_text)),
+    }
+}
+
+fn fetch_coordination_targets(
+    kind: CoordinationFilterListKind,
+) -> anyhow::Result<Vec<CoordinationTargetSnapshot>> {
+    let targets = DaemonClient::new()?.coordination_targets()?;
+    Ok(match kind {
+        CoordinationFilterListKind::Mpris => targets.mpris,
+        CoordinationFilterListKind::PipeWire => targets.pipewire,
+    })
+}
+
+fn coordination_target_popup_row(
+    state: &Arc<Mutex<AppState>>,
+    settings: &AppSettings,
+    kind: CoordinationFilterListKind,
+    target: &CoordinationTargetSnapshot,
+) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("settings-row");
+    let copy = GtkBox::new(Orientation::Vertical, 2);
+    copy.set_hexpand(true);
+    let label = Label::new(Some(&target.label));
+    label.add_css_class("settings-row-title");
+    label.set_halign(Align::Start);
+    copy.append(&label);
+    let detail = if !target.filterable {
+        if target.detail.is_empty() {
+            "No stable filter key exposed.".to_string()
+        } else {
+            format!("{} | no stable filter key", target.detail)
+        }
+    } else if target.detail.is_empty() {
+        format!("key={}", target.key)
+    } else {
+        format!("{} | key={}", target.detail, target.key)
+    };
+    let hint = Label::new(Some(&detail));
+    hint.add_css_class("settings-row-copy");
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    copy.append(&hint);
+    row.append(&copy);
+
+    let switch =
+        settings_switch(target.filterable && coordination_target_is_listed(settings, kind, target));
+    switch.set_sensitive(target.filterable);
+    row.append(&switch);
+
+    {
+        let state = state.clone();
+        let identifiers = vec![target.key.clone(), target.label.clone()];
+        switch.connect_active_notify(move |sw| {
+            let listed = sw.is_active();
+            update_app_settings(&state, |settings| {
+                set_coordination_filter_target_listed(settings, kind, &identifiers, listed);
+            });
+        });
+    }
+
+    row
+}
+
+fn settings_read_only_row(text: &str) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 12);
+    row.add_css_class("settings-row");
+    let label = Label::new(Some(text));
+    label.add_css_class("settings-row-copy");
+    label.set_wrap(true);
+    label.set_halign(Align::Start);
+    label.set_hexpand(true);
+    row.append(&label);
+    row
 }
 
 fn settings_cli_only_note() -> Label {

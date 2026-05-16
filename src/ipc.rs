@@ -74,6 +74,26 @@ pub struct PlaybackSnapshot {
     pub probe_restore_position_millis: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinationTargetSnapshot {
+    pub key: String,
+    pub label: String,
+    pub detail: String,
+    pub active: bool,
+    #[serde(default = "default_coordination_target_filterable")]
+    pub filterable: bool,
+}
+
+fn default_coordination_target_filterable() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoordinationTargetsSnapshot {
+    pub mpris: Vec<CoordinationTargetSnapshot>,
+    pub pipewire: Vec<CoordinationTargetSnapshot>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedPlaybackState {
     pub snapshot: PlaybackSnapshot,
@@ -211,6 +231,7 @@ pub enum DaemonRequest {
         source: LogSource,
         message: String,
     },
+    GetCoordinationTargets,
     ReloadSettings,
     Shutdown,
 }
@@ -220,6 +241,7 @@ pub enum DaemonResponse {
     Ok,
     Pong,
     State(PlaybackSnapshot),
+    CoordinationTargets(CoordinationTargetsSnapshot),
     Error(String),
 }
 
@@ -630,6 +652,14 @@ impl DaemonClient {
 
     pub fn reload_settings(&self) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::ReloadSettings)
+    }
+
+    pub fn coordination_targets(&self) -> Result<CoordinationTargetsSnapshot> {
+        match self.request(&DaemonRequest::GetCoordinationTargets)? {
+            DaemonResponse::CoordinationTargets(targets) => Ok(targets),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
     }
 
     pub fn shutdown(&self) -> Result<()> {

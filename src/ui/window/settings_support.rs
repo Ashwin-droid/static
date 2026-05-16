@@ -28,6 +28,87 @@ where
     crate::player::notify_daemon_settings_changed();
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CoordinationFilterListKind {
+    Mpris,
+    PipeWire,
+}
+
+pub(super) fn coordination_filter_mode_labels() -> Vec<&'static str> {
+    CoordinationFilterMode::ALL
+        .iter()
+        .map(|mode| mode.label())
+        .collect()
+}
+
+pub(super) fn coordination_filter_mode_for_settings(
+    settings: &AppSettings,
+    kind: CoordinationFilterListKind,
+) -> CoordinationFilterMode {
+    match kind {
+        CoordinationFilterListKind::Mpris => settings.other_mpris_filter_mode,
+        CoordinationFilterListKind::PipeWire => settings.pipewire_filter_mode,
+    }
+}
+
+pub(super) fn set_coordination_filter_mode_for_settings(
+    settings: &mut AppSettings,
+    kind: CoordinationFilterListKind,
+    mode: CoordinationFilterMode,
+) {
+    match kind {
+        CoordinationFilterListKind::Mpris => settings.other_mpris_filter_mode = mode,
+        CoordinationFilterListKind::PipeWire => settings.pipewire_filter_mode = mode,
+    }
+}
+
+pub(super) fn coordination_filter_list_for_settings(
+    settings: &AppSettings,
+    kind: CoordinationFilterListKind,
+) -> &[String] {
+    match kind {
+        CoordinationFilterListKind::Mpris => &settings.other_mpris_filter_list,
+        CoordinationFilterListKind::PipeWire => &settings.pipewire_filter_list,
+    }
+}
+
+pub(super) fn set_coordination_filter_target_listed(
+    settings: &mut AppSettings,
+    kind: CoordinationFilterListKind,
+    identifiers: &[String],
+    listed: bool,
+) {
+    let list = match kind {
+        CoordinationFilterListKind::Mpris => &mut settings.other_mpris_filter_list,
+        CoordinationFilterListKind::PipeWire => &mut settings.pipewire_filter_list,
+    };
+
+    if listed {
+        if let Some(key) = identifiers.first().filter(|key| !key.trim().is_empty()) {
+            list.push(key.to_string());
+        }
+    } else {
+        list.retain(|entry| !coordination_filter_contains(&[entry.clone()], identifiers));
+    }
+    *list = sanitize_coordination_filter_entries(list);
+}
+
+pub(super) fn coordination_target_is_listed(
+    settings: &AppSettings,
+    kind: CoordinationFilterListKind,
+    target: &CoordinationTargetSnapshot,
+) -> bool {
+    if !target.filterable || target.key.trim().is_empty() {
+        return false;
+    }
+
+    let identifiers = [target.key.clone(), target.label.clone()];
+    coordination_filter_contains(
+        coordination_filter_list_for_settings(settings, kind),
+        &identifiers,
+    )
+}
+
 pub(super) fn persist_and_sync_settings<F>(
     state: &Arc<Mutex<AppState>>,
     updater: F,

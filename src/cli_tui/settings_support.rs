@@ -567,6 +567,15 @@ impl InteractiveTui {
     ) -> Result<()> {
         let cache = open_tui_music_cache()?;
         let settings = cache.load_settings()?;
+        if let Some(current) = current_coordination_filter_setting(&settings, key) {
+            let index = CoordinationFilterMode::ALL
+                .iter()
+                .position(|mode| *mode == current)
+                .unwrap_or(0);
+            let next_index = move_index(index, CoordinationFilterMode::ALL.len(), delta);
+            return self
+                .persist_setting_value(key, CoordinationFilterMode::ALL[next_index].as_str());
+        }
         let current = current_coordination_setting(&settings, key);
         let index = CoordinationMode::ALL
             .iter()
@@ -849,6 +858,25 @@ pub(in crate::cli_tui) fn dropdown_setting_field(
     }
 }
 
+pub(in crate::cli_tui) fn filter_mode_setting_field(
+    settings: &AppSettings,
+    key: &'static str,
+    title: &str,
+    subtitle: &str,
+) -> TuiSettingsField {
+    TuiSettingsField {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        control: TuiSettingsControl::Dropdown {
+            key,
+            value: current_coordination_filter_setting(settings, key)
+                .unwrap_or(CoordinationFilterMode::Blacklist)
+                .label()
+                .to_string(),
+        },
+    }
+}
+
 pub(in crate::cli_tui) fn stepper_setting_field(
     settings: &AppSettings,
     key: &'static str,
@@ -905,6 +933,17 @@ pub(in crate::cli_tui) fn current_coordination_setting(
         "other_mpris_mode" => settings.other_mpris_mode,
         "pipewire_pause_mode" => settings.pipewire_pause_mode,
         _ => CoordinationMode::Off,
+    }
+}
+
+pub(in crate::cli_tui) fn current_coordination_filter_setting(
+    settings: &AppSettings,
+    key: &str,
+) -> Option<CoordinationFilterMode> {
+    match key {
+        "other_mpris_filter_mode" => Some(settings.other_mpris_filter_mode),
+        "pipewire_filter_mode" => Some(settings.pipewire_filter_mode),
+        _ => None,
     }
 }
 
@@ -999,14 +1038,136 @@ pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSetti
     }
 }
 
+fn coordination_target_list_value(targets: Option<&[CoordinationTargetSnapshot]>) -> String {
+    let Some(targets) = targets else {
+        return "Unavailable".to_string();
+    };
+
+    if targets.is_empty() {
+        return "None".to_string();
+    }
+
+    targets
+        .iter()
+        .take(6)
+        .map(|target| {
+            if target.filterable {
+                format!("{} -> {}", target.label, target.key)
+            } else {
+                format!("{} -> no stable key", target.label)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub(in crate::cli_tui) fn build_tui_settings_sections(
     settings: &AppSettings,
     cache: &MusicCache,
+    coordination_targets: Option<&CoordinationTargetsSnapshot>,
 ) -> Result<Vec<TuiSettingsSection>> {
     let storage_root_override = get_storage_root().unwrap_or_default();
     let default_storage_root = std::env::var("HOME")
         .map(|home| format!("{home}/Music/Static"))
         .unwrap_or_else(|_| "/tmp/Music/Static".to_string());
+    let mut coordination_fields = vec![
+        dropdown_setting_field(
+            settings,
+            "other_mpris_mode",
+            "MPRIS coordination",
+            "Choose whether Static halts, auto-resumes, or ignores peer players.",
+        ),
+        stepper_setting_field(
+            settings,
+            "other_mpris_halt_auto_resume_secs",
+            "Halt auto delay",
+            "Delay before Static resumes after peer media goes quiet.",
+        )?,
+        filter_mode_setting_field(
+            settings,
+            "other_mpris_filter_mode",
+            "MPRIS filter mode",
+            "Switch between blacklist and whitelist matching for peer media apps.",
+        ),
+        text_setting_field(
+            settings,
+            "other_mpris_filter_list",
+            "MPRIS filter list",
+            "Comma-separated app-level identifiers matched against app key, identity, and desktop entry.",
+            "No MPRIS entries",
+        )?,
+        TuiSettingsField {
+            title: "Current MPRIS players".to_string(),
+            subtitle: "Keys you can add to the MPRIS filter list.".to_string(),
+            control: TuiSettingsControl::ReadOnly {
+                value: coordination_target_list_value(
+                    coordination_targets.map(|targets| targets.mpris.as_slice()),
+                ),
+            },
+        },
+        toggle_setting_field(
+            settings,
+            "pipewire_ducking_enabled",
+            "PipeWire ducking",
+            "Lower or pause Static when other desktop audio becomes active.",
+        ),
+        dropdown_setting_field(
+            settings,
+            "pipewire_pause_mode",
+            "PipeWire coordination",
+            "Choose whether PipeWire activity ducks, halts, or auto-resumes.",
+        ),
+        stepper_setting_field(
+            settings,
+            "pipewire_pause_halt_auto_resume_secs",
+            "PipeWire halt auto delay",
+            "Delay before Static comes back after PipeWire activity stops.",
+        )?,
+        stepper_setting_field(
+            settings,
+            "pipewire_ducking_threshold_secs",
+            "PipeWire trigger delay",
+            "How long foreign audio must stay active before coordination starts.",
+        )?,
+        stepper_setting_field(
+            settings,
+            "pipewire_ducking_volume",
+            "PipeWire duck volume",
+            "Temporary playback level while foreign audio is active.",
+        )?,
+        filter_mode_setting_field(
+            settings,
+            "pipewire_filter_mode",
+            "PipeWire filter mode",
+            "Switch between blacklist and whitelist matching for foreign audio streams.",
+        ),
+        text_setting_field(
+            settings,
+            "pipewire_filter_list",
+            "PipeWire filter list",
+            "Comma-separated stable identifiers matched against app name, binary, media, and node labels.",
+            "No PipeWire entries",
+        )?,
+        TuiSettingsField {
+            title: "Current PipeWire streams".to_string(),
+            subtitle: "Keys you can add to the PipeWire filter list.".to_string(),
+            control: TuiSettingsControl::ReadOnly {
+                value: coordination_target_list_value(
+                    coordination_targets.map(|targets| targets.pipewire.as_slice()),
+                ),
+            },
+        },
+    ];
+    if coordination_targets.is_none() {
+        coordination_fields.push(TuiSettingsField {
+            title: "Target discovery".to_string(),
+            subtitle: "Open the daemon-backed settings page again after staticd starts."
+                .to_string(),
+            control: TuiSettingsControl::ReadOnly {
+                value: "No daemon target snapshot available".to_string(),
+            },
+        });
+    }
 
     Ok(vec![
         TuiSettingsSection {
@@ -1096,50 +1257,7 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
         TuiSettingsSection {
             title: "Coordination".to_string(),
             subtitle: "How Static reacts to other media and audio streams.".to_string(),
-            fields: vec![
-                dropdown_setting_field(
-                    settings,
-                    "other_mpris_mode",
-                    "MPRIS coordination",
-                    "Choose whether Static halts, auto-resumes, or ignores peer players.",
-                ),
-                stepper_setting_field(
-                    settings,
-                    "other_mpris_halt_auto_resume_secs",
-                    "Halt auto delay",
-                    "Delay before Static resumes after peer media goes quiet.",
-                )?,
-                toggle_setting_field(
-                    settings,
-                    "pipewire_ducking_enabled",
-                    "PipeWire ducking",
-                    "Lower or pause Static when other desktop audio becomes active.",
-                ),
-                dropdown_setting_field(
-                    settings,
-                    "pipewire_pause_mode",
-                    "PipeWire coordination",
-                    "Choose whether PipeWire activity ducks, halts, or auto-resumes.",
-                ),
-                stepper_setting_field(
-                    settings,
-                    "pipewire_pause_halt_auto_resume_secs",
-                    "PipeWire halt auto delay",
-                    "Delay before Static comes back after PipeWire activity stops.",
-                )?,
-                stepper_setting_field(
-                    settings,
-                    "pipewire_ducking_threshold_secs",
-                    "PipeWire trigger delay",
-                    "How long foreign audio must stay active before coordination starts.",
-                )?,
-                stepper_setting_field(
-                    settings,
-                    "pipewire_ducking_volume",
-                    "PipeWire duck volume",
-                    "Temporary playback level while foreign audio is active.",
-                )?,
-            ],
+            fields: coordination_fields,
         },
         TuiSettingsSection {
             title: "Import & Filtering".to_string(),

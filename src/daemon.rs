@@ -24,10 +24,10 @@ use zbus::blocking::{Connection, Proxy};
 use zbus::interface;
 
 use crate::ipc::{
-    ActiveTrackSnapshot, DAEMON_BUS_NAME, DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse,
-    PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, RepeatMode,
-    clear_persisted_playback_state, current_unix_millis, store_persisted_playback_state,
-    store_persisted_playlist_state,
+    ActiveTrackSnapshot, CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DAEMON_BUS_NAME,
+    DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse, PersistedPlaybackState, PlaybackSnapshot,
+    PlaylistContext, RepeatMode, clear_persisted_playback_state, current_unix_millis,
+    store_persisted_playback_state, store_persisted_playlist_state,
 };
 use crate::models::{RadioChip, RadioVirtualPlaylist, Track};
 use crate::network::{
@@ -36,7 +36,10 @@ use crate::network::{
     sanitize_categories,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, CoordinationMode, MusicCache, PIPEWIRE_DUCKING_VOLUME_CLI_MAX};
+use crate::offline::{
+    AppSettings, CoordinationMode, MusicCache, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+    coordination_filter_allows,
+};
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
 
@@ -249,10 +252,77 @@ struct DaemonState {
 struct ExternalMprisCoordinator {
     last_poll_at: Option<Instant>,
     last_error_log_at: Option<Instant>,
+    known_targets: Vec<CoordinationTargetSnapshot>,
     playing_services: Vec<String>,
     last_logged_playing_services: Vec<String>,
     waiting_for_services: Vec<String>,
     no_playing_services_since: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+struct MprisPeerInfo {
+    bus_name: String,
+    app_key: Option<String>,
+    identity: Option<String>,
+    desktop_entry: Option<String>,
+    playing: bool,
+}
+
+impl MprisPeerInfo {
+    fn filter_key(&self) -> Option<String> {
+        self.desktop_entry
+            .clone()
+            .or_else(|| self.app_key.clone())
+            .or_else(|| self.identity.clone())
+    }
+
+    fn label(&self) -> String {
+        self.identity
+            .clone()
+            .or_else(|| self.desktop_entry.clone())
+            .or_else(|| self.app_key.clone())
+            .unwrap_or_else(|| self.bus_name.clone())
+    }
+
+    fn detail(&self) -> String {
+        let mut parts = vec![format!("bus={}", self.bus_name)];
+        if let Some(app_key) = self.app_key.as_deref() {
+            parts.push(format!("app={app_key}"));
+        }
+        if let Some(desktop_entry) = self.desktop_entry.as_deref() {
+            parts.push(format!("desktop={desktop_entry}"));
+        }
+        if self.playing {
+            parts.push("playing".to_string());
+        } else {
+            parts.push("not playing".to_string());
+        }
+        parts.join(" | ")
+    }
+
+    fn identifiers(&self) -> Vec<String> {
+        [
+            self.filter_key(),
+            self.app_key.clone(),
+            self.identity.clone(),
+            self.desktop_entry.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+    }
+
+    fn target_snapshot(&self) -> CoordinationTargetSnapshot {
+        let key = self.filter_key().unwrap_or_default();
+        CoordinationTargetSnapshot {
+            filterable: !key.is_empty(),
+            key,
+            label: self.label(),
+            detail: self.detail(),
+            active: self.playing,
+        }
+    }
 }
 
 impl ExternalMprisCoordinator {
@@ -260,6 +330,7 @@ impl ExternalMprisCoordinator {
         Self {
             last_poll_at: None,
             last_error_log_at: None,
+            known_targets: Vec::new(),
             playing_services: Vec::new(),
             last_logged_playing_services: Vec::new(),
             waiting_for_services: Vec::new(),
@@ -267,7 +338,7 @@ impl ExternalMprisCoordinator {
         }
     }
 
-    fn poll_if_due(&mut self) {
+    fn poll_if_due(&mut self, settings: &AppSettings) {
         if self
             .last_poll_at
             .is_some_and(|last_poll_at| last_poll_at.elapsed() < EXTERNAL_MPRIS_POLL_INTERVAL)
@@ -275,14 +346,30 @@ impl ExternalMprisCoordinator {
             return;
         }
         self.last_poll_at = Some(Instant::now());
-        self.poll_now();
+        self.poll_now(settings);
     }
 
-    fn poll_now(&mut self) {
-        match self.scan_other_playing_services() {
-            Ok(services) => self.update_playing_services(services),
+    fn poll_now(&mut self, settings: &AppSettings) {
+        match self.scan_other_mpris_services() {
+            Ok(peers) => {
+                self.known_targets = mpris_target_snapshots(&peers);
+                let services = peers
+                    .iter()
+                    .filter(|peer| peer.playing)
+                    .filter(|peer| {
+                        coordination_filter_allows(
+                            settings.other_mpris_filter_mode,
+                            &settings.other_mpris_filter_list,
+                            &peer.identifiers(),
+                        )
+                    })
+                    .map(|peer| peer.bus_name.clone())
+                    .collect();
+                self.update_playing_services(services);
+            }
             Err(err) => {
                 self.log_error(format!("[MPRIS] failed to inspect peer players: {err}"));
+                self.known_targets.clear();
                 self.update_playing_services(Vec::new());
             }
         }
@@ -292,8 +379,8 @@ impl ExternalMprisCoordinator {
         &self.playing_services
     }
 
-    fn pause_other_playing_services(&mut self) -> Vec<String> {
-        self.poll_now();
+    fn pause_other_playing_services(&mut self, settings: &AppSettings) -> Vec<String> {
+        self.poll_now(settings);
         let mut paused = Vec::new();
         for bus_name in self.playing_services.clone() {
             match peer_player_for_bus(&bus_name) {
@@ -327,26 +414,33 @@ impl ExternalMprisCoordinator {
         paused
     }
 
-    fn scan_other_playing_services(&mut self) -> Result<Vec<String>> {
+    fn scan_other_mpris_services(&mut self) -> Result<Vec<MprisPeerInfo>> {
         let services = list_other_mpris_services()?;
-        let mut playing = Vec::new();
+        let mut peers = Vec::new();
 
         for bus_name in services {
-            match peer_player_for_bus(&bus_name) {
-                Ok(player) => match player.get_playback_status() {
-                    Ok(PeerPlaybackStatus::Playing) => playing.push(bus_name),
-                    Ok(_) => {}
-                    Err(err) => self.log_error(format!(
-                        "[MPRIS] failed to read PlaybackStatus from {bus_name}: {err}"
-                    )),
-                },
+            match inspect_mpris_peer(&bus_name) {
+                Ok(peer) => peers.push(peer),
                 Err(err) => self.log_error(format!(
-                    "[MPRIS] failed to create peer client for {bus_name}: {err}"
+                    "[MPRIS] failed to inspect peer player {bus_name}: {err}"
                 )),
             }
         }
 
-        Ok(playing)
+        Ok(peers)
+    }
+
+    fn refresh_known_targets(&mut self) -> Vec<CoordinationTargetSnapshot> {
+        match self.scan_other_mpris_services() {
+            Ok(peers) => {
+                self.known_targets = mpris_target_snapshots(&peers);
+                self.known_targets.clone()
+            }
+            Err(err) => {
+                self.log_error(format!("[MPRIS] failed to inspect peer players: {err}"));
+                self.known_targets.clone()
+            }
+        }
     }
 
     fn set_waiting_for_services(&mut self, services: &[String]) {
@@ -1680,6 +1774,9 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 Ok(()) => DaemonResponse::Ok,
                 Err(err) => DaemonResponse::Error(format!("Failed to write log: {err}")),
             }
+        }
+        DaemonRequest::GetCoordinationTargets => {
+            DaemonResponse::CoordinationTargets(coordination_targets_snapshot(state))
         }
         DaemonRequest::ReloadSettings => {
             reload_settings(state);
@@ -4126,6 +4223,53 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
     }
 }
 
+fn coordination_targets_snapshot(state: &mut DaemonState) -> CoordinationTargetsSnapshot {
+    CoordinationTargetsSnapshot {
+        mpris: state.peer_mpris.refresh_known_targets(),
+        pipewire: pipewire_target_snapshots(state),
+    }
+}
+
+fn pipewire_target_snapshots(state: &DaemonState) -> Vec<CoordinationTargetSnapshot> {
+    let mut targets = state
+        .pipewire_monitor
+        .active_streams()
+        .values()
+        .map(|stream| {
+            let key = stream.stable_filter_key().unwrap_or_default();
+            CoordinationTargetSnapshot {
+                filterable: !key.is_empty(),
+                key,
+                label: stream.label(),
+                detail: stream.detail(),
+                active: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.label
+            .to_ascii_lowercase()
+            .cmp(&right.label.to_ascii_lowercase())
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    targets.dedup_by(|left, right| {
+        pipewire_target_dedupe_key(left) == pipewire_target_dedupe_key(right)
+    });
+    targets
+}
+
+fn pipewire_target_dedupe_key(target: &CoordinationTargetSnapshot) -> String {
+    if !target.key.trim().is_empty() {
+        format!("key:{}", target.key.to_ascii_lowercase())
+    } else {
+        format!(
+            "unidentified:{}:{}",
+            target.label.to_ascii_lowercase(),
+            target.detail.to_ascii_lowercase()
+        )
+    }
+}
+
 fn maybe_persist_playback_state(state: &mut DaemonState, force: bool) {
     let Some(snapshot) = persisted_playback_snapshot(state) else {
         if force || state.last_persisted_playback_json.is_some() {
@@ -4593,12 +4737,18 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
     state.last_pipewire_poll_at = Some(Instant::now());
     let threshold =
         Duration::from_secs(state.settings.pipewire_ducking_threshold_secs.max(1).into());
+    let active_streams = state.pipewire_monitor.active_streams();
 
-    state.pipewire_trigger_active = state
-        .pipewire_monitor
-        .active_streams()
+    state.pipewire_trigger_active = active_streams
         .values()
-        .any(|first_seen| first_seen.elapsed() >= threshold);
+        .filter(|stream| {
+            coordination_filter_allows(
+                state.settings.pipewire_filter_mode,
+                &state.settings.pipewire_filter_list,
+                &stream.identifiers(),
+            )
+        })
+        .any(|stream| stream.first_seen.elapsed() >= threshold);
     if state.pipewire_trigger_active {
         state.pipewire_quiet_since = None;
     } else {
@@ -4709,7 +4859,8 @@ fn pause_other_mpris_players(state: &mut DaemonState) {
         return;
     }
 
-    let paused_services = state.peer_mpris.pause_other_playing_services();
+    let settings = state.settings.clone();
+    let paused_services = state.peer_mpris.pause_other_playing_services(&settings);
     if paused_services.is_empty() {
         return;
     }
@@ -4790,7 +4941,8 @@ fn poll_external_mpris(state: &mut DaemonState) {
         return;
     }
 
-    state.peer_mpris.poll_if_due();
+    let settings = state.settings.clone();
+    state.peer_mpris.poll_if_due(&settings);
 }
 
 fn should_resume_after_external_mpris_pause(
@@ -4834,6 +4986,58 @@ fn list_other_mpris_services() -> Result<Vec<String>> {
         .into_iter()
         .filter(|name| name.starts_with("org.mpris.MediaPlayer2.") && name != STATIC_MPRIS_BUS_NAME)
         .collect())
+}
+
+fn inspect_mpris_peer(bus_name: &str) -> Result<MprisPeerInfo> {
+    let player = peer_player_for_bus(bus_name)?;
+    let app_key = mpris_app_key_from_bus(bus_name);
+    let identity = non_empty_string(player.identity().to_string());
+    let desktop_entry = player
+        .get_desktop_entry()
+        .ok()
+        .flatten()
+        .and_then(non_empty_string);
+    let playing = matches!(
+        player.get_playback_status(),
+        Ok(PeerPlaybackStatus::Playing)
+    );
+
+    Ok(MprisPeerInfo {
+        bus_name: bus_name.to_string(),
+        app_key,
+        identity,
+        desktop_entry,
+        playing,
+    })
+}
+
+fn mpris_app_key_from_bus(bus_name: &str) -> Option<String> {
+    let app = bus_name.strip_prefix("org.mpris.MediaPlayer2.")?;
+    let app = app
+        .split_once(".instance")
+        .map(|(app, _)| app)
+        .unwrap_or(app);
+    non_empty_string(app.to_string())
+}
+
+fn mpris_target_snapshots(peers: &[MprisPeerInfo]) -> Vec<CoordinationTargetSnapshot> {
+    let mut targets = peers
+        .iter()
+        .map(MprisPeerInfo::target_snapshot)
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        left.label
+            .to_ascii_lowercase()
+            .cmp(&right.label.to_ascii_lowercase())
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    targets.dedup_by(|left, right| left.key.eq_ignore_ascii_case(&right.key));
+    targets
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn peer_player_for_bus(bus_name: &str) -> Result<PeerMprisPlayer> {

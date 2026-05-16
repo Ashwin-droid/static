@@ -4,8 +4,8 @@ use super::{
     PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
     apply_radio_chips_from_refresh, cache_media_download_retry_delay, current_listened_millis,
     dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
-    hide_timing_for_track, mpris_halt_auto_peer_transition, mpris_position_millis_for_track,
-    natural_end_target_index, next_repeat_state_after_natural_end,
+    hide_timing_for_track, mpris_app_key_from_bus, mpris_halt_auto_peer_transition,
+    mpris_position_millis_for_track, natural_end_target_index, next_repeat_state_after_natural_end,
     pause_previous_threshold_clock_for_track, pending_mpris_transport_decision,
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
     playback_start_stalled, previous_action, previous_threshold_millis,
@@ -449,6 +449,23 @@ fn mpris_position_uses_elapsed_time_while_waiting_for_first_real_sample() {
 
     let visible = mpris_position_millis_for_track(&track, None, false).unwrap();
     assert!((1_000..=2_000).contains(&visible));
+}
+
+#[test]
+fn mpris_filter_key_strips_runtime_instance_suffix() {
+    assert_eq!(
+        mpris_app_key_from_bus("org.mpris.MediaPlayer2.firefox.instance123"),
+        Some("firefox".to_string())
+    );
+}
+
+#[test]
+fn mpris_filter_key_keeps_app_level_bus_name() {
+    assert_eq!(
+        mpris_app_key_from_bus("org.mpris.MediaPlayer2.spotify"),
+        Some("spotify".to_string())
+    );
+    assert_eq!(mpris_app_key_from_bus(":1.52"), None);
 }
 
 #[test]

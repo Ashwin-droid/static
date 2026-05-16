@@ -52,6 +52,38 @@ impl CoordinationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationFilterMode {
+    Blacklist,
+    Whitelist,
+}
+
+impl CoordinationFilterMode {
+    pub const ALL: [Self; 2] = [Self::Blacklist, Self::Whitelist];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blacklist => "blacklist",
+            Self::Whitelist => "whitelist",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blacklist => "Blacklist",
+            Self::Whitelist => "Whitelist",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "blacklist" | "blocklist" | "denylist" | "deny" | "block" => Some(Self::Blacklist),
+            "whitelist" | "allowlist" | "allow" => Some(Self::Whitelist),
+            _ => None,
+        }
+    }
+}
+
 pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 0;
 pub const OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
 pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 0;
@@ -80,11 +112,15 @@ pub struct AppSettings {
     pub prefer_local_cache_on_playback: bool,
     pub other_mpris_mode: CoordinationMode,
     pub other_mpris_halt_auto_resume_secs: u32,
+    pub other_mpris_filter_mode: CoordinationFilterMode,
+    pub other_mpris_filter_list: Vec<String>,
     pub pipewire_ducking_enabled: bool,
     pub pipewire_pause_mode: CoordinationMode,
     pub pipewire_pause_halt_auto_resume_secs: u32,
     pub pipewire_ducking_threshold_secs: u32,
     pub pipewire_ducking_volume: f64,
+    pub pipewire_filter_mode: CoordinationFilterMode,
+    pub pipewire_filter_list: Vec<String>,
     pub sponsorblock_enabled: bool,
     pub sponsorblock_categories: Vec<String>,
 }
@@ -108,11 +144,15 @@ impl Default for AppSettings {
             prefer_local_cache_on_playback: true,
             other_mpris_mode: CoordinationMode::HaltAuto,
             other_mpris_halt_auto_resume_secs: 0,
+            other_mpris_filter_mode: CoordinationFilterMode::Blacklist,
+            other_mpris_filter_list: Vec::new(),
             pipewire_ducking_enabled: false,
             pipewire_pause_mode: CoordinationMode::Off,
             pipewire_pause_halt_auto_resume_secs: 5,
             pipewire_ducking_threshold_secs: 5,
             pipewire_ducking_volume: 0.3,
+            pipewire_filter_mode: CoordinationFilterMode::Blacklist,
+            pipewire_filter_list: Vec::new(),
             sponsorblock_enabled: true,
             sponsorblock_categories: default_skip_categories(),
         }
@@ -123,7 +163,9 @@ impl MusicCache {
     pub fn load_settings(&self) -> Result<AppSettings> {
         let mut settings = AppSettings::default();
         let mut loaded_other_mpris_mode = None;
+        let mut loaded_other_mpris_filter_mode = None;
         let mut loaded_pipewire_pause_mode = None;
+        let mut loaded_pipewire_filter_mode = None;
         let mut stmt = self.db.prepare("SELECT key, value FROM app_settings")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -224,6 +266,12 @@ impl MusicCache {
                         OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
                     );
                 }
+                "other_mpris_filter_mode" => {
+                    loaded_other_mpris_filter_mode = CoordinationFilterMode::from_str(&row.1);
+                }
+                "other_mpris_filter_list" => {
+                    settings.other_mpris_filter_list = parse_string_list_setting(&row.1);
+                }
                 "pipewire_ducking_enabled" => {
                     settings.pipewire_ducking_enabled =
                         parse_bool_setting(&row.1, settings.pipewire_ducking_enabled);
@@ -253,6 +301,12 @@ impl MusicCache {
                         PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
                     );
                 }
+                "pipewire_filter_mode" => {
+                    loaded_pipewire_filter_mode = CoordinationFilterMode::from_str(&row.1);
+                }
+                "pipewire_filter_list" => {
+                    settings.pipewire_filter_list = parse_string_list_setting(&row.1);
+                }
                 "sponsorblock_enabled" => {
                     settings.sponsorblock_enabled =
                         parse_bool_setting(&row.1, settings.sponsorblock_enabled);
@@ -267,8 +321,16 @@ impl MusicCache {
         }
 
         settings.other_mpris_mode = loaded_other_mpris_mode.unwrap_or(settings.other_mpris_mode);
+        settings.other_mpris_filter_mode =
+            loaded_other_mpris_filter_mode.unwrap_or(settings.other_mpris_filter_mode);
+        settings.other_mpris_filter_list =
+            sanitize_coordination_filter_entries(&settings.other_mpris_filter_list);
         settings.pipewire_pause_mode =
             loaded_pipewire_pause_mode.unwrap_or(settings.pipewire_pause_mode);
+        settings.pipewire_filter_mode =
+            loaded_pipewire_filter_mode.unwrap_or(settings.pipewire_filter_mode);
+        settings.pipewire_filter_list =
+            sanitize_coordination_filter_entries(&settings.pipewire_filter_list);
 
         Ok(settings)
     }
@@ -277,6 +339,12 @@ impl MusicCache {
         let tx = self.db.unchecked_transaction()?;
         let sponsorblock_categories =
             serde_json::to_string(&sanitize_categories(&settings.sponsorblock_categories))?;
+        let other_mpris_filter_list = serde_json::to_string(
+            &sanitize_coordination_filter_entries(&settings.other_mpris_filter_list),
+        )?;
+        let pipewire_filter_list = serde_json::to_string(&sanitize_coordination_filter_entries(
+            &settings.pipewire_filter_list,
+        ))?;
         for (key, value) in [
             (
                 "auto_sync_chromium_cookies",
@@ -337,6 +405,11 @@ impl MusicCache {
                 settings.other_mpris_halt_auto_resume_secs.to_string(),
             ),
             (
+                "other_mpris_filter_mode",
+                settings.other_mpris_filter_mode.as_str().to_string(),
+            ),
+            ("other_mpris_filter_list", other_mpris_filter_list.clone()),
+            (
                 "pipewire_ducking_enabled",
                 bool_setting(settings.pipewire_ducking_enabled),
             ),
@@ -356,6 +429,11 @@ impl MusicCache {
                 "pipewire_ducking_volume",
                 settings.pipewire_ducking_volume.to_string(),
             ),
+            (
+                "pipewire_filter_mode",
+                settings.pipewire_filter_mode.as_str().to_string(),
+            ),
+            ("pipewire_filter_list", pipewire_filter_list.clone()),
             (
                 "sponsorblock_enabled",
                 bool_setting(settings.sponsorblock_enabled),
@@ -392,8 +470,70 @@ fn parse_f64_setting_in_range(value: &str, default: f64, minimum: f64, maximum: 
     }
 }
 
+fn parse_string_list_setting(value: &str) -> Vec<String> {
+    if let Ok(values) = serde_json::from_str::<Vec<String>>(value) {
+        return sanitize_coordination_filter_entries(&values);
+    }
+
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    sanitize_coordination_filter_entries(&values)
+}
+
 fn bool_setting(value: bool) -> String {
     if value { "1" } else { "0" }.to_string()
+}
+
+pub fn sanitize_coordination_filter_entries(entries: &[String]) -> Vec<String> {
+    let mut seen = Vec::<String>::new();
+    let mut sanitized = Vec::new();
+
+    for entry in entries {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let normalized = normalize_coordination_identifier(trimmed);
+        if normalized.is_empty() || seen.iter().any(|candidate| candidate == &normalized) {
+            continue;
+        }
+
+        seen.push(normalized);
+        sanitized.push(trimmed.to_string());
+    }
+
+    sanitized
+}
+
+pub fn coordination_filter_contains(entries: &[String], identifiers: &[String]) -> bool {
+    entries.iter().any(|entry| {
+        let normalized_entry = normalize_coordination_identifier(entry);
+        !normalized_entry.is_empty()
+            && identifiers
+                .iter()
+                .any(|identifier| normalize_coordination_identifier(identifier) == normalized_entry)
+    })
+}
+
+pub fn coordination_filter_allows(
+    mode: CoordinationFilterMode,
+    entries: &[String],
+    identifiers: &[String],
+) -> bool {
+    let listed = coordination_filter_contains(entries, identifiers);
+    match mode {
+        CoordinationFilterMode::Blacklist => !listed,
+        CoordinationFilterMode::Whitelist => listed,
+    }
+}
+
+pub fn normalize_coordination_identifier(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
 }
 
 #[cfg(test)]

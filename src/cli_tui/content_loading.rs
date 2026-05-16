@@ -723,7 +723,10 @@ pub(in crate::cli_tui) fn offline_thumbnail_url_tui(
 pub(in crate::cli_tui) fn load_settings_page_data() -> Result<TuiSettingsPageData> {
     let cache = open_tui_music_cache()?;
     let settings = cache.load_settings()?;
+    let coordination_targets = DaemonClient::new()
+        .and_then(|client| client.coordination_targets())
+        .ok();
     Ok(TuiSettingsPageData {
-        sections: build_tui_settings_sections(&settings, &cache)?,
+        sections: build_tui_settings_sections(&settings, &cache, coordination_targets.as_ref())?,
     })
 }

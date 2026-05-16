@@ -1,7 +1,7 @@
 use super::{
     AppSettings, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
     apply_config_value, config_description, cross_device_queue_is_singleton_seed,
-    should_use_local_resume_for_cross_device,
+    format_config_value, should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{PersistedPlaybackState, PlaybackSnapshot};
 use crate::models::{CrossDeviceQueue, Track};
@@ -30,6 +30,38 @@ fn config_set_supports_boosted_pipewire_ducking_volume() {
     assert_eq!(
         settings.pipewire_ducking_volume,
         PIPEWIRE_DUCKING_VOLUME_CLI_MAX
+    );
+}
+
+#[test]
+fn config_set_supports_coordination_filter_modes_and_lists() {
+    let mut settings = AppSettings::default();
+
+    apply_config_value(&mut settings, "other_mpris_filter_mode", "whitelist").unwrap();
+    apply_config_value(
+        &mut settings,
+        "other_mpris_filter_list",
+        " Firefox , firefox, mpv ",
+    )
+    .unwrap();
+    apply_config_value(&mut settings, "pipewire_filter_mode", "blacklist").unwrap();
+    apply_config_value(&mut settings, "pipewire_filter_list", "Firefox,Game").unwrap();
+
+    assert_eq!(
+        format_config_value(&settings, "other_mpris_filter_mode").unwrap(),
+        "whitelist"
+    );
+    assert_eq!(
+        format_config_value(&settings, "other_mpris_filter_list").unwrap(),
+        "Firefox,mpv"
+    );
+    assert_eq!(
+        format_config_value(&settings, "pipewire_filter_mode").unwrap(),
+        "blacklist"
+    );
+    assert_eq!(
+        format_config_value(&settings, "pipewire_filter_list").unwrap(),
+        "Firefox,Game"
     );
 }
 

@@ -38,8 +38,8 @@ use crate::cli::{
     saved_network_state, should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{
-    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
-    PlaylistContextSource, RepeatMode,
+    ActiveTrackSnapshot, CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DaemonClient,
+    PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode,
 };
 use crate::models::{
     BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
@@ -49,7 +49,7 @@ use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
     get_storage_root, store_storage_root,
 };
-use crate::offline::{AppSettings, CoordinationMode, MusicCache};
+use crate::offline::{AppSettings, CoordinationFilterMode, CoordinationMode, MusicCache};
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);

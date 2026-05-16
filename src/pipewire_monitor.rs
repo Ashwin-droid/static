@@ -17,8 +17,82 @@ macro_rules! eprintln {
 }
 
 pub struct PipeWireMonitor {
-    active_streams: Arc<Mutex<HashMap<u32, Instant>>>,
+    active_streams: Arc<Mutex<HashMap<u32, PipeWireStreamInfo>>>,
     _thread: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PipeWireStreamInfo {
+    pub node_id: u32,
+    pub first_seen: Instant,
+    pub application_id: Option<String>,
+    pub application_name: Option<String>,
+    pub process_binary: Option<String>,
+    pub process_id: Option<String>,
+    pub media_name: Option<String>,
+    pub node_name: Option<String>,
+    pub node_description: Option<String>,
+}
+
+impl PipeWireStreamInfo {
+    pub fn stable_filter_key(&self) -> Option<String> {
+        self.application_id
+            .clone()
+            .or_else(|| self.application_name.clone())
+            .or_else(|| self.process_binary.clone())
+            .or_else(|| self.node_description.clone())
+            .or_else(|| self.node_name.clone())
+            .or_else(|| self.media_name.clone())
+    }
+
+    pub fn label(&self) -> String {
+        self.application_name
+            .clone()
+            .or_else(|| self.process_binary.clone())
+            .or_else(|| self.node_description.clone())
+            .or_else(|| self.node_name.clone())
+            .or_else(|| self.media_name.clone())
+            .unwrap_or_else(|| "Unidentified PipeWire stream".to_string())
+    }
+
+    pub fn detail(&self) -> String {
+        let mut parts = vec![format!("node={}", self.node_id)];
+        if let Some(application_id) = self.application_id.as_deref() {
+            parts.push(format!("app_id={application_id}"));
+        }
+        if let Some(application_name) = self.application_name.as_deref() {
+            parts.push(format!("app={application_name}"));
+        }
+        if let Some(binary) = self.process_binary.as_deref() {
+            parts.push(format!("binary={binary}"));
+        }
+        if let Some(pid) = self.process_id.as_deref() {
+            parts.push(format!("pid={pid}"));
+        }
+        if let Some(media_name) = self.media_name.as_deref() {
+            parts.push(format!("media={media_name}"));
+        }
+        if let Some(node_name) = self.node_name.as_deref() {
+            parts.push(format!("node={node_name}"));
+        }
+        parts.join(" | ")
+    }
+
+    pub fn identifiers(&self) -> Vec<String> {
+        [
+            self.stable_filter_key(),
+            self.application_id.clone(),
+            self.application_name.clone(),
+            self.process_binary.clone(),
+            self.media_name.clone(),
+            self.node_name.clone(),
+            self.node_description.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect()
+    }
 }
 
 struct TrackedNode {
@@ -38,12 +112,12 @@ impl PipeWireMonitor {
         }
     }
 
-    pub fn active_streams(&self) -> HashMap<u32, Instant> {
+    pub fn active_streams(&self) -> HashMap<u32, PipeWireStreamInfo> {
         lock_streams(&self.active_streams).clone()
     }
 }
 
-fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
+fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, PipeWireStreamInfo>>>) {
     pw::init();
 
     let self_identifiers = own_process_identifiers();
@@ -126,6 +200,7 @@ fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
             };
 
             let node_id = obj.id;
+            let initial_stream = stream_info_from_props(node_id, props);
             let node: pw::node::Node = match registry.bind(obj) {
                 Ok(node) => node,
                 Err(err) => {
@@ -138,7 +213,11 @@ fn run_pipewire_monitor(active_streams: Arc<Mutex<HashMap<u32, Instant>>>) {
             let listener = node
                 .add_listener_local()
                 .info(move |info: &pw::node::NodeInfoRef| {
-                    update_stream_state(&active_streams_for_info, node_id, info.state());
+                    let stream = info
+                        .props()
+                        .map(|props| stream_info_from_props(node_id, props))
+                        .unwrap_or_else(|| initial_stream.clone());
+                    update_stream_state(&active_streams_for_info, stream, info.state());
                 })
                 .register();
 
@@ -179,6 +258,28 @@ fn is_own_stream(props: &DictRef, self_identifiers: &HashSet<String>, self_pid: 
         .any(|value| matches_own_identifier(value, self_identifiers))
 }
 
+fn stream_info_from_props(node_id: u32, props: &DictRef) -> PipeWireStreamInfo {
+    PipeWireStreamInfo {
+        node_id,
+        first_seen: Instant::now(),
+        application_id: dict_string(props, "application.id"),
+        application_name: dict_string(props, "application.name"),
+        process_binary: dict_string(props, "application.process.binary"),
+        process_id: dict_string(props, "application.process.id"),
+        media_name: dict_string(props, "media.name"),
+        node_name: dict_string(props, "node.name"),
+        node_description: dict_string(props, "node.description"),
+    }
+}
+
+fn dict_string(props: &DictRef, key: &str) -> Option<String> {
+    props
+        .get(key)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn matches_own_identifier(value: &str, self_identifiers: &HashSet<String>) -> bool {
     let normalized = normalize_identifier(value);
     if self_identifiers.contains(&normalized) {
@@ -215,32 +316,35 @@ fn normalize_identifier(value: &str) -> String {
 }
 
 fn update_stream_state(
-    active_streams: &Arc<Mutex<HashMap<u32, Instant>>>,
-    node_id: u32,
+    active_streams: &Arc<Mutex<HashMap<u32, PipeWireStreamInfo>>>,
+    mut stream: PipeWireStreamInfo,
     state: pw::node::NodeState<'_>,
 ) {
     let mut active_streams = lock_streams(active_streams);
 
     match state {
         pw::node::NodeState::Running => {
-            active_streams.entry(node_id).or_insert_with(Instant::now);
+            if let Some(existing) = active_streams.get(&stream.node_id) {
+                stream.first_seen = existing.first_seen;
+            }
+            active_streams.insert(stream.node_id, stream);
         }
         pw::node::NodeState::Creating
         | pw::node::NodeState::Suspended
         | pw::node::NodeState::Idle
         | pw::node::NodeState::Error(_) => {
-            active_streams.remove(&node_id);
+            active_streams.remove(&stream.node_id);
         }
     }
 }
 
-fn clear_streams(active_streams: &Arc<Mutex<HashMap<u32, Instant>>>) {
+fn clear_streams(active_streams: &Arc<Mutex<HashMap<u32, PipeWireStreamInfo>>>) {
     lock_streams(active_streams).clear();
 }
 
 fn lock_streams(
-    active_streams: &Arc<Mutex<HashMap<u32, Instant>>>,
-) -> MutexGuard<'_, HashMap<u32, Instant>> {
+    active_streams: &Arc<Mutex<HashMap<u32, PipeWireStreamInfo>>>,
+) -> MutexGuard<'_, HashMap<u32, PipeWireStreamInfo>> {
     active_streams
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())

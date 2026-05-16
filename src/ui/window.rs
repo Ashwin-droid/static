@@ -38,9 +38,9 @@ const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
 
 use crate::ipc::{
-    ActiveTrackSnapshot, DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext,
-    PlaylistContextSource, RepeatMode, current_unix_millis, load_persisted_playlist_state,
-    store_persisted_playback_state, store_persisted_playlist_state,
+    ActiveTrackSnapshot, CoordinationTargetSnapshot, DaemonClient, PersistedPlaybackState,
+    PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode, current_unix_millis,
+    load_persisted_playlist_state, store_persisted_playback_state, store_persisted_playlist_state,
 };
 use crate::models::{
     Artist, BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem,
@@ -54,7 +54,10 @@ use crate::network::{
     load_cookie_from_chromium_profile, sanitize_categories, store_cookie, store_vr_refresh_token,
 };
 use crate::network_state::NetworkState;
-use crate::offline::{AppSettings, CoordinationMode, MusicCache};
+use crate::offline::{
+    AppSettings, CoordinationFilterMode, CoordinationMode, MusicCache,
+    coordination_filter_contains, sanitize_coordination_filter_entries,
+};
 use crate::player::Player;
 
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =

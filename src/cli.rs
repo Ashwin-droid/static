@@ -3,8 +3,9 @@ use std::sync::Once;
 use anyhow::{Context, Result, bail};
 
 use crate::ipc::{
-    DaemonClient, PersistedPlaybackState, PlaybackSnapshot, PlaylistContext, PlaylistContextSource,
-    RepeatMode, daemon_is_running, load_persisted_playback_state,
+    CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DaemonClient, PersistedPlaybackState,
+    PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode, daemon_is_running,
+    load_persisted_playback_state,
 };
 use crate::models::{Artist, CrossDeviceQueue, HomeItem, SearchResult, Track};
 use crate::network::{
@@ -14,11 +15,13 @@ use crate::network::{
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{
-    AppSettings, CoordinationMode, MusicCache, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
-    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
-    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+    AppSettings, CoordinationFilterMode, CoordinationMode, MusicCache,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
+    PIPEWIRE_DUCKING_VOLUME_CLI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
+    sanitize_coordination_filter_entries,
 };
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
@@ -36,6 +39,7 @@ Usage:
   static queue addNext <ytm/yt url | video id | search term>
   static queue addLast <ytm/yt url | video id | search term>
   static info
+  static coordination list
   static config list
   static config desc [config_name]
   static config get [config_name]
@@ -73,6 +77,7 @@ pub fn run(args: &[String]) -> Result<()> {
         "exec" => run_exec(&args[1..]),
         "queue" => run_queue(&args[1..]),
         "info" => run_info(),
+        "coordination" => run_coordination(&args[1..]),
         "config" => run_config(&args[1..]),
         "i" => run_interactive_tui(),
         other => bail!("Unknown CLI command `{other}`.\n\n{HELP_TEXT}"),
@@ -243,6 +248,96 @@ fn run_info() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_coordination(args: &[String]) -> Result<()> {
+    let Some(command) = args.first().map(String::as_str) else {
+        bail!("`static coordination` expects `list`");
+    };
+
+    match command {
+        "list" => {
+            let cache = open_music_cache()?;
+            let settings = cache.load_settings()?;
+            let targets = DaemonClient::new()?.coordination_targets()?;
+            print_coordination_targets(&settings, &targets);
+            Ok(())
+        }
+        other => bail!("Unknown coordination command `{other}`"),
+    }
+}
+
+fn print_coordination_targets(settings: &AppSettings, targets: &CoordinationTargetsSnapshot) {
+    println!(
+        "MPRIS mode: {} ({})",
+        settings.other_mpris_filter_mode.label(),
+        if settings.other_mpris_filter_list.is_empty() {
+            "empty list"
+        } else {
+            "configured list"
+        }
+    );
+    print_coordination_target_group(
+        &targets.mpris,
+        &settings.other_mpris_filter_list,
+        settings.other_mpris_filter_mode,
+    );
+    println!();
+    println!(
+        "PipeWire mode: {} ({})",
+        settings.pipewire_filter_mode.label(),
+        if settings.pipewire_filter_list.is_empty() {
+            "empty list"
+        } else {
+            "configured list"
+        }
+    );
+    print_coordination_target_group(
+        &targets.pipewire,
+        &settings.pipewire_filter_list,
+        settings.pipewire_filter_mode,
+    );
+}
+
+fn print_coordination_target_group(
+    targets: &[CoordinationTargetSnapshot],
+    configured: &[String],
+    mode: CoordinationFilterMode,
+) {
+    if targets.is_empty() {
+        println!("  No current targets.");
+        return;
+    }
+
+    for target in targets {
+        let identifiers = vec![target.key.clone(), target.label.clone()];
+        let listed = target.filterable && coordination_filter_contains(configured, &identifiers);
+        let coordinated = target.filterable
+            && match mode {
+                CoordinationFilterMode::Blacklist => !listed,
+                CoordinationFilterMode::Whitelist => listed,
+            };
+        let listed_label = if listed { "listed" } else { "unlisted" };
+        let coordinated_label = if coordinated {
+            "coordinated"
+        } else if target.filterable {
+            "ignored"
+        } else {
+            "no stable key"
+        };
+        let key = if target.filterable {
+            target.key.as_str()
+        } else {
+            "-"
+        };
+        println!(
+            "  - {} [{}; {}; key={}]",
+            target.label, listed_label, coordinated_label, key
+        );
+        if !target.detail.is_empty() {
+            println!("    {}", target.detail);
+        }
+    }
 }
 
 fn run_config(args: &[String]) -> Result<()> {
@@ -825,6 +920,14 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::U32,
     },
     ConfigSpec {
+        name: "other_mpris_filter_mode",
+        kind: ConfigKind::String,
+    },
+    ConfigSpec {
+        name: "other_mpris_filter_list",
+        kind: ConfigKind::StringList,
+    },
+    ConfigSpec {
         name: "pipewire_ducking_enabled",
         kind: ConfigKind::Bool,
     },
@@ -843,6 +946,14 @@ const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "pipewire_ducking_volume",
         kind: ConfigKind::F64,
+    },
+    ConfigSpec {
+        name: "pipewire_filter_mode",
+        kind: ConfigKind::String,
+    },
+    ConfigSpec {
+        name: "pipewire_filter_list",
+        kind: ConfigKind::StringList,
     },
     ConfigSpec {
         name: "sponsorblock_enabled",
@@ -999,6 +1110,17 @@ seconds after peer players stop; `0` means resume immediately after they stop.\n
                 )
             )
         ),
+        "other_mpris_filter_mode" => "Switches how `other_mpris_filter_list` is interpreted.\n\
+Values:\n  - `blacklist`: coordinate with every current MPRIS player except listed identifiers.\n  - \
+`whitelist`: coordinate only with listed MPRIS identifiers.\nAn empty blacklist preserves the \
+default behavior; an empty whitelist ignores every peer player."
+            .to_string(),
+        "other_mpris_filter_list" => "Comma-separated MPRIS identifiers for the current filter \
+mode.\nStatic saves app-level identifiers, matching entries case-insensitively against the peer \
+desktop entry, normalized MPRIS app key, and identity. Runtime instance bus names are shown for \
+diagnostics but are not saved as filter keys. Use the settings UI or `static coordination list` to \
+discover current identifiers."
+            .to_string(),
         "pipewire_ducking_enabled" => format!(
             "Master switch for PipeWire-based coordination with non-MPRIS audio such as games, \
 calls, or browsers.\nWhen enabled, Static watches for active foreign streams and then either \
@@ -1058,6 +1180,17 @@ Static can punch through other audio when that is useful.\n{}",
                 )
             )
         ),
+        "pipewire_filter_mode" => "Switches how `pipewire_filter_list` is interpreted.\nValues:\n  - \
+`blacklist`: coordinate with every current foreign PipeWire stream except listed identifiers.\n  - \
+`whitelist`: coordinate only with listed PipeWire identifiers.\nAn empty blacklist preserves the \
+default behavior; an empty whitelist ignores every foreign stream."
+            .to_string(),
+        "pipewire_filter_list" => "Comma-separated PipeWire identifiers for the current filter \
+mode.\nStatic matches entries case-insensitively against the stream application name, binary, \
+media name, and node labels. Runtime-only node ids and process ids are shown for diagnostics but \
+are not saved as stable filter keys. Use the settings UI or `static coordination list` to discover \
+current identifiers."
+            .to_string(),
         "sponsorblock_enabled" => format!(
             "Controls whether Static loads SponsorBlock metadata and uses it to skip configured \
 segment categories during playback.\n{}",
@@ -1120,6 +1253,8 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "other_mpris_halt_auto_resume_secs" => {
             settings.other_mpris_halt_auto_resume_secs.to_string()
         }
+        "other_mpris_filter_mode" => settings.other_mpris_filter_mode.as_str().to_string(),
+        "other_mpris_filter_list" => settings.other_mpris_filter_list.join(","),
         "pipewire_ducking_enabled" => yes_no_bool(settings.pipewire_ducking_enabled),
         "pipewire_pause_mode" => settings.pipewire_pause_mode.as_str().to_string(),
         "pipewire_pause_halt_auto_resume_secs" => {
@@ -1127,6 +1262,8 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         }
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
         "pipewire_ducking_volume" => settings.pipewire_ducking_volume.to_string(),
+        "pipewire_filter_mode" => settings.pipewire_filter_mode.as_str().to_string(),
+        "pipewire_filter_list" => settings.pipewire_filter_list.join(","),
         "sponsorblock_enabled" => yes_no_bool(settings.sponsorblock_enabled),
         "sponsorblock_categories" => settings.sponsorblock_categories.join(","),
         other => return Err(anyhow::anyhow!("Unknown config key `{other}`")),
@@ -1171,6 +1308,12 @@ pub(crate) fn apply_config_value(
             settings.other_mpris_halt_auto_resume_secs =
                 parse_u32(trimmed)?.max(OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS)
         }
+        "other_mpris_filter_mode" => {
+            settings.other_mpris_filter_mode = parse_coordination_filter_mode(trimmed)?
+        }
+        "other_mpris_filter_list" => {
+            settings.other_mpris_filter_list = parse_coordination_filter_list(trimmed)
+        }
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled = parse_bool(trimmed)?,
         "pipewire_pause_mode" => settings.pipewire_pause_mode = parse_coordination_mode(trimmed)?,
         "pipewire_pause_halt_auto_resume_secs" => {
@@ -1186,6 +1329,12 @@ pub(crate) fn apply_config_value(
                 PIPEWIRE_DUCKING_VOLUME_UI_MIN,
                 PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
             )
+        }
+        "pipewire_filter_mode" => {
+            settings.pipewire_filter_mode = parse_coordination_filter_mode(trimmed)?
+        }
+        "pipewire_filter_list" => {
+            settings.pipewire_filter_list = parse_coordination_filter_list(trimmed)
         }
         "sponsorblock_enabled" => settings.sponsorblock_enabled = parse_bool(trimmed)?,
         "sponsorblock_categories" => {
@@ -1215,6 +1364,21 @@ fn parse_coordination_mode(value: &str) -> Result<CoordinationMode> {
     CoordinationMode::from_str(value).ok_or_else(|| {
         anyhow::anyhow!("Expected one of `off`, `halt`, or `halt_auto`, got `{value}`")
     })
+}
+
+fn parse_coordination_filter_mode(value: &str) -> Result<CoordinationFilterMode> {
+    CoordinationFilterMode::from_str(value)
+        .ok_or_else(|| anyhow::anyhow!("Expected one of `blacklist` or `whitelist`, got `{value}`"))
+}
+
+fn parse_coordination_filter_list(value: &str) -> Vec<String> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    sanitize_coordination_filter_entries(&values)
 }
 
 fn parse_u32(value: &str) -> Result<u32> {

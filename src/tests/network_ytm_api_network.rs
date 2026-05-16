@@ -622,6 +622,26 @@ fn reload_page_player_response_is_detected() {
 }
 
 #[test]
+fn music_watch_html_exposes_canonical_replacement_video_id() {
+    let html = r#"
+        <script>
+        ytcfg.set({"INITIAL_ENDPOINT":"{\"watchEndpoint\":{\"videoId\":\"Uk3Hx5Ed-gs\"}}"});
+        </script>
+        <link rel="canonical" href="https://music.youtube.com/watch?v=Uk3Hx5Ed-gs">
+        <title>No Friends - Female Version</title>
+    "#;
+
+    assert_eq!(
+        YtMusicClient::replacement_video_id_from_music_watch_html("q41_0g0vKWo", html).as_deref(),
+        Some("Uk3Hx5Ed-gs")
+    );
+    assert_eq!(
+        YtMusicClient::replacement_video_id_from_music_watch_html("Uk3Hx5Ed-gs", html),
+        None
+    );
+}
+
+#[test]
 fn tracking_player_body_carries_playlist_identity_and_cpn() {
     let profile = YtmWebProfile::fallback();
     let body = YtMusicClient::tracking_player_body(

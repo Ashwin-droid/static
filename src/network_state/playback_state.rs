@@ -5,6 +5,11 @@ use crate::network::{SongRating, TrackingInfo};
 
 use super::session_state::NetworkState;
 
+pub(crate) struct ResolvedAudioStreamUrl {
+    pub video_id: String,
+    pub url: String,
+}
+
 impl NetworkState {
     pub fn song_rating(&self, video_id: &str) -> Result<SongRating> {
         self.client.get_song_rating(video_id)
@@ -36,6 +41,14 @@ impl NetworkState {
 
     pub fn audio_stream_url(&self, video_id: &str) -> Result<String> {
         self.client.get_audio_url_no_track(video_id)
+    }
+
+    pub fn resolved_audio_stream_url(&self, video_id: &str) -> Result<ResolvedAudioStreamUrl> {
+        let resolved = self.client.get_audio_url_no_track_resolved(video_id)?;
+        Ok(ResolvedAudioStreamUrl {
+            video_id: resolved.video_id,
+            url: resolved.url,
+        })
     }
 
     pub fn get_audio_url_no_track(&self, video_id: &str) -> Result<String> {

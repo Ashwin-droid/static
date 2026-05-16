@@ -105,6 +105,17 @@ impl PlaybackSource {
     }
 }
 
+struct PreparedPlayback {
+    uri: String,
+    source: PlaybackSource,
+    video_id: String,
+}
+
+struct CacheAudioDownload {
+    video_id: String,
+    audio: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PipeWireSuppressionMode {
     None,
@@ -2021,8 +2032,9 @@ fn start_probe_playback(
     Ok(())
 }
 
-fn probe_track(state: &mut DaemonState, track: Track) -> Result<()> {
-    let (prepared_uri, playback_source) = prepare_playback(state, &track.video_id)?;
+fn probe_track(state: &mut DaemonState, mut track: Track) -> Result<()> {
+    let prepared = prepare_playback(state, &track.video_id)?;
+    apply_prepared_video_id_to_track(state, None, &mut track, &prepared.video_id);
     if state.probe_context.is_none() {
         let probe_restore = capture_probe_restore_state(state);
         maybe_persist_playback_state(state, true);
@@ -2030,7 +2042,7 @@ fn probe_track(state: &mut DaemonState, track: Track) -> Result<()> {
     }
 
     suspend_playback_for_probe(state);
-    start_probe_playback(state, track, prepared_uri, playback_source)
+    start_probe_playback(state, track, prepared.uri, prepared.source)
 }
 
 fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result<()> {
@@ -2751,23 +2763,24 @@ fn play_index_with_startup_retries(
     state.player = PlaybackEngine::new();
     state.probe_context = None;
 
-    let track = state
+    let mut track = state
         .queue
         .get(index)
         .cloned()
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
-    let (prepared_uri, playback_source) = prepare_playback(state, &track.video_id)?;
+    let prepared = prepare_playback(state, &track.video_id)?;
+    apply_prepared_video_id_to_track(state, Some(index), &mut track, &prepared.video_id);
     let startup_attempt = startup_retries.saturating_add(1);
     state.queue_index = index;
     mark_radio_touched_through(state, index);
     eprintln!(
         "[DAEMON] starting playback for {} from {} (startup attempt {startup_attempt}/{})",
         track.video_id,
-        playback_source.label(),
+        prepared.source.label(),
         playback_start_attempt_total(),
     );
     state.player.set_volume(steady_output_volume(state));
-    state.player.play_uri(&prepared_uri);
+    state.player.play_uri(&prepared.uri);
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -2775,7 +2788,7 @@ fn play_index_with_startup_retries(
         title: track.title.clone(),
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
-        playback_source,
+        playback_source: prepared.source,
         reporting_enabled: !suppress_reporting,
         rating: SongRating::Indifferent,
         tracking: None,
@@ -2852,27 +2865,80 @@ fn stop_playback(state: &mut DaemonState, exiting: bool) {
     sync_mpris(state);
 }
 
-fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<(String, PlaybackSource)> {
+fn apply_prepared_video_id_to_track(
+    state: &mut DaemonState,
+    queue_index: Option<usize>,
+    track: &mut Track,
+    prepared_video_id: &str,
+) {
+    if track.video_id == prepared_video_id {
+        return;
+    }
+
+    let old_video_id = std::mem::replace(&mut track.video_id, prepared_video_id.to_string());
+    if let Some(index) = queue_index {
+        if let Some(queue_track) = state.queue.get_mut(index) {
+            if queue_track.video_id == old_video_id {
+                queue_track.video_id = prepared_video_id.to_string();
+            }
+        }
+    }
+
+    let artist = artist_string(track);
+    if let Err(err) = state.cache.upsert_track_metadata(
+        prepared_video_id,
+        &track.title,
+        &artist,
+        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+    ) {
+        eprintln!(
+            "[PLAYER] failed to persist canonical metadata for {old_video_id} -> {prepared_video_id}: {err}"
+        );
+    }
+    eprintln!("[PLAYER] using canonical video id {prepared_video_id} for stale id {old_video_id}");
+}
+
+fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<PreparedPlayback> {
     if state.settings.prefer_local_cache_on_playback {
         if let Some(cached_path) = state.cache.get_cached_audio(video_id) {
             return url::Url::from_file_path(cached_path)
-                .map(|url| (url.to_string(), PlaybackSource::OfflineCache))
+                .map(|url| PreparedPlayback {
+                    uri: url.to_string(),
+                    source: PlaybackSource::OfflineCache,
+                    video_id: video_id.to_string(),
+                })
                 .map_err(|_| anyhow!("Failed to build file URL for cached audio"));
         }
         if state.settings.prefetch_enabled {
             if let Some(temp_path) = state.cache.get_temp_audio(video_id) {
                 return url::Url::from_file_path(temp_path)
-                    .map(|url| (url.to_string(), PlaybackSource::TempPrefetch))
+                    .map(|url| PreparedPlayback {
+                        uri: url.to_string(),
+                        source: PlaybackSource::TempPrefetch,
+                        video_id: video_id.to_string(),
+                    })
                     .map_err(|_| anyhow!("Failed to build file URL for prefetched audio"));
             }
         }
     }
 
     let client = ensure_client_loaded(state)?;
-    client
-        .get_audio_url_no_track(video_id)
-        .map(|url| (url, PlaybackSource::RemoteStream))
-        .map_err(|err| anyhow!("Playback failed: {err}"))
+    let resolved = client
+        .resolved_audio_stream_url(video_id)
+        .map_err(|err| anyhow!("Playback failed: {err}"))?;
+    if resolved.video_id != video_id {
+        if let Err(err) = state.cache.replace_video_id(video_id, &resolved.video_id) {
+            eprintln!(
+                "[PLAYER] failed to migrate stale video id {video_id} -> {}: {err}",
+                resolved.video_id
+            );
+        }
+    }
+    Ok(PreparedPlayback {
+        uri: resolved.url,
+        source: PlaybackSource::RemoteStream,
+        video_id: resolved.video_id,
+    })
 }
 
 fn should_retry_after_offline_cache_failure(
@@ -3186,10 +3252,14 @@ fn sync_auto_offline_cache(
 
     for video_id in to_download {
         eprintln!("[CACHE] downloading {video_id} for offline...");
-        let audio = match download_audio_for_cache(client, &video_id, "CACHE") {
-            Ok(bytes) => {
-                eprintln!("[CACHE] {video_id} downloaded {} KB", bytes.len() / 1024);
-                bytes
+        let download = match download_audio_for_cache(cache, client, &video_id, "CACHE") {
+            Ok(download) => {
+                eprintln!(
+                    "[CACHE] {} downloaded {} KB",
+                    download.video_id,
+                    download.audio.len() / 1024
+                );
+                download
             }
             Err(err) => {
                 eprintln!("[CACHE] download failed for {video_id}: {err}");
@@ -3197,11 +3267,13 @@ fn sync_auto_offline_cache(
             }
         };
 
-        let thumb_url = cache.get_thumbnail_url(&video_id);
+        let thumb_url = cache
+            .get_thumbnail_url(&download.video_id)
+            .or_else(|| cache.get_thumbnail_url(&video_id));
         let art = thumb_url.as_deref().and_then(fetch_thumbnail_bytes);
 
-        let _ = cache.store_audio(&video_id, &audio, art.as_deref());
-        hydrate_offline_sponsorblock_cache(cache, &video_id);
+        let _ = cache.store_audio(&download.video_id, &download.audio, art.as_deref());
+        hydrate_offline_sponsorblock_cache(cache, &download.video_id);
     }
 }
 
@@ -3231,8 +3303,8 @@ fn ensure_track_available_offline(
         0,
     );
 
-    let audio = match download_audio_for_cache(client, video_id, log_prefix) {
-        Ok(bytes) => bytes,
+    let download = match download_audio_for_cache(cache, client, video_id, log_prefix) {
+        Ok(download) => download,
         Err(err) => {
             eprintln!("[{log_prefix}] download failed for {video_id}: {err}");
             return false;
@@ -3244,11 +3316,20 @@ fn ensure_track_available_offline(
         .as_ref()
         .and_then(|url| fetch_thumbnail_bytes(url));
 
-    let _ = cache.store_audio(video_id, &audio, art.as_deref());
-    if pin {
-        let _ = cache.pin_offline(video_id);
+    if download.video_id != video_id.as_str() {
+        let artist = artist_string(track);
+        let _ = cache.upsert_track_metadata(
+            &download.video_id,
+            &track.title,
+            &artist,
+            history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        );
     }
-    hydrate_offline_sponsorblock_cache(cache, video_id);
+    let _ = cache.store_audio(&download.video_id, &download.audio, art.as_deref());
+    if pin {
+        let _ = cache.pin_offline(&download.video_id);
+    }
+    hydrate_offline_sponsorblock_cache(cache, &download.video_id);
     true
 }
 
@@ -3260,27 +3341,43 @@ fn cache_media_download_retry_delay(failed_attempt: usize) -> Duration {
 }
 
 fn download_audio_for_cache(
+    cache: &MusicCache,
     client: &NetworkState,
     video_id: &str,
     log_prefix: &str,
-) -> Result<Vec<u8>> {
+) -> Result<CacheAudioDownload> {
+    let mut video_id = video_id.to_string();
     let mut last_error = None;
     let mut saw_media_download_failure = false;
 
     for attempt in 1..=CACHE_MEDIA_DOWNLOAD_ATTEMPTS {
-        let attempt_result = match client.get_audio_url_no_track(video_id) {
-            Ok(url) => download_media_bytes(&url, Some("bytes=0-"))
-                .with_context(|| format!("failed to download media for {video_id}")),
-            Err(err) => Err(err).with_context(|| format!("failed to get audio URL for {video_id}")),
-        };
+        let resolved = client
+            .resolved_audio_stream_url(&video_id)
+            .with_context(|| format!("failed to get audio URL for {video_id}"))?;
+        if resolved.video_id != video_id {
+            cache
+                .replace_video_id(&video_id, &resolved.video_id)
+                .with_context(|| {
+                    format!(
+                        "failed to migrate stale video id {video_id} -> {}",
+                        resolved.video_id
+                    )
+                })?;
+            video_id = resolved.video_id.clone();
+        }
+        let resolved_video_id = resolved.video_id;
+        let attempt_result = download_media_bytes(&resolved.url, Some("bytes=0-"))
+            .with_context(|| format!("failed to download media for {resolved_video_id}"))
+            .map(|audio| CacheAudioDownload {
+                video_id: resolved_video_id,
+                audio,
+            });
 
         match attempt_result {
-            Ok(audio) => return Ok(audio),
+            Ok(download) => return Ok(download),
             Err(err) => {
                 let message = format!("{err:#}");
-                if message.contains("failed to download media for") {
-                    saw_media_download_failure = true;
-                }
+                saw_media_download_failure = true;
                 if attempt < CACHE_MEDIA_DOWNLOAD_ATTEMPTS {
                     eprintln!(
                         "[{log_prefix}] download attempt {attempt}/{CACHE_MEDIA_DOWNLOAD_ATTEMPTS} failed for {video_id}: {message}; retrying with a fresh URL"
@@ -3296,12 +3393,17 @@ fn download_audio_for_cache(
         eprintln!(
             "[{log_prefix}] WEB_REMIX media download failed for {video_id}; trying Android VR cache fallback"
         );
+        let fallback_video_id = video_id.clone();
         return client
-            .android_vr_audio_stream_url(video_id)
+            .android_vr_audio_stream_url(&video_id)
             .with_context(|| format!("failed to get Android VR audio URL for {video_id}"))
             .and_then(|url| {
                 download_media_bytes(&url, Some("bytes=0-"))
                     .with_context(|| format!("failed to download Android VR media for {video_id}"))
+            })
+            .map(|audio| CacheAudioDownload {
+                video_id: fallback_video_id,
+                audio,
             })
             .or_else(|fallback_err| {
                 if let Some(original_err) = last_error {
@@ -3884,12 +3986,13 @@ fn prefetch_upcoming(state: &mut DaemonState) {
                 continue;
             }
 
-            let Ok(audio) = download_audio_for_cache(&client, &video_id, "PREFETCH") else {
+            let Ok(download) = download_audio_for_cache(&cache, &client, &video_id, "PREFETCH")
+            else {
                 let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             };
 
-            cache.store_temp_audio(&video_id, &audio);
+            cache.store_temp_audio(&download.video_id, &download.audio);
             let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
         }
     });

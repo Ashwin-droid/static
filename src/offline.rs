@@ -4,6 +4,7 @@ pub mod migration_offline;
 pub mod playlist_offline;
 pub mod settings_offline;
 pub mod store_offline;
+pub mod video_id_migration_offline;
 
 pub use settings_offline::{
     AppSettings, CoordinationMode, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,

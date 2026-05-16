@@ -1304,6 +1304,11 @@ pub struct YtMusicClient {
     vr_access_token: std::sync::Mutex<Option<(String, u64)>>,
 }
 
+pub(crate) struct ResolvedAudioUrl {
+    pub video_id: String,
+    pub url: String,
+}
+
 fn cookie_value(cookie: &str, name: &str) -> Option<String> {
     cookie.split(';').map(|s| s.trim()).find_map(|cookie| {
         let (cookie_name, value) = cookie.split_once('=')?;
@@ -2012,36 +2017,150 @@ impl YtMusicClient {
     /// Get just the streaming URL without reporting anything to YouTube.
     /// Use this for cache downloads and other non-playback fetches.
     pub fn get_audio_url_no_track(&self, video_id: &str) -> Result<String> {
-        self.rt.block_on(async {
-            eprintln!("[PLAYER] trying WEB_REMIX client for {video_id}...");
-            let web_remix_err = match self.try_web_remix_audio(video_id).await {
-                Ok(url) => {
-                    eprintln!("[PLAYER] got URL via WEB_REMIX");
-                    return Ok(url);
-                }
-                Err(e) => {
-                    eprintln!("[PLAYER] WEB_REMIX failed: {e}, trying Android VR fallback...");
-                    e
-                }
-            };
+        self.get_audio_url_no_track_resolved(video_id)
+            .map(|resolved| resolved.url)
+    }
 
-            // Android VR stays as the last-ditch playable URL path for offline/cache reliability.
-            match self.try_android_vr_audio(video_id).await {
-                Ok(url) => {
-                    eprintln!("[PLAYER] got direct URL via Android VR fallback");
-                    Ok(url)
-                }
-                Err(vr_err) => {
-                    bail!(
-                        "Could not get audio URL via WEB_REMIX or Android VR: WEB_REMIX: {web_remix_err}; Android VR: {vr_err}"
-                    )
-                }
-            }
-        })
+    pub(crate) fn get_audio_url_no_track_resolved(
+        &self,
+        video_id: &str,
+    ) -> Result<ResolvedAudioUrl> {
+        self.rt
+            .block_on(self.get_audio_url_no_track_resolved_async(video_id))
     }
 
     pub fn get_android_vr_audio_url_no_track(&self, video_id: &str) -> Result<String> {
         self.rt.block_on(self.try_android_vr_audio(video_id))
+    }
+
+    async fn get_audio_url_no_track_resolved_async(
+        &self,
+        video_id: &str,
+    ) -> Result<ResolvedAudioUrl> {
+        match self.try_audio_url_no_track(video_id).await {
+            Ok(url) => {
+                return Ok(ResolvedAudioUrl {
+                    video_id: video_id.to_string(),
+                    url,
+                });
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                if !Self::audio_url_error_may_have_music_replacement(&message) {
+                    return Err(err);
+                }
+
+                match self.music_watch_replacement_video_id(video_id).await {
+                    Ok(Some(replacement)) => {
+                        eprintln!(
+                            "[PLAYER] YouTube Music canonicalized {video_id} -> {replacement}; retrying canonical ID"
+                        );
+                        let url = self
+                            .try_audio_url_no_track(&replacement)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "canonical replacement {replacement} for {video_id} was not playable"
+                                )
+                            })?;
+                        return Ok(ResolvedAudioUrl {
+                            video_id: replacement,
+                            url,
+                        });
+                    }
+                    Ok(None) => return Err(err),
+                    Err(replacement_err) => {
+                        return Err(err.context(format!(
+                            "failed to check YouTube Music canonical watch page for {video_id}: {replacement_err:#}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    async fn try_audio_url_no_track(&self, video_id: &str) -> Result<String> {
+        eprintln!("[PLAYER] trying WEB_REMIX client for {video_id}...");
+        let web_remix_err = match self.try_web_remix_audio(video_id).await {
+            Ok(url) => {
+                eprintln!("[PLAYER] got URL via WEB_REMIX");
+                return Ok(url);
+            }
+            Err(e) => {
+                eprintln!("[PLAYER] WEB_REMIX failed: {e}, trying Android VR fallback...");
+                e
+            }
+        };
+
+        // Android VR stays as the last-ditch playable URL path for offline/cache reliability.
+        match self.try_android_vr_audio(video_id).await {
+            Ok(url) => {
+                eprintln!("[PLAYER] got direct URL via Android VR fallback");
+                Ok(url)
+            }
+            Err(vr_err) => {
+                bail!(
+                    "Could not get audio URL via WEB_REMIX or Android VR: WEB_REMIX: {web_remix_err}; Android VR: {vr_err}"
+                )
+            }
+        }
+    }
+
+    fn audio_url_error_may_have_music_replacement(message: &str) -> bool {
+        message.contains("Video unavailable")
+            || message.contains("This video is not available")
+            || message.contains("status=UNPLAYABLE")
+    }
+
+    async fn music_watch_replacement_video_id(&self, video_id: &str) -> Result<Option<String>> {
+        let watch_url = format!("{YTM_ORIGIN}/watch?v={video_id}");
+        let html = self
+            .http
+            .get(&watch_url)
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("referer", format!("{YTM_ORIGIN}/"))
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch YouTube Music watch page for {video_id}"))?
+            .error_for_status()
+            .with_context(|| {
+                format!("YouTube Music watch page request was rejected for {video_id}")
+            })?
+            .text()
+            .await
+            .with_context(|| format!("Failed to read YouTube Music watch page for {video_id}"))?;
+        Ok(Self::replacement_video_id_from_music_watch_html(
+            video_id, &html,
+        ))
+    }
+
+    fn replacement_video_id_from_music_watch_html(
+        requested_video_id: &str,
+        html: &str,
+    ) -> Option<String> {
+        let canonical_re = Regex::new(
+            r#"<link\s+rel="canonical"\s+href="https://music\.youtube\.com/watch\?v=([A-Za-z0-9_-]{11})""#,
+        )
+        .expect("canonical watch regex should compile");
+        if let Some(video_id) = canonical_re
+            .captures(html)
+            .and_then(|captures| captures.get(1))
+            .map(|match_| match_.as_str())
+            .filter(|video_id| *video_id != requested_video_id)
+        {
+            return Some(video_id.to_string());
+        }
+
+        let endpoint_re = Regex::new(r##"\\?"videoId\\?"\s*:\s*\\?"([A-Za-z0-9_-]{11})\\?""##)
+            .expect("watch endpoint video id regex should compile");
+        endpoint_re
+            .captures_iter(html)
+            .filter_map(|captures| captures.get(1).map(|match_| match_.as_str()))
+            .find(|video_id| *video_id != requested_video_id)
+            .map(str::to_string)
     }
 
     async fn tracking_player_response(

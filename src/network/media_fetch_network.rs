@@ -19,6 +19,7 @@ static DOWNLOAD_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
     BlockingClient::builder()
         .timeout(Duration::from_secs(120))
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0")
+        .http1_only()
         .build()
         .unwrap()
 });
@@ -33,7 +34,8 @@ static THUMB_CLIENT: LazyLock<BlockingClient> = LazyLock::new(|| {
 static THUMBNAIL_BYTES_CACHE: LazyLock<Mutex<HashMap<String, Vec<u8>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-const MEDIA_CHUNK_BYTES: u64 = 1024 * 1024;
+const MEDIA_INITIAL_CHUNK_BYTES: u64 = 512 * 1024;
+const MEDIA_MIN_CHUNK_BYTES: u64 = 64 * 1024;
 const MEDIA_ALT_URL_FOLLOW_LIMIT: usize = 3;
 const TEXT_MEDIA_ERROR_LIMIT_BYTES: usize = 16 * 1024;
 
@@ -46,6 +48,15 @@ fn download_media_bytes_inner(
     range_header: Option<&str>,
     follow_depth: usize,
 ) -> Result<Vec<u8>> {
+    if range_header == Some("bytes=0-") && media_url_is_web_remix(url) {
+        return download_media_bytes_chunked(url, follow_depth).with_context(|| {
+            format!(
+                "WEB_REMIX chunked media download failed for {}",
+                media_url_for_log(url)
+            )
+        });
+    }
+
     let response = send_media_request(url, range_header)?;
     let status = response.status();
     if !status.is_success() {
@@ -103,14 +114,27 @@ fn send_media_request(url: &str, range_header: Option<&str>) -> Result<Response>
 fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8>> {
     let mut audio = Vec::new();
     let mut total_len = None;
+    let mut chunk_bytes = MEDIA_INITIAL_CHUNK_BYTES;
 
     loop {
         let start = audio.len() as u64;
-        let end = start.saturating_add(MEDIA_CHUNK_BYTES - 1);
+        let end = start.saturating_add(chunk_bytes - 1);
         let range_header = format!("bytes={start}-{end}");
         let response = send_media_request(url, Some(&range_header))?;
         let status = response.status();
         if !status.is_success() {
+            if status == StatusCode::FORBIDDEN {
+                if let Some(smaller_chunk_bytes) = smaller_media_chunk_size(chunk_bytes) {
+                    eprintln!(
+                        "[MEDIA] media server rejected {} KiB range for {}; retrying with {} KiB",
+                        chunk_bytes / 1024,
+                        media_url_for_log(url),
+                        smaller_chunk_bytes / 1024
+                    );
+                    chunk_bytes = smaller_chunk_bytes;
+                    continue;
+                }
+            }
             return Err(media_status_error(response, url));
         }
 
@@ -166,10 +190,14 @@ fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8
         if total_len.is_some_and(|len| audio.len() as u64 >= len) {
             return Ok(audio);
         }
-        if total_len.is_none() && chunk.len() < MEDIA_CHUNK_BYTES as usize {
+        if total_len.is_none() && chunk.len() < chunk_bytes as usize {
             return Ok(audio);
         }
     }
+}
+
+fn smaller_media_chunk_size(current: u64) -> Option<u64> {
+    (current > MEDIA_MIN_CHUNK_BYTES).then(|| (current / 2).max(MEDIA_MIN_CHUNK_BYTES))
 }
 
 fn media_status_error(response: Response, url: &str) -> anyhow::Error {
@@ -229,6 +257,15 @@ fn alternate_media_url_from_bytes(bytes: &[u8]) -> Option<String> {
         .host_str()
         .is_some_and(|host| host.ends_with(".googlevideo.com") || host == "googlevideo.com");
     (is_googlevideo && parsed.path().contains("/videoplayback")).then(|| value.to_string())
+}
+
+fn media_url_is_web_remix(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    parsed
+        .query_pairs()
+        .any(|(key, value)| key == "c" && value.eq_ignore_ascii_case("WEB_REMIX"))
 }
 
 fn text_media_response_without_alternate(content_type: &Option<String>, bytes: &[u8]) -> bool {
@@ -312,7 +349,10 @@ pub fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{alternate_media_url_from_bytes, content_range_total, media_url_for_log};
+    use super::{
+        alternate_media_url_from_bytes, content_range_total, media_url_for_log,
+        media_url_is_web_remix, smaller_media_chunk_size,
+    };
 
     #[test]
     fn media_log_url_keeps_shape_without_signed_params() {
@@ -339,6 +379,26 @@ mod tests {
             None
         );
         assert_eq!(alternate_media_url_from_bytes(b"not a url"), None);
+    }
+
+    #[test]
+    fn web_remix_media_urls_are_identified_from_client_query() {
+        assert!(media_url_is_web_remix(
+            "https://rr1---sn-ci5gup-2o9l.googlevideo.com/videoplayback?itag=251&c=WEB_REMIX"
+        ));
+        assert!(media_url_is_web_remix(
+            "https://rr1---sn-ci5gup-2o9l.googlevideo.com/videoplayback?itag=251&c=web_remix"
+        ));
+        assert!(!media_url_is_web_remix(
+            "https://rr1---sn-ci5gup-2o9l.googlevideo.com/videoplayback?itag=251&c=ANDROID_VR"
+        ));
+    }
+
+    #[test]
+    fn chunk_size_retry_stops_at_minimum() {
+        assert_eq!(smaller_media_chunk_size(512 * 1024), Some(256 * 1024));
+        assert_eq!(smaller_media_chunk_size(128 * 1024), Some(64 * 1024));
+        assert_eq!(smaller_media_chunk_size(64 * 1024), None);
     }
 
     #[test]

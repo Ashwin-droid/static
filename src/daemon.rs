@@ -79,6 +79,7 @@ struct ActiveTrack {
     artist: String,
     thumb_url: Option<String>,
     playback_source: PlaybackSource,
+    playback_uri: String,
     reporting_enabled: bool,
     rating: SongRating,
     tracking: Option<TrackingInfo>,
@@ -2103,6 +2104,7 @@ fn start_probe_playback(
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
         playback_source,
+        playback_uri: prepared_uri,
         reporting_enabled: false,
         rating: SongRating::Indifferent,
         tracking: None,
@@ -2759,8 +2761,12 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
         state.active_track.is_some(),
     ) {
         PreviousAction::RestartCurrent => {
-            seek_to_position(state, ClockTime::ZERO);
-            Ok(())
+            if state.probe_context.is_some() {
+                seek_to_position(state, ClockTime::ZERO);
+                Ok(())
+            } else {
+                restart_current_track(state)
+            }
         }
         PreviousAction::PlayIndex(index) => play_index(state, index),
         PreviousAction::Noop => Ok(()),
@@ -2856,28 +2862,89 @@ fn play_index_with_startup_retries(
         TrackRepeatBudgetMode::ResetForCurrentTrack => None,
         TrackRepeatBudgetMode::PreserveCurrent => state.track_repeat_loops_left,
     };
-    stop_playback(state, false);
-    state.player = PlaybackEngine::new();
-    state.probe_context = None;
-
-    let mut track = state
+    let track = state
         .queue
         .get(index)
         .cloned()
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
     let prepared = prepare_playback(state, &track.video_id)?;
-    apply_prepared_video_id_to_track(state, Some(index), &mut track, &prepared.video_id);
+
+    stop_playback(state, false);
+    state.player = PlaybackEngine::new();
+    state.probe_context = None;
+
+    start_prepared_playback(
+        state,
+        index,
+        track,
+        prepared,
+        startup_retries,
+        budget_mode,
+        suppress_reporting,
+        preserved_track_repeat_loops_left,
+    )
+}
+
+fn restart_current_track(state: &mut DaemonState) -> Result<()> {
+    let Some(active) = state.active_track.as_ref() else {
+        return Ok(());
+    };
+    let index = state.queue_index;
+    let Some(track) = state.queue.get(index).cloned() else {
+        seek_to_position(state, ClockTime::ZERO);
+        return Ok(());
+    };
+    let prepared = PreparedPlayback {
+        uri: active.playback_uri.clone(),
+        source: active.playback_source,
+        video_id: active.video_id.clone(),
+    };
+    let suppress_reporting = !active.reporting_enabled;
+    let preserved_track_repeat_loops_left = state.track_repeat_loops_left;
+
+    stop_playback(state, false);
+    state.player = PlaybackEngine::new();
+    state.probe_context = None;
+
+    start_prepared_playback(
+        state,
+        index,
+        track,
+        prepared,
+        0,
+        TrackRepeatBudgetMode::PreserveCurrent,
+        suppress_reporting,
+        preserved_track_repeat_loops_left,
+    )
+}
+
+fn start_prepared_playback(
+    state: &mut DaemonState,
+    index: usize,
+    mut track: Track,
+    prepared: PreparedPlayback,
+    startup_retries: u8,
+    budget_mode: TrackRepeatBudgetMode,
+    suppress_reporting: bool,
+    preserved_track_repeat_loops_left: Option<u32>,
+) -> Result<()> {
+    let PreparedPlayback {
+        uri: playback_uri,
+        source: playback_source,
+        video_id: prepared_video_id,
+    } = prepared;
+    apply_prepared_video_id_to_track(state, Some(index), &mut track, &prepared_video_id);
     let startup_attempt = startup_retries.saturating_add(1);
     state.queue_index = index;
     mark_radio_touched_through(state, index);
     eprintln!(
         "[DAEMON] starting playback for {} from {} (startup attempt {startup_attempt}/{})",
         track.video_id,
-        prepared.source.label(),
+        playback_source.label(),
         playback_start_attempt_total(),
     );
     state.player.set_volume(steady_output_volume(state));
-    state.player.play_uri(&prepared.uri);
+    state.player.play_uri(&playback_uri);
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -2885,7 +2952,8 @@ fn play_index_with_startup_retries(
         title: track.title.clone(),
         artist: artist_string(&track),
         thumb_url: track.thumbnail_url.clone(),
-        playback_source: prepared.source,
+        playback_source,
+        playback_uri,
         reporting_enabled: !suppress_reporting,
         rating: SongRating::Indifferent,
         tracking: None,
@@ -4023,12 +4091,9 @@ fn prefetch_upcoming(state: &mut DaemonState) {
     }
 
     let prefetch_ahead = state.settings.prefetch_ahead.clamp(1, 12) as usize;
-    let start = state.queue_index.saturating_add(1);
-    let to_fetch = state
-        .queue
-        .iter()
-        .skip(start)
-        .take(prefetch_ahead)
+    let to_fetch = prefetch_candidate_indices(state.queue.len(), state.queue_index, prefetch_ahead)
+        .into_iter()
+        .filter_map(|index| state.queue.get(index))
         .filter(|track| {
             !state.cache.is_cached(&track.video_id)
                 && state.cache.get_temp_audio(&track.video_id).is_none()
@@ -4093,6 +4158,25 @@ fn prefetch_upcoming(state: &mut DaemonState) {
             let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
         }
     });
+}
+
+fn prefetch_candidate_indices(
+    queue_len: usize,
+    queue_index: usize,
+    prefetch_ahead: usize,
+) -> Vec<usize> {
+    if queue_len == 0 {
+        return Vec::new();
+    }
+
+    let mut indices = Vec::new();
+    if queue_index > 0 {
+        indices.push(queue_index - 1);
+    }
+
+    let start = queue_index.saturating_add(1);
+    indices.extend(start..start.saturating_add(prefetch_ahead).min(queue_len));
+    indices
 }
 
 fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {

@@ -8,7 +8,7 @@ use super::{
     mpris_position_millis_for_track, natural_end_target_index, next_repeat_state_after_natural_end,
     pause_previous_threshold_clock_for_track, pending_mpris_transport_decision,
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
-    playback_start_stalled, previous_action, previous_threshold_millis,
+    playback_start_stalled, prefetch_candidate_indices, previous_action, previous_threshold_millis,
     radio_chips_with_replacement, rearm_track_repeat_loops_for_snapshot,
     reset_previous_threshold_clock_for_track, resolve_pipewire_suppression_mode,
     should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
@@ -30,6 +30,7 @@ fn test_active_track(started_at: Instant) -> ActiveTrack {
         artist: "Test Artist".to_string(),
         thumb_url: None,
         playback_source: PlaybackSource::RemoteStream,
+        playback_uri: "https://example.test/audio".to_string(),
         reporting_enabled: true,
         rating: SongRating::Indifferent,
         tracking: None,
@@ -141,6 +142,16 @@ fn previous_threshold_resets_after_restarting_current_track() {
     reset_previous_threshold_clock_for_track(&mut track, true);
 
     assert!(previous_threshold_millis(&track) < PREVIOUS_TRACK_THRESHOLD_MILLIS);
+}
+
+#[test]
+fn prefetch_candidates_include_previous_before_upcoming() {
+    assert_eq!(prefetch_candidate_indices(6, 3, 2), vec![2, 4, 5]);
+}
+
+#[test]
+fn prefetch_candidates_do_not_wrap_before_queue_start() {
+    assert_eq!(prefetch_candidate_indices(3, 0, 2), vec![1, 2]);
 }
 
 #[test]

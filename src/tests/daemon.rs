@@ -6,20 +6,21 @@ use super::{
     dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
     hide_timing_for_track, mpris_app_key_from_bus, mpris_halt_auto_peer_transition,
     mpris_position_millis_for_track, natural_end_target_index, next_repeat_state_after_natural_end,
-    pause_previous_threshold_clock_for_track, pending_mpris_transport_decision,
+    note_sponsorblock_auto_skip, pending_mpris_transport_decision,
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
-    playback_start_stalled, prefetch_candidate_indices, previous_action, previous_threshold_millis,
-    radio_chips_with_replacement, rearm_track_repeat_loops_for_snapshot,
-    reset_previous_threshold_clock_for_track, resolve_pipewire_suppression_mode,
-    should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
-    should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
-    should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-    should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
+    playback_start_stalled, prefetch_candidate_indices, previous_action,
+    previous_action_position_millis_for_track, radio_chips_with_replacement,
+    rearm_track_repeat_loops_for_snapshot, resolve_pipewire_suppression_mode,
+    should_count_paused_idle_for_shutdown, should_emit_live_mpris_seeked_hint,
+    should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
+    should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
+    should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+    should_wait_for_radio_extension_at_natural_end,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
 use crate::models::{RadioChip, RadioVirtualPlaylist};
-use crate::network::SongRating;
+use crate::network::{SongRating, SponsorSegment};
 use crate::offline::{AppSettings, CoordinationMode};
 use std::time::{Duration, Instant};
 
@@ -36,8 +37,8 @@ fn test_active_track(started_at: Instant) -> ActiveTrack {
         tracking: None,
         started_at,
         last_position_millis: 0,
-        previous_threshold_played_millis: 0,
-        previous_threshold_resumed_at: Some(started_at),
+        sponsorblock_auto_skip_offset_millis: 0,
+        sponsorblock_skipped_segment_ids: Default::default(),
         startup_seek_millis: None,
         startup_retries: 0,
         awaiting_fresh_position: true,
@@ -75,6 +76,15 @@ fn test_track(video_id: &str) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+    }
+}
+
+fn test_sponsor_segment(uuid: &str, start_seconds: f64, end_seconds: f64) -> SponsorSegment {
+    SponsorSegment {
+        uuid: uuid.to_string(),
+        category: "intro".to_string(),
+        action_type: "skip".to_string(),
+        segment: vec![start_seconds, end_seconds],
     }
 }
 
@@ -123,25 +133,65 @@ fn previous_restarts_current_track_after_threshold() {
 }
 
 #[test]
-fn previous_threshold_ignores_sponsorblock_jump_position() {
-    let started_at = Instant::now() - Duration::from_millis(1_500);
+fn previous_position_uses_resumed_seekbar_position_before_fresh_sample() {
+    let started_at = Instant::now() - Duration::from_millis(500);
     let mut track = test_active_track(started_at);
-    track.awaiting_fresh_position = false;
-    track.last_position_millis = 75_000;
+    track.startup_seek_millis = Some(180_000);
 
-    assert!(previous_threshold_millis(&track) < PREVIOUS_TRACK_THRESHOLD_MILLIS);
+    assert_eq!(
+        previous_action_position_millis_for_track(&track, Some(0), None),
+        180_000
+    );
 }
 
 #[test]
-fn previous_threshold_resets_after_restarting_current_track() {
-    let started_at = Instant::now() - Duration::from_secs(10);
+fn previous_position_treats_hidden_startup_seekbar_as_zero() {
+    let started_at = Instant::now() - Duration::from_millis(500);
+    let track = test_active_track(started_at);
+
+    assert_eq!(
+        previous_action_position_millis_for_track(&track, Some(75_000), None),
+        0
+    );
+}
+
+#[test]
+fn previous_position_subtracts_actual_sponsorblock_skip() {
+    let started_at = Instant::now() - Duration::from_secs(2);
     let mut track = test_active_track(started_at);
     track.awaiting_fresh_position = false;
+    track.last_position_millis = 8_050;
+    track.sponsorblock_auto_skip_offset_millis = 8_050;
 
-    pause_previous_threshold_clock_for_track(&mut track);
-    reset_previous_threshold_clock_for_track(&mut track, true);
+    assert!(
+        previous_action_position_millis_for_track(&track, Some(8_050), None)
+            < PREVIOUS_TRACK_THRESHOLD_MILLIS
+    );
+}
 
-    assert!(previous_threshold_millis(&track) < PREVIOUS_TRACK_THRESHOLD_MILLIS);
+#[test]
+fn previous_position_keeps_raw_seekbar_when_sponsorblock_did_not_skip() {
+    let started_at = Instant::now() - Duration::from_secs(2);
+    let mut track = test_active_track(started_at);
+    track.awaiting_fresh_position = false;
+    track.last_position_millis = 8_050;
+
+    assert_eq!(
+        previous_action_position_millis_for_track(&track, Some(8_050), None),
+        8_050
+    );
+}
+
+#[test]
+fn sponsorblock_skip_offset_records_each_segment_once() {
+    let started_at = Instant::now() - Duration::from_secs(2);
+    let mut track = test_active_track(started_at);
+    let segment = test_sponsor_segment("intro-1", 0.0, 8.0);
+
+    note_sponsorblock_auto_skip(&mut track, &segment, 250, 8_050);
+    note_sponsorblock_auto_skip(&mut track, &segment, 250, 8_050);
+
+    assert_eq!(track.sponsorblock_auto_skip_offset_millis, 7_800);
 }
 
 #[test]
@@ -510,6 +560,32 @@ fn live_mpris_position_sync_runs_when_position_advances_after_interval() {
         Some(1_250),
         Some(now - Duration::from_millis(300)),
         now
+    ));
+}
+
+#[test]
+fn paused_idle_shutdown_timer_counts_only_plain_paused_playback() {
+    assert!(should_count_paused_idle_for_shutdown(
+        true, true, false, false, false
+    ));
+    assert!(!should_count_paused_idle_for_shutdown(
+        false, true, false, false, false
+    ));
+    assert!(!should_count_paused_idle_for_shutdown(
+        true, false, false, false, false
+    ));
+}
+
+#[test]
+fn paused_idle_shutdown_timer_ignores_coordination_holds() {
+    assert!(!should_count_paused_idle_for_shutdown(
+        true, true, true, false, false
+    ));
+    assert!(!should_count_paused_idle_for_shutdown(
+        true, true, false, true, false
+    ));
+    assert!(!should_count_paused_idle_for_shutdown(
+        true, true, false, false, true
     ));
 }
 

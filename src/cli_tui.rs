@@ -34,8 +34,9 @@ use ratatui_image::{
 use crate::cli::{
     apply_config_value, artist_string, format_config_value, format_millis, format_track_summary,
     load_local_resume_state, play_track_with_radio, restore_cross_device_queue_via_daemon,
-    restore_playback_snapshot_via_daemon, resume_snapshot_meta, resume_snapshot_track,
-    saved_network_state, should_use_local_resume_for_cross_device,
+    restore_paused_playback_snapshot_via_daemon, restore_playback_snapshot_via_daemon,
+    resume_snapshot_meta, resume_snapshot_track, saved_network_state,
+    should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{
     ActiveTrackSnapshot, CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DaemonClient,

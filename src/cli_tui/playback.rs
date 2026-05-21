@@ -363,7 +363,9 @@ impl InteractiveTui {
         let snapshot = self.playback_snapshot_from_tui_state();
         let has_recoverable_state = snapshot.current_track.is_some() || !snapshot.queue.is_empty();
 
-        let restored = if has_recoverable_state {
+        let restored = if snapshot.paused && snapshot.current_track.is_some() {
+            restore_paused_playback_snapshot_via_daemon(snapshot.clone())?
+        } else if has_recoverable_state {
             restore_playback_snapshot_via_daemon(
                 snapshot.clone(),
                 snapshot.current_track.is_some(),

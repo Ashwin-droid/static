@@ -1043,6 +1043,218 @@ fn search_results_include_top_result_card_sections() {
 }
 
 #[test]
+fn search_results_group_item_section_renderer_rows() {
+    let json = json!({
+        "contents": {
+            "tabbedSearchResultsRenderer": {
+                "tabs": [{
+                    "tabRenderer": {
+                        "content": {
+                            "sectionListRenderer": {
+                                "contents": [
+                                    {
+                                        "musicCardShelfRenderer": {
+                                            "title": {
+                                                "runs": [{
+                                                    "text": "Headlights (feat. KIDDO)",
+                                                    "navigationEndpoint": {
+                                                        "watchEndpoint": {
+                                                            "videoId": "QX1KRphxnQc"
+                                                        }
+                                                    }
+                                                }]
+                                            },
+                                            "subtitle": {
+                                                "runs": [
+                                                    { "text": "Song" },
+                                                    { "text": " • " },
+                                                    { "text": "Alok & Alan Walker" },
+                                                    { "text": " • " },
+                                                    { "text": "2:39" }
+                                                ]
+                                            },
+                                            "contents": [
+                                                { "messageRenderer": {} },
+                                                {
+                                                    "musicResponsiveListItemRenderer": {
+                                                        "flexColumns": [
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{
+                                                                            "text": "Headlights video",
+                                                                            "navigationEndpoint": {
+                                                                                "watchEndpoint": {
+                                                                                    "videoId": "video123"
+                                                                                }
+                                                                            }
+                                                                        }]
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "musicResponsiveListItemFlexColumnRenderer": {
+                                                                    "text": {
+                                                                        "runs": [{ "text": "Video • Static Channel • 10M views • 2:40" }]
+                                                                    }
+                                                                }
+                                                            }
+                                                        ]
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    },
+                                    {
+                                        "itemSectionRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{
+                                                                        "text": "Headlights [Extended Mix]",
+                                                                        "navigationEndpoint": {
+                                                                            "watchEndpoint": {
+                                                                                "videoId": "song123"
+                                                                            }
+                                                                        }
+                                                                    }]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{ "text": "Song • Alok & Alan Walker" }]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }]
+                                        }
+                                    },
+                                    {
+                                        "itemSectionRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{
+                                                                        "text": "Headlights",
+                                                                        "navigationEndpoint": {
+                                                                            "browseEndpoint": {
+                                                                                "browseId": "UCartist",
+                                                                                "browseEndpointContextSupportedConfigs": {
+                                                                                    "browseEndpointContextMusicConfig": {
+                                                                                        "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{ "text": "Artist • 299 subscribers" }]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }]
+                                        }
+                                    },
+                                    {
+                                        "itemSectionRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{
+                                                                        "text": "Headlights playlist",
+                                                                        "navigationEndpoint": {
+                                                                            "browseEndpoint": {
+                                                                                "browseId": "VLplaylist",
+                                                                                "browseEndpointContextSupportedConfigs": {
+                                                                                    "browseEndpointContextMusicConfig": {
+                                                                                        "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{ "text": "Playlist • 50 songs" }]
+                                                                }
+                                                            }
+                                                        }
+                                                    ]
+                                                }
+                                            }]
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+    });
+
+    let results = parse_search_results(&json).expect("search results should parse");
+    let section_titles: Vec<_> = results
+        .sections
+        .iter()
+        .map(|section| section.title.as_str())
+        .collect();
+    assert_eq!(
+        section_titles,
+        vec!["Top result", "Songs", "Videos", "Artists", "Playlists"]
+    );
+
+    assert_eq!(results.sections[1].contents.len(), 1);
+    assert_eq!(results.sections[2].contents.len(), 1);
+    assert_eq!(results.sections[3].contents.len(), 1);
+    assert_eq!(results.sections[4].contents.len(), 1);
+
+    let HomeItem::Track(song) = &results.sections[1].contents[0] else {
+        panic!("itemSectionRenderer song should parse as a track");
+    };
+    assert_eq!(song.video_id, "song123");
+
+    let HomeItem::Track(video) = &results.sections[2].contents[0] else {
+        panic!("card shelf related video should parse as a track");
+    };
+    assert_eq!(video.video_id, "video123");
+
+    let HomeItem::BrowseCard(artist) = &results.sections[3].contents[0] else {
+        panic!("itemSectionRenderer artist should parse as a browse card");
+    };
+    assert_eq!(artist.page_type, HomeBrowsePageType::Artist);
+
+    let HomeItem::BrowseCard(playlist) = &results.sections[4].contents[0] else {
+        panic!("itemSectionRenderer playlist should parse as a browse card");
+    };
+    assert_eq!(playlist.page_type, HomeBrowsePageType::Playlist);
+}
+
+#[test]
 fn search_suggestions_include_history_and_regular_items() {
     let json = json!({
         "contents": [{

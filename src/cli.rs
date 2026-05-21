@@ -542,6 +542,32 @@ pub(crate) fn restore_playback_snapshot_via_daemon(
     Ok(restored)
 }
 
+pub(crate) fn restore_paused_playback_snapshot_via_daemon(
+    snapshot: PlaybackSnapshot,
+) -> Result<PlaybackSnapshot> {
+    let client = DaemonClient::new()?;
+    let queue_index = snapshot
+        .queue_index
+        .min(snapshot.queue.len().saturating_sub(1));
+
+    let mut restored = client.set_volume(snapshot.volume)?;
+    if snapshot.queue.is_empty() {
+        return Ok(restored);
+    }
+
+    restored = client.restore_queue_at(
+        snapshot.queue.clone(),
+        queue_index,
+        snapshot.playlist_context.clone(),
+        snapshot.radio_virtual_playlist.clone(),
+        snapshot.repeat_mode,
+        false,
+        true,
+        snapshot.position_millis,
+    )?;
+    Ok(restored)
+}
+
 pub(crate) fn restore_cross_device_queue_via_daemon(
     queue: CrossDeviceQueue,
 ) -> Result<PlaybackSnapshot> {

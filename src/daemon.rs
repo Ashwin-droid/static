@@ -85,8 +85,8 @@ struct ActiveTrack {
     tracking: Option<TrackingInfo>,
     started_at: Instant,
     last_position_millis: u64,
-    previous_threshold_played_millis: u64,
-    previous_threshold_resumed_at: Option<Instant>,
+    sponsorblock_auto_skip_offset_millis: u64,
+    sponsorblock_skipped_segment_ids: HashSet<String>,
     startup_seek_millis: Option<u64>,
     startup_retries: u8,
     awaiting_fresh_position: bool,
@@ -137,6 +137,12 @@ enum VolumeRampCompletion {
 enum PlaybackTransition {
     Immediate,
     Calm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackStartMode {
+    Playing,
+    Paused { position_millis: Option<u64> },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -880,7 +886,7 @@ impl DaemonMprisBridge {
                 queue_len,
                 snapshot.queue_index,
                 snapshot.repeat_mode,
-                snapshot.position_millis,
+                previous_action_position_millis(state),
                 snapshot.current_track.is_some(),
             ),
             PreviousAction::RestartCurrent | PreviousAction::PlayIndex(_)
@@ -1331,6 +1337,7 @@ fn start_radio_from_seed(
             playlist_context,
             Some(radio_virtual_playlist),
             repeat_mode,
+            PlaybackStartMode::Playing,
             suppress_reporting,
         );
     }
@@ -1552,13 +1559,23 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             playlist_context,
             radio_virtual_playlist,
             repeat_mode,
+            pause_other_mpris_players: should_pause_peer_mpris_players,
+            start_paused,
+            start_position_millis,
             suppress_reporting,
         } => {
-            if !queue.is_empty() {
+            if should_pause_peer_mpris_players && !queue.is_empty() {
                 pause_other_mpris_players(state);
             }
             let radio_virtual_playlist =
                 daemon_owned_radio_virtual_playlist(state, radio_virtual_playlist, queue.len());
+            let start_mode = if start_paused {
+                PlaybackStartMode::Paused {
+                    position_millis: start_position_millis,
+                }
+            } else {
+                PlaybackStartMode::Playing
+            };
             match play_queue_at(
                 state,
                 queue,
@@ -1566,7 +1583,8 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 playlist_context,
                 radio_virtual_playlist,
                 repeat_mode,
-                suppress_reporting,
+                start_mode,
+                suppress_reporting || start_paused,
             ) {
                 Ok(()) => {
                     maybe_persist_playback_state(state, true);
@@ -1893,13 +1911,15 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_duck_for_pipewire(state);
     advance_volume_ramp(state);
 
-    if state.active_track.is_some() {
-        if is_logically_paused(state) {
-            if state.paused_since.is_none() {
-                state.paused_since = Some(Instant::now());
-            }
-        } else {
-            state.paused_since = None;
+    if should_count_paused_idle_for_shutdown(
+        state.active_track.is_some(),
+        is_logically_paused(state),
+        state.peer_mpris.is_waiting_for_peer_pause(),
+        mpris_halt_auto_resume_is_pending(state),
+        state.pipewire_pause_active,
+    ) {
+        if state.paused_since.is_none() {
+            state.paused_since = Some(Instant::now());
         }
     } else {
         state.paused_since = None;
@@ -1983,9 +2003,14 @@ fn maintain_playback(state: &mut DaemonState) {
                 } else {
                     TrackRepeatBudgetMode::ResetForCurrentTrack
                 };
-                if let Err(err) =
-                    play_index_with_startup_retries(state, target, 0, budget_mode, false)
-                {
+                if let Err(err) = play_index_with_startup_retries(
+                    state,
+                    target,
+                    0,
+                    budget_mode,
+                    PlaybackStartMode::Playing,
+                    false,
+                ) {
                     eprintln!("[DAEMON] failed to auto-advance: {err}");
                 }
             }
@@ -2000,6 +2025,20 @@ fn maintain_playback(state: &mut DaemonState) {
     }
 }
 
+fn should_count_paused_idle_for_shutdown(
+    has_active_track: bool,
+    logically_paused: bool,
+    mpris_peer_pause_active: bool,
+    mpris_halt_auto_pending: bool,
+    pipewire_pause_active: bool,
+) -> bool {
+    has_active_track
+        && logically_paused
+        && !mpris_peer_pause_active
+        && !mpris_halt_auto_pending
+        && !pipewire_pause_active
+}
+
 fn play_queue_at(
     state: &mut DaemonState,
     queue: Vec<Track>,
@@ -2007,6 +2046,7 @@ fn play_queue_at(
     playlist_context: Option<PlaylistContext>,
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
+    start_mode: PlaybackStartMode,
     suppress_reporting: bool,
 ) -> Result<()> {
     if queue.is_empty() {
@@ -2021,7 +2061,7 @@ fn play_queue_at(
     state.last_radio_append_anchor = None;
     state.repeat_mode = repeat_mode;
     state.track_repeat_loops_left = None;
-    play_index_with_reporting(state, state.queue_index, suppress_reporting)
+    play_index_with_start_mode(state, state.queue_index, start_mode, suppress_reporting)
 }
 
 fn capture_probe_restore_state(state: &DaemonState) -> ProbeRestoreState {
@@ -2110,8 +2150,8 @@ fn start_probe_playback(
         tracking: None,
         started_at: now,
         last_position_millis: 0,
-        previous_threshold_played_millis: 0,
-        previous_threshold_resumed_at: Some(now),
+        sponsorblock_auto_skip_offset_millis: 0,
+        sponsorblock_skipped_segment_ids: HashSet::new(),
         startup_seek_millis: None,
         startup_retries: 0,
         awaiting_fresh_position: true,
@@ -2435,34 +2475,32 @@ fn maybe_sync_pending_mpris_halt_auto_position(state: &DaemonState) {
 }
 
 fn note_explicit_seek(state: &mut DaemonState, target_millis: u64) {
-    let should_reset_previous_threshold = target_millis == 0;
-    {
-        let Some(track) = state.active_track.as_mut() else {
-            return;
-        };
+    let Some(track) = state.active_track.as_mut() else {
+        return;
+    };
 
-        if track.awaiting_fresh_position {
-            if target_millis > 0 {
-                if track.startup_seek_millis != Some(target_millis) {
-                    eprintln!(
-                        "[DAEMON] tracking explicit startup seek for {} at {} ms",
-                        track.video_id, target_millis
-                    );
-                }
-                track.startup_seek_millis = Some(target_millis);
-            } else {
-                track.startup_seek_millis = None;
+    if track.awaiting_fresh_position {
+        if target_millis > 0 {
+            if track.startup_seek_millis != Some(target_millis) {
+                eprintln!(
+                    "[DAEMON] tracking explicit startup seek for {} at {} ms",
+                    track.video_id, target_millis
+                );
             }
+            track.startup_seek_millis = Some(target_millis);
         } else {
             track.startup_seek_millis = None;
         }
-
-        track.last_position_millis = target_millis;
+    } else {
+        track.startup_seek_millis = None;
     }
 
-    if should_reset_previous_threshold {
-        reset_previous_threshold_clock(state);
+    if target_millis == 0 {
+        track.sponsorblock_auto_skip_offset_millis = 0;
+        track.sponsorblock_skipped_segment_ids.clear();
     }
+
+    track.last_position_millis = target_millis;
 }
 
 fn seek_to_position(state: &mut DaemonState, target: ClockTime) {
@@ -2496,34 +2534,30 @@ fn playback_position_confirms_start(track: &ActiveTrack, position_millis: u64) -
             && position_millis >= track.last_position_millis.saturating_add(200))
 }
 
-fn previous_threshold_millis(track: &ActiveTrack) -> u64 {
-    let live_played_millis = track
-        .previous_threshold_resumed_at
-        .map(|resumed_at| resumed_at.elapsed().as_millis() as u64)
-        .unwrap_or(0);
-    track
-        .previous_threshold_played_millis
-        .saturating_add(live_played_millis)
-}
-
-fn pause_previous_threshold_clock_for_track(track: &mut ActiveTrack) {
-    let Some(resumed_at) = track.previous_threshold_resumed_at.take() else {
-        return;
+fn previous_action_position_millis_for_track(
+    track: &ActiveTrack,
+    player_position_millis: Option<u64>,
+    pending_pause_position_millis: Option<u64>,
+) -> u64 {
+    let raw_position_millis = if let Some(position_millis) = pending_pause_position_millis {
+        position_millis
+    } else if track.awaiting_fresh_position {
+        track.startup_seek_millis.unwrap_or(0)
+    } else {
+        player_position_millis.unwrap_or(track.last_position_millis)
     };
-    track.previous_threshold_played_millis = track
-        .previous_threshold_played_millis
-        .saturating_add(resumed_at.elapsed().as_millis() as u64);
+
+    raw_position_millis.saturating_sub(track.sponsorblock_auto_skip_offset_millis)
 }
 
-fn resume_previous_threshold_clock_for_track(track: &mut ActiveTrack) {
-    if track.previous_threshold_resumed_at.is_none() {
-        track.previous_threshold_resumed_at = Some(Instant::now());
-    }
-}
-
-fn reset_previous_threshold_clock_for_track(track: &mut ActiveTrack, playing: bool) {
-    track.previous_threshold_played_millis = 0;
-    track.previous_threshold_resumed_at = playing.then_some(Instant::now());
+fn previous_action_position_millis(state: &DaemonState) -> Option<u64> {
+    let track = state.active_track.as_ref()?;
+    let player_position_millis = state.player.position().map(|position| position.mseconds());
+    Some(previous_action_position_millis_for_track(
+        track,
+        player_position_millis,
+        pending_pause_position_millis(state),
+    ))
 }
 
 fn pending_pause_position_millis(state: &DaemonState) -> Option<u64> {
@@ -2566,7 +2600,6 @@ fn pause_local_playback(state: &mut DaemonState, transition: PlaybackTransition)
     };
 
     if let Some(track) = state.active_track.as_mut() {
-        pause_previous_threshold_clock_for_track(track);
         track.last_position_millis = position_millis;
     }
 
@@ -2600,17 +2633,6 @@ fn resume_local_playback(state: &mut DaemonState, transition: PlaybackTransition
             }
             start_playback_volume_ramp(state, steady_output_volume(state));
         }
-    }
-
-    if let Some(track) = state.active_track.as_mut() {
-        resume_previous_threshold_clock_for_track(track);
-    }
-}
-
-fn reset_previous_threshold_clock(state: &mut DaemonState) {
-    let playing = !is_logically_paused(state);
-    if let Some(track) = state.active_track.as_mut() {
-        reset_previous_threshold_clock_for_track(track, playing);
     }
 }
 
@@ -2695,6 +2717,7 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
             queue_index,
             next_retry,
             TrackRepeatBudgetMode::PreserveCurrent,
+            PlaybackStartMode::Playing,
             false,
         ) {
             eprintln!("[DAEMON] startup retry failed for {video_id}: {err}");
@@ -2743,7 +2766,7 @@ fn previous_action(
 }
 
 fn handle_previous(state: &mut DaemonState) -> Result<()> {
-    let position_millis = state.active_track.as_ref().map(previous_threshold_millis);
+    let position_millis = previous_action_position_millis(state);
     let queue_len = effective_queue_len(
         state.queue.len(),
         state.repeat_mode,
@@ -2774,7 +2797,7 @@ fn handle_previous(state: &mut DaemonState) -> Result<()> {
 }
 
 fn handle_previous_for_user_action(state: &mut DaemonState) -> Result<()> {
-    let position_millis = state.active_track.as_ref().map(previous_threshold_millis);
+    let position_millis = previous_action_position_millis(state);
     let queue_len = effective_queue_len(
         state.queue.len(),
         state.repeat_mode,
@@ -2842,11 +2865,21 @@ fn play_index_with_reporting(
     index: usize,
     suppress_reporting: bool,
 ) -> Result<()> {
+    play_index_with_start_mode(state, index, PlaybackStartMode::Playing, suppress_reporting)
+}
+
+fn play_index_with_start_mode(
+    state: &mut DaemonState,
+    index: usize,
+    start_mode: PlaybackStartMode,
+    suppress_reporting: bool,
+) -> Result<()> {
     play_index_with_startup_retries(
         state,
         index,
         0,
         TrackRepeatBudgetMode::ResetForCurrentTrack,
+        start_mode,
         suppress_reporting,
     )
 }
@@ -2856,6 +2889,7 @@ fn play_index_with_startup_retries(
     index: usize,
     startup_retries: u8,
     budget_mode: TrackRepeatBudgetMode,
+    start_mode: PlaybackStartMode,
     suppress_reporting: bool,
 ) -> Result<()> {
     let preserved_track_repeat_loops_left = match budget_mode {
@@ -2880,6 +2914,7 @@ fn play_index_with_startup_retries(
         prepared,
         startup_retries,
         budget_mode,
+        start_mode,
         suppress_reporting,
         preserved_track_repeat_loops_left,
     )
@@ -2913,6 +2948,7 @@ fn restart_current_track(state: &mut DaemonState) -> Result<()> {
         prepared,
         0,
         TrackRepeatBudgetMode::PreserveCurrent,
+        PlaybackStartMode::Playing,
         suppress_reporting,
         preserved_track_repeat_loops_left,
     )
@@ -2925,6 +2961,7 @@ fn start_prepared_playback(
     prepared: PreparedPlayback,
     startup_retries: u8,
     budget_mode: TrackRepeatBudgetMode,
+    start_mode: PlaybackStartMode,
     suppress_reporting: bool,
     preserved_track_repeat_loops_left: Option<u32>,
 ) -> Result<()> {
@@ -2943,8 +2980,23 @@ fn start_prepared_playback(
         playback_source.label(),
         playback_start_attempt_total(),
     );
-    state.player.set_volume(steady_output_volume(state));
+    let paused_start_position_millis = match start_mode {
+        PlaybackStartMode::Playing => None,
+        PlaybackStartMode::Paused { position_millis } => position_millis,
+    };
+    let start_paused = matches!(start_mode, PlaybackStartMode::Paused { .. });
+    state.player.set_volume(if start_paused {
+        0.0
+    } else {
+        steady_output_volume(state)
+    });
     state.player.play_uri(&playback_uri);
+    if start_paused {
+        state.player.pause();
+        if let Some(position_millis) = paused_start_position_millis {
+            state.player.seek(ClockTime::from_mseconds(position_millis));
+        }
+    }
     state.last_duration_micros.set(None);
     let now = Instant::now();
     state.active_track = Some(ActiveTrack {
@@ -2958,10 +3010,10 @@ fn start_prepared_playback(
         rating: SongRating::Indifferent,
         tracking: None,
         started_at: now,
-        last_position_millis: 0,
-        previous_threshold_played_millis: 0,
-        previous_threshold_resumed_at: Some(now),
-        startup_seek_millis: None,
+        last_position_millis: paused_start_position_millis.unwrap_or(0),
+        sponsorblock_auto_skip_offset_millis: 0,
+        sponsorblock_skipped_segment_ids: HashSet::new(),
+        startup_seek_millis: paused_start_position_millis,
         startup_retries,
         awaiting_fresh_position: true,
     });
@@ -4018,6 +4070,22 @@ fn refresh_sponsorblock_for_current_track(state: &mut DaemonState) {
     });
 }
 
+fn note_sponsorblock_auto_skip(
+    track: &mut ActiveTrack,
+    segment: &SponsorSegment,
+    from_millis: u64,
+    target_millis: u64,
+) {
+    if track
+        .sponsorblock_skipped_segment_ids
+        .insert(segment.uuid.clone())
+    {
+        track.sponsorblock_auto_skip_offset_millis = track
+            .sponsorblock_auto_skip_offset_millis
+            .saturating_add(target_millis.saturating_sub(from_millis));
+    }
+}
+
 fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
     if is_logically_paused(state) {
         return;
@@ -4047,11 +4115,15 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
         return;
     };
 
+    let from_millis = position.mseconds();
     let target_millis = (target_seconds * 1_000.0).round() as u64;
     eprintln!(
         "[SPONSORBLOCK] skipping {} segment on {} to {:.2}s",
         segment.category, video_id, target_seconds
     );
+    if let Some(track) = state.active_track.as_mut() {
+        note_sponsorblock_auto_skip(track, &segment, from_millis, target_millis);
+    }
     let target = ClockTime::from_mseconds(target_millis);
     seek_to_position(state, target);
 
@@ -4475,7 +4547,6 @@ fn freeze_local_playback_for_mpris_halt_auto(state: &mut DaemonState) {
     };
 
     if let Some(track) = state.active_track.as_mut() {
-        pause_previous_threshold_clock_for_track(track);
         track.last_position_millis = position_millis;
     }
 

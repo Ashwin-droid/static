@@ -88,6 +88,10 @@ fn default_coordination_target_filterable() -> bool {
     true
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinationTargetsSnapshot {
     pub mpris: Vec<CoordinationTargetSnapshot>,
@@ -171,6 +175,12 @@ pub enum DaemonRequest {
         playlist_context: Option<PlaylistContext>,
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
+        #[serde(default = "default_true")]
+        pause_other_mpris_players: bool,
+        #[serde(default)]
+        start_paused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_position_millis: Option<u64>,
         #[serde(default)]
         suppress_reporting: bool,
     },
@@ -521,13 +531,65 @@ impl DaemonClient {
         radio_virtual_playlist: Option<RadioVirtualPlaylist>,
         repeat_mode: RepeatMode,
     ) -> Result<PlaybackSnapshot> {
+        self.play_queue_at_with_options(
+            queue,
+            index,
+            playlist_context,
+            radio_virtual_playlist,
+            repeat_mode,
+            true,
+            false,
+            None,
+            false,
+        )
+    }
+
+    pub fn restore_queue_at(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        playlist_context: Option<PlaylistContext>,
+        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+        repeat_mode: RepeatMode,
+        pause_other_mpris_players: bool,
+        start_paused: bool,
+        start_position_millis: Option<u64>,
+    ) -> Result<PlaybackSnapshot> {
+        self.play_queue_at_with_options(
+            queue,
+            index,
+            playlist_context,
+            radio_virtual_playlist,
+            repeat_mode,
+            pause_other_mpris_players,
+            start_paused,
+            start_position_millis,
+            false,
+        )
+    }
+
+    fn play_queue_at_with_options(
+        &self,
+        queue: Vec<Track>,
+        index: usize,
+        playlist_context: Option<PlaylistContext>,
+        radio_virtual_playlist: Option<RadioVirtualPlaylist>,
+        repeat_mode: RepeatMode,
+        pause_other_mpris_players: bool,
+        start_paused: bool,
+        start_position_millis: Option<u64>,
+        suppress_reporting: bool,
+    ) -> Result<PlaybackSnapshot> {
         match self.request(&DaemonRequest::PlayQueueAt {
             queue,
             index,
             playlist_context,
             radio_virtual_playlist,
             repeat_mode,
-            suppress_reporting: false,
+            pause_other_mpris_players,
+            start_paused,
+            start_position_millis,
+            suppress_reporting,
         })? {
             DaemonResponse::State(state) => Ok(state),
             DaemonResponse::Error(err) => bail!(err),

@@ -207,8 +207,48 @@ fn play_queue_at_requests_default_to_reporting_when_flag_is_missing() {
 
     match request {
         DaemonRequest::PlayQueueAt {
-            suppress_reporting, ..
-        } => assert!(!suppress_reporting),
+            pause_other_mpris_players,
+            start_paused,
+            start_position_millis,
+            suppress_reporting,
+            ..
+        } => {
+            assert!(pause_other_mpris_players);
+            assert!(!start_paused);
+            assert_eq!(start_position_millis, None);
+            assert!(!suppress_reporting);
+        }
+        other => panic!("unexpected request variant: {other:?}"),
+    }
+}
+
+#[test]
+fn play_queue_at_requests_can_start_paused_without_peer_mpris_pause() {
+    let request = serde_json::from_value::<DaemonRequest>(json!({
+        "PlayQueueAt": {
+            "queue": [],
+            "index": 0,
+            "playlist_context": null,
+            "radio_virtual_playlist": null,
+            "repeat_mode": "Off",
+            "pause_other_mpris_players": false,
+            "start_paused": true,
+            "start_position_millis": 42_000
+        }
+    }))
+    .expect("request should deserialize");
+
+    match request {
+        DaemonRequest::PlayQueueAt {
+            pause_other_mpris_players,
+            start_paused,
+            start_position_millis,
+            ..
+        } => {
+            assert!(!pause_other_mpris_players);
+            assert!(start_paused);
+            assert_eq!(start_position_millis, Some(42_000));
+        }
         other => panic!("unexpected request variant: {other:?}"),
     }
 }

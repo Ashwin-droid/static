@@ -175,61 +175,30 @@ impl SearchSectionBucket {
     }
 }
 
-fn parse_search_sections(section: &Value) -> Vec<HomeSection> {
-    if let Some(card_shelf) = section.get("musicCardShelfRenderer") {
-        return parse_search_card_shelf(card_shelf).into_iter().collect();
+fn append_grouped_search_item(
+    grouped: &mut Vec<(SearchSectionBucket, Vec<HomeItem>)>,
+    item: HomeItem,
+    bucket: SearchSectionBucket,
+) {
+    if let Some((_, contents)) = grouped.iter_mut().find(|(existing, _)| *existing == bucket) {
+        contents.push(item);
+    } else {
+        grouped.push((bucket, vec![item]));
     }
-
-    section
-        .get("musicShelfRenderer")
-        .map(parse_search_music_shelf)
-        .unwrap_or_default()
 }
 
-fn parse_search_card_shelf(shelf: &Value) -> Option<HomeSection> {
-    let item = parse_search_card_shelf_item(shelf)?;
-    Some(HomeSection {
-        title: "Top result".to_string(),
-        contents: vec![item],
-    })
+fn append_grouped_search_items(
+    grouped: &mut Vec<(SearchSectionBucket, Vec<HomeItem>)>,
+    items: impl IntoIterator<Item = (HomeItem, SearchSectionBucket)>,
+) {
+    for (item, bucket) in items {
+        append_grouped_search_item(grouped, item, bucket);
+    }
 }
 
-fn parse_search_music_shelf(shelf: &Value) -> Vec<HomeSection> {
-    let title = shelf
-        .pointer("/title/runs/0/text")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            shelf
-                .pointer("/title/simpleText")
-                .and_then(|value| value.as_str())
-        })
-        .unwrap_or_default()
-        .to_string();
-
-    let Some(items) = shelf
-        .pointer("/contents")
-        .and_then(|value| value.as_array())
-    else {
-        return Vec::new();
-    };
-
-    if !title.trim().is_empty() {
-        let contents: Vec<HomeItem> = items.iter().filter_map(parse_search_item).collect();
-        return (!contents.is_empty())
-            .then_some(HomeSection { title, contents })
-            .into_iter()
-            .collect();
-    }
-
-    let mut grouped: Vec<(SearchSectionBucket, Vec<HomeItem>)> = Vec::new();
-    for (item, bucket) in items.iter().filter_map(parse_search_item_with_bucket) {
-        if let Some((_, contents)) = grouped.iter_mut().find(|(existing, _)| *existing == bucket) {
-            contents.push(item);
-        } else {
-            grouped.push((bucket, vec![item]));
-        }
-    }
-
+fn grouped_search_sections(
+    mut grouped: Vec<(SearchSectionBucket, Vec<HomeItem>)>,
+) -> Vec<HomeSection> {
     let order = [
         SearchSectionBucket::Songs,
         SearchSectionBucket::Videos,
@@ -256,6 +225,65 @@ fn parse_search_music_shelf(shelf: &Value) -> Vec<HomeSection> {
     }
 
     sections
+}
+
+fn search_shelf_title(shelf: &Value) -> String {
+    shelf
+        .pointer("/title/runs/0/text")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            shelf
+                .pointer("/title/simpleText")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn search_container_items(container: &Value) -> Option<&[Value]> {
+    container
+        .pointer("/contents")
+        .and_then(|value| value.as_array())
+        .map(Vec::as_slice)
+}
+
+fn parse_search_card_shelf(shelf: &Value) -> Option<HomeSection> {
+    let item = parse_search_card_shelf_item(shelf)?;
+    Some(HomeSection {
+        title: "Top result".to_string(),
+        contents: vec![item],
+    })
+}
+
+fn parse_search_music_shelf(shelf: &Value) -> Vec<HomeSection> {
+    let title = search_shelf_title(shelf);
+
+    let Some(items) = search_container_items(shelf) else {
+        return Vec::new();
+    };
+
+    if !title.trim().is_empty() {
+        let contents: Vec<HomeItem> = items.iter().filter_map(parse_search_item).collect();
+        return (!contents.is_empty())
+            .then_some(HomeSection { title, contents })
+            .into_iter()
+            .collect();
+    }
+
+    let mut grouped: Vec<(SearchSectionBucket, Vec<HomeItem>)> = Vec::new();
+    for (item, bucket) in items.iter().filter_map(parse_search_item_with_bucket) {
+        append_grouped_search_item(&mut grouped, item, bucket);
+    }
+
+    grouped_search_sections(grouped)
+}
+
+fn parse_search_container_items(container: &Value) -> Vec<(HomeItem, SearchSectionBucket)> {
+    search_container_items(container)
+        .into_iter()
+        .flatten()
+        .filter_map(parse_search_item_with_bucket)
+        .collect()
 }
 
 fn parse_search_card_shelf_item(renderer: &Value) -> Option<HomeItem> {
@@ -852,8 +880,45 @@ pub fn parse_search_results(json: &Value) -> Result<SearchResult> {
         return Ok(SearchResult::default());
     };
 
+    let mut parsed_sections = Vec::new();
+    let mut grouped_items: Vec<(SearchSectionBucket, Vec<HomeItem>)> = Vec::new();
+
+    for section in sections {
+        if let Some(card_shelf) = section.get("musicCardShelfRenderer") {
+            if let Some(top_result) = parse_search_card_shelf(card_shelf) {
+                parsed_sections.push(top_result);
+            }
+            append_grouped_search_items(
+                &mut grouped_items,
+                parse_search_container_items(card_shelf),
+            );
+            continue;
+        }
+
+        if let Some(music_shelf) = section.get("musicShelfRenderer") {
+            if search_shelf_title(music_shelf).trim().is_empty() {
+                append_grouped_search_items(
+                    &mut grouped_items,
+                    parse_search_container_items(music_shelf),
+                );
+            } else {
+                parsed_sections.extend(parse_search_music_shelf(music_shelf));
+            }
+            continue;
+        }
+
+        if let Some(item_section) = section.get("itemSectionRenderer") {
+            append_grouped_search_items(
+                &mut grouped_items,
+                parse_search_container_items(item_section),
+            );
+        }
+    }
+
+    parsed_sections.extend(grouped_search_sections(grouped_items));
+
     Ok(SearchResult {
-        sections: sections.iter().flat_map(parse_search_sections).collect(),
+        sections: parsed_sections,
     })
 }
 

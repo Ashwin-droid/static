@@ -717,7 +717,7 @@ impl DaemonMprisBridge {
                 ) {
                     return;
                 }
-                if state.active_track.is_some() && !is_logically_paused(&state) {
+                if state.active_track.is_some() && !state.player.is_paused() {
                     if state.probe_context.is_some() {
                         if let Err(err) = restore_after_probe(&mut state, false) {
                             eprintln!("[MPRIS] failed to restore queue after probe Pause: {err}");
@@ -2575,6 +2575,14 @@ fn is_logically_paused(state: &DaemonState) -> bool {
     state.player.is_paused() || is_fading_out_to_pause(state)
 }
 
+fn pause_request_already_satisfied(
+    player_paused: bool,
+    pause_fade_pending: bool,
+    transition: PlaybackTransition,
+) -> bool {
+    player_paused || (pause_fade_pending && transition == PlaybackTransition::Calm)
+}
+
 fn pause_anchor_position_millis(state: &DaemonState) -> Option<u64> {
     pending_pause_position_millis(state).or_else(|| {
         state.active_track.as_ref().map(|track| {
@@ -2592,7 +2600,11 @@ fn pause_anchor_position_millis(state: &DaemonState) -> Option<u64> {
 }
 
 fn pause_local_playback(state: &mut DaemonState, transition: PlaybackTransition) {
-    if is_logically_paused(state) {
+    if pause_request_already_satisfied(
+        state.player.is_paused(),
+        is_fading_out_to_pause(state),
+        transition,
+    ) {
         return;
     }
     let Some(position_millis) = pause_anchor_position_millis(state) else {

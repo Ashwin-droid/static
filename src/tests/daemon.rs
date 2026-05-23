@@ -1,12 +1,13 @@
 use super::{
     ActiveTrack, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition, PLAYBACK_START_TIMEOUT,
     PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision, PendingMprisTransportIntent,
-    PipeWireSuppressionMode, PlaybackSource, PreviousAction, VolumeRamp, VolumeRampCompletion,
-    apply_radio_chips_from_refresh, cache_media_download_retry_delay, current_listened_millis,
-    dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
-    hide_timing_for_track, mpris_app_key_from_bus, mpris_halt_auto_peer_transition,
-    mpris_position_millis_for_track, natural_end_target_index, next_repeat_state_after_natural_end,
-    note_sponsorblock_auto_skip, pending_mpris_transport_decision,
+    PipeWireSuppressionMode, PlaybackSource, PlaybackTransition, PreviousAction, VolumeRamp,
+    VolumeRampCompletion, apply_radio_chips_from_refresh, cache_media_download_retry_delay,
+    current_listened_millis, dedupe_radio_recommendations, effective_queue_len,
+    extend_radio_touched_for_insert, hide_timing_for_track, mpris_app_key_from_bus,
+    mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
+    next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
+    pause_request_already_satisfied, pending_mpris_transport_decision,
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
     playback_start_stalled, prefetch_candidate_indices, previous_action,
     previous_action_position_millis_for_track, radio_chips_with_replacement,
@@ -939,6 +940,25 @@ fn pipewire_unduck_keeps_pending_pause_ramp() {
     assert!(!pipewire_unduck_can_replace_volume_ramp(Some(pause_ramp)));
     assert!(pipewire_unduck_can_replace_volume_ramp(Some(duck_ramp)));
     assert!(pipewire_unduck_can_replace_volume_ramp(None));
+}
+
+#[test]
+fn immediate_pause_interrupts_pending_pause_fade() {
+    assert!(!pause_request_already_satisfied(
+        false,
+        true,
+        PlaybackTransition::Immediate
+    ));
+    assert!(pause_request_already_satisfied(
+        false,
+        true,
+        PlaybackTransition::Calm
+    ));
+    assert!(pause_request_already_satisfied(
+        true,
+        false,
+        PlaybackTransition::Immediate
+    ));
 }
 
 #[test]

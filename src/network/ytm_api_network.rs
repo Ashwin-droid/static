@@ -100,19 +100,26 @@ function installBrowserStubs() {
   };
 }
 
-function findUrlCipherHelperName(playerJs) {
-  const helperRe = /([A-Za-z_$][\w$]*)=function\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=""(?:,([A-Za-z_$][\w$]*)="")?\)\{\2=new g\.bB\(\2,!0\);\2\.set\("alr","yes"\);/g;
+function findUrlCipherHelperNames(playerJs) {
+  const helperRe = /([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)=function\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=""(?:,([A-Za-z_$][\w$]*)="")?\)\{\2=new g\.[A-Za-z_$][\w$]*\(\2,!0\);\2\.set\("alr","yes"\);/g;
+  const helpers = [];
   for (const match of playerJs.matchAll(helperRe)) {
     if (!match[4] || playerJs.slice(match.index, match.index + 220).includes(`${match[4]}&&`)) {
-      return match[1];
+      helpers.push(match[1]);
     }
+  }
+  if (helpers.length) {
+    return [...new Set(helpers)];
   }
   throw new Error("WEB_REMIX URL cipher helper was not found in player JS");
 }
 
-function exportUrlCipherHelper(playerJs, helperName) {
+function exportUrlCipherHelpers(playerJs, helperNames) {
   const end = "})(_yt_player);";
-  const injection = `;globalThis.__staticYtCipher = { helper: typeof ${helperName} !== "undefined" ? ${helperName} : null };`;
+  const exports = helperNames
+    .map((helperName) => `${JSON.stringify(helperName)}: typeof ${helperName} !== "undefined" ? ${helperName} : null`)
+    .join(",");
+  const injection = `;globalThis.__staticYtCipher = { helpers: {${exports}} };`;
   if (!playerJs.includes(end)) {
     throw new Error("WEB_REMIX player JS wrapper was not recognized");
   }
@@ -120,20 +127,49 @@ function exportUrlCipherHelper(playerJs, helperName) {
 }
 
 function renderedUrl(value) {
-  if (value && typeof value.Ws === "function") {
-    return String(value.Ws());
+  for (const key of ["Ws", "dO", "toString"]) {
+    if (value && typeof value[key] === "function") {
+      const rendered = String(value[key]());
+      if (/^https?:\/\//.test(rendered)) {
+        return rendered;
+      }
+    }
   }
   return String(value);
 }
 
-installBrowserStubs();
-const helperName = findUrlCipherHelperName(input.playerJs || "");
-eval(exportUrlCipherHelper(input.playerJs || "", helperName));
-if (!globalThis.__staticYtCipher || typeof globalThis.__staticYtCipher.helper !== "function") {
-  throw new Error("WEB_REMIX URL cipher helper did not export");
+function hasSolvedSignature(url, sp) {
+  const params = new URL(url).searchParams;
+  return params.has(sp || "signature") || params.has("sig") || params.has("signature");
 }
-const solved = globalThis.__staticYtCipher.helper(input.url || "", input.sp || "signature", input.s || "");
-process.stdout.write(JSON.stringify({ url: renderedUrl(solved) }));
+
+installBrowserStubs();
+const helperNames = findUrlCipherHelperNames(input.playerJs || "");
+eval(exportUrlCipherHelpers(input.playerJs || "", helperNames));
+const errors = [];
+let solvedUrl = null;
+for (const helperName of helperNames) {
+  const helper = globalThis.__staticYtCipher && globalThis.__staticYtCipher.helpers && globalThis.__staticYtCipher.helpers[helperName];
+  if (typeof helper !== "function") {
+    errors.push(`${helperName}: did not export`);
+    continue;
+  }
+  try {
+    const url = renderedUrl(helper(input.url || "", input.sp || "signature", input.s || ""));
+    new URL(url);
+    if (input.s && !hasSolvedSignature(url, input.sp || "signature")) {
+      throw new Error("returned URL without deciphered signature");
+    }
+    solvedUrl = url;
+    break;
+  } catch (err) {
+    errors.push(`${helperName}: ${err && err.message ? err.message : err}`);
+  }
+}
+if (!solvedUrl) {
+  throw new Error(`WEB_REMIX URL cipher helpers failed: ${errors.slice(0, 3).join("; ")}`);
+}
+process.stdout.write(JSON.stringify({ url: solvedUrl }));
 "#;
 
 // OAuth device flow for Android VR auth (premium content)

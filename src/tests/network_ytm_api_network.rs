@@ -154,6 +154,53 @@ fn node_binary_candidates_include_nvm_versions_when_path_is_plain() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[test]
+fn web_remix_node_solver_handles_current_hd_helper_shape() -> anyhow::Result<()> {
+    if super::executable_node_binary().is_err() {
+        return Ok(());
+    }
+
+    let player_js = r#"
+var _yt_player = {};
+(function(g) {
+g.Hd = class {
+  constructor(url) { this.url = new URL(url); }
+  set(key, value) { this.url.searchParams.set(key, value); }
+  get(key) { return this.url.searchParams.get(key); }
+  dO() { return this.url.toString(); }
+};
+var X = [];
+X[21] = "set";
+var SJ = function(_mode, _key, value) { return value; };
+var ax = function(_mode, _key, value) { return value.split("").reverse().join(""); };
+xJ=function(z,D="",E=""){z=new g.Hd(z,!0);z.set("alr","yes");E&&(E=SJ(8,5797,SJ(7,4168,E)),z[X[21]](D,ax(15,8264,E)));return z};
+})(_yt_player);
+"#;
+    let stream = super::WebRemixStreamUrl {
+        url: "https://rr.example.com/videoplayback?n=raw".to_string(),
+        sp: "sig".to_string(),
+        signature: Some("cba".to_string()),
+        ciphered: true,
+    };
+
+    let solved = YtMusicClient::solve_web_remix_stream_url_with_node(player_js, &stream)?;
+    let parsed = url::Url::parse(&solved)?;
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "sig").then(|| value.into_owned())),
+        Some("abc".to_string())
+    );
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "alr").then(|| value.into_owned())),
+        Some("yes".to_string())
+    );
+
+    Ok(())
+}
+
 fn live_test_cookie() -> Option<String> {
     std::env::var("STATIC_YTM_TEST_COOKIE")
         .ok()

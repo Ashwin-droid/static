@@ -3,14 +3,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use rusqlite::{Connection as SqliteConnection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +36,7 @@ const YTM_ORIGIN: &str = "https://music.youtube.com";
 const YTM_WEB_REMIX_HEADER_CLIENT_NAME: &str = "67";
 const YTM_WEB_REMIX_CLIENT_NAME: &str = "WEB_REMIX";
 const YTM_WEB_REMIX_CLIENT_VERSION: &str = "1.20260426.12.00";
+const YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION: &str = "1.20260114.03.00";
 const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
 const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
 const YTM_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
@@ -50,6 +51,7 @@ const TRACKING_SEC_CH_UA: &str =
 const TRACKING_SEC_CH_UA_MOBILE: &str = "?0";
 const TRACKING_SEC_CH_UA_PLATFORM: &str = "\"Linux\"";
 const ATR_REPORT_DELAY: Duration = Duration::from_secs(4);
+const WEB_REMIX_MEDIA_PROBE_RANGE: &str = "bytes=0-0";
 const YTM_WEB_PROFILE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
@@ -179,6 +181,14 @@ const VR_OAUTH_CLIENT_SECRET: &str = "3fTWrBJI5Uojm1TK7_iJCW5Z";
 const VR_OAUTH_TOKEN_URL: &str = "https://www.youtube.com/o/oauth2/token?prettyPrint=false";
 const VR_OAUTH_DEVICE_CODE_URL: &str =
     "https://www.youtube.com/o/oauth2/device/code?prettyPrint=false";
+
+static WEB_REMIX_MEDIA_PROBE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(YTM_USER_AGENT)
+        .build()
+        .expect("WEB_REMIX media probe client should build")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SongRating {
@@ -1687,6 +1697,27 @@ impl YtMusicClient {
         body
     }
 
+    fn web_remix_direct_media_profile(profile: &YtmWebProfile) -> YtmWebProfile {
+        let mut profile = profile.clone();
+        profile.client_name = YTM_WEB_REMIX_CLIENT_NAME.to_string();
+        profile.header_client_name = YTM_WEB_REMIX_HEADER_CLIENT_NAME.to_string();
+        profile.client_version = YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION.to_string();
+        profile
+    }
+
+    fn web_remix_direct_media_player_body(video_id: &str, profile: &YtmWebProfile) -> Value {
+        let mut body = Self::client_context_with(
+            YTM_WEB_REMIX_CLIENT_NAME,
+            YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION,
+        );
+        body["context"]["client"]["hl"] = json!(profile.hl);
+        body["context"]["client"]["gl"] = json!(profile.gl);
+        body["videoId"] = json!(video_id);
+        body["contentCheckOk"] = json!(true);
+        body["racyCheckOk"] = json!(true);
+        body
+    }
+
     fn cross_device_queue_body(profile: &YtmWebProfile) -> Value {
         let mut body = Self::web_profile_client_context(profile);
         body["watchNextType"] = json!("WATCH_NEXT_TYPE_GET_QUEUE");
@@ -2118,10 +2149,18 @@ impl YtMusicClient {
     async fn try_audio_url_no_track(&self, video_id: &str) -> Result<String> {
         eprintln!("[PLAYER] trying WEB_REMIX client for {video_id}...");
         let web_remix_err = match self.try_web_remix_audio(video_id).await {
-            Ok(url) => {
-                eprintln!("[PLAYER] got URL via WEB_REMIX");
-                return Ok(url);
-            }
+            Ok(url) => match self.ensure_web_remix_media_url_fetchable(&url).await {
+                Ok(()) => {
+                    eprintln!("[PLAYER] got URL via WEB_REMIX");
+                    return Ok(url);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[PLAYER] WEB_REMIX media URL rejected for {video_id}: {err}; trying Android VR fallback..."
+                    );
+                    err
+                }
+            },
             Err(e) => {
                 eprintln!("[PLAYER] WEB_REMIX failed: {e}, trying Android VR fallback...");
                 e
@@ -2140,6 +2179,20 @@ impl YtMusicClient {
                 )
             }
         }
+    }
+
+    async fn ensure_web_remix_media_url_fetchable(&self, url: &str) -> Result<()> {
+        let response = WEB_REMIX_MEDIA_PROBE_CLIENT
+            .get(url)
+            .header(RANGE, WEB_REMIX_MEDIA_PROBE_RANGE)
+            .send()
+            .await
+            .context("WEB_REMIX media URL probe failed")?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        bail!("WEB_REMIX media URL probe returned {status}")
     }
 
     fn audio_url_error_may_have_music_replacement(message: &str) -> bool {
@@ -2223,11 +2276,31 @@ impl YtMusicClient {
         })
     }
 
+    async fn web_remix_direct_media_player_response(
+        &self,
+        video_id: &str,
+        profile: &YtmWebProfile,
+    ) -> Result<Value> {
+        let request_profile = Self::web_remix_direct_media_profile(profile);
+        let body = Self::web_remix_direct_media_player_body(video_id, &request_profile);
+        let req = self
+            .apply_ytm_web_profile_headers(
+                self.post(&format!("{YTM_BASE_URL}/player?{YTM_PARAMS}")),
+                &request_profile,
+            )
+            .json(&body);
+        let resp = req.send().await.with_context(|| {
+            format!("WEB_REMIX direct-media player request failed for {video_id}")
+        })?;
+        resp.json().await.with_context(|| {
+            format!("WEB_REMIX direct-media player response was not JSON for {video_id}")
+        })
+    }
+
     async fn try_web_remix_audio(&self, video_id: &str) -> Result<String> {
-        let cpn = generate_cpn();
         let mut profile = self.ytm_web_profile(false).await;
         let mut json = match self
-            .tracking_player_response(video_id, &cpn, None, None, &profile)
+            .web_remix_direct_media_player_response(video_id, &profile)
             .await
         {
             Ok(json) => json,
@@ -2236,7 +2309,7 @@ impl YtMusicClient {
                     "[PLAYER] WEB_REMIX player request failed for {video_id}: {err}; refreshing profile"
                 );
                 profile = self.ytm_web_profile(true).await;
-                self.tracking_player_response(video_id, &cpn, None, None, &profile)
+                self.web_remix_direct_media_player_response(video_id, &profile)
                     .await
                     .with_context(|| {
                         format!(
@@ -2252,7 +2325,7 @@ impl YtMusicClient {
             );
             profile = self.ytm_web_profile(true).await;
             json = self
-                .tracking_player_response(video_id, &cpn, None, None, &profile)
+                .web_remix_direct_media_player_response(video_id, &profile)
                 .await
                 .with_context(|| {
                     format!("WEB_REMIX retry failed after profile refresh for {video_id}")

@@ -717,6 +717,28 @@ fn tracking_player_body_carries_playlist_identity_and_cpn() {
 }
 
 #[test]
+fn web_remix_direct_media_body_uses_pinned_fetchable_client_shape() {
+    let profile = YtmWebProfile::fallback();
+    let body = YtMusicClient::web_remix_direct_media_player_body("Dx69Ut6Wyuk", &profile);
+
+    assert_eq!(body["videoId"], "Dx69Ut6Wyuk");
+    assert_eq!(body["contentCheckOk"], true);
+    assert_eq!(body["racyCheckOk"], true);
+    assert!(body.get("playbackContext").is_none());
+    assert!(body.get("cpn").is_none());
+    assert_eq!(
+        body.pointer("/context/client/clientName")
+            .and_then(|value| value.as_str()),
+        Some("WEB_REMIX")
+    );
+    assert_eq!(
+        body.pointer("/context/client/clientVersion")
+            .and_then(|value| value.as_str()),
+        Some(super::YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION)
+    );
+}
+
+#[test]
 fn cross_device_queue_body_requests_server_queue_restore() {
     let profile = YtmWebProfile::fallback();
     let body = YtMusicClient::cross_device_queue_body(&profile);

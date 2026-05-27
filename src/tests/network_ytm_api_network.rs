@@ -201,6 +201,80 @@ xJ=function(z,D="",E=""){z=new g.Hd(z,!0);z.set("alr","yes");E&&(E=SJ(8,5797,SJ(
     Ok(())
 }
 
+#[test]
+fn web_remix_node_solver_handles_current_fd_er_helper_shape() -> anyhow::Result<()> {
+    if super::executable_node_binary().is_err() {
+        return Ok(());
+    }
+
+    let player_js = r#"
+var _yt_player = {};
+(function(g) {
+var D = [];
+D[1] = "params";
+D[10] = "cache";
+D[16] = "trusted";
+D[17] = "";
+D[20] = "unusedA";
+D[21] = "unusedB";
+D[28] = "raw";
+D[31] = "set";
+D[34] = "unusedC";
+function YY(_mode, _key, self) {
+  const url = new URL(self[D[28]]);
+  for (const [key, value] of Object.entries(self[D[1]])) {
+    url.searchParams.set(key, value);
+  }
+  return url.toString();
+}
+g.fd = class {
+  constructor(url, trusted = false) {
+    this[D[28]] = url;
+    this[D[16]] = trusted;
+    this[D[20]] = this[D[21]] = this[D[34]] = D[17];
+    this[D[1]] = {};
+    this[D[10]] = D[17];
+  }
+  set(key, value) {
+    this[D[1]][key] = value;
+    this[D[10]] = D[17];
+  }
+  get(key) { return this[D[1]][key] || null; }
+  ER() {
+    this[D[10]] || (this[D[10]] = YY(20, 6946, this));
+    return this[D[10]];
+  }
+};
+var yj = function(_mode, _key, value) { return value; };
+var J0 = function(_mode, _key, value) { return value.split("").reverse().join(""); };
+vm=function(e,r="",w=""){e=new g.fd(e,!0);e.set("alr","yes");w&&(w=yj(15,1824,yj(11,6168,w)),e[D[31]](r,J0(56,532,w)));return e};
+})(_yt_player);
+"#;
+    let stream = super::WebRemixStreamUrl {
+        url: "https://rr.example.com/videoplayback?n=raw".to_string(),
+        sp: "sig".to_string(),
+        signature: Some("cba".to_string()),
+        ciphered: true,
+    };
+
+    let solved = YtMusicClient::solve_web_remix_stream_url_with_node(player_js, &stream)?;
+    let parsed = url::Url::parse(&solved)?;
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "sig").then(|| value.into_owned())),
+        Some("abc".to_string())
+    );
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "alr").then(|| value.into_owned())),
+        Some("yes".to_string())
+    );
+
+    Ok(())
+}
+
 fn live_test_cookie() -> Option<String> {
     std::env::var("STATIC_YTM_TEST_COOKIE")
         .ok()
@@ -296,6 +370,57 @@ fn web_remix_live_hardcoded_ytm_id_resolves_high_quality_url() -> anyhow::Result
             .query_pairs()
             .any(|(key, _)| key == "sig" || key == "signature"),
         "resolved WEB_REMIX URL is missing a deciphered signature parameter"
+    );
+
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "c").then(|| value.into_owned())),
+        Some("WEB_REMIX".to_string())
+    );
+
+    let bytes = crate::network::download_media_bytes(&url, Some("bytes=0-"))
+        .context("failed to download WEB_REMIX media URL through the cache downloader")?;
+    assert!(
+        bytes.len() > 1024,
+        "WEB_REMIX media downloader returned too few bytes: {}",
+        bytes.len()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires authenticated YouTube Music cookies and live network access"]
+fn audio_url_live_hardcoded_ytm_id_resolves_downloadable_url() -> anyhow::Result<()> {
+    let client = live_test_client()?;
+    let resolved = client.get_audio_url_no_track_resolved(WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID)?;
+    let parsed = url::Url::parse(&resolved.url)?;
+    let client_name = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "c").then(|| value.into_owned()))
+        .unwrap_or_else(|| "missing".to_string());
+    assert_eq!(client_name, "WEB_REMIX");
+
+    let response = reqwest::blocking::Client::new()
+        .get(&resolved.url)
+        .header(reqwest::header::RANGE, super::WEB_REMIX_MEDIA_PROBE_RANGE)
+        .header("user-agent", super::YTM_USER_AGENT)
+        .send()
+        .context("failed to range-probe resolved media URL")?;
+
+    assert!(
+        response.status().is_success(),
+        "{client_name} media URL range probe returned {}",
+        response.status()
+    );
+
+    let bytes = crate::network::download_media_bytes(&resolved.url, Some("bytes=0-"))
+        .context("failed to download resolved media URL through the cache downloader")?;
+    assert!(
+        bytes.len() > 1024,
+        "resolved media downloader returned too few bytes: {}",
+        bytes.len()
     );
 
     Ok(())
@@ -724,8 +849,21 @@ fn web_remix_direct_media_body_uses_pinned_fetchable_client_shape() {
     assert_eq!(body["videoId"], "Dx69Ut6Wyuk");
     assert_eq!(body["contentCheckOk"], true);
     assert_eq!(body["racyCheckOk"], true);
-    assert!(body.get("playbackContext").is_none());
     assert!(body.get("cpn").is_none());
+    assert_eq!(
+        body.pointer("/playbackContext/contentPlaybackContext/html5Preference")
+            .and_then(|value| value.as_str()),
+        Some("HTML5_PREF_WANTS")
+    );
+    assert_eq!(
+        body.pointer("/playbackContext/contentPlaybackContext/signatureTimestamp")
+            .and_then(|value| value.as_u64()),
+        Some(YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK)
+    );
+    assert!(
+        body.pointer("/playbackContext/devicePlaybackCapabilities")
+            .is_none()
+    );
     assert_eq!(
         body.pointer("/context/client/clientName")
             .and_then(|value| value.as_str()),

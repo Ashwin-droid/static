@@ -57,6 +57,8 @@ const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
 const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
 const YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK: u64 = 20_572;
+const WEB_REMIX_EJS_SOLVER_LIB: &str = include_str!("ytm_ejs_solver_lib.min.js");
+const WEB_REMIX_EJS_SOLVER_CORE: &str = include_str!("ytm_ejs_solver_core.js");
 const WEB_REMIX_NODE_CIPHER_SOLVER: &str = r#"
 const fs = require("fs");
 const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
@@ -129,7 +131,7 @@ function exportUrlCipherHelpers(playerJs, helperNames) {
 }
 
 function renderedUrl(value) {
-  for (const key of ["Ws", "dO", "toString"]) {
+  for (const key of ["ER", "Ws", "dO", "toString"]) {
     if (value && typeof value[key] === "function") {
       const rendered = String(value[key]());
       if (/^https?:\/\//.test(rendered)) {
@@ -145,11 +147,108 @@ function hasSolvedSignature(url, sp) {
   return params.has(sp || "signature") || params.has("sig") || params.has("signature");
 }
 
+function withUpdatedQuery(url, params) {
+  const parsed = new URL(url);
+  for (const [key, value] of Object.entries(params)) {
+    if (value) {
+      parsed.searchParams.set(key, value);
+    }
+  }
+  return parsed.toString();
+}
+
+function uniqueUrls(urls) {
+  const seen = new Set();
+  const unique = [];
+  for (const url of urls) {
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    unique.push(url);
+  }
+  return unique;
+}
+
+function solveWithEjs(input) {
+  if (!input.ejsLib || !input.ejsCore) {
+    throw new Error("EJS challenge solver scripts are missing");
+  }
+
+  const parsed = new URL(input.url || "");
+  const nChallenge = parsed.searchParams.get("n");
+  const requests = [];
+  if (input.s) {
+    requests.push({ type: "sig", challenges: [input.s] });
+  }
+  if (nChallenge) {
+    requests.push({ type: "n", challenges: [nChallenge] });
+  }
+  if (!requests.length) {
+    return null;
+  }
+
+  eval(input.ejsLib);
+  Object.assign(globalThis, lib);
+  const meriyah = globalThis.meriyah;
+  const astring = globalThis.astring;
+  eval(input.ejsCore);
+  const output = jsc({
+    type: "player",
+    player: input.playerJs || "",
+    requests,
+    output_preprocessed: false
+  });
+  if (!output || output.type === "error") {
+    throw new Error(output && output.error ? output.error : "EJS challenge solver failed");
+  }
+
+  let signature = null;
+  let n = null;
+  for (const response of output.responses || []) {
+    if (!response || response.type === "error") {
+      continue;
+    }
+    if (response.data && input.s && Object.prototype.hasOwnProperty.call(response.data, input.s)) {
+      signature = response.data[input.s];
+    }
+    if (response.data && nChallenge && Object.prototype.hasOwnProperty.call(response.data, nChallenge)) {
+      n = response.data[nChallenge];
+    }
+  }
+  if (input.s && !signature) {
+    throw new Error("EJS challenge solver returned no signature");
+  }
+
+  const updates = {};
+  if (signature) {
+    updates[input.sp || "signature"] = signature;
+  }
+  if (n) {
+    updates.n = n;
+  }
+  return withUpdatedQuery(input.url || "", updates);
+}
+
 installBrowserStubs();
-const helperNames = findUrlCipherHelperNames(input.playerJs || "");
-eval(exportUrlCipherHelpers(input.playerJs || "", helperNames));
 const errors = [];
-let solvedUrl = null;
+const candidateUrls = [];
+try {
+  const ejsUrl = solveWithEjs(input);
+  if (ejsUrl) {
+    candidateUrls.push(ejsUrl);
+  }
+} catch (err) {
+  errors.push(`ejs: ${err && err.message ? err.message : err}`);
+}
+
+let helperNames = [];
+try {
+  helperNames = findUrlCipherHelperNames(input.playerJs || "");
+  eval(exportUrlCipherHelpers(input.playerJs || "", helperNames));
+} catch (err) {
+  errors.push(`helper-export: ${err && err.message ? err.message : err}`);
+}
 for (const helperName of helperNames) {
   const helper = globalThis.__staticYtCipher && globalThis.__staticYtCipher.helpers && globalThis.__staticYtCipher.helpers[helperName];
   if (typeof helper !== "function") {
@@ -162,16 +261,16 @@ for (const helperName of helperNames) {
     if (input.s && !hasSolvedSignature(url, input.sp || "signature")) {
       throw new Error("returned URL without deciphered signature");
     }
-    solvedUrl = url;
-    break;
+    candidateUrls.push(url);
   } catch (err) {
     errors.push(`${helperName}: ${err && err.message ? err.message : err}`);
   }
 }
-if (!solvedUrl) {
-  throw new Error(`WEB_REMIX URL cipher helpers failed: ${errors.slice(0, 3).join("; ")}`);
+const urls = uniqueUrls(candidateUrls);
+if (!urls.length) {
+  throw new Error(`WEB_REMIX URL challenge solvers failed: ${errors.slice(0, 3).join("; ")}`);
 }
-process.stdout.write(JSON.stringify({ url: solvedUrl }));
+process.stdout.write(JSON.stringify({ url: urls[0], urls }));
 "#;
 
 // OAuth device flow for Android VR auth (premium content)
@@ -1713,6 +1812,12 @@ impl YtMusicClient {
         body["context"]["client"]["hl"] = json!(profile.hl);
         body["context"]["client"]["gl"] = json!(profile.gl);
         body["videoId"] = json!(video_id);
+        body["playbackContext"] = json!({
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS",
+                "signatureTimestamp": profile.signature_timestamp,
+            }
+        });
         body["contentCheckOk"] = json!(true);
         body["racyCheckOk"] = json!(true);
         body
@@ -2407,13 +2512,25 @@ impl YtMusicClient {
         let solver_stream = stream.clone();
 
         let resolved = tokio::task::spawn_blocking(move || {
-            Self::solve_web_remix_stream_url_with_node(&player_js, &solver_stream)
+            Self::solve_web_remix_stream_url_candidates_with_node(&player_js, &solver_stream)
         })
         .await
         .context("WEB_REMIX URL solver task failed")?;
 
         match resolved {
-            Ok(url) => Ok(url),
+            Ok(urls) => {
+                let mut last_probe_err = None;
+                for url in urls {
+                    match self.ensure_web_remix_media_url_fetchable(&url).await {
+                        Ok(()) => return Ok(url),
+                        Err(err) => last_probe_err = Some(err),
+                    }
+                }
+                let detail = last_probe_err
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "solver returned no URL candidates".to_string());
+                bail!("WEB_REMIX solved media URL candidates were rejected: {detail}")
+            }
             Err(err) if !stream.ciphered => {
                 eprintln!(
                     "[PLAYER] WEB_REMIX direct URL transform failed ({err}); using direct URL"
@@ -2428,11 +2545,23 @@ impl YtMusicClient {
         player_js: &str,
         stream: &WebRemixStreamUrl,
     ) -> Result<String> {
+        Self::solve_web_remix_stream_url_candidates_with_node(player_js, stream)?
+            .into_iter()
+            .next()
+            .context("WEB_REMIX URL solver returned no URL")
+    }
+
+    fn solve_web_remix_stream_url_candidates_with_node(
+        player_js: &str,
+        stream: &WebRemixStreamUrl,
+    ) -> Result<Vec<String>> {
         let input = serde_json::to_vec(&json!({
             "playerJs": player_js,
             "url": stream.url,
             "sp": stream.sp,
             "s": stream.signature.as_deref().unwrap_or(""),
+            "ejsLib": WEB_REMIX_EJS_SOLVER_LIB,
+            "ejsCore": WEB_REMIX_EJS_SOLVER_CORE,
         }))
         .context("Failed to encode WEB_REMIX URL solver input")?;
 
@@ -2477,13 +2606,34 @@ impl YtMusicClient {
 
         let output_json: Value = serde_json::from_slice(&output.stdout)
             .context("WEB_REMIX URL solver response was not JSON")?;
-        let url = output_json
-            .get("url")
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.trim().is_empty())
-            .context("WEB_REMIX URL solver returned no URL")?;
-        Url::parse(url).context("WEB_REMIX URL solver returned an invalid URL")?;
-        Ok(url.to_string())
+        let mut urls = Vec::new();
+        if let Some(values) = output_json.get("urls").and_then(|value| value.as_array()) {
+            for value in values {
+                if let Some(url) = value.as_str().filter(|value| !value.trim().is_empty()) {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+        if urls.is_empty()
+            && let Some(url) = output_json
+                .get("url")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+        {
+            urls.push(url.to_string());
+        }
+        if urls.is_empty() {
+            bail!("WEB_REMIX URL solver returned no URL");
+        }
+
+        let mut valid_urls = Vec::new();
+        for url in urls {
+            Url::parse(&url).context("WEB_REMIX URL solver returned an invalid URL")?;
+            if !valid_urls.iter().any(|existing| existing == &url) {
+                valid_urls.push(url);
+            }
+        }
+        Ok(valid_urls)
     }
 
     fn tracking_urls_from_player_response(

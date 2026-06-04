@@ -533,20 +533,71 @@ impl InteractiveTui {
         key: &'static str,
         value: &str,
     ) -> Result<()> {
+        self.persist_setting_value_inner(key, value, false)
+    }
+
+    fn persist_setting_value_inner(
+        &mut self,
+        key: &'static str,
+        value: &str,
+        confirmed: bool,
+    ) -> Result<()> {
         let cache = open_tui_music_cache()?;
-        let mut settings = cache.load_settings()?;
+        let current_settings = cache.load_settings()?;
+        let mut settings = current_settings.clone();
         apply_config_value(&mut settings, key, value)?;
-        cache.save_settings(&settings)?;
-        self.refresh_settings_view();
-        match self.client.reload_settings() {
-            Ok(snapshot) => self.apply_snapshot(snapshot),
-            Err(err) => {
-                self.status_line = format!("Saved {key}, but daemon reload needs attention: {err}");
+        if !confirmed {
+            if let Some(warning) =
+                settings_eviction_warning(&cache, &current_settings, &settings, key)?
+            {
+                self.settings_confirmation = Some(TuiSettingsConfirmation {
+                    key,
+                    value: value.to_string(),
+                    warning: warning.clone(),
+                });
+                self.status_line = format!(
+                    "Warning: {} Enter applies; Esc cancels.",
+                    shorten(&warning.message, 92)
+                );
+                return Ok(());
             }
         }
+
+        cache.save_settings(&settings)?;
+        self.settings_confirmation = None;
+        self.refresh_settings_view();
+        let reload_error = match self.client.reload_settings() {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot);
+                None
+            }
+            Err(err) => Some(format!("daemon reload needs attention: {err}")),
+        };
         let rendered = format_config_value(&settings, key)?;
-        self.status_line = format!("{key} = {rendered}");
+        self.status_line = if let Some(reload_error) = reload_error {
+            format!("{key} = {rendered}; {reload_error}")
+        } else {
+            format!("{key} = {rendered}")
+        };
         Ok(())
+    }
+
+    pub(in crate::cli_tui) fn confirm_pending_settings_change(&mut self) -> Result<()> {
+        let Some(pending) = self.settings_confirmation.take() else {
+            return Ok(());
+        };
+        self.persist_setting_value_inner(pending.key, &pending.value, true)
+    }
+
+    pub(in crate::cli_tui) fn cancel_pending_settings_change(&mut self) {
+        if let Some(pending) = self.settings_confirmation.take() {
+            self.status_line = format!(
+                "Cancelled setting change; {}",
+                shorten(&pending.warning.message, 86)
+            );
+        } else {
+            self.status_line = "No settings warning is pending.".to_string();
+        }
     }
 
     pub(in crate::cli_tui) fn toggle_boolean_setting(&mut self, key: &'static str) -> Result<()> {

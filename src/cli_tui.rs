@@ -32,10 +32,11 @@ use ratatui_image::{
 };
 
 use crate::cli::{
-    apply_config_value, artist_string, format_config_value, format_millis, format_track_summary,
+    OfflineEvictionWarning, apply_config_value, artist_string, copy_text_to_clipboard,
+    format_config_value, format_duration_secs, format_millis, format_track_summary,
     load_local_resume_state, play_track_with_radio, restore_cross_device_queue_via_daemon,
     restore_paused_playback_snapshot_via_daemon, restore_playback_snapshot_via_daemon,
-    resume_snapshot_meta, resume_snapshot_track, saved_network_state,
+    resume_snapshot_meta, resume_snapshot_track, saved_network_state, settings_eviction_warning,
     should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{
@@ -521,6 +522,13 @@ struct TuiSettingsTextEdit {
     buffer: String,
 }
 
+#[derive(Clone)]
+struct TuiSettingsConfirmation {
+    key: &'static str,
+    value: String,
+    warning: OfflineEvictionWarning,
+}
+
 enum TuiBackgroundEvent {
     HomeLoaded(Result<HomePage, String>),
     CrossDeviceQueueLoaded(Result<Option<CrossDeviceQueue>, String>),
@@ -567,6 +575,7 @@ enum ClickTargetKind {
     SearchBox,
     SearchSuggestion(usize),
     ContentBack,
+    PlayerBar,
     DetailTab(DetailTab),
     RadioChipScroll(isize),
     RadioChip(usize),
@@ -645,6 +654,12 @@ enum ContextMenuAction {
     RemoveQueueItem {
         index: usize,
     },
+    SetSleepTimer {
+        minutes: u32,
+    },
+    SetSleepAfterCurrent,
+    ClearSleepTimer,
+    CopyShareUrl,
     SubmitFeedbackToken {
         token: String,
         verb: &'static str,
@@ -800,6 +815,7 @@ struct InteractiveTui {
     settings_field_offsets: Vec<(usize, usize)>,
     settings_total_height: usize,
     settings_text_edit: Option<TuiSettingsTextEdit>,
+    settings_confirmation: Option<TuiSettingsConfirmation>,
     focus: TuiFocus,
     player_selected: usize,
     detail_tab: DetailTab,

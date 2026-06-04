@@ -1,10 +1,13 @@
 use super::{
     AppSettings, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
     apply_config_value, config_description, cross_device_queue_is_singleton_seed,
-    format_config_value, should_use_local_resume_for_cross_device,
+    format_config_value, settings_eviction_warning, should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{PersistedPlaybackState, PlaybackSnapshot};
 use crate::models::{CrossDeviceQueue, Track};
+use crate::offline::MusicCache;
+use std::fs;
+use uuid::Uuid;
 
 #[test]
 fn config_set_preserves_cli_only_delay_values() {
@@ -72,6 +75,39 @@ fn config_descriptions_explain_cli_only_ranges() {
     assert!(description.contains("GTK settings UI range: 0.0-1.0."));
     assert!(description.contains("CLI range: 0.0-2.0."));
     assert!(description.contains("CLI-only"));
+}
+
+#[test]
+fn config_eviction_warning_reports_auto_download_impact() {
+    let base = std::env::temp_dir().join(format!("static-cli-test-{}", Uuid::new_v4()));
+    let raw_root = base.to_string_lossy().to_string();
+    let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+    cache
+        .record_play("video123", "Track", "Artist", None, 0)
+        .expect("record play");
+    cache
+        .store_audio("video123", b"audio bytes", None)
+        .expect("store audio");
+
+    let current = AppSettings {
+        auto_manage_offline_cache: true,
+        auto_cache_listen_again: false,
+        offline_cache_target: 1,
+        offline_rewatch_threshold: 0,
+        ..AppSettings::default()
+    };
+    let next = AppSettings {
+        auto_manage_offline_cache: false,
+        ..current.clone()
+    };
+
+    let warning = settings_eviction_warning(&cache, &current, &next, "auto_manage_offline_cache")
+        .expect("warning calculation")
+        .expect("warning");
+    assert_eq!(warning.impact, 1);
+    assert!(warning.message.contains("1 auto-downloaded song"));
+
+    let _ = fs::remove_dir_all(base);
 }
 
 fn test_track(video_id: &str) -> Track {

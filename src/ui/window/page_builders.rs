@@ -557,6 +557,15 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     content_dimmer.set_can_target(false);
     content_overlay.add_overlay(&content_dimmer);
 
+    let toast_label = Label::new(None);
+    toast_label.add_css_class("app-toast");
+    toast_label.set_halign(Align::Center);
+    toast_label.set_valign(Align::End);
+    toast_label.set_margin_bottom(24);
+    toast_label.set_visible(false);
+    toast_label.set_can_target(false);
+    content_overlay.add_overlay(&toast_label);
+
     content_outer.append(&content_overlay);
 
     // ======= NOW PLAYING BAR (YTM-style) =======
@@ -598,6 +607,10 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     let next_btn = icon_button(ICON_NEXT, 20, "np-icon-btn");
     next_btn.set_sensitive(false);
     transport_box.append(&next_btn);
+
+    let sleep_btn = icon_button(ICON_SLEEP, 18, "np-icon-btn");
+    sleep_btn.set_tooltip_text(Some("Sleep timer"));
+    transport_box.append(&sleep_btn);
 
     let halt_auto_cancel_btn = Button::with_label("Cancel");
     halt_auto_cancel_btn.add_css_class("np-halt-auto-btn");
@@ -681,6 +694,11 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
     let like_btn = icon_button(ICON_LIKE, 18, "np-icon-btn");
     like_btn.set_sensitive(false);
     actions_box.append(&like_btn);
+
+    let share_btn = icon_button(ICON_SHARE, 18, "np-icon-btn");
+    share_btn.set_sensitive(false);
+    share_btn.set_tooltip_text(Some("Copy share URL"));
+    actions_box.append(&share_btn);
 
     let menu_btn = icon_button(ICON_MENU, 18, "np-icon-btn");
     menu_btn.set_sensitive(false);
@@ -891,6 +909,7 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         prev_btn: prev_btn.clone(),
         play_pause_btn: play_pause_btn.clone(),
         next_btn: next_btn.clone(),
+        sleep_btn: sleep_btn.clone(),
         halt_auto_cancel_btn: halt_auto_cancel_btn.clone(),
         halt_auto_resume_btn: halt_auto_resume_btn.clone(),
         time_label: time_label.clone(),
@@ -900,7 +919,10 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         np_artist: np_artist.clone(),
         dislike_btn: dislike_btn.clone(),
         like_btn: like_btn.clone(),
+        share_btn: share_btn.clone(),
         menu_btn: menu_btn.clone(),
+        toast_label: toast_label.clone(),
+        toast_serial: Cell::new(0),
         volume_slider: volume_slider.clone(),
         repeat_btn: repeat_btn.clone(),
         repeat_mode: Cell::new(RepeatMode::Off),
@@ -1078,6 +1100,15 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
         });
     }
 
+    {
+        let ps = ps.clone();
+        let state = state.clone();
+        let sleep_popover = build_sleep_popover(&sleep_btn, &ps, &state);
+        sleep_btn.connect_clicked(move |_| {
+            sleep_popover.popup();
+        });
+    }
+
     // Repeat mode toggle
     {
         let ps = ps.clone();
@@ -1179,6 +1210,13 @@ pub(super) fn build_main_page(stack: &Stack, state: &Arc<Mutex<AppState>>) -> Ma
                 _ => SongRating::Dislike,
             };
             submit_song_rating(&state, &ps, next_rating);
+        });
+    }
+
+    {
+        let ps = ps.clone();
+        share_btn.connect_clicked(move |_| {
+            copy_current_share_url_gtk(&ps);
         });
     }
 
@@ -3415,6 +3453,169 @@ pub(super) fn icon_button(svg_bytes: &[u8], size: i32, css_class: &str) -> Butto
     btn
 }
 
+#[derive(Clone, Copy)]
+enum GtkSleepRequest {
+    Timer(u32),
+    AfterCurrent,
+    Clear,
+}
+
+fn build_sleep_popover(
+    anchor: &Button,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+) -> Popover {
+    let popover = Popover::new();
+    popover.set_parent(anchor);
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(10);
+    content.set_margin_bottom(10);
+    content.set_margin_start(10);
+    content.set_margin_end(10);
+    content.set_size_request(220, -1);
+
+    let after_btn = sleep_popover_button("After this song");
+    content.append(&after_btn);
+    connect_sleep_popover_button(
+        &after_btn,
+        &popover,
+        ps,
+        state,
+        GtkSleepRequest::AfterCurrent,
+    );
+
+    for minutes in [15, 30, 45, 60] {
+        let button = sleep_popover_button(&format!("{minutes} minutes"));
+        content.append(&button);
+        connect_sleep_popover_button(
+            &button,
+            &popover,
+            ps,
+            state,
+            GtkSleepRequest::Timer(minutes),
+        );
+    }
+
+    let custom_row = GtkBox::new(Orientation::Horizontal, 8);
+    let custom_spin = SpinButton::with_range(1.0, 360.0, 5.0);
+    custom_spin.set_value(30.0);
+    custom_spin.set_hexpand(true);
+    custom_row.append(&custom_spin);
+    let custom_btn = Button::with_label("Set");
+    custom_btn.add_css_class("popover-action-btn");
+    custom_row.append(&custom_btn);
+    content.append(&custom_row);
+    {
+        let popover = popover.clone();
+        let ps = ps.clone();
+        let state = state.clone();
+        custom_btn.connect_clicked(move |_| {
+            let minutes = custom_spin.value().round().clamp(1.0, 360.0) as u32;
+            request_sleep_update_gtk(
+                ps.clone(),
+                state.clone(),
+                popover.clone(),
+                GtkSleepRequest::Timer(minutes),
+            );
+        });
+    }
+
+    let clear_btn = sleep_popover_button("Off");
+    clear_btn.add_css_class("popover-danger-btn");
+    content.append(&clear_btn);
+    connect_sleep_popover_button(&clear_btn, &popover, ps, state, GtkSleepRequest::Clear);
+
+    popover.set_child(Some(&content));
+    popover
+}
+
+fn sleep_popover_button(label: &str) -> Button {
+    let button = Button::with_label(label);
+    button.add_css_class("popover-action-btn");
+    button
+}
+
+fn connect_sleep_popover_button(
+    button: &Button,
+    popover: &Popover,
+    ps: &Rc<PlayerState>,
+    state: &Arc<Mutex<AppState>>,
+    request: GtkSleepRequest,
+) {
+    let popover = popover.clone();
+    let ps = ps.clone();
+    let state = state.clone();
+    button.connect_clicked(move |_| {
+        request_sleep_update_gtk(ps.clone(), state.clone(), popover.clone(), request);
+    });
+}
+
+fn request_sleep_update_gtk(
+    ps: Rc<PlayerState>,
+    state: Arc<Mutex<AppState>>,
+    popover: Popover,
+    request: GtkSleepRequest,
+) {
+    popover.popdown();
+    let client = ps.player.daemon_client();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(move || match request {
+            GtkSleepRequest::Timer(minutes) => client.set_sleep_timer(minutes),
+            GtkSleepRequest::AfterCurrent => client.set_sleep_after_current(),
+            GtkSleepRequest::Clear => client.clear_sleep_timer(),
+        })
+        .await;
+
+        match result {
+            Ok(Ok(snapshot)) => {
+                let message = match request {
+                    GtkSleepRequest::Timer(minutes) => format!("Sleep set for {minutes} minutes"),
+                    GtkSleepRequest::AfterCurrent => "Sleep after this song".to_string(),
+                    GtkSleepRequest::Clear => "Sleep timer off".to_string(),
+                };
+                apply_remote_snapshot(&ps, &state, snapshot);
+                show_toast(&ps, &message);
+            }
+            Ok(Err(err)) => show_toast(&ps, &format!("Sleep failed: {err}")),
+            Err(_) => show_toast(&ps, "Sleep failed: background task ended"),
+        }
+    });
+}
+
+fn copy_current_share_url_gtk(ps: &Rc<PlayerState>) {
+    let client = ps.player.daemon_client();
+    let ps = ps.clone();
+    glib::spawn_future_local(async move {
+        match gio::spawn_blocking(move || client.copy_share_url()).await {
+            Ok(Ok(url)) => {
+                if let Some(display) = gtk::gdk::Display::default() {
+                    display.clipboard().set_text(&url);
+                    show_toast(&ps, "Copied!");
+                } else {
+                    show_toast(&ps, "Clipboard unavailable");
+                }
+            }
+            Ok(Err(err)) => show_toast(&ps, &format!("Share failed: {err}")),
+            Err(_) => show_toast(&ps, "Share failed: background task ended"),
+        }
+    });
+}
+
+fn show_toast(ps: &Rc<PlayerState>, message: &str) {
+    let serial = ps.toast_serial.get().wrapping_add(1);
+    ps.toast_serial.set(serial);
+    ps.toast_label.set_text(message);
+    ps.toast_label.set_visible(true);
+
+    let ps = ps.clone();
+    glib::timeout_add_local(Duration::from_secs(2), move || {
+        if ps.toast_serial.get() == serial {
+            ps.toast_label.set_visible(false);
+        }
+        glib::ControlFlow::Break
+    });
+}
+
 pub(super) fn settings_switch(active: bool) -> Switch {
     let sw = Switch::new();
     sw.set_active(active);
@@ -3750,6 +3951,37 @@ pub(super) fn update_repeat_button_ui(btn: &Button, mode: RepeatMode) {
             btn.remove_css_class("repeat-active");
             btn.add_css_class("repeat-one-active");
         }
+    }
+}
+
+pub(super) fn update_sleep_button_ui(btn: &Button, snapshot: &PlaybackSnapshot) {
+    if let Some(label) = sleep_status_label(snapshot) {
+        btn.add_css_class("sleep-active");
+        btn.set_tooltip_text(Some(&label));
+    } else {
+        btn.remove_css_class("sleep-active");
+        btn.set_tooltip_text(Some("Sleep timer"));
+    }
+}
+
+fn sleep_status_label(snapshot: &PlaybackSnapshot) -> Option<String> {
+    if snapshot.sleep_after_current {
+        Some("Sleep after this song".to_string())
+    } else {
+        snapshot
+            .sleep_remaining_secs
+            .map(|secs| format!("Sleep in {}", format_sleep_secs(secs)))
+    }
+}
+
+fn format_sleep_secs(total_seconds: u64) -> String {
+    let seconds = total_seconds % 60;
+    let minutes = (total_seconds / 60) % 60;
+    let hours = total_seconds / 3600;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 

@@ -52,6 +52,8 @@ fn persisted_playback_state_round_trips_through_database() {
         halt_auto_resume_pending: false,
         probe_active: false,
         probe_restore_position_millis: None,
+        sleep_remaining_secs: None,
+        sleep_after_current: false,
     };
     let persisted = PersistedPlaybackState {
         snapshot,

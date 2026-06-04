@@ -32,6 +32,18 @@ impl InteractiveTui {
             return Ok(false);
         }
 
+        if self.settings_confirmation.is_some() {
+            match code {
+                KeyCode::Esc => self.cancel_pending_settings_change(),
+                KeyCode::Enter => self.confirm_pending_settings_change()?,
+                _ => {
+                    self.status_line =
+                        "Confirm the settings warning with Enter, or cancel with Esc.".to_string();
+                }
+            }
+            return Ok(false);
+        }
+
         if self.search_input_active {
             match code {
                 KeyCode::Esc => {
@@ -144,6 +156,7 @@ impl InteractiveTui {
             KeyCode::Char('p') => self.run_action(TuiAction::Previous)?,
             KeyCode::Char('a') => self.seek_relative_millis(-(SEEK_STEP_MILLIS as i64))?,
             KeyCode::Char('s') => self.seek_relative_millis(SEEK_STEP_MILLIS as i64)?,
+            KeyCode::Char('y') => self.copy_current_share_url()?,
             KeyCode::Char('l') => self.run_action(TuiAction::CycleRepeat)?,
             KeyCode::Char('f') => self.run_action(TuiAction::Like)?,
             KeyCode::Char('d') => self.run_action(TuiAction::Dislike)?,
@@ -191,6 +204,12 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.settings_confirmation.is_some() {
+            self.status_line =
+                "Confirm the settings warning with Enter, or cancel with Esc.".to_string();
+            return Ok(());
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollDown => self.scroll_panel(mouse.column, mouse.row, 2),
             MouseEventKind::ScrollUp => self.scroll_panel(mouse.column, mouse.row, -2),

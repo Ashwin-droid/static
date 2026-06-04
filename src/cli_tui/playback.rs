@@ -149,7 +149,10 @@ impl InteractiveTui {
                     ),
                     Style::default().fg(theme.muted),
                 )),
-                Line::from(player_bar_meta_spans(&self.snapshot)),
+                Line::from(player_bar_meta_spans(
+                    &self.snapshot,
+                    self.displayed_sleep_remaining_secs(),
+                )),
             ])
             .alignment(Alignment::Left),
             track_info[1],
@@ -284,6 +287,11 @@ impl InteractiveTui {
             false,
             self.player_action_focused_action(TuiAction::VolumeUp),
         ));
+
+        targets.push(ClickTarget {
+            rect: area,
+            kind: ClickTargetKind::PlayerBar,
+        });
 
         targets
     }
@@ -442,6 +450,56 @@ impl InteractiveTui {
         })
     }
 
+    pub(in crate::cli_tui) fn displayed_sleep_remaining_secs(&self) -> Option<u64> {
+        self.snapshot
+            .sleep_remaining_secs
+            .map(|secs| secs.saturating_sub(self.last_snapshot_at.elapsed().as_secs()))
+    }
+
+    pub(in crate::cli_tui) fn copy_current_share_url(&mut self) -> Result<()> {
+        match self.client.copy_share_url() {
+            Ok(url) => match copy_text_to_clipboard(&url) {
+                Ok(()) => self.status_line = "Copied!".to_string(),
+                Err(err) => self.status_line = format!("Copy failed: {err}"),
+            },
+            Err(err) => self.status_line = format!("Share failed: {err}"),
+        }
+        Ok(())
+    }
+
+    pub(in crate::cli_tui) fn set_sleep_timer(&mut self, minutes: u32) -> Result<()> {
+        match self.client.set_sleep_timer(minutes) {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot);
+                self.status_line = format!("Sleep set for {minutes} min.");
+            }
+            Err(err) => self.status_line = format!("Sleep failed: {err}"),
+        }
+        Ok(())
+    }
+
+    pub(in crate::cli_tui) fn set_sleep_after_current(&mut self) -> Result<()> {
+        match self.client.set_sleep_after_current() {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot);
+                self.status_line = "Sleep after this song.".to_string();
+            }
+            Err(err) => self.status_line = format!("Sleep failed: {err}"),
+        }
+        Ok(())
+    }
+
+    pub(in crate::cli_tui) fn clear_sleep_timer(&mut self) -> Result<()> {
+        match self.client.clear_sleep_timer() {
+            Ok(snapshot) => {
+                self.apply_snapshot(snapshot);
+                self.status_line = "Sleep cleared.".to_string();
+            }
+            Err(err) => self.status_line = format!("Sleep clear failed: {err}"),
+        }
+        Ok(())
+    }
+
     pub(in crate::cli_tui) fn toggle_detail_tab(&mut self) {
         self.detail_tab = match self.detail_tab {
             DetailTab::Queue => DetailTab::Lyrics,
@@ -586,7 +644,10 @@ pub(in crate::cli_tui) fn repeat_loops_left_label(snapshot: &PlaybackSnapshot) -
         })
 }
 
-pub(in crate::cli_tui) fn player_bar_meta_spans(snapshot: &PlaybackSnapshot) -> Vec<Span<'static>> {
+pub(in crate::cli_tui) fn player_bar_meta_spans(
+    snapshot: &PlaybackSnapshot,
+    displayed_sleep_remaining_secs: Option<u64>,
+) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(
         current_context_label(snapshot),
         Style::default().fg(Color::Rgb(130, 160, 255)),
@@ -596,6 +657,20 @@ pub(in crate::cli_tui) fn player_bar_meta_spans(snapshot: &PlaybackSnapshot) -> 
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             loop_label,
+            Style::default().fg(Color::Rgb(208, 221, 255)),
+        ));
+    }
+
+    if snapshot.sleep_after_current {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            "sleep after song".to_string(),
+            Style::default().fg(Color::Rgb(208, 221, 255)),
+        ));
+    } else if let Some(remaining_secs) = displayed_sleep_remaining_secs {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("sleep {}", format_duration_secs(remaining_secs)),
             Style::default().fg(Color::Rgb(208, 221, 255)),
         ));
     }
@@ -652,6 +727,7 @@ pub(in crate::cli_tui) fn help_shortcut_sections()
         ("f", "Like (favourite)"),
         ("d", "Dislike"),
         ("u", "Clear rating"),
+        ("y", "Copy share URL"),
         ("l", "Cycle loop / repeat"),
         ("↑ / ↓", "Volume (Player focus only)"),
         ("- / +", "Volume down / up"),

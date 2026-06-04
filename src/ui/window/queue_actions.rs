@@ -36,6 +36,7 @@ pub(super) fn play_track(
     ps.play_pause_btn.set_sensitive(false);
     ps.like_btn.set_sensitive(false);
     ps.dislike_btn.set_sensitive(false);
+    ps.share_btn.set_sensitive(false);
     ps.menu_btn.set_sensitive(false);
 
     if let Some(url) = thumb_url {

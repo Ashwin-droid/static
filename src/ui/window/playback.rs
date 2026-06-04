@@ -308,6 +308,7 @@ pub(super) fn apply_remote_snapshot(
         ps.repeat_mode.set(snapshot.repeat_mode);
         update_repeat_button_ui(&ps.repeat_btn, snapshot.repeat_mode);
     }
+    update_sleep_button_ui(&ps.sleep_btn, &snapshot);
 
     ps.halt_auto_cancel_btn
         .set_visible(snapshot.halt_auto_resume_pending);
@@ -389,6 +390,7 @@ pub(super) fn apply_remote_snapshot(
             ps.next_btn.set_sensitive(!snapshot.queue.is_empty());
             ps.like_btn.set_sensitive(true);
             ps.dislike_btn.set_sensitive(true);
+            ps.share_btn.set_sensitive(true);
             ps.menu_btn.set_sensitive(true);
             update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, persisted_rating);
 
@@ -423,6 +425,7 @@ pub(super) fn apply_remote_snapshot(
             ps.halt_auto_resume_btn.set_sensitive(false);
             ps.like_btn.set_sensitive(false);
             ps.dislike_btn.set_sensitive(false);
+            ps.share_btn.set_sensitive(false);
             ps.menu_btn.set_sensitive(false);
             update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
         }

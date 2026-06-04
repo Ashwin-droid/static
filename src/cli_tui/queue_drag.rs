@@ -70,6 +70,9 @@ impl InteractiveTui {
                 self.recent_selected = *index;
                 self.ensure_recent_visible();
             }
+            ClickTargetKind::PlayerBar => {
+                self.focus = TuiFocus::Player;
+            }
             _ => {}
         }
     }
@@ -90,6 +93,7 @@ impl InteractiveTui {
                     (TuiFocus::Recent, ClickTargetKind::RecentItem(index)) => {
                         *index == self.recent_selected
                     }
+                    (TuiFocus::Player, ClickTargetKind::PlayerBar) => true,
                     _ => false,
                 })?;
 

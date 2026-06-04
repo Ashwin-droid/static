@@ -150,6 +150,10 @@ impl InteractiveTui {
                 self.go_back_content();
                 Ok(())
             }
+            ClickTargetKind::PlayerBar => {
+                self.focus = TuiFocus::Player;
+                Ok(())
+            }
             ClickTargetKind::DetailTab(tab) => {
                 self.detail_tab = *tab;
                 Ok(())

@@ -220,6 +220,47 @@ impl InteractiveTui {
                     self.context_menu_track_items(&track),
                 )
             }
+            ClickTargetKind::PlayerBar => {
+                let mut items = Vec::new();
+                if self.snapshot.sleep_after_current || self.snapshot.sleep_remaining_secs.is_some()
+                {
+                    items.push(ContextMenuItem {
+                        label: "Clear sleep".to_string(),
+                        hint: "timer off".to_string(),
+                        tone: ContextMenuTone::Danger,
+                        action: ContextMenuAction::ClearSleepTimer,
+                    });
+                }
+                items.push(ContextMenuItem {
+                    label: "Sleep after song".to_string(),
+                    hint: "current ends".to_string(),
+                    tone: ContextMenuTone::Accent,
+                    action: ContextMenuAction::SetSleepAfterCurrent,
+                });
+                for minutes in [15, 30, 45, 60] {
+                    items.push(ContextMenuItem {
+                        label: format!("Sleep {minutes} min"),
+                        hint: "fade pause".to_string(),
+                        tone: ContextMenuTone::Default,
+                        action: ContextMenuAction::SetSleepTimer { minutes },
+                    });
+                }
+                items.push(ContextMenuItem {
+                    label: "Copy share URL".to_string(),
+                    hint: "clipboard".to_string(),
+                    tone: ContextMenuTone::Default,
+                    action: ContextMenuAction::CopyShareUrl,
+                });
+                (
+                    "Player".to_string(),
+                    self.snapshot
+                        .current_track
+                        .as_ref()
+                        .map(|track| format!("{} - {}", track.title, track.artist))
+                        .unwrap_or_else(|| "Nothing playing".to_string()),
+                    items,
+                )
+            }
             _ => return None,
         };
 
@@ -505,6 +546,10 @@ impl InteractiveTui {
             ),
             ContextMenuAction::ProbeTrack { track } => self.probe_track_now(track),
             ContextMenuAction::RemoveQueueItem { index } => self.remove_queue_item(index),
+            ContextMenuAction::SetSleepTimer { minutes } => self.set_sleep_timer(minutes),
+            ContextMenuAction::SetSleepAfterCurrent => self.set_sleep_after_current(),
+            ContextMenuAction::ClearSleepTimer => self.clear_sleep_timer(),
+            ContextMenuAction::CopyShareUrl => self.copy_current_share_url(),
             ContextMenuAction::SubmitFeedbackToken {
                 token,
                 verb,

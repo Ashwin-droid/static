@@ -41,6 +41,7 @@ impl InteractiveTui {
             settings_field_offsets: Vec::new(),
             settings_total_height: 0,
             settings_text_edit: None,
+            settings_confirmation: None,
             focus: TuiFocus::Home,
             player_selected: 1,
             detail_tab: DetailTab::Queue,

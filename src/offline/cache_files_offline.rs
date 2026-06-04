@@ -198,6 +198,15 @@ impl MusicCache {
         Ok(())
     }
 
+    /// Let the automatic offline manager evict this song again if it no longer qualifies.
+    pub fn unpin_offline(&self, video_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE offline SET pinned = 0 WHERE video_id = ?1",
+            [video_id],
+        )?;
+        Ok(())
+    }
+
     /// Return all pinned (manually downloaded) video IDs.
     pub fn pinned_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self

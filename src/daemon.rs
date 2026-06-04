@@ -26,8 +26,9 @@ use zbus::interface;
 use crate::ipc::{
     ActiveTrackSnapshot, CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DAEMON_BUS_NAME,
     DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse, PersistedPlaybackState, PlaybackSnapshot,
-    PlaylistContext, RepeatMode, clear_persisted_playback_state, current_unix_millis,
-    store_persisted_playback_state, store_persisted_playlist_state,
+    PlaylistContext, RepeatMode, SleepStatusSnapshot, clear_persisted_playback_state,
+    current_unix_millis, store_persisted_playback_state, store_persisted_playlist_state,
+    youtube_music_watch_url,
 };
 use crate::models::{RadioChip, RadioVirtualPlaylist, Track};
 use crate::network::{
@@ -251,6 +252,8 @@ struct DaemonState {
     pipewire_pause_active: bool,
     pre_duck_volume: f64,
     volume_ramp: Option<VolumeRamp>,
+    sleep_deadline: Option<Instant>,
+    sleep_after_current: bool,
     last_persisted_playback_json: Option<String>,
     last_persisted_playback_at: Option<Instant>,
     shutting_down: Cell<bool>,
@@ -995,6 +998,8 @@ pub fn run() -> Result<()> {
         pipewire_pause_active: false,
         pre_duck_volume: initial_volume,
         volume_ramp: None,
+        sleep_deadline: None,
+        sleep_after_current: false,
         last_persisted_playback_json: None,
         last_persisted_playback_at: None,
         shutting_down: Cell::new(false),
@@ -1082,8 +1087,57 @@ pub fn run() -> Result<()> {
 }
 
 fn request_daemon_shutdown(state: &mut DaemonState, exiting: bool) {
+    state.sleep_deadline = None;
+    state.sleep_after_current = false;
     stop_playback(state, exiting);
     state.shutting_down.set(true);
+}
+
+fn remaining_sleep_secs(deadline: Instant, now: Instant) -> u64 {
+    let remaining = deadline.saturating_duration_since(now);
+    remaining
+        .as_secs()
+        .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+}
+
+fn sleep_status_snapshot(state: &DaemonState) -> SleepStatusSnapshot {
+    let now = Instant::now();
+    SleepStatusSnapshot {
+        remaining_secs: state
+            .sleep_deadline
+            .map(|deadline| remaining_sleep_secs(deadline, now)),
+        after_current: state.sleep_after_current,
+    }
+}
+
+fn clear_sleep_state(state: &mut DaemonState) {
+    state.sleep_deadline = None;
+    state.sleep_after_current = false;
+}
+
+fn trigger_sleep_pause(state: &mut DaemonState) {
+    clear_sleep_state(state);
+    state.peer_mpris.clear_waiting();
+    clear_mpris_halt_auto_resume_pending(state);
+    pause_local_playback(state, PlaybackTransition::Calm);
+    sync_mpris(state);
+    maybe_persist_playback_state(state, true);
+}
+
+fn maybe_trigger_sleep_deadline(state: &mut DaemonState, now: Instant) -> bool {
+    if !state.sleep_deadline.is_some_and(|deadline| now >= deadline) {
+        return false;
+    }
+
+    trigger_sleep_pause(state);
+    true
+}
+
+fn current_share_url(state: &DaemonState) -> Option<String> {
+    state
+        .active_track
+        .as_ref()
+        .map(|track| youtube_music_watch_url(&track.video_id))
 }
 
 fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
@@ -1788,6 +1842,38 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                 Err(err) => DaemonResponse::Error(err.to_string()),
             }
         }
+        DaemonRequest::SetSleepTimer { minutes } => {
+            if minutes == 0 {
+                return DaemonResponse::Error(
+                    "Sleep timer minutes must be greater than zero".to_string(),
+                );
+            }
+            let duration = Duration::from_secs(minutes as u64 * 60);
+            let now = Instant::now();
+            let Some(deadline) = now.checked_add(duration) else {
+                return DaemonResponse::Error("Sleep timer is too far in the future".to_string());
+            };
+            state.sleep_deadline = Some(deadline);
+            state.sleep_after_current = false;
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::SetSleepAfterCurrent => {
+            if state.active_track.is_none() {
+                return DaemonResponse::Error("No song is currently playing".to_string());
+            }
+            state.sleep_deadline = None;
+            state.sleep_after_current = true;
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::ClearSleepTimer => {
+            clear_sleep_state(state);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::GetSleepStatus => DaemonResponse::SleepStatus(sleep_status_snapshot(state)),
+        DaemonRequest::CopyShareUrl => match current_share_url(state) {
+            Some(url) => DaemonResponse::ShareUrl(url),
+            None => DaemonResponse::Error("No song is currently playing".to_string()),
+        },
         DaemonRequest::LogMessage { source, message } => {
             match crate::logging::append_log(source, &message) {
                 Ok(()) => DaemonResponse::Ok,
@@ -1911,6 +1997,10 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_duck_for_pipewire(state);
     advance_volume_ramp(state);
 
+    if maybe_trigger_sleep_deadline(state, Instant::now()) {
+        return;
+    }
+
     if should_count_paused_idle_for_shutdown(
         state.active_track.is_some(),
         is_logically_paused(state),
@@ -1963,15 +2053,16 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_extend_radio_queue(state);
     maybe_persist_playback_state(state, false);
 
-    let reached_track_end = state.active_track.as_ref().is_some_and(|active| {
-        !active.awaiting_fresh_position
-            && matches!(
-                (state.player.position(), state.player.duration()),
-                (Some(position), Some(duration))
-                    if duration > ClockTime::from_seconds(1)
-                        && position + ClockTime::from_mseconds(500) >= duration
-            )
-    });
+    let reached_track_end = !is_fading_out_to_pause(state)
+        && state.active_track.as_ref().is_some_and(|active| {
+            !active.awaiting_fresh_position
+                && matches!(
+                    (state.player.position(), state.player.duration()),
+                    (Some(position), Some(duration))
+                        if duration > ClockTime::from_seconds(1)
+                            && position + ClockTime::from_mseconds(500) >= duration
+                )
+        });
 
     if reached_track_end {
         if let Some(resume_playback) = state
@@ -1984,6 +2075,11 @@ fn maintain_playback(state: &mut DaemonState) {
                 state.probe_context = None;
                 stop_playback(state, false);
             }
+            return;
+        }
+
+        if state.sleep_after_current {
+            trigger_sleep_pause(state);
             return;
         }
 
@@ -4343,6 +4439,8 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         halt_auto_resume_pending: false,
         probe_active: false,
         probe_restore_position_millis: None,
+        sleep_remaining_secs: None,
+        sleep_after_current: false,
     };
     rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
     Some(snapshot)
@@ -4355,6 +4453,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             .active_track
             .as_ref()
             .is_some_and(hide_timing_for_track);
+    let sleep_status = sleep_status_snapshot(state);
 
     PlaybackSnapshot {
         current_track: state
@@ -4388,6 +4487,8 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             .probe_context
             .as_ref()
             .and_then(|probe| probe.position_millis),
+        sleep_remaining_secs: sleep_status.remaining_secs,
+        sleep_after_current: sleep_status.after_current,
     }
 }
 

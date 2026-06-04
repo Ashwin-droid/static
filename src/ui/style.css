@@ -570,6 +570,21 @@ popover > contents {
     color: #e8efff;
 }
 
+.sleep-active {
+    opacity: 1;
+    background-color: rgba(130, 160, 255, 0.14);
+}
+
+.app-toast {
+    padding: 8px 14px;
+    border-radius: 999px;
+    background-color: rgba(16, 18, 28, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 700;
+}
+
 /* =============================================
    TRACK INFO IN BAR
    ============================================= */
@@ -919,6 +934,10 @@ popover.context-menu > contents {
 .popover-action-btn:hover {
     background-color: rgba(255, 255, 255, 0.08);
     color: #ffffff;
+}
+
+.popover-danger-btn {
+    color: #ff9b9b;
 }
 
 .content-dim-overlay {

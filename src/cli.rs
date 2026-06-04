@@ -1,17 +1,20 @@
+use std::collections::HashSet;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::Once;
 
 use anyhow::{Context, Result, bail};
 
 use crate::ipc::{
     CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DaemonClient, PersistedPlaybackState,
-    PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode, daemon_is_running,
-    load_persisted_playback_state,
+    PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode, SleepStatusSnapshot,
+    daemon_is_running, load_persisted_playback_state,
 };
 use crate::models::{Artist, CrossDeviceQueue, HomeItem, SearchResult, Track};
 use crate::network::{
-    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, extract_video_id_from_input,
-    get_cookie, get_storage_root, load_cookie_from_chromium_profile, sanitize_categories,
-    store_cookie,
+    SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, download_media_bytes,
+    extract_video_id_from_input, fetch_thumbnail_bytes, get_cookie, get_storage_root,
+    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{
@@ -34,10 +37,18 @@ Usage:
   static dislike
   static neutral
   static resume
+  static sleep [minutes|after|song|off]
+  static share
   static exec <ytm/yt url | video id | search term> [probe=y|n]
   static queue get
   static queue addNext <ytm/yt url | video id | search term>
   static queue addLast <ytm/yt url | video id | search term>
+  static offline list
+  static offline add <ytm/yt url | video id | search term>
+  static offline remove <ytm/yt url | video id>
+  static offline pin <ytm/yt url | video id>
+  static offline unpin <ytm/yt url | video id>
+  static offline play [ytm/yt url | video id]
   static info
   static coordination list
   static config list
@@ -74,8 +85,11 @@ pub fn run(args: &[String]) -> Result<()> {
         "dislike" => run_rate_current_track(SongRating::Dislike),
         "neutral" => run_rate_current_track(SongRating::Indifferent),
         "resume" => run_resume(),
+        "sleep" => run_sleep(&args[1..]),
+        "share" => run_share(),
         "exec" => run_exec(&args[1..]),
         "queue" => run_queue(&args[1..]),
+        "offline" => run_offline(&args[1..]),
         "info" => run_info(),
         "coordination" => run_coordination(&args[1..]),
         "config" => run_config(&args[1..]),
@@ -106,6 +120,108 @@ fn run_resume() -> Result<()> {
     let restored = restore_playback_snapshot_via_daemon(snapshot, true)?;
     println!("Resumed {}", current_track_label(&restored));
     Ok(())
+}
+
+fn run_sleep(args: &[String]) -> Result<()> {
+    let client = DaemonClient::new()?;
+    match args.first().map(String::as_str) {
+        None => {
+            println!("sleep: {}", format_sleep_status(&client.sleep_status()?));
+        }
+        Some("off") | Some("clear") => {
+            client.clear_sleep_timer()?;
+            println!("sleep: off");
+        }
+        Some("after") | Some("song") => {
+            client.set_sleep_after_current()?;
+            println!("sleep: after current song");
+        }
+        Some(raw_minutes) => {
+            let minutes = raw_minutes
+                .parse::<u32>()
+                .with_context(|| format!("Invalid sleep timer value `{raw_minutes}`"))?;
+            if minutes == 0 {
+                bail!("Sleep timer minutes must be greater than zero");
+            }
+            client.set_sleep_timer(minutes)?;
+            let unit = if minutes == 1 { "minute" } else { "minutes" };
+            println!("sleep: {minutes} {unit}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_share() -> Result<()> {
+    let client = DaemonClient::new()?;
+    let url = client.copy_share_url()?;
+    println!("{url}");
+    if let Err(err) = copy_text_to_clipboard(&url) {
+        eprintln!("copy failed: {err}");
+    }
+    Ok(())
+}
+
+fn format_sleep_status(status: &SleepStatusSnapshot) -> String {
+    if status.after_current {
+        "after current song".to_string()
+    } else if let Some(remaining_secs) = status.remaining_secs {
+        format!("{} remaining", format_duration_secs(remaining_secs))
+    } else {
+        "off".to_string()
+    }
+}
+
+fn format_sleep_status_from_snapshot(snapshot: &PlaybackSnapshot) -> String {
+    format_sleep_status(&SleepStatusSnapshot {
+        remaining_secs: snapshot.sleep_remaining_secs,
+        after_current: snapshot.sleep_after_current,
+    })
+}
+
+pub(crate) fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    match copy_text_with_command("wl-copy", &[], text) {
+        Ok(()) => Ok(()),
+        Err(wl_err) => match copy_text_with_command("xclip", &["-selection", "clipboard"], text) {
+            Ok(()) => Ok(()),
+            Err(xclip_err) => bail!("wl-copy failed ({wl_err}); xclip failed ({xclip_err})"),
+        },
+    }
+}
+
+fn copy_text_with_command(program: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(text.as_bytes())
+            .with_context(|| format!("failed to write to {program}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for {program}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{} exited with {}{}",
+            program,
+            output.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        )
+    }
 }
 
 fn run_exec(args: &[String]) -> Result<()> {
@@ -176,6 +292,326 @@ fn run_queue_insert(mode: QueueInsertMode, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_offline(args: &[String]) -> Result<()> {
+    let command = args.first().map(String::as_str).unwrap_or("list");
+
+    match command {
+        "list" => {
+            let cache = open_music_cache()?;
+            print_offline_library(&cache)?;
+            Ok(())
+        }
+        "add" | "download" => run_offline_add(&args[1..]),
+        "remove" | "delete" | "rm" => run_offline_remove(&args[1..]),
+        "pin" => run_offline_pin(&args[1..], true),
+        "unpin" => run_offline_pin(&args[1..], false),
+        "play" => run_offline_play(&args[1..]),
+        other => bail!("Unknown offline command `{other}`"),
+    }
+}
+
+fn run_offline_add(args: &[String]) -> Result<()> {
+    let input = join_required_input(args, "offline track")?;
+    let network = saved_network_state()?;
+    let track = resolve_track_input(&network, &input, true)?;
+    let cache = open_music_cache()?;
+    let result = ensure_cli_track_available_offline(&cache, &network, &track, true)
+        .with_context(|| format!("Failed to cache {}", format_track_summary(&track)))?;
+    notify_daemon_settings_if_running();
+
+    if result.already_cached {
+        println!("Already offline: {}", format_track_summary(&track));
+    } else {
+        println!(
+            "Downloaded offline: {} ({} KB)",
+            format_track_summary(&track),
+            result.bytes / 1024
+        );
+    }
+    if result.video_id != track.video_id {
+        println!("canonical_video_id: {}", result.video_id);
+    }
+    Ok(())
+}
+
+fn run_offline_remove(args: &[String]) -> Result<()> {
+    let video_id = parse_video_id_argument(args, "offline removal")?;
+    let cache = open_music_cache()?;
+    if !cache.is_cached(&video_id) {
+        bail!("No offline download exists for `{video_id}`");
+    }
+    cache.remove_cached(&video_id)?;
+    notify_daemon_settings_if_running();
+    println!("Removed offline: {video_id}");
+    Ok(())
+}
+
+fn run_offline_pin(args: &[String], pinned: bool) -> Result<()> {
+    let video_id = parse_video_id_argument(args, "offline pin")?;
+    let cache = open_music_cache()?;
+    if !cache.is_cached(&video_id) {
+        bail!(
+            "No offline download exists for `{video_id}`. Use `static offline add {video_id}` first."
+        );
+    }
+
+    if pinned {
+        cache.pin_offline(&video_id)?;
+        println!("Pinned offline: {video_id}");
+    } else {
+        cache.unpin_offline(&video_id)?;
+        println!("Unpinned offline: {video_id}");
+    }
+    notify_daemon_settings_if_running();
+    Ok(())
+}
+
+fn run_offline_play(args: &[String]) -> Result<()> {
+    let cache = open_music_cache()?;
+    let settings = cache.load_settings()?;
+    let queue = if args.is_empty() {
+        offline_tracks_as_queue(&cache)?
+    } else {
+        let video_id = parse_video_id_argument(args, "offline playback")?;
+        vec![offline_track_by_id(&cache, &video_id)?]
+    };
+
+    if queue.is_empty() {
+        bail!("No offline songs are cached yet");
+    }
+    if !settings.prefer_local_cache_on_playback {
+        eprintln!(
+            "warning: prefer_local_cache_on_playback=no, so staticd may stream instead of using cached audio"
+        );
+    }
+
+    let context = PlaylistContext {
+        playlist_id: "cli-offline".to_string(),
+        title: "Offline".to_string(),
+        thumbnail_url: queue.first().and_then(|track| track.thumbnail_url.clone()),
+        subtitle: Some(format!("{} cached songs", queue.len())),
+        source: PlaylistContextSource::Offline,
+    };
+    let snapshot = DaemonClient::new()?.play_queue_at(
+        queue.clone(),
+        0,
+        Some(context),
+        None,
+        RepeatMode::Off,
+    )?;
+    println!("Playing offline {}", current_track_label(&snapshot));
+    Ok(())
+}
+
+fn print_offline_library(cache: &MusicCache) -> Result<()> {
+    let playlists = cache.offline_playlists()?;
+    let tracks = cache.offline_tracks()?;
+    let pinned = cache.pinned_ids()?.into_iter().collect::<HashSet<_>>();
+
+    println!("offline_root: {}", cache.offline_dir().display());
+    println!("offline_playlists: {}", playlists.len());
+    for (playlist_id, title, _, subtitle) in playlists {
+        println!(
+            "  - {} ({playlist_id}){}",
+            title,
+            subtitle
+                .as_deref()
+                .map(|value| format!(" - {value}"))
+                .unwrap_or_default()
+        );
+    }
+
+    println!("offline_tracks: {}", tracks.len());
+    for (video_id, title, artist, _) in tracks {
+        let pinned_label = if pinned.contains(&video_id) {
+            " [pinned]"
+        } else {
+            ""
+        };
+        if artist.trim().is_empty() {
+            println!("  - {title} ({video_id}){pinned_label}");
+        } else {
+            println!("  - {title} - {artist} ({video_id}){pinned_label}");
+        }
+    }
+
+    Ok(())
+}
+
+struct CliOfflineDownload {
+    video_id: String,
+    bytes: usize,
+    already_cached: bool,
+}
+
+struct CliAudioDownload {
+    video_id: String,
+    audio: Vec<u8>,
+}
+
+fn ensure_cli_track_available_offline(
+    cache: &MusicCache,
+    network: &NetworkState,
+    track: &Track,
+    pin: bool,
+) -> Result<CliOfflineDownload> {
+    cache_track_metadata_cli(cache, track)?;
+    if cache.is_cached(&track.video_id) {
+        if pin {
+            cache.pin_offline(&track.video_id)?;
+        }
+        return Ok(CliOfflineDownload {
+            video_id: track.video_id.clone(),
+            bytes: 0,
+            already_cached: true,
+        });
+    }
+
+    let download = download_audio_for_offline_cli(cache, network, &track.video_id)?;
+    if download.video_id != track.video_id {
+        cache.upsert_track_metadata(
+            &download.video_id,
+            &track.title,
+            &artist_string(track),
+            history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        )?;
+    }
+
+    let art = track
+        .thumbnail_url
+        .as_ref()
+        .and_then(|url| fetch_thumbnail_bytes(url));
+    cache.store_audio(&download.video_id, &download.audio, art.as_deref())?;
+    if pin {
+        cache.pin_offline(&download.video_id)?;
+    }
+
+    Ok(CliOfflineDownload {
+        video_id: download.video_id,
+        bytes: download.audio.len(),
+        already_cached: false,
+    })
+}
+
+fn download_audio_for_offline_cli(
+    cache: &MusicCache,
+    network: &NetworkState,
+    video_id: &str,
+) -> Result<CliAudioDownload> {
+    let resolved = network
+        .resolved_audio_stream_url(video_id)
+        .with_context(|| format!("failed to get audio URL for {video_id}"))?;
+    if resolved.video_id != video_id {
+        cache
+            .replace_video_id(video_id, &resolved.video_id)
+            .with_context(|| {
+                format!(
+                    "failed to migrate stale video id {video_id} -> {}",
+                    resolved.video_id
+                )
+            })?;
+    }
+
+    let resolved_video_id = resolved.video_id;
+    let audio = download_media_bytes(&resolved.url, Some("bytes=0-")).or_else(|primary_err| {
+        let fallback_url = network
+            .android_vr_audio_stream_url(&resolved_video_id)
+            .with_context(|| {
+                format!("failed to get Android VR audio URL for {resolved_video_id}")
+            })?;
+        download_media_bytes(&fallback_url, Some("bytes=0-"))
+            .with_context(|| format!("failed to download Android VR media for {resolved_video_id}"))
+            .map_err(|fallback_err| {
+                primary_err.context(format!(
+                    "Android VR fallback also failed for {resolved_video_id}: {fallback_err:#}"
+                ))
+            })
+    })?;
+
+    Ok(CliAudioDownload {
+        video_id: resolved_video_id,
+        audio,
+    })
+}
+
+fn cache_track_metadata_cli(cache: &MusicCache, track: &Track) -> Result<()> {
+    cache.record_play(
+        &track.video_id,
+        &track.title,
+        &artist_string(track),
+        history_thumbnail_candidate(track.thumbnail_url.as_deref()),
+        0,
+    )
+}
+
+fn parse_video_id_argument(args: &[String], label: &str) -> Result<String> {
+    let input = join_required_input(args, label)?;
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Missing {label}");
+    }
+    Ok(extract_video_id_from_input(trimmed).unwrap_or_else(|| trimmed.to_string()))
+}
+
+fn offline_tracks_as_queue(cache: &MusicCache) -> Result<Vec<Track>> {
+    cache
+        .offline_tracks()?
+        .into_iter()
+        .map(|(video_id, title, artist, _)| {
+            offline_track_from_parts(cache, video_id, title, artist)
+        })
+        .collect()
+}
+
+fn offline_track_by_id(cache: &MusicCache, video_id: &str) -> Result<Track> {
+    if !cache.is_cached(video_id) {
+        bail!("No offline download exists for `{video_id}`");
+    }
+    let (title, artist) = cache
+        .get_track_meta(video_id)
+        .unwrap_or_else(|| (video_id.to_string(), String::new()));
+    offline_track_from_parts(cache, video_id.to_string(), title, artist)
+}
+
+fn offline_track_from_parts(
+    cache: &MusicCache,
+    video_id: String,
+    title: String,
+    artist: String,
+) -> Result<Track> {
+    Ok(Track {
+        video_id: video_id.clone(),
+        title,
+        artists: if artist.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![Artist {
+                name: artist,
+                id: None,
+            }]
+        },
+        album: None,
+        duration: None,
+        thumbnail_url: cache
+            .get_cached_art(&video_id)
+            .map(|path| format!("file://{}", path.display())),
+        playback_playlist_id: None,
+        playback_params: None,
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
+    })
+}
+
+fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
+    url.filter(|value| !value.starts_with("file://"))
+}
+
+fn notify_daemon_settings_if_running() {
+    if daemon_is_running() {
+        let _ = DaemonClient::new().and_then(|client| client.reload_settings());
+    }
+}
+
 fn run_info() -> Result<()> {
     let snapshot = DaemonClient::new()?.state()?;
     let remote_rating = snapshot
@@ -187,6 +623,7 @@ fn run_info() -> Result<()> {
     println!("probe_active: {}", yes_no(snapshot.probe_active));
     println!("repeat_mode: {}", repeat_mode_label(snapshot.repeat_mode));
     println!("loops_left: {}", format_loops_left(&snapshot));
+    println!("sleep: {}", format_sleep_status_from_snapshot(&snapshot));
     println!("queue_len: {}", snapshot.queue.len());
     println!(
         "queue_position: {}",
@@ -386,8 +823,14 @@ fn run_config(args: &[String]) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("`static config set` requires a config name"))?;
             let value = join_required_input(&args[2..], "config value")?;
             let cache = open_music_cache()?;
-            let mut settings = cache.load_settings()?;
+            let current_settings = cache.load_settings()?;
+            let mut settings = current_settings.clone();
             apply_config_value(&mut settings, name, &value)?;
+            if let Some(warning) =
+                settings_eviction_warning(&cache, &current_settings, &settings, name)?
+            {
+                eprintln!("warning: {}", warning.message);
+            }
             cache.save_settings(&settings)?;
             if daemon_is_running() {
                 let _ = DaemonClient::new().and_then(|client| client.reload_settings());
@@ -397,6 +840,88 @@ fn run_config(args: &[String]) -> Result<()> {
         }
         other => bail!("Unknown config command `{other}`"),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OfflineEvictionWarning {
+    pub(crate) impact: usize,
+    pub(crate) message: String,
+}
+
+pub(crate) fn settings_eviction_warning(
+    cache: &MusicCache,
+    current: &AppSettings,
+    next: &AppSettings,
+    key: &str,
+) -> Result<Option<OfflineEvictionWarning>> {
+    if !settings_change_can_evict_auto_downloads(current, next, key) {
+        return Ok(None);
+    }
+
+    let impact = cache.auto_download_eviction_count(next)?;
+    if impact == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(OfflineEvictionWarning {
+        impact,
+        message: offline_eviction_warning_message(impact, key),
+    }))
+}
+
+fn settings_change_can_evict_auto_downloads(
+    current: &AppSettings,
+    next: &AppSettings,
+    key: &str,
+) -> bool {
+    match key {
+        "auto_cache_listen_again" => {
+            current.auto_cache_listen_again && !next.auto_cache_listen_again
+        }
+        "listen_again_cache_days" => next.listen_again_cache_days < current.listen_again_cache_days,
+        "auto_manage_offline_cache" => {
+            current.auto_manage_offline_cache && !next.auto_manage_offline_cache
+        }
+        "offline_cache_target" => next.offline_cache_target < current.offline_cache_target,
+        "offline_rewatch_threshold" => {
+            next.offline_rewatch_threshold > current.offline_rewatch_threshold
+        }
+        "score_decay_window_days" => next.score_decay_window_days < current.score_decay_window_days,
+        "minimum_offline_score" => next.minimum_offline_score > current.minimum_offline_score,
+        _ => false,
+    }
+}
+
+fn offline_eviction_warning_message(impact: usize, key: &str) -> String {
+    let song_label = if impact == 1 { "song" } else { "songs" };
+    let pronoun = if impact == 1 { "it" } else { "they" };
+    let object = if impact == 1 { "it" } else { "them" };
+    let qualify = if impact == 1 { "qualifies" } else { "qualify" };
+    let fall = if impact == 1 { "falls" } else { "fall" };
+    let reason = match key {
+        "auto_cache_listen_again" => {
+            format!("{pronoun} only {qualify} through Listen again cache right now")
+        }
+        "listen_again_cache_days" => {
+            format!("{pronoun} would {fall} outside the new Listen again cache window")
+        }
+        "auto_manage_offline_cache" => {
+            format!("{pronoun} only {qualify} through the heuristic offline cache right now")
+        }
+        "offline_cache_target" => {
+            format!("the smaller heuristic offline library size would no longer include {object}")
+        }
+        "offline_rewatch_threshold" => {
+            format!("{pronoun} no longer {qualify} for the heuristic offline cache")
+        }
+        "score_decay_window_days" => format!("{pronoun} would {fall} below the offline cutoff"),
+        "minimum_offline_score" => {
+            format!("{pronoun} would {fall} below the new score floor")
+        }
+        _ => format!("the new offline cache settings would no longer include {object}"),
+    };
+
+    format!("{impact} auto-downloaded {song_label} would be evicted immediately because {reason}.")
 }
 
 fn run_interactive_tui() -> Result<()> {
@@ -1500,6 +2025,17 @@ fn format_progress(position_millis: Option<u64>, duration_millis: Option<u64>) -
 
 pub(crate) fn format_millis(millis: u64) -> String {
     let total_seconds = millis / 1000;
+    let seconds = total_seconds % 60;
+    let minutes = (total_seconds / 60) % 60;
+    let hours = total_seconds / 3600;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+pub(crate) fn format_duration_secs(total_seconds: u64) -> String {
     let seconds = total_seconds % 60;
     let minutes = (total_seconds / 60) % 60;
     let hours = total_seconds / 3600;

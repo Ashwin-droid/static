@@ -25,6 +25,10 @@ const PLAYBACK_STATE_ROW_KEY: &str = "resume";
 const PLAYLIST_STATE_ROW_KEY_PREFIX: &str = "playlist";
 const PLAYBACK_STATE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
+pub fn youtube_music_watch_url(video_id: &str) -> String {
+    format!("https://music.youtube.com/watch?v={video_id}")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepeatMode {
     Off,
@@ -72,6 +76,10 @@ pub struct PlaybackSnapshot {
     pub probe_active: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe_restore_position_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep_remaining_secs: Option<u64>,
+    #[serde(default)]
+    pub sleep_after_current: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +104,14 @@ fn default_true() -> bool {
 pub struct CoordinationTargetsSnapshot {
     pub mpris: Vec<CoordinationTargetSnapshot>,
     pub pipewire: Vec<CoordinationTargetSnapshot>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SleepStatusSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u64>,
+    #[serde(default)]
+    pub after_current: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +174,8 @@ impl Default for PlaybackSnapshot {
             halt_auto_resume_pending: false,
             probe_active: false,
             probe_restore_position_millis: None,
+            sleep_remaining_secs: None,
+            sleep_after_current: false,
         }
     }
 }
@@ -237,6 +255,13 @@ pub enum DaemonRequest {
     ActivateRadioChip {
         chip_index: usize,
     },
+    SetSleepTimer {
+        minutes: u32,
+    },
+    SetSleepAfterCurrent,
+    ClearSleepTimer,
+    GetSleepStatus,
+    CopyShareUrl,
     LogMessage {
         source: LogSource,
         message: String,
@@ -252,6 +277,8 @@ pub enum DaemonResponse {
     Pong,
     State(PlaybackSnapshot),
     CoordinationTargets(CoordinationTargetsSnapshot),
+    SleepStatus(SleepStatusSnapshot),
+    ShareUrl(String),
     Error(String),
 }
 
@@ -710,6 +737,34 @@ impl DaemonClient {
 
     pub fn activate_radio_chip(&self, chip_index: usize) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::ActivateRadioChip { chip_index })
+    }
+
+    pub fn set_sleep_timer(&self, minutes: u32) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::SetSleepTimer { minutes })
+    }
+
+    pub fn set_sleep_after_current(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::SetSleepAfterCurrent)
+    }
+
+    pub fn clear_sleep_timer(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::ClearSleepTimer)
+    }
+
+    pub fn sleep_status(&self) -> Result<SleepStatusSnapshot> {
+        match self.request(&DaemonRequest::GetSleepStatus)? {
+            DaemonResponse::SleepStatus(status) => Ok(status),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
+    }
+
+    pub fn copy_share_url(&self) -> Result<String> {
+        match self.request(&DaemonRequest::CopyShareUrl)? {
+            DaemonResponse::ShareUrl(url) => Ok(url),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
     }
 
     pub fn reload_settings(&self) -> Result<PlaybackSnapshot> {

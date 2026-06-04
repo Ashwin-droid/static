@@ -31,6 +31,8 @@ const ICON_REPEAT: &[u8] = include_bytes!("../../assets/icons/repeat.svg");
 const ICON_REPEAT_ONE: &[u8] = include_bytes!("../../assets/icons/repeat_one.svg");
 const ICON_SHUFFLE: &[u8] = include_bytes!("../../assets/icons/shuffle.svg");
 const ICON_DOWNLOAD: &[u8] = include_bytes!("../../assets/icons/download.svg");
+const ICON_SLEEP: &[u8] = include_bytes!("../../assets/icons/sleep.svg");
+const ICON_SHARE: &[u8] = include_bytes!("../../assets/icons/share.svg");
 
 const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
@@ -255,6 +257,7 @@ struct PlayerState {
     prev_btn: Button,
     play_pause_btn: Button,
     next_btn: Button,
+    sleep_btn: Button,
     halt_auto_cancel_btn: Button,
     halt_auto_resume_btn: Button,
     // Time
@@ -267,7 +270,10 @@ struct PlayerState {
     // Actions
     dislike_btn: Button,
     like_btn: Button,
+    share_btn: Button,
     menu_btn: Button,
+    toast_label: Label,
+    toast_serial: Cell<u64>,
     // Volume
     volume_slider: Scale,
     // Modes
@@ -810,6 +816,7 @@ fn reset_player_ui(ps: &PlayerState, state: &Arc<Mutex<AppState>>) {
     ps.halt_auto_resume_btn.set_sensitive(false);
     ps.like_btn.set_sensitive(false);
     ps.dislike_btn.set_sensitive(false);
+    ps.share_btn.set_sensitive(false);
     update_rating_buttons_ui(&ps.like_btn, &ps.dislike_btn, SongRating::Indifferent);
     ps.menu_btn.set_sensitive(false);
 }

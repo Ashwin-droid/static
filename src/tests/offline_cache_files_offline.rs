@@ -87,3 +87,21 @@ fn replace_video_id_swaps_rows_and_cache_files_without_alias_table() {
 
     let _ = fs::remove_dir_all(base);
 }
+
+#[test]
+fn unpin_offline_returns_download_to_auto_managed_pool() {
+    let base = std::env::temp_dir().join(format!("static-cache-test-{}", Uuid::new_v4()));
+    let raw_root = base.to_string_lossy().to_string();
+
+    let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+    cache
+        .store_audio("video123", b"audio bytes", None)
+        .expect("store audio");
+    cache.pin_offline("video123").expect("pin video");
+    assert!(cache.is_pinned_offline("video123"));
+
+    cache.unpin_offline("video123").expect("unpin video");
+    assert!(!cache.is_pinned_offline("video123"));
+
+    let _ = fs::remove_dir_all(base);
+}

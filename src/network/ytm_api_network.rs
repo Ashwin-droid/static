@@ -57,221 +57,9 @@ const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
 const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
 const YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK: u64 = 20_572;
-const WEB_REMIX_EJS_SOLVER_LIB: &str = include_str!("ytm_ejs_solver_lib.min.js");
-const WEB_REMIX_EJS_SOLVER_CORE: &str = include_str!("ytm_ejs_solver_core.js");
-const WEB_REMIX_NODE_CIPHER_SOLVER: &str = r#"
-const fs = require("fs");
-const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
-
-function installBrowserStubs() {
-  const loc = new URL("https://music.youtube.com/");
-  globalThis.window = globalThis;
-  globalThis.self = globalThis;
-  globalThis.location = loc;
-  try {
-    Object.defineProperty(globalThis, "navigator", {
-      value: { userAgent: "Mozilla/5.0", cookieEnabled: true },
-      configurable: true
-    });
-  } catch (_) {}
-  globalThis.XMLHttpRequest = function XMLHttpRequest() {};
-  const storage = {
-    getItem() { return null; },
-    setItem() {},
-    removeItem() {}
-  };
-  globalThis.localStorage = globalThis.localStorage || storage;
-  globalThis.sessionStorage = globalThis.sessionStorage || storage;
-  globalThis.CustomEvent = globalThis.CustomEvent || function CustomEvent() {};
-  globalThis.addEventListener = globalThis.addEventListener || function addEventListener() {};
-  globalThis.removeEventListener = globalThis.removeEventListener || function removeEventListener() {};
-  globalThis.dispatchEvent = globalThis.dispatchEvent || function dispatchEvent() {};
-  globalThis.matchMedia = globalThis.matchMedia || function matchMedia() {
-    return { matches: false, addEventListener() {}, removeEventListener() {} };
-  };
-  globalThis.document = globalThis.document || {
-    location: loc,
-    createElement() {
-      return {
-        style: {},
-        setAttribute() {},
-        appendChild() {},
-        getElementsByTagName() { return []; }
-      };
-    },
-    querySelector() { return null; },
-    addEventListener() {}
-  };
-}
-
-function findUrlCipherHelperNames(playerJs) {
-  const helperRe = /([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)?)=function\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=""(?:,([A-Za-z_$][\w$]*)="")?\)\{\2=new g\.[A-Za-z_$][\w$]*\(\2,!0\);\2\.set\("alr","yes"\);/g;
-  const helpers = [];
-  for (const match of playerJs.matchAll(helperRe)) {
-    if (!match[4] || playerJs.slice(match.index, match.index + 220).includes(`${match[4]}&&`)) {
-      helpers.push(match[1]);
-    }
-  }
-  if (helpers.length) {
-    return [...new Set(helpers)];
-  }
-  throw new Error("WEB_REMIX URL cipher helper was not found in player JS");
-}
-
-function exportUrlCipherHelpers(playerJs, helperNames) {
-  const end = "})(_yt_player);";
-  const exports = helperNames
-    .map((helperName) => `${JSON.stringify(helperName)}: typeof ${helperName} !== "undefined" ? ${helperName} : null`)
-    .join(",");
-  const injection = `;globalThis.__staticYtCipher = { helpers: {${exports}} };`;
-  if (!playerJs.includes(end)) {
-    throw new Error("WEB_REMIX player JS wrapper was not recognized");
-  }
-  return playerJs.replace(end, `${injection}${end}`);
-}
-
-function renderedUrl(value) {
-  for (const key of ["ER", "Ws", "dO", "toString"]) {
-    if (value && typeof value[key] === "function") {
-      const rendered = String(value[key]());
-      if (/^https?:\/\//.test(rendered)) {
-        return rendered;
-      }
-    }
-  }
-  return String(value);
-}
-
-function hasSolvedSignature(url, sp) {
-  const params = new URL(url).searchParams;
-  return params.has(sp || "signature") || params.has("sig") || params.has("signature");
-}
-
-function withUpdatedQuery(url, params) {
-  const parsed = new URL(url);
-  for (const [key, value] of Object.entries(params)) {
-    if (value) {
-      parsed.searchParams.set(key, value);
-    }
-  }
-  return parsed.toString();
-}
-
-function uniqueUrls(urls) {
-  const seen = new Set();
-  const unique = [];
-  for (const url of urls) {
-    if (!url || seen.has(url)) {
-      continue;
-    }
-    seen.add(url);
-    unique.push(url);
-  }
-  return unique;
-}
-
-function solveWithEjs(input) {
-  if (!input.ejsLib || !input.ejsCore) {
-    throw new Error("EJS challenge solver scripts are missing");
-  }
-
-  const parsed = new URL(input.url || "");
-  const nChallenge = parsed.searchParams.get("n");
-  const requests = [];
-  if (input.s) {
-    requests.push({ type: "sig", challenges: [input.s] });
-  }
-  if (nChallenge) {
-    requests.push({ type: "n", challenges: [nChallenge] });
-  }
-  if (!requests.length) {
-    return null;
-  }
-
-  eval(input.ejsLib);
-  Object.assign(globalThis, lib);
-  const meriyah = globalThis.meriyah;
-  const astring = globalThis.astring;
-  eval(input.ejsCore);
-  const output = jsc({
-    type: "player",
-    player: input.playerJs || "",
-    requests,
-    output_preprocessed: false
-  });
-  if (!output || output.type === "error") {
-    throw new Error(output && output.error ? output.error : "EJS challenge solver failed");
-  }
-
-  let signature = null;
-  let n = null;
-  for (const response of output.responses || []) {
-    if (!response || response.type === "error") {
-      continue;
-    }
-    if (response.data && input.s && Object.prototype.hasOwnProperty.call(response.data, input.s)) {
-      signature = response.data[input.s];
-    }
-    if (response.data && nChallenge && Object.prototype.hasOwnProperty.call(response.data, nChallenge)) {
-      n = response.data[nChallenge];
-    }
-  }
-  if (input.s && !signature) {
-    throw new Error("EJS challenge solver returned no signature");
-  }
-
-  const updates = {};
-  if (signature) {
-    updates[input.sp || "signature"] = signature;
-  }
-  if (n) {
-    updates.n = n;
-  }
-  return withUpdatedQuery(input.url || "", updates);
-}
-
-installBrowserStubs();
-const errors = [];
-const candidateUrls = [];
-try {
-  const ejsUrl = solveWithEjs(input);
-  if (ejsUrl) {
-    candidateUrls.push(ejsUrl);
-  }
-} catch (err) {
-  errors.push(`ejs: ${err && err.message ? err.message : err}`);
-}
-
-let helperNames = [];
-try {
-  helperNames = findUrlCipherHelperNames(input.playerJs || "");
-  eval(exportUrlCipherHelpers(input.playerJs || "", helperNames));
-} catch (err) {
-  errors.push(`helper-export: ${err && err.message ? err.message : err}`);
-}
-for (const helperName of helperNames) {
-  const helper = globalThis.__staticYtCipher && globalThis.__staticYtCipher.helpers && globalThis.__staticYtCipher.helpers[helperName];
-  if (typeof helper !== "function") {
-    errors.push(`${helperName}: did not export`);
-    continue;
-  }
-  try {
-    const url = renderedUrl(helper(input.url || "", input.sp || "signature", input.s || ""));
-    new URL(url);
-    if (input.s && !hasSolvedSignature(url, input.sp || "signature")) {
-      throw new Error("returned URL without deciphered signature");
-    }
-    candidateUrls.push(url);
-  } catch (err) {
-    errors.push(`${helperName}: ${err && err.message ? err.message : err}`);
-  }
-}
-const urls = uniqueUrls(candidateUrls);
-if (!urls.length) {
-  throw new Error(`WEB_REMIX URL challenge solvers failed: ${errors.slice(0, 3).join("; ")}`);
-}
-process.stdout.write(JSON.stringify({ url: urls[0], urls }));
-"#;
+const WEB_REMIX_SOLVER_FILE_NAME: &str = "solver.js";
+const WEB_REMIX_SOLVER_INFO_URL: &str = "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/yt_dlp/extractor/youtube/jsc/_builtin/vendor/_info.py";
+const WEB_REMIX_SOLVER_CORE_URL: &str = "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js";
 
 // OAuth device flow for Android VR auth (premium content)
 const VR_OAUTH_CLIENT_ID: &str =
@@ -1293,6 +1081,203 @@ fn executable_node_binary() -> Result<PathBuf> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+fn web_remix_solver_path() -> PathBuf {
+    static_storage_root().join(WEB_REMIX_SOLVER_FILE_NAME)
+}
+
+fn web_remix_solver_release_version(info_py: &str) -> Result<String> {
+    let re = Regex::new(r#"VERSION\s*=\s*['"]([^'"]+)['"]"#)
+        .expect("EJS solver version regex should compile");
+    re.captures(info_py)
+        .and_then(|captures| captures.get(1))
+        .map(|capture| capture.as_str().to_string())
+        .context("yt-dlp HEAD did not expose an EJS solver version")
+}
+
+fn web_remix_solver_lib_url(version: &str) -> String {
+    format!("https://github.com/yt-dlp/ejs/releases/download/{version}/yt.solver.lib.min.js")
+}
+
+fn web_remix_solver_script(lib_js: &str, core_js: &str) -> Result<String> {
+    if !lib_js.contains("var lib=") && !lib_js.contains("var lib =") {
+        bail!("downloaded yt-dlp EJS solver lib did not define lib");
+    }
+    if !core_js.contains("var jsc=") && !core_js.contains("var jsc =") {
+        bail!("downloaded yt-dlp EJS solver core did not define jsc");
+    }
+
+    Ok(format!(
+        r#"{lib_js}
+Object.assign(globalThis, lib);
+{core_js}
+
+(function staticWebRemixSolver() {{
+  const fs = require("fs");
+  const input = JSON.parse(fs.readFileSync(0, "utf8") || "{{}}");
+
+  function writeSolved(urls) {{
+    fs.writeFileSync(1, JSON.stringify({{ url: urls[0] || "", urls }}));
+    process.exit(0);
+  }}
+
+  function withUpdatedQuery(url, params) {{
+    const parsed = new URL(url);
+    for (const [key, value] of Object.entries(params)) {{
+      if (value) {{
+        parsed.searchParams.set(key, value);
+      }}
+    }}
+    return parsed.toString();
+  }}
+
+  try {{
+    const inputUrl = input.url || "";
+    const parsed = new URL(inputUrl);
+    const nChallenge = parsed.searchParams.get("n");
+    const requests = [];
+    if (input.s) {{
+      requests.push({{ type: "sig", challenges: [input.s] }});
+    }}
+    if (nChallenge) {{
+      requests.push({{ type: "n", challenges: [nChallenge] }});
+    }}
+    if (!requests.length) {{
+      writeSolved([inputUrl]);
+    }}
+
+    const output = jsc({{
+      type: "player",
+      player: input.playerJs || "",
+      requests,
+      output_preprocessed: false
+    }});
+    if (!output || output.type === "error") {{
+      throw new Error(output && output.error ? output.error : "yt-dlp EJS challenge solver failed");
+    }}
+
+    let signature = null;
+    let n = null;
+    const errors = [];
+    for (const response of output.responses || []) {{
+      if (!response || response.type === "error") {{
+        errors.push(response && response.error ? response.error : "unknown solver response error");
+        continue;
+      }}
+      if (response.data && input.s && Object.prototype.hasOwnProperty.call(response.data, input.s)) {{
+        signature = response.data[input.s];
+      }}
+      if (response.data && nChallenge && Object.prototype.hasOwnProperty.call(response.data, nChallenge)) {{
+        n = response.data[nChallenge];
+      }}
+    }}
+    if (input.s && !signature) {{
+      errors.push("signature challenge was not solved");
+    }}
+    if (nChallenge && !n) {{
+      errors.push("n challenge was not solved");
+    }}
+    if (errors.length) {{
+      throw new Error(`WEB_REMIX URL challenges failed: ${{errors.slice(0, 3).join("; ")}}`);
+    }}
+
+    const updates = {{}};
+    if (signature) {{
+      updates[input.sp || "signature"] = signature;
+    }}
+    if (n) {{
+      updates.n = n;
+    }}
+    writeSolved([withUpdatedQuery(inputUrl, updates)]);
+  }} catch (err) {{
+    const message = err && err.stack ? err.stack : String(err);
+    fs.writeFileSync(2, message + "\n");
+    process.exit(1);
+  }}
+}})();
+"#
+    ))
+}
+
+fn fetch_web_remix_solver_text(
+    http: &reqwest::blocking::Client,
+    url: &str,
+    label: &str,
+) -> Result<String> {
+    http.get(url)
+        .header("user-agent", YTM_USER_AGENT)
+        .send()
+        .with_context(|| format!("failed to fetch {label} from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("{label} request was rejected by {url}"))?
+        .text()
+        .with_context(|| format!("failed to read {label} from {url}"))
+}
+
+fn ensure_web_remix_solver_script() -> Result<PathBuf> {
+    let path = web_remix_solver_path();
+    if path
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create WEB_REMIX solver dir {}", parent.display())
+        })?;
+    }
+
+    eprintln!(
+        "[PLAYER] WEB_REMIX solver.js missing; fetching yt-dlp HEAD solver into {}",
+        path.display()
+    );
+
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build WEB_REMIX solver download client")?;
+    let info_py = fetch_web_remix_solver_text(
+        &http,
+        WEB_REMIX_SOLVER_INFO_URL,
+        "yt-dlp EJS solver metadata",
+    )?;
+    let version = web_remix_solver_release_version(&info_py)?;
+    let lib_url = web_remix_solver_lib_url(&version);
+    let lib_js = fetch_web_remix_solver_text(&http, &lib_url, "yt-dlp EJS solver lib")?;
+    let core_js = fetch_web_remix_solver_text(
+        &http,
+        WEB_REMIX_SOLVER_CORE_URL,
+        "yt-dlp HEAD EJS solver core",
+    )?;
+    let script = web_remix_solver_script(&lib_js, &core_js)?;
+
+    let temp_path = path.with_extension(format!(
+        "js.tmp-{}-{}",
+        std::process::id(),
+        unix_epoch_millis_u64()
+    ));
+    std::fs::write(&temp_path, script.as_bytes()).with_context(|| {
+        format!(
+            "failed to write temporary WEB_REMIX solver {}",
+            temp_path.display()
+        )
+    })?;
+    std::fs::rename(&temp_path, &path).with_context(|| {
+        format!(
+            "failed to move WEB_REMIX solver {} into {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+
+    eprintln!(
+        "[PLAYER] cached yt-dlp EJS solver v{version} at {}",
+        path.display()
+    );
+    Ok(path)
 }
 
 fn signature_timestamp_from_player_js(js: &str) -> Option<u64> {
@@ -2541,16 +2526,6 @@ impl YtMusicClient {
         }
     }
 
-    fn solve_web_remix_stream_url_with_node(
-        player_js: &str,
-        stream: &WebRemixStreamUrl,
-    ) -> Result<String> {
-        Self::solve_web_remix_stream_url_candidates_with_node(player_js, stream)?
-            .into_iter()
-            .next()
-            .context("WEB_REMIX URL solver returned no URL")
-    }
-
     fn solve_web_remix_stream_url_candidates_with_node(
         player_js: &str,
         stream: &WebRemixStreamUrl,
@@ -2560,20 +2535,27 @@ impl YtMusicClient {
             "url": stream.url,
             "sp": stream.sp,
             "s": stream.signature.as_deref().unwrap_or(""),
-            "ejsLib": WEB_REMIX_EJS_SOLVER_LIB,
-            "ejsCore": WEB_REMIX_EJS_SOLVER_CORE,
         }))
         .context("Failed to encode WEB_REMIX URL solver input")?;
 
+        let solver_path = ensure_web_remix_solver_script()?;
+        Self::run_web_remix_solver_with_node(&solver_path, &input)
+    }
+
+    fn run_web_remix_solver_with_node(solver_path: &Path, input: &[u8]) -> Result<Vec<String>> {
         let node = executable_node_binary()?;
         let mut child = Command::new(&node)
-            .arg("-e")
-            .arg(WEB_REMIX_NODE_CIPHER_SOLVER)
+            .arg(solver_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("Node.js is not available for WEB_REMIX URL solving")?;
+            .with_context(|| {
+                format!(
+                    "Node.js failed to start WEB_REMIX solver {}",
+                    solver_path.display()
+                )
+            })?;
 
         child
             .stdin

@@ -155,123 +155,83 @@ fn node_binary_candidates_include_nvm_versions_when_path_is_plain() {
 }
 
 #[test]
-fn web_remix_node_solver_handles_current_hd_helper_shape() -> anyhow::Result<()> {
-    if super::executable_node_binary().is_err() {
-        return Ok(());
-    }
+fn web_remix_solver_release_version_parses_yt_dlp_metadata() -> anyhow::Result<()> {
+    let version = super::web_remix_solver_release_version(
+        r#"
+        # generated metadata
+        VERSION = '0.8.0'
+        HASHES = {}
+        "#,
+    )?;
 
-    let player_js = r#"
-var _yt_player = {};
-(function(g) {
-g.Hd = class {
-  constructor(url) { this.url = new URL(url); }
-  set(key, value) { this.url.searchParams.set(key, value); }
-  get(key) { return this.url.searchParams.get(key); }
-  dO() { return this.url.toString(); }
-};
-var X = [];
-X[21] = "set";
-var SJ = function(_mode, _key, value) { return value; };
-var ax = function(_mode, _key, value) { return value.split("").reverse().join(""); };
-xJ=function(z,D="",E=""){z=new g.Hd(z,!0);z.set("alr","yes");E&&(E=SJ(8,5797,SJ(7,4168,E)),z[X[21]](D,ax(15,8264,E)));return z};
-})(_yt_player);
-"#;
-    let stream = super::WebRemixStreamUrl {
-        url: "https://rr.example.com/videoplayback?n=raw".to_string(),
-        sp: "sig".to_string(),
-        signature: Some("cba".to_string()),
-        ciphered: true,
-    };
-
-    let solved = YtMusicClient::solve_web_remix_stream_url_with_node(player_js, &stream)?;
-    let parsed = url::Url::parse(&solved)?;
+    assert_eq!(version, "0.8.0");
     assert_eq!(
-        parsed
-            .query_pairs()
-            .find_map(|(key, value)| (key == "sig").then(|| value.into_owned())),
-        Some("abc".to_string())
+        super::web_remix_solver_lib_url(&version),
+        "https://github.com/yt-dlp/ejs/releases/download/0.8.0/yt.solver.lib.min.js"
     );
-    assert_eq!(
-        parsed
-            .query_pairs()
-            .find_map(|(key, value)| (key == "alr").then(|| value.into_owned())),
-        Some("yes".to_string())
-    );
-
     Ok(())
 }
 
 #[test]
-fn web_remix_node_solver_handles_current_fd_er_helper_shape() -> anyhow::Result<()> {
+fn web_remix_solver_script_is_disk_runner_without_static_cipher_stubs() -> anyhow::Result<()> {
+    let script = super::web_remix_solver_script(
+        "var lib={meriyah:null,astring:null};",
+        "var jsc=function(){return {type:'result',responses:[]};};",
+    )?;
+
+    assert!(script.contains("function staticWebRemixSolver()"));
+    assert!(script.contains("process.exit(0)"));
+    assert!(!script.contains("__staticYtCipher"));
+    assert!(!script.contains("installBrowserStubs"));
+    Ok(())
+}
+
+#[test]
+fn web_remix_node_solver_runs_cached_solver_file() -> anyhow::Result<()> {
     if super::executable_node_binary().is_err() {
         return Ok(());
     }
 
-    let player_js = r#"
-var _yt_player = {};
-(function(g) {
-var D = [];
-D[1] = "params";
-D[10] = "cache";
-D[16] = "trusted";
-D[17] = "";
-D[20] = "unusedA";
-D[21] = "unusedB";
-D[28] = "raw";
-D[31] = "set";
-D[34] = "unusedC";
-function YY(_mode, _key, self) {
-  const url = new URL(self[D[28]]);
-  for (const [key, value] of Object.entries(self[D[1]])) {
-    url.searchParams.set(key, value);
-  }
-  return url.toString();
-}
-g.fd = class {
-  constructor(url, trusted = false) {
-    this[D[28]] = url;
-    this[D[16]] = trusted;
-    this[D[20]] = this[D[21]] = this[D[34]] = D[17];
-    this[D[1]] = {};
-    this[D[10]] = D[17];
-  }
-  set(key, value) {
-    this[D[1]][key] = value;
-    this[D[10]] = D[17];
-  }
-  get(key) { return this[D[1]][key] || null; }
-  ER() {
-    this[D[10]] || (this[D[10]] = YY(20, 6946, this));
-    return this[D[10]];
-  }
-};
-var yj = function(_mode, _key, value) { return value; };
-var J0 = function(_mode, _key, value) { return value.split("").reverse().join(""); };
-vm=function(e,r="",w=""){e=new g.fd(e,!0);e.set("alr","yes");w&&(w=yj(15,1824,yj(11,6168,w)),e[D[31]](r,J0(56,532,w)));return e};
-})(_yt_player);
-"#;
-    let stream = super::WebRemixStreamUrl {
-        url: "https://rr.example.com/videoplayback?n=raw".to_string(),
-        sp: "sig".to_string(),
-        signature: Some("cba".to_string()),
-        ciphered: true,
-    };
+    let root = std::env::temp_dir().join(format!("static-solver-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&root)?;
+    let solver_path = root.join("solver.js");
+    std::fs::write(
+        &solver_path,
+        r#"
+const fs = require("fs");
+const input = JSON.parse(fs.readFileSync(0, "utf8") || "{}");
+const parsed = new URL(input.url);
+parsed.searchParams.set(input.sp || "signature", "disk-sig");
+parsed.searchParams.set("n", "disk-n");
+const url = parsed.toString();
+fs.writeFileSync(1, JSON.stringify({ url, urls: [url, url] }));
+"#,
+    )?;
 
-    let solved = YtMusicClient::solve_web_remix_stream_url_with_node(player_js, &stream)?;
-    let parsed = url::Url::parse(&solved)?;
+    let input = serde_json::to_vec(&json!({
+        "playerJs": "unused",
+        "url": "https://rr.example.com/videoplayback?n=raw",
+        "sp": "sig",
+        "s": "encrypted"
+    }))?;
+    let urls = YtMusicClient::run_web_remix_solver_with_node(&solver_path, &input)?;
+    assert_eq!(urls.len(), 1);
+
+    let parsed = url::Url::parse(&urls[0])?;
     assert_eq!(
         parsed
             .query_pairs()
             .find_map(|(key, value)| (key == "sig").then(|| value.into_owned())),
-        Some("abc".to_string())
+        Some("disk-sig".to_string())
     );
     assert_eq!(
         parsed
             .query_pairs()
-            .find_map(|(key, value)| (key == "alr").then(|| value.into_owned())),
-        Some("yes".to_string())
+            .find_map(|(key, value)| (key == "n").then(|| value.into_owned())),
+        Some("disk-n".to_string())
     );
 
+    let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 

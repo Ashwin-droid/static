@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
+use reqwest::cookie::Jar;
 use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use rusqlite::{Connection as SqliteConnection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,13 @@ const YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION: &str = "1.20260114.03.00";
 const YTM_MOBILE_CLIENT_NAME: &str = "ANDROID_MUSIC";
 const YTM_MOBILE_CLIENT_VERSION: &str = "7.21.50";
 const YTM_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0";
+const YOUTUBE_ORIGIN: &str = "https://www.youtube.com";
+// Newer Android VR versions can return SABR-only streams; 1.65.10 still exposes
+// direct signed media URLs for cache/offline fallback downloads.
+const YOUTUBE_ANDROID_VR_HEADER_CLIENT_NAME: &str = "28";
+const YOUTUBE_ANDROID_VR_CLIENT_NAME: &str = "ANDROID_VR";
+const YOUTUBE_ANDROID_VR_CLIENT_VERSION: &str = "1.65.10";
+const YOUTUBE_ANDROID_VR_USER_AGENT: &str = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const TRACKING_BROWSER_BRAND: &str = "Edge Chromium";
 const TRACKING_BROWSER_VERSION: &str = "147.0.0.0";
 const TRACKING_BROWSER_ENGINE: &str = "WebKit";
@@ -983,6 +991,15 @@ fn ytm_web_player_js_url(map: &serde_json::Map<String, Value>) -> Option<String>
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn youtube_visitor_data_from_html(html: &str) -> Option<String> {
+    let re =
+        Regex::new(r#""visitorData"\s*:\s*"([^"]+)""#).expect("visitorData regex should compile");
+    re.captures(html)
+        .and_then(|captures| captures.get(1))
+        .map(|match_| match_.as_str().to_string())
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn absolute_ytm_url(path_or_url: &str) -> Option<String> {
@@ -2260,7 +2277,7 @@ impl YtMusicClient {
         // Android VR stays as the last-ditch playable URL path for offline/cache reliability.
         match self.try_android_vr_audio(video_id).await {
             Ok(url) => {
-                eprintln!("[PLAYER] got direct URL via Android VR fallback");
+                eprintln!("[PLAYER] got URL via Android VR fallback");
                 Ok(url)
             }
             Err(vr_err) => {
@@ -2922,11 +2939,7 @@ impl YtMusicClient {
             .text()
             .await?;
 
-        let re = Regex::new(r#""visitorData":"([^"]+)""#).unwrap();
-        let vd = re
-            .captures(&page)
-            .and_then(|c| c.get(1))
-            .map(|m| m.as_str().to_string())
+        let vd = youtube_visitor_data_from_html(&page)
             .context("Could not find visitorData in YouTube page")?;
 
         eprintln!("[VISITOR] got visitorData: {}...", &vd[..vd.len().min(30)]);
@@ -2952,45 +2965,141 @@ impl YtMusicClient {
         }
     }
 
+    fn android_vr_player_body(video_id: &str, signature_timestamp: u64) -> Value {
+        json!({
+            "context": {
+                "client": {
+                    "clientName": YOUTUBE_ANDROID_VR_CLIENT_NAME,
+                    "clientVersion": YOUTUBE_ANDROID_VR_CLIENT_VERSION,
+                    "deviceMake": "Oculus",
+                    "deviceModel": "Quest 3",
+                    "androidSdkVersion": 32,
+                    "userAgent": YOUTUBE_ANDROID_VR_USER_AGENT,
+                    "osName": "Android",
+                    "osVersion": "12L",
+                    "hl": "en",
+                    "timeZone": "UTC",
+                    "utcOffsetMinutes": 0,
+                }
+            },
+            "videoId": video_id,
+            "playbackContext": {
+                "contentPlaybackContext": {
+                    "html5Preference": "HTML5_PREF_WANTS",
+                    "signatureTimestamp": signature_timestamp,
+                }
+            },
+            "contentCheckOk": true,
+            "racyCheckOk": true,
+        })
+    }
+
+    async fn youtube_watch_session(
+        &self,
+        video_id: &str,
+        profile: &YtmWebProfile,
+    ) -> Result<(reqwest::Client, String)> {
+        let jar = Arc::new(Jar::default());
+        let youtube_origin = Url::parse(YOUTUBE_ORIGIN).expect("static YouTube URL should parse");
+        jar.add_cookie_str("PREF=hl=en&tz=UTC; Path=/", &youtube_origin);
+        jar.add_cookie_str("SOCS=CAI; Path=/", &youtube_origin);
+
+        let client = reqwest::Client::builder()
+            .cookie_provider(jar)
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .context("Failed to build Android VR HTTP client")?;
+        let watch_url =
+            format!("{YOUTUBE_ORIGIN}/watch?v={video_id}&bpctr=9999999999&has_verified=1");
+        let watch_page = client
+            .get(&watch_url)
+            .header("user-agent", YTM_USER_AGENT)
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("accept-language", "en-us,en;q=0.5")
+            .send()
+            .await
+            .with_context(|| {
+                format!("Failed to fetch YouTube watch page for Android VR {video_id}")
+            })?
+            .error_for_status()
+            .with_context(|| {
+                format!("YouTube watch page request for Android VR was rejected for {video_id}")
+            })?
+            .text()
+            .await
+            .with_context(|| {
+                format!("Failed to read YouTube watch page for Android VR {video_id}")
+            })?;
+
+        let visitor_data = match youtube_visitor_data_from_html(&watch_page) {
+            Some(visitor_data) => visitor_data,
+            None => match profile
+                .visitor_data
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(visitor_data) => visitor_data,
+                None => self
+                    .ensure_visitor_data()
+                    .await
+                    .context("Could not find visitorData for Android VR player request")?,
+            },
+        };
+        let mut guard = self.visitor_data.lock().unwrap();
+        *guard = Some(visitor_data.clone());
+
+        Ok((client, visitor_data))
+    }
+
     /// Send a single Android VR player request, optionally with OAuth Bearer auth.
     async fn vr_player_request(
         &self,
         video_id: &str,
         access_token: Option<&str>,
     ) -> Result<String> {
-        let vr_ua = "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
-        let vr_client = reqwest::Client::new();
+        let json = self.vr_player_response(video_id, access_token).await?;
+        self.android_vr_audio_url_from_response(&json).await
+    }
 
-        let mut body = json!({
-            "context": {
-                "client": {
-                    "clientName": "ANDROID_VR",
-                    "clientVersion": "1.71.26",
-                    "deviceMake": "Oculus",
-                    "deviceModel": "Quest 3",
-                    "androidSdkVersion": 32,
-                    "osName": "Android",
-                    "osVersion": "12L",
-                    "hl": "en",
-                    "gl": "US",
-                }
-            },
-            "videoId": video_id,
-        });
-
-        // Only include visitorData for unauthenticated requests
-        if access_token.is_none() {
-            let vd = self.ensure_visitor_data().await?;
-            body["context"]["client"]["visitorData"] = json!(vd);
+    async fn vr_player_response(
+        &self,
+        video_id: &str,
+        access_token: Option<&str>,
+    ) -> Result<Value> {
+        let profile = self.ytm_web_profile(false).await;
+        let (vr_client, visitor_data) = self.youtube_watch_session(video_id, &profile).await?;
+        let mut endpoint = Url::parse(&format!("{YOUTUBE_ORIGIN}/youtubei/v1/player"))
+            .expect("static URL should parse");
+        {
+            let mut query = endpoint.query_pairs_mut();
+            query.append_pair("prettyPrint", "false");
         }
 
+        let body = Self::android_vr_player_body(video_id, profile.signature_timestamp);
+
         let mut req = vr_client
-            .post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .post(endpoint)
             .header("content-type", "application/json")
-            .header("user-agent", vr_ua)
-            .header("origin", "https://www.youtube.com")
-            .header("x-youtube-client-name", "28")
-            .header("x-youtube-client-version", "1.71.26");
+            .header("user-agent", YOUTUBE_ANDROID_VR_USER_AGENT)
+            .header(
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .header("accept-language", "en-us,en;q=0.5")
+            .header("sec-fetch-mode", "navigate")
+            .header("origin", YOUTUBE_ORIGIN)
+            .header("x-goog-visitor-id", visitor_data)
+            .header(
+                "x-youtube-client-name",
+                YOUTUBE_ANDROID_VR_HEADER_CLIENT_NAME,
+            )
+            .header(
+                "x-youtube-client-version",
+                YOUTUBE_ANDROID_VR_CLIENT_VERSION,
+            );
 
         if let Some(token) = access_token {
             req = req.header("authorization", format!("Bearer {token}"));
@@ -3000,7 +3109,9 @@ impl YtMusicClient {
             .json(&body)
             .send()
             .await
-            .context("Failed to fetch Android VR player data")?;
+            .context("Failed to fetch Android VR player data")?
+            .error_for_status()
+            .context("YouTube rejected Android VR player request")?;
 
         let json: Value = resp
             .json()
@@ -3014,12 +3125,35 @@ impl YtMusicClient {
             bail!("Unplayable: {reason}");
         }
 
+        Ok(json)
+    }
+
+    async fn android_vr_audio_url_from_response(&self, json: &Value) -> Result<String> {
         let formats = Self::sorted_audio_formats(&json)?;
-        formats
+        if let Some(url) = formats
+            .iter()
+            .find_map(|format| Self::format_direct_url(format))
+        {
+            return Ok(url.to_string());
+        }
+
+        let Some(format) = formats
             .into_iter()
-            .find_map(Self::format_direct_url)
-            .map(|s| s.to_string())
-            .context("Android VR stream has no direct URL")
+            .find(|format| Self::format_signature_cipher(format).is_some())
+        else {
+            let has_sabr = json
+                .pointer("/streamingData/serverAbrStreamingUrl")
+                .and_then(|value| value.as_str())
+                .is_some();
+            if has_sabr {
+                bail!("Android VR stream is SABR-only and has no direct or ciphered URL");
+            }
+            bail!("Android VR stream has no direct or ciphered URL");
+        };
+        let profile = self.ytm_web_profile(false).await;
+        self.resolve_web_remix_audio_format(format, &profile)
+            .await
+            .context("failed to solve Android VR ciphered audio URL")
     }
 
     async fn get_lyrics_browse_id(&self, video_id: &str) -> Result<Option<String>> {

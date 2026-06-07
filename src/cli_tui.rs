@@ -30,6 +30,7 @@ use ratatui_image::{
     picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
+use uuid::Uuid;
 
 use crate::cli::{
     OfflineEvictionWarning, apply_config_value, artist_string, copy_text_to_clipboard,
@@ -55,6 +56,7 @@ use crate::offline::{AppSettings, CoordinationFilterMode, CoordinationMode, Musi
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);
+const UI_CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_WIDTH: u16 = 124;
 const MIN_HEIGHT: u16 = 34;
 const SIDEBAR_WIDTH: u16 = 30;
@@ -786,6 +788,8 @@ struct ThumbnailSlotState {
 struct InteractiveTui {
     client: DaemonClient,
     snapshot: PlaybackSnapshot,
+    ui_client_id: String,
+    last_ui_heartbeat_at: Instant,
     queue_selected: usize,
     queue_scroll_offset: usize,
     queue_viewport_rows: usize,

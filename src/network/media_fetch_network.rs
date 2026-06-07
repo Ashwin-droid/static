@@ -118,7 +118,10 @@ fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8
 
     loop {
         let start = audio.len() as u64;
-        let end = start.saturating_add(chunk_bytes - 1);
+        if total_len.is_some_and(|len| start >= len) {
+            return Ok(audio);
+        }
+        let end = media_chunk_end(start, chunk_bytes, total_len);
         let range_header = format!("bytes={start}-{end}");
         let response = send_media_request(url, Some(&range_header))?;
         let status = response.status();
@@ -126,7 +129,7 @@ fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8
             if status == StatusCode::FORBIDDEN {
                 if let Some(smaller_chunk_bytes) = smaller_media_chunk_size(chunk_bytes) {
                     eprintln!(
-                        "[MEDIA] media server rejected {} KiB range for {}; retrying with {} KiB",
+                        "[MEDIA] media server rejected range {range_header} ({} KiB chunk) for {}; retrying with {} KiB",
                         chunk_bytes / 1024,
                         media_url_for_log(url),
                         smaller_chunk_bytes / 1024
@@ -134,6 +137,11 @@ fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8
                     chunk_bytes = smaller_chunk_bytes;
                     continue;
                 }
+                eprintln!(
+                    "[MEDIA] media server rejected minimum range {range_header} ({} KiB chunk) for {}",
+                    chunk_bytes / 1024,
+                    media_url_for_log(url)
+                );
             }
             return Err(media_status_error(response, url));
         }
@@ -198,6 +206,14 @@ fn download_media_bytes_chunked(url: &str, follow_depth: usize) -> Result<Vec<u8
 
 fn smaller_media_chunk_size(current: u64) -> Option<u64> {
     (current > MEDIA_MIN_CHUNK_BYTES).then(|| (current / 2).max(MEDIA_MIN_CHUNK_BYTES))
+}
+
+fn media_chunk_end(start: u64, chunk_bytes: u64, total_len: Option<u64>) -> u64 {
+    let uncapped_end = start.saturating_add(chunk_bytes - 1);
+    match total_len {
+        Some(len) => uncapped_end.min(len.saturating_sub(1)),
+        None => uncapped_end,
+    }
 }
 
 fn media_status_error(response: Response, url: &str) -> anyhow::Error {
@@ -350,7 +366,7 @@ pub fn fetch_thumbnail_bytes(url: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        alternate_media_url_from_bytes, content_range_total, media_url_for_log,
+        alternate_media_url_from_bytes, content_range_total, media_chunk_end, media_url_for_log,
         media_url_is_web_remix, smaller_media_chunk_size,
     };
 
@@ -399,6 +415,19 @@ mod tests {
         assert_eq!(smaller_media_chunk_size(512 * 1024), Some(256 * 1024));
         assert_eq!(smaller_media_chunk_size(128 * 1024), Some(64 * 1024));
         assert_eq!(smaller_media_chunk_size(64 * 1024), None);
+    }
+
+    #[test]
+    fn media_chunk_end_caps_to_known_total_length() {
+        assert_eq!(
+            media_chunk_end(3_670_016, 512 * 1024, Some(3_901_969)),
+            3_901_968
+        );
+        assert_eq!(
+            media_chunk_end(524_288, 512 * 1024, Some(3_901_969)),
+            1_048_575
+        );
+        assert_eq!(media_chunk_end(3_670_016, 512 * 1024, None), 4_194_303);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::super::session_network::get_cookie;
+use super::super::session_network::{get_cookie, get_vr_refresh_token};
 use super::{
     CaptionTrack, TrackingInfo, YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK, YtMusicClient, YtmWebProfile,
     finalize_synced_lyric_lines, generate_cpn, lyrics_browse_id_from_next_response,
@@ -247,7 +247,11 @@ fn live_test_client() -> anyhow::Result<YtMusicClient> {
     let cookie = live_test_cookie().context(
         "set STATIC_YTM_TEST_COOKIE or save a YouTube Music cookie in Static's keyring first",
     )?;
-    YtMusicClient::new(&cookie)
+    let client = YtMusicClient::new(&cookie)?;
+    if let Some(token) = get_vr_refresh_token() {
+        client.set_vr_refresh_token(&token);
+    }
+    Ok(client)
 }
 
 #[test]
@@ -339,11 +343,48 @@ fn web_remix_live_hardcoded_ytm_id_resolves_high_quality_url() -> anyhow::Result
         Some("WEB_REMIX".to_string())
     );
 
+    let response = reqwest::blocking::Client::new()
+        .get(&url)
+        .header(reqwest::header::RANGE, super::WEB_REMIX_MEDIA_PROBE_RANGE)
+        .header("user-agent", super::YTM_USER_AGENT)
+        .send()
+        .context("failed to range-probe resolved WEB_REMIX media URL")?;
+    assert!(
+        response.status().is_success(),
+        "WEB_REMIX media URL range probe returned {}",
+        response.status()
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires authenticated YouTube Music cookies and live network access"]
+fn android_vr_live_hardcoded_ytm_id_resolves_downloadable_url() -> anyhow::Result<()> {
+    let client = live_test_client()?;
+    let url = client.rt.block_on(async {
+        client
+            .try_android_vr_audio(WEB_REMIX_HIGH_AUDIO_TEST_VIDEO_ID)
+            .await
+    })?;
+    let parsed = url::Url::parse(&url)?;
+    let client_name = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "c").then(|| value.into_owned()))
+        .unwrap_or_else(|| "missing".to_string());
+    assert_eq!(client_name, "ANDROID_VR");
+    assert!(
+        parsed
+            .query_pairs()
+            .any(|(key, _)| key == "sig" || key == "signature"),
+        "resolved Android VR URL is missing a signed media parameter"
+    );
+
     let bytes = crate::network::download_media_bytes(&url, Some("bytes=0-"))
-        .context("failed to download WEB_REMIX media URL through the cache downloader")?;
+        .context("failed to download Android VR media URL through the cache downloader")?;
     assert!(
         bytes.len() > 1024,
-        "WEB_REMIX media downloader returned too few bytes: {}",
+        "Android VR media downloader returned too few bytes: {}",
         bytes.len()
     );
 
@@ -360,7 +401,10 @@ fn audio_url_live_hardcoded_ytm_id_resolves_downloadable_url() -> anyhow::Result
         .query_pairs()
         .find_map(|(key, value)| (key == "c").then(|| value.into_owned()))
         .unwrap_or_else(|| "missing".to_string());
-    assert_eq!(client_name, "WEB_REMIX");
+    assert!(
+        matches!(client_name.as_str(), "WEB_REMIX" | "ANDROID_VR"),
+        "resolved media URL came from unexpected client {client_name}"
+    );
 
     let response = reqwest::blocking::Client::new()
         .get(&resolved.url)
@@ -375,8 +419,31 @@ fn audio_url_live_hardcoded_ytm_id_resolves_downloadable_url() -> anyhow::Result
         response.status()
     );
 
-    let bytes = crate::network::download_media_bytes(&resolved.url, Some("bytes=0-"))
-        .context("failed to download resolved media URL through the cache downloader")?;
+    let bytes = crate::network::download_media_bytes(&resolved.url, Some("bytes=0-")).or_else(
+        |primary_err| {
+            let fallback_url = client
+                .get_android_vr_audio_url_no_track(&resolved.video_id)
+                .with_context(|| {
+                    format!(
+                        "failed to get Android VR audio URL for {}",
+                        resolved.video_id
+                    )
+                })?;
+            crate::network::download_media_bytes(&fallback_url, Some("bytes=0-"))
+                .with_context(|| {
+                    format!(
+                        "failed to download Android VR media for {}",
+                        resolved.video_id
+                    )
+                })
+                .map_err(|fallback_err| {
+                    primary_err.context(format!(
+                        "Android VR fallback also failed for {}: {fallback_err:#}",
+                        resolved.video_id
+                    ))
+                })
+        },
+    )?;
     assert!(
         bytes.len() > 1024,
         "resolved media downloader returned too few bytes: {}",
@@ -833,6 +900,36 @@ fn web_remix_direct_media_body_uses_pinned_fetchable_client_shape() {
         body.pointer("/context/client/clientVersion")
             .and_then(|value| value.as_str()),
         Some(super::YTM_WEB_REMIX_DIRECT_MEDIA_CLIENT_VERSION)
+    );
+}
+
+#[test]
+fn android_vr_player_body_uses_non_sabr_client_shape() {
+    let body = YtMusicClient::android_vr_player_body("Dx69Ut6Wyuk", 20_606);
+
+    assert_eq!(body["videoId"], "Dx69Ut6Wyuk");
+    assert_eq!(body["contentCheckOk"], true);
+    assert_eq!(body["racyCheckOk"], true);
+    assert_eq!(
+        body.pointer("/context/client/clientName")
+            .and_then(|value| value.as_str()),
+        Some("ANDROID_VR")
+    );
+    assert_eq!(
+        body.pointer("/context/client/clientVersion")
+            .and_then(|value| value.as_str()),
+        Some(super::YOUTUBE_ANDROID_VR_CLIENT_VERSION)
+    );
+    assert_eq!(
+        body.pointer("/context/client/userAgent")
+            .and_then(|value| value.as_str()),
+        Some(super::YOUTUBE_ANDROID_VR_USER_AGENT)
+    );
+    assert!(body.pointer("/context/client/gl").is_none());
+    assert_eq!(
+        body.pointer("/playbackContext/contentPlaybackContext/signatureTimestamp")
+            .and_then(|value| value.as_u64()),
+        Some(20_606)
     );
 }
 

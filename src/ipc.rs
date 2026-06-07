@@ -261,6 +261,12 @@ pub enum DaemonRequest {
     SetSleepAfterCurrent,
     ClearSleepTimer,
     GetSleepStatus,
+    RegisterUiClient {
+        client_id: String,
+    },
+    UnregisterUiClient {
+        client_id: String,
+    },
     CopyShareUrl,
     LogMessage {
         source: LogSource,
@@ -754,6 +760,26 @@ impl DaemonClient {
     pub fn sleep_status(&self) -> Result<SleepStatusSnapshot> {
         match self.request(&DaemonRequest::GetSleepStatus)? {
             DaemonResponse::SleepStatus(status) => Ok(status),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
+    }
+
+    pub fn register_ui_client(&self, client_id: &str) -> Result<()> {
+        match self.request(&DaemonRequest::RegisterUiClient {
+            client_id: client_id.to_string(),
+        })? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected daemon response: {other:?}"),
+        }
+    }
+
+    pub fn unregister_ui_client(&self, client_id: &str) -> Result<()> {
+        match self.request(&DaemonRequest::UnregisterUiClient {
+            client_id: client_id.to_string(),
+        })? {
+            DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error(err) => bail!(err),
             other => bail!("Unexpected daemon response: {other:?}"),
         }

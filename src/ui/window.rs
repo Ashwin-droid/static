@@ -12,6 +12,7 @@ use gtk::{
     Picture, Popover, ResponseType, Scale, ScrolledWindow, Separator, SpinButton, Stack,
     StackTransitionType, Switch, gio, glib,
 };
+use uuid::Uuid;
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -38,6 +39,7 @@ const SIDEBAR_WIDTH: i32 = 240;
 const SIDEBAR_RECENT_CONTENT_WIDTH: i32 = SIDEBAR_WIDTH - 32;
 const SIDEBAR_HISTORY_LIMIT: usize = 200;
 const OFFLINE_LISTEN_AGAIN_PLAYLIST_ID: &str = "__offline_listen_again__";
+const UI_CLIENT_HEARTBEAT_INTERVAL_SECS: u32 = 5;
 
 use crate::ipc::{
     ActiveTrackSnapshot, CoordinationTargetSnapshot, DaemonClient, PersistedPlaybackState,
@@ -443,6 +445,15 @@ pub fn build_window(app: &Application) {
     let onboarding = build_onboarding_page(&stack, &state);
     let vr_auth = build_vr_auth_page(&stack, &state);
     let main_widgets = build_main_page(&stack, &state);
+    let ui_client_id = format!("gtk-{}", Uuid::new_v4());
+    if let Err(err) = main_widgets
+        .player_state
+        .player
+        .daemon_client()
+        .register_ui_client(&ui_client_id)
+    {
+        eprintln!("[STATIC] failed to register UI client with staticd: {err}");
+    }
     let startup_saved_cookie = get_cookie().filter(|cookie| !cookie.trim().is_empty());
     let has_cached_offline_library = {
         let guard = state.lock().unwrap();
@@ -471,11 +482,15 @@ pub fn build_window(app: &Application) {
     {
         let ps = main_widgets.player_state.clone();
         let state = state.clone();
+        let ui_client_id = ui_client_id.clone();
         window.connect_close_request(move |_| {
             let snapshot = ps.player.snapshot();
             persist_resume_snapshot_from_ui_state(&ps, &state);
+            let client = ps.player.daemon_client();
+            if let Err(err) = client.unregister_ui_client(&ui_client_id) {
+                eprintln!("[STATIC] failed to unregister UI client with staticd: {err}");
+            }
             if snapshot.paused && snapshot.current_track.is_some() {
-                let client = ps.player.daemon_client();
                 if let Err(err) = client.shutdown() {
                     eprintln!("[STATIC] failed to stop paused staticd while closing window: {err}");
                 }
@@ -577,6 +592,17 @@ pub fn build_window(app: &Application) {
             if stack.visible_child_name().as_deref() == Some("main") && app_client(&state).is_some()
             {
                 load_sidebar_history(&state, &recent_list, &ps);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    {
+        let client = main_widgets.player_state.player.daemon_client();
+        let ui_client_id = ui_client_id.clone();
+        glib::timeout_add_seconds_local(UI_CLIENT_HEARTBEAT_INTERVAL_SECS, move || {
+            if let Err(err) = client.register_ui_client(&ui_client_id) {
+                eprintln!("[STATIC] failed to refresh UI client lease with staticd: {err}");
             }
             glib::ControlFlow::Continue
         });

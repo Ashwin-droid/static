@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{
@@ -68,6 +68,7 @@ const MPRIS_PENDING_POSITION_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
+const UI_CLIENT_LEASE_TTL: Duration = Duration::from_secs(20);
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
 const DBUS_OBJECT_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
@@ -254,6 +255,8 @@ struct DaemonState {
     volume_ramp: Option<VolumeRamp>,
     sleep_deadline: Option<Instant>,
     sleep_after_current: bool,
+    sleep_shutdown_pending: bool,
+    ui_clients: HashMap<String, Instant>,
     last_persisted_playback_json: Option<String>,
     last_persisted_playback_at: Option<Instant>,
     shutting_down: Cell<bool>,
@@ -1000,6 +1003,8 @@ pub fn run() -> Result<()> {
         volume_ramp: None,
         sleep_deadline: None,
         sleep_after_current: false,
+        sleep_shutdown_pending: false,
+        ui_clients: HashMap::new(),
         last_persisted_playback_json: None,
         last_persisted_playback_at: None,
         shutting_down: Cell::new(false),
@@ -1089,6 +1094,7 @@ pub fn run() -> Result<()> {
 fn request_daemon_shutdown(state: &mut DaemonState, exiting: bool) {
     state.sleep_deadline = None;
     state.sleep_after_current = false;
+    state.sleep_shutdown_pending = false;
     stop_playback(state, exiting);
     state.shutting_down.set(true);
 }
@@ -1113,15 +1119,21 @@ fn sleep_status_snapshot(state: &DaemonState) -> SleepStatusSnapshot {
 fn clear_sleep_state(state: &mut DaemonState) {
     state.sleep_deadline = None;
     state.sleep_after_current = false;
+    state.sleep_shutdown_pending = false;
 }
 
 fn trigger_sleep_pause(state: &mut DaemonState) {
+    let should_shutdown_headless = !has_live_ui_clients(state, Instant::now());
     clear_sleep_state(state);
     state.peer_mpris.clear_waiting();
     clear_mpris_halt_auto_resume_pending(state);
     pause_local_playback(state, PlaybackTransition::Calm);
     sync_mpris(state);
     maybe_persist_playback_state(state, true);
+    if should_shutdown_headless {
+        state.sleep_shutdown_pending = true;
+        maybe_request_headless_sleep_shutdown(state, Instant::now());
+    }
 }
 
 fn maybe_trigger_sleep_deadline(state: &mut DaemonState, now: Instant) -> bool {
@@ -1138,6 +1150,49 @@ fn current_share_url(state: &DaemonState) -> Option<String> {
         .active_track
         .as_ref()
         .map(|track| youtube_music_watch_url(&track.video_id))
+}
+
+fn note_ui_client(state: &mut DaemonState, client_id: String) {
+    let client_id = client_id.trim();
+    if client_id.is_empty() {
+        return;
+    }
+    state
+        .ui_clients
+        .insert(client_id.to_string(), Instant::now());
+    state.sleep_shutdown_pending = false;
+}
+
+fn remove_ui_client(state: &mut DaemonState, client_id: &str) {
+    state.ui_clients.remove(client_id.trim());
+}
+
+fn prune_stale_ui_clients(state: &mut DaemonState, now: Instant) {
+    state
+        .ui_clients
+        .retain(|_, last_seen| now.saturating_duration_since(*last_seen) <= UI_CLIENT_LEASE_TTL);
+}
+
+fn has_live_ui_clients(state: &mut DaemonState, now: Instant) -> bool {
+    prune_stale_ui_clients(state, now);
+    !state.ui_clients.is_empty()
+}
+
+fn maybe_request_headless_sleep_shutdown(state: &mut DaemonState, now: Instant) -> bool {
+    if !state.sleep_shutdown_pending {
+        return false;
+    }
+    if has_live_ui_clients(state, now) {
+        state.sleep_shutdown_pending = false;
+        return false;
+    }
+    if is_fading_out_to_pause(state) {
+        return false;
+    }
+
+    eprintln!("[SLEEP] no UI clients remain after sleep pause; shutting down daemon");
+    request_daemon_shutdown(state, true);
+    true
 }
 
 fn dedupe_radio_recommendations(prefix: &[Track], tracks: Vec<Track>) -> Vec<Track> {
@@ -1870,6 +1925,14 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::GetSleepStatus => DaemonResponse::SleepStatus(sleep_status_snapshot(state)),
+        DaemonRequest::RegisterUiClient { client_id } => {
+            note_ui_client(state, client_id);
+            DaemonResponse::Ok
+        }
+        DaemonRequest::UnregisterUiClient { client_id } => {
+            remove_ui_client(state, &client_id);
+            DaemonResponse::Ok
+        }
         DaemonRequest::CopyShareUrl => match current_share_url(state) {
             Some(url) => DaemonResponse::ShareUrl(url),
             None => DaemonResponse::Error("No song is currently playing".to_string()),
@@ -1996,6 +2059,12 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_unduck_for_pipewire(state);
     maybe_duck_for_pipewire(state);
     advance_volume_ramp(state);
+    if state.shutting_down.get() {
+        return;
+    }
+    if maybe_request_headless_sleep_shutdown(state, Instant::now()) {
+        return;
+    }
 
     if maybe_trigger_sleep_deadline(state, Instant::now()) {
         return;
@@ -2053,16 +2122,14 @@ fn maintain_playback(state: &mut DaemonState) {
     maybe_extend_radio_queue(state);
     maybe_persist_playback_state(state, false);
 
-    let reached_track_end = !is_fading_out_to_pause(state)
-        && state.active_track.as_ref().is_some_and(|active| {
-            !active.awaiting_fresh_position
-                && matches!(
-                    (state.player.position(), state.player.duration()),
-                    (Some(position), Some(duration))
-                        if duration > ClockTime::from_seconds(1)
-                            && position + ClockTime::from_mseconds(500) >= duration
-                )
-        });
+    let reached_track_end = state.active_track.as_ref().is_some_and(|active| {
+        has_reached_track_end(
+            is_fading_out_to_pause(state),
+            active.awaiting_fresh_position,
+            state.player.position(),
+            state.player.duration(),
+        )
+    });
 
     if reached_track_end {
         if let Some(resume_playback) = state
@@ -2133,6 +2200,22 @@ fn should_count_paused_idle_for_shutdown(
         && !mpris_peer_pause_active
         && !mpris_halt_auto_pending
         && !pipewire_pause_active
+}
+
+fn has_reached_track_end(
+    pause_fade_pending: bool,
+    awaiting_fresh_position: bool,
+    position: Option<ClockTime>,
+    duration: Option<ClockTime>,
+) -> bool {
+    !pause_fade_pending
+        && !awaiting_fresh_position
+        && matches!(
+            (position, duration),
+            (Some(position), Some(duration))
+                if duration > ClockTime::from_seconds(1)
+                    && position + ClockTime::from_mseconds(500) >= duration
+        )
 }
 
 fn play_queue_at(
@@ -2725,6 +2808,8 @@ fn resume_local_playback(state: &mut DaemonState, transition: PlaybackTransition
     if !is_logically_paused(state) {
         return;
     }
+
+    state.sleep_shutdown_pending = false;
 
     match transition {
         PlaybackTransition::Immediate => {
@@ -4900,7 +4985,7 @@ fn advance_volume_ramp(state: &mut DaemonState) {
     let next_volume = volume_ramp_value(ramp);
     state.player.set_volume(next_volume);
 
-    if volumes_match(next_volume, ramp.target_volume) {
+    if volume_ramp_is_complete(ramp, next_volume) {
         finish_volume_ramp(state, ramp.target_volume, ramp.completion);
     }
 }
@@ -4925,6 +5010,7 @@ fn finish_volume_ramp(
             }
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
+            maybe_request_headless_sleep_shutdown(state, Instant::now());
         }
     }
 }
@@ -4938,6 +5024,10 @@ fn volume_ramp_value(ramp: VolumeRamp) -> f64 {
 
 fn volumes_match(left: f64, right: f64) -> bool {
     (left - right).abs() <= 0.0001
+}
+
+fn volume_ramp_is_complete(ramp: VolumeRamp, next_volume: f64) -> bool {
+    ramp.started_at.elapsed() >= ramp.duration || volumes_match(next_volume, ramp.target_volume)
 }
 
 fn desired_pipewire_suppression_mode(state: &DaemonState) -> PipeWireSuppressionMode {

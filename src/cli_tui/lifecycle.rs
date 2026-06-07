@@ -4,12 +4,16 @@ use super::{content_loading::*, thumbnails::*};
 impl InteractiveTui {
     pub(in crate::cli_tui) fn new(client: DaemonClient) -> Result<Self> {
         let snapshot = client.state()?;
+        let ui_client_id = format!("tui-{}", Uuid::new_v4());
+        client.register_ui_client(&ui_client_id)?;
         let (background_tx, background_rx) = mpsc::channel();
         spawn_home_bootstrap(background_tx.clone());
 
         let mut app = Self {
             client,
             snapshot: snapshot.clone(),
+            ui_client_id,
+            last_ui_heartbeat_at: Instant::now(),
             queue_selected: snapshot
                 .queue_index
                 .min(snapshot.queue.len().saturating_sub(1)),
@@ -113,9 +117,25 @@ impl InteractiveTui {
             if self.last_daemon_poll_at.elapsed() >= DAEMON_POLL_INTERVAL {
                 self.refresh_snapshot();
             }
+            self.maybe_refresh_ui_client_lease();
         }
 
         Ok(())
+    }
+
+    pub(in crate::cli_tui) fn maybe_refresh_ui_client_lease(&mut self) {
+        if self.last_ui_heartbeat_at.elapsed() < UI_CLIENT_HEARTBEAT_INTERVAL {
+            return;
+        }
+        match self.client.register_ui_client(&self.ui_client_id) {
+            Ok(()) => {
+                self.last_ui_heartbeat_at = Instant::now();
+            }
+            Err(err) => {
+                self.last_ui_heartbeat_at = Instant::now();
+                self.status_line = format!("Daemon UI lease refresh failed: {err}");
+            }
+        }
     }
 
     pub(in crate::cli_tui) fn initialize_terminal_images(&mut self) {
@@ -159,5 +179,11 @@ impl InteractiveTui {
                 | TuiContentView::PlaylistDetail(_)
                 | TuiContentView::Search(_)
         )
+    }
+}
+
+impl Drop for InteractiveTui {
+    fn drop(&mut self) {
+        let _ = self.client.unregister_ui_client(&self.ui_client_id);
     }
 }

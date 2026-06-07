@@ -4,9 +4,9 @@ use super::{
     PipeWireSuppressionMode, PlaybackSource, PlaybackTransition, PreviousAction, VolumeRamp,
     VolumeRampCompletion, apply_radio_chips_from_refresh, cache_media_download_retry_delay,
     current_listened_millis, dedupe_radio_recommendations, effective_queue_len,
-    extend_radio_touched_for_insert, hide_timing_for_track, mpris_app_key_from_bus,
-    mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
-    next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
+    extend_radio_touched_for_insert, has_reached_track_end, hide_timing_for_track,
+    mpris_app_key_from_bus, mpris_halt_auto_peer_transition, mpris_position_millis_for_track,
+    natural_end_target_index, next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
     pause_request_already_satisfied, pending_mpris_transport_decision,
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
     playback_start_stalled, prefetch_candidate_indices, previous_action,
@@ -16,13 +16,14 @@ use super::{
     should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
     should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
     should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
-    should_wait_for_radio_extension_at_natural_end,
+    should_wait_for_radio_extension_at_natural_end, volume_ramp_is_complete,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
 use crate::models::{RadioChip, RadioVirtualPlaylist};
 use crate::network::{SongRating, SponsorSegment};
 use crate::offline::{AppSettings, CoordinationMode};
+use gstreamer::ClockTime;
 use std::time::{Duration, Instant};
 
 fn test_active_track(started_at: Instant) -> ActiveTrack {
@@ -588,6 +589,47 @@ fn paused_idle_shutdown_timer_ignores_coordination_holds() {
     assert!(!should_count_paused_idle_for_shutdown(
         true, true, false, false, true
     ));
+}
+
+#[test]
+fn natural_end_detector_counts_song_completed_near_duration() {
+    assert!(has_reached_track_end(
+        false,
+        false,
+        Some(ClockTime::from_seconds(179) + ClockTime::from_mseconds(600)),
+        Some(ClockTime::from_seconds(180)),
+    ));
+}
+
+#[test]
+fn natural_end_detector_ignores_startup_and_pause_fade_edges() {
+    assert!(!has_reached_track_end(
+        false,
+        true,
+        Some(ClockTime::from_seconds(180)),
+        Some(ClockTime::from_seconds(180)),
+    ));
+    assert!(!has_reached_track_end(
+        true,
+        false,
+        Some(ClockTime::from_seconds(180)),
+        Some(ClockTime::from_seconds(180)),
+    ));
+}
+
+#[test]
+fn volume_ramp_completion_is_deadline_based() {
+    let ramp = VolumeRamp {
+        started_at: Instant::now() - Duration::from_secs(3),
+        start_volume: 0.5,
+        target_volume: 0.0,
+        duration: Duration::from_secs(2),
+        completion: VolumeRampCompletion::PauseAtPosition {
+            position_millis: 42,
+        },
+    };
+
+    assert!(volume_ramp_is_complete(ramp, 0.25));
 }
 
 #[test]

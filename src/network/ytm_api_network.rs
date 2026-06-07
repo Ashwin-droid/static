@@ -60,12 +60,17 @@ const TRACKING_SEC_CH_UA_MOBILE: &str = "?0";
 const TRACKING_SEC_CH_UA_PLATFORM: &str = "\"Linux\"";
 const ATR_REPORT_DELAY: Duration = Duration::from_secs(4);
 const WEB_REMIX_MEDIA_PROBE_RANGE: &str = "bytes=0-0";
+const WEB_REMIX_MEDIA_LATE_PROBE_OFFSET: u64 = 1024 * 1024;
 const YTM_WEB_PROFILE_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const YTM_WEB_PROFILE_DB_FILE_NAME: &str = "data.db";
 const YTM_WEB_PROFILE_TABLE: &str = "ytm_web_profile";
 const YTM_WEB_PROFILE_ROW_ID: &str = "web_remix";
 const YTM_WEB_SIGNATURE_TIMESTAMP_FALLBACK: u64 = 20_572;
 const WEB_REMIX_SOLVER_FILE_NAME: &str = "solver.js";
+const WEB_REMIX_POT_PROVIDER_HOME_ENV: &str = "STATIC_WEB_REMIX_POT_PROVIDER_HOME";
+const WEB_REMIX_POT_PROVIDER_SCRIPT_ENV: &str = "STATIC_WEB_REMIX_POT_PROVIDER_SCRIPT";
+const WEB_REMIX_POT_PROVIDER_DIR: &str = "bgutil-ytdlp-pot-provider/server";
+const WEB_REMIX_POT_PROVIDER_SCRIPT: &str = "build/generate_once.js";
 const WEB_REMIX_SOLVER_INFO_URL: &str = "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/yt_dlp/extractor/youtube/jsc/_builtin/vendor/_info.py";
 const WEB_REMIX_SOLVER_CORE_URL: &str = "https://raw.githubusercontent.com/yt-dlp/yt-dlp/master/yt_dlp/extractor/youtube/jsc/_builtin/vendor/yt.solver.core.js";
 
@@ -84,6 +89,8 @@ static WEB_REMIX_MEDIA_PROBE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|
         .build()
         .expect("WEB_REMIX media probe client should build")
 });
+
+static WEB_REMIX_POT_PROVIDER_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SongRating {
@@ -1102,6 +1109,114 @@ fn executable_node_binary() -> Result<PathBuf> {
 
 fn web_remix_solver_path() -> PathBuf {
     static_storage_root().join(WEB_REMIX_SOLVER_FILE_NAME)
+}
+
+fn push_web_remix_pot_provider_candidate(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    push_unique_path(paths, path.clone());
+    push_unique_path(paths, path.join(WEB_REMIX_POT_PROVIDER_SCRIPT));
+}
+
+fn web_remix_pot_provider_script_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(script) = std::env::var_os(WEB_REMIX_POT_PROVIDER_SCRIPT_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push_unique_path(&mut candidates, script);
+    }
+
+    if let Some(provider_home) = std::env::var_os(WEB_REMIX_POT_PROVIDER_HOME_ENV)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push_web_remix_pot_provider_candidate(&mut candidates, provider_home);
+    }
+
+    push_unique_path(
+        &mut candidates,
+        static_storage_root()
+            .join(WEB_REMIX_POT_PROVIDER_DIR)
+            .join(WEB_REMIX_POT_PROVIDER_SCRIPT),
+    );
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for dir in [
+            home.join(WEB_REMIX_POT_PROVIDER_DIR),
+            home.join(".cache/static").join(WEB_REMIX_POT_PROVIDER_DIR),
+        ] {
+            push_unique_path(&mut candidates, dir.join(WEB_REMIX_POT_PROVIDER_SCRIPT));
+        }
+    }
+
+    candidates
+}
+
+fn web_remix_pot_provider_script_path() -> Option<PathBuf> {
+    web_remix_pot_provider_script_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn web_remix_pot_provider_output_token(output: &[u8]) -> Result<String> {
+    let stdout = String::from_utf8_lossy(output);
+    for line in stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(json) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(token) = json
+            .get("poToken")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(token.to_string());
+        }
+    }
+    bail!("WEB_REMIX POT provider did not return a poToken")
+}
+
+fn run_web_remix_pot_provider(script_path: &Path, content_binding: &str) -> Result<String> {
+    let node = executable_node_binary()?;
+    let output = Command::new(&node)
+        .arg(script_path)
+        .arg("--content-binding")
+        .arg(content_binding)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run WEB_REMIX POT provider {}",
+                script_path.display()
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+        bail!(
+            "WEB_REMIX POT provider failed: {}",
+            if message.is_empty() {
+                "no stderr".to_string()
+            } else {
+                message
+            }
+        );
+    }
+
+    web_remix_pot_provider_output_token(&output.stdout)
 }
 
 fn web_remix_solver_release_version(info_py: &str) -> Result<String> {
@@ -2289,17 +2404,94 @@ impl YtMusicClient {
     }
 
     async fn ensure_web_remix_media_url_fetchable(&self, url: &str) -> Result<()> {
-        let response = WEB_REMIX_MEDIA_PROBE_CLIENT
-            .get(url)
-            .header(RANGE, WEB_REMIX_MEDIA_PROBE_RANGE)
-            .send()
+        let ranges = [
+            WEB_REMIX_MEDIA_PROBE_RANGE.to_string(),
+            format!(
+                "bytes={WEB_REMIX_MEDIA_LATE_PROBE_OFFSET}-{WEB_REMIX_MEDIA_LATE_PROBE_OFFSET}"
+            ),
+        ];
+        self.ensure_web_remix_media_url_fetchable_with_ranges(url, &ranges)
             .await
-            .context("WEB_REMIX media URL probe failed")?;
-        let status = response.status();
-        if status.is_success() {
-            return Ok(());
+    }
+
+    async fn ensure_web_remix_media_url_fetchable_with_ranges(
+        &self,
+        url: &str,
+        ranges: &[String],
+    ) -> Result<()> {
+        for range in ranges {
+            let response = WEB_REMIX_MEDIA_PROBE_CLIENT
+                .get(url)
+                .header(RANGE, range)
+                .header("referer", format!("{YTM_ORIGIN}/"))
+                .send()
+                .await
+                .with_context(|| format!("WEB_REMIX media URL probe failed for {range}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("WEB_REMIX media URL probe returned {status} for {range}");
+            }
         }
-        bail!("WEB_REMIX media URL probe returned {status}")
+        Ok(())
+    }
+
+    async fn web_remix_gvs_po_token(&self, video_id: &str) -> Result<Option<String>> {
+        let Some(script_path) = web_remix_pot_provider_script_path() else {
+            if !WEB_REMIX_POT_PROVIDER_MISSING_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[PLAYER] WEB_REMIX POT provider not found; install bgutil-ytdlp-pot-provider at {} or set {WEB_REMIX_POT_PROVIDER_HOME_ENV}/{WEB_REMIX_POT_PROVIDER_SCRIPT_ENV}",
+                    static_storage_root()
+                        .join(WEB_REMIX_POT_PROVIDER_DIR)
+                        .display()
+                );
+            }
+            return Ok(None);
+        };
+
+        let video_id = video_id.to_string();
+        let token = tokio::task::spawn_blocking(move || {
+            run_web_remix_pot_provider(&script_path, &video_id)
+        })
+        .await
+        .context("WEB_REMIX POT provider task failed")??;
+        Ok(Some(token))
+    }
+
+    fn web_remix_media_validation_ranges(format: &Value) -> Vec<String> {
+        let mut ranges = vec![WEB_REMIX_MEDIA_PROBE_RANGE.to_string()];
+        let content_len = parse_json_u64(format.get("contentLength"));
+        if content_len.is_none_or(|len| len > WEB_REMIX_MEDIA_LATE_PROBE_OFFSET) {
+            ranges.push(format!(
+                "bytes={WEB_REMIX_MEDIA_LATE_PROBE_OFFSET}-{WEB_REMIX_MEDIA_LATE_PROBE_OFFSET}"
+            ));
+        }
+        ranges
+    }
+
+    fn web_remix_media_url_uses_client(url: &str, client_name: &str) -> bool {
+        Url::parse(url).is_ok_and(|parsed| {
+            parsed
+                .query_pairs()
+                .any(|(key, value)| key == "c" && value == client_name)
+        })
+    }
+
+    fn media_url_with_query_param(url: &str, key: &str, value: &str) -> Result<String> {
+        let mut parsed = Url::parse(url).context("failed to parse media URL")?;
+        let query_pairs = parsed
+            .query_pairs()
+            .filter(|(existing_key, _)| existing_key != key)
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        parsed.set_query(None);
+        {
+            let mut pairs = parsed.query_pairs_mut();
+            for (key, value) in query_pairs {
+                pairs.append_pair(&key, &value);
+            }
+            pairs.append_pair(key, value);
+        }
+        Ok(parsed.to_string())
     }
 
     fn audio_url_error_may_have_music_replacement(message: &str) -> bool {
@@ -2461,7 +2653,7 @@ impl YtMusicClient {
             .unwrap_or_else(|| "unknown".to_string());
         let bitrate = Self::format_effective_bitrate(format);
         let url = self
-            .resolve_web_remix_audio_format(format, &profile)
+            .resolve_web_remix_audio_format(format, &profile, Some(video_id))
             .await?;
         eprintln!("[PLAYER] selected WEB_REMIX itag {itag} audio at ~{bitrate} bps");
         Ok(url)
@@ -2508,6 +2700,7 @@ impl YtMusicClient {
         &self,
         format: &Value,
         profile: &YtmWebProfile,
+        web_remix_video_id: Option<&str>,
     ) -> Result<String> {
         let stream = Self::web_remix_stream_url_from_format(format)?;
         let player_js = self.web_remix_player_js(profile).await?;
@@ -2522,10 +2715,40 @@ impl YtMusicClient {
         match resolved {
             Ok(urls) => {
                 let mut last_probe_err = None;
+                let po_token = match web_remix_video_id {
+                    Some(video_id) => match self.web_remix_gvs_po_token(video_id).await {
+                        Ok(token) => token,
+                        Err(err) => {
+                            eprintln!("[PLAYER] WEB_REMIX POT provider failed: {err:#}");
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let validation_ranges = Self::web_remix_media_validation_ranges(format);
                 for url in urls {
-                    match self.ensure_web_remix_media_url_fetchable(&url).await {
-                        Ok(()) => return Ok(url),
-                        Err(err) => last_probe_err = Some(err),
+                    let mut candidates = Vec::new();
+                    if let Some(token) = po_token.as_deref()
+                        && Self::web_remix_media_url_uses_client(&url, YTM_WEB_REMIX_CLIENT_NAME)
+                    {
+                        match Self::media_url_with_query_param(&url, "pot", token) {
+                            Ok(url_with_pot) => candidates.push(url_with_pot),
+                            Err(err) => last_probe_err = Some(err),
+                        }
+                    }
+                    candidates.push(url);
+
+                    for candidate in candidates {
+                        match self
+                            .ensure_web_remix_media_url_fetchable_with_ranges(
+                                &candidate,
+                                &validation_ranges,
+                            )
+                            .await
+                        {
+                            Ok(()) => return Ok(candidate),
+                            Err(err) => last_probe_err = Some(err),
+                        }
                     }
                 }
                 let detail = last_probe_err
@@ -3151,7 +3374,7 @@ impl YtMusicClient {
             bail!("Android VR stream has no direct or ciphered URL");
         };
         let profile = self.ytm_web_profile(false).await;
-        self.resolve_web_remix_audio_format(format, &profile)
+        self.resolve_web_remix_audio_format(format, &profile, None)
             .await
             .context("failed to solve Android VR ciphered audio URL")
     }

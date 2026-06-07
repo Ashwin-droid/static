@@ -235,6 +235,39 @@ fs.writeFileSync(1, JSON.stringify({ url, urls: [url, url] }));
     Ok(())
 }
 
+#[test]
+fn web_remix_pot_provider_output_token_parses_final_json_line() -> anyhow::Result<()> {
+    let token = super::web_remix_pot_provider_output_token(
+        br#"debug line
+{"poToken":"abc123","contentBinding":"q2DBeby7ni8"}
+"#,
+    )?;
+    assert_eq!(token, "abc123");
+    Ok(())
+}
+
+#[test]
+fn media_url_with_query_param_replaces_existing_value() -> anyhow::Result<()> {
+    let url = YtMusicClient::media_url_with_query_param(
+        "https://rr.example.com/videoplayback?c=WEB_REMIX&pot=old&n=abc",
+        "pot",
+        "new",
+    )?;
+    let parsed = url::Url::parse(&url)?;
+    let pots = parsed
+        .query_pairs()
+        .filter_map(|(key, value)| (key == "pot").then(|| value.into_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(pots, ["new"]);
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find_map(|(key, value)| (key == "n").then(|| value.into_owned())),
+        Some("abc".to_string())
+    );
+    Ok(())
+}
+
 fn live_test_cookie() -> Option<String> {
     std::env::var("STATIC_YTM_TEST_COOKIE")
         .ok()

@@ -11,20 +11,24 @@ use super::{
     pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
     playback_start_stalled, prefetch_candidate_indices, previous_action,
     previous_action_position_millis_for_track, radio_chips_with_replacement,
-    rearm_track_repeat_loops_for_snapshot, resolve_pipewire_suppression_mode,
-    should_count_paused_idle_for_shutdown, should_emit_live_mpris_seeked_hint,
-    should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
-    should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
-    should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
-    should_wait_for_radio_extension_at_natural_end, volume_ramp_is_complete,
+    rearm_track_repeat_loops_for_snapshot, remove_cached_if_unwanted_after_playlist_sync,
+    resolve_pipewire_suppression_mode, should_count_paused_idle_for_shutdown,
+    should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
+    should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
+    should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
+    should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
+    volume_ramp_is_complete,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
 use crate::models::{RadioChip, RadioVirtualPlaylist};
 use crate::network::{SongRating, SponsorSegment};
-use crate::offline::{AppSettings, CoordinationMode};
+use crate::offline::{AppSettings, CoordinationMode, MusicCache};
 use gstreamer::ClockTime;
+use std::collections::HashSet;
+use std::fs;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 fn test_active_track(started_at: Instant) -> ActiveTrack {
     ActiveTrack {
@@ -483,6 +487,46 @@ fn startup_stalls_evict_local_cache_sources_before_retrying() {
     assert!(!should_evict_cache_after_startup_stall(
         PlaybackSource::RemoteStream
     ));
+}
+
+#[test]
+fn playlist_sync_keeps_removed_track_when_auto_cache_still_wants_it() {
+    let base = std::env::temp_dir().join(format!("static-daemon-test-{}", Uuid::new_v4()));
+    let raw_root = base.to_string_lossy().to_string();
+    let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+    cache
+        .store_audio("premium-but-cached", b"audio bytes", None)
+        .expect("store audio");
+    cache
+        .pin_offline("premium-but-cached")
+        .expect("pin cached track");
+
+    let auto_retained_ids = HashSet::from(["premium-but-cached".to_string()]);
+    remove_cached_if_unwanted_after_playlist_sync(&cache, "premium-but-cached", &auto_retained_ids);
+
+    assert!(cache.get_cached_audio("premium-but-cached").is_some());
+    assert!(!cache.is_pinned_offline("premium-but-cached"));
+
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn playlist_sync_removes_track_when_no_offline_policy_retains_it() {
+    let base = std::env::temp_dir().join(format!("static-daemon-test-{}", Uuid::new_v4()));
+    let raw_root = base.to_string_lossy().to_string();
+    let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+    cache
+        .store_audio("removed-track", b"audio bytes", None)
+        .expect("store audio");
+    cache
+        .pin_offline("removed-track")
+        .expect("pin cached track");
+
+    remove_cached_if_unwanted_after_playlist_sync(&cache, "removed-track", &HashSet::new());
+
+    assert!(cache.get_cached_audio("removed-track").is_none());
+
+    let _ = fs::remove_dir_all(base);
 }
 
 #[test]

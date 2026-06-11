@@ -3547,13 +3547,17 @@ fn run_offline_cache_sync(
         }
     });
 
-    sync_downloaded_playlists(&mut cache, client.as_ref());
+    sync_downloaded_playlists(&mut cache, settings, client.as_ref());
     sync_auto_offline_cache(&mut cache, settings, client.as_ref());
 
     Ok(())
 }
 
-fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&NetworkState>) {
+fn sync_downloaded_playlists(
+    cache: &mut MusicCache,
+    settings: &AppSettings,
+    client: Option<&NetworkState>,
+) {
     let offline_playlists = cache.offline_playlists().unwrap_or_default();
     if offline_playlists.is_empty() {
         return;
@@ -3611,17 +3615,48 @@ fn sync_downloaded_playlists(cache: &mut MusicCache, client: Option<&NetworkStat
             &upstream_ids,
         );
 
+        let auto_retained_ids = auto_offline_retention_ids(cache, settings);
         for video_id in removed_ids {
-            let still_needed = cache
-                .is_track_in_any_offline_playlist(&video_id)
-                .unwrap_or(false);
-            if !still_needed {
-                let _ = cache.remove_cached(&video_id);
-            }
+            remove_cached_if_unwanted_after_playlist_sync(cache, &video_id, &auto_retained_ids);
         }
 
         eprintln!("[PLAYLIST_SYNC] refreshed downloaded playlist: {playlist_id}");
     }
+}
+
+fn auto_offline_retention_ids(cache: &MusicCache, settings: &AppSettings) -> HashSet<String> {
+    match cache.auto_offline_candidates(settings, settings.offline_cache_target as usize) {
+        Ok(candidates) => candidates.into_iter().collect(),
+        Err(err) => {
+            eprintln!("[CACHE] failed to compute offline retention candidates: {err}");
+            HashSet::new()
+        }
+    }
+}
+
+fn remove_cached_if_unwanted_after_playlist_sync(
+    cache: &MusicCache,
+    video_id: &str,
+    auto_retained_ids: &HashSet<String>,
+) {
+    let still_in_playlist = cache
+        .is_track_in_any_offline_playlist(video_id)
+        .unwrap_or(false);
+    if still_in_playlist {
+        return;
+    }
+
+    if auto_retained_ids.contains(video_id) {
+        if let Err(err) = cache.unpin_offline(video_id) {
+            eprintln!("[PLAYLIST_SYNC] failed to unpin auto-retained {video_id}: {err}");
+        }
+        eprintln!(
+            "[PLAYLIST_SYNC] kept removed track {video_id} because auto-cache still wants it"
+        );
+        return;
+    }
+
+    let _ = cache.remove_cached(video_id);
 }
 
 fn sync_auto_offline_cache(

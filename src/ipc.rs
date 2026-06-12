@@ -4,7 +4,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use gstreamer::ClockTime;
 use rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
@@ -820,10 +819,6 @@ impl DaemonClient {
             other => bail!("Unexpected daemon response: {other:?}"),
         }
     }
-}
-
-pub fn millis_to_clock_time(value: Option<u64>) -> Option<ClockTime> {
-    value.map(ClockTime::from_mseconds)
 }
 
 #[cfg(test)]

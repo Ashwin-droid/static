@@ -13,8 +13,6 @@ mod playback_engine;
 mod player;
 mod ui;
 
-use gtk::prelude::*;
-
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
 
@@ -34,7 +32,6 @@ fn main() {
     } else {
         tracing_subscriber::fmt::init();
         gstreamer::init().expect("Failed to initialise GStreamer");
-        let app = ui::build_app();
-        app.run();
+        ui::run().expect("Failed to run UI");
     }
 }

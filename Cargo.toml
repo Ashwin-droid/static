@@ -2,7 +2,7 @@
 name = "static"
 version = "1.0.0"
 edition = "2024"
-description = "A YouTube Music client built with Rust and GTK4"
+description = "A YouTube Music client built with Rust and iced"
 authors = ["Ashwin Mhaskar"]
 license = "MIT"
 
@@ -18,8 +18,8 @@ assets = [
 ]
 
 [dependencies]
-# GTK4 UI
-gtk = { package = "gtk4", version = "0.9", features = ["v4_8"] }
+# iced UI (see src/ui/)
+iced = { version = "0.14", features = ["tokio", "image", "svg", "lazy"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

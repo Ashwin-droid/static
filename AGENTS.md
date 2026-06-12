@@ -4,7 +4,7 @@
 
 Static is a personal YouTube Music client written in Rust. It is one app with several faces:
 
-- a GTK desktop interface,
+- an iced desktop GUI,
 - a terminal UI,
 - a small CLI surface,
 - and a background playback daemon that owns the real playback session.
@@ -18,7 +18,7 @@ This repo is practical and personal. Prefer local, direct changes that match the
 - Start by reading the nearby implementation. The source tree is the best reference for exact paths and helper names.
 - Keep patches narrow and behavioral. The user usually wants the reported flow fixed, not a general cleanup pass.
 - Do not preserve legacy behavior just for compatibility unless the user asks. This is primarily a single-user app, and clean semantic changes are often preferred.
-- Treat GTK, TUI, and CLI as related surfaces. If behavior exists in more than one surface, check whether the change needs parity.
+- Treat the GUI, TUI, and CLI as related surfaces. If behavior exists in more than one surface, check whether the change needs parity.
 - Placement matters in UI parity work. A queue action or status control being in the "same place" as another frontend is part of the requirement.
 - Avoid replacing runtime investigation with source-only theories when the bug is about tracking, auth, playback state, or daemon behavior.
 - Do not install, restart, or replace the live packaged app unless the user explicitly asks.
@@ -64,7 +64,7 @@ Do not simplify this into ordinary play/pause handling. The side channel exists 
 
 PipeWire coordination has its own priority relationship with MPRIS coordination. When both are involved, keep the intended order in mind: MPRIS pause takes precedence over PipeWire pause, which takes precedence over PipeWire ducking. Bugs in this area often look like "the UI says paused but audio is still playing" or "auto resume/cancel buttons linger after the decision is already made."
 
-Pending halt-auto controls in GTK and TUI should be driven by daemon snapshots. When the daemon decides, times out, resumes, or cancels, stale pending UI should disappear promptly.
+Pending halt-auto controls in the GUI and TUI should be driven by daemon snapshots. When the daemon decides, times out, resumes, or cancels, stale pending UI should disappear promptly.
 
 ## Settings Model
 
@@ -72,17 +72,17 @@ Settings are shared product behavior, not just preferences UI.
 
 There are three settings surfaces:
 
-- GTK settings,
+- GUI settings,
 - TUI settings,
 - and CLI config commands.
 
-The CLI intentionally supports some wider/advanced values than the GTK settings cards. When a saved value is outside the UI-safe range, the UI should communicate that it is CLI-only rather than silently clamping it away. Do not "fix" this by forcing every setting through the GTK range.
+The CLI intentionally supports some wider/advanced values than the GUI settings cards. When a saved value is outside the UI-safe range, the UI should communicate that it is CLI-only rather than silently clamping it away. Do not "fix" this by forcing every setting through the GUI range.
 
 Settings that affect playback coordination, cookies, offline cache behavior, prefetching, SponsorBlock, storage roots, or Chromium cookie sync can have daemon/runtime consequences. If a setting changes while the daemon is running, make sure the daemon reload path or equivalent state sync remains intact.
 
 ## Network, Auth, Tracking, And Offline State
 
-Static depends on a saved YouTube Music session. The GTK app is the normal way to establish auth; CLI and TUI flows can bootstrap from saved cookies or configured Chromium cookie sync.
+Static depends on a saved YouTube Music session. The GUI app is the normal way to establish auth; CLI and TUI flows can bootstrap from saved cookies or configured Chromium cookie sync.
 
 Tracking bugs should be investigated with runtime evidence. A successful local play row or a successful-looking tracking request does not necessarily prove YouTube Music credited the listen. When the user reports tracking/auth behavior, inspect logs, stored auth/session state, and the real request/response path before making a source-only fix.
 
@@ -90,7 +90,7 @@ Offline cache and storage-root behavior are part of the product, not incidental 
 
 ## UI Parity
 
-GTK and TUI should feel like two views over the same app, not separate products.
+The GUI and TUI should feel like two views over the same app, not separate products.
 
 Areas that commonly need parity:
 

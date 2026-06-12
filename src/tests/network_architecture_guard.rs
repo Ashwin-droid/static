@@ -49,8 +49,7 @@ fn internet_and_keyring_stay_inside_network() {
             violations.push(format!("{relative}: found keyring usage outside network"));
         }
 
-        let allow_url_literals = relative == "src/ui/window/content_loading.rs"
-            || relative == "src/ui/window/page_builders.rs"
+        let allow_url_literals = relative == "src/ui/content_loading.rs"
             || relative == "src/ipc.rs"
             || relative == "src/network_parser/shared_parser.rs";
 

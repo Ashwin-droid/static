@@ -776,14 +776,20 @@ fn load_offline_page_data(
         .unwrap_or_default()
         .into_iter()
         .map(|(playlist_id, title, thumbnail_url, subtitle)| {
-            let thumbnail_url = thumbnail_url.or_else(|| {
-                cache
-                    .offline_playlist_track_ids(&playlist_id)
-                    .ok()
-                    .and_then(|ids| ids.first().cloned())
-                    .and_then(|vid| cache.get_cached_art(&vid))
-                    .map(|path| format!("file://{}", path.display()))
-            });
+            // Drop a stored cover that points at a `file://` path no longer on
+            // disk (cover fetch failed at download time, or the file was
+            // evicted) so the fallback below can recover from a cached track
+            // — without this filter a dead `Some(file://...)` short-circuits
+            // `or_else` and the card shows a letter placeholder.
+            let thumbnail_url = thumbnail_url
+                .filter(|url| offline_thumbnail_present(url))
+                .or_else(|| {
+                    cache
+                        .offline_playlist_track_ids(&playlist_id)
+                        .ok()
+                        .and_then(|ids| ids.first().cloned())
+                        .and_then(|vid| offline_thumbnail_url(&cache, &vid))
+                });
 
             PlaylistSummary {
                 playlist_id,
@@ -809,8 +815,11 @@ fn load_offline_page_data(
         );
     }
 
+    // Ranked by descending offline score (play_count decayed by recency) so
+    // the most-wanted offline songs surface first, consistent with auto-cache
+    // retention scoring.
     let all_tracks: Vec<Track> = cache
-        .offline_tracks()
+        .offline_tracks_by_score(settings.score_decay_window_days)
         .unwrap_or_default()
         .into_iter()
         .map(|(video_id, title, artist, _art)| {
@@ -950,6 +959,16 @@ fn offline_thumbnail_url(cache: &MusicCache, video_id: &str) -> Option<String> {
         .get_cached_art(video_id)
         .map(|path| format!("file://{}", path.display()))
         .or_else(|| cache.get_thumbnail_url(video_id))
+}
+
+/// Whether a stored thumbnail URL is still usable. A `file://` cover must exist
+/// on disk (the thumbnail loader fails silently to a placeholder otherwise);
+/// remote URLs are always kept so the loader can attempt a fetch.
+fn offline_thumbnail_present(url: &str) -> bool {
+    match url.strip_prefix("file://") {
+        Some(path) => std::path::Path::new(path).exists(),
+        None => true,
+    }
 }
 
 fn offline_track(

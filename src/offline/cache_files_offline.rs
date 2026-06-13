@@ -67,6 +67,41 @@ impl MusicCache {
         Ok(rows)
     }
 
+    /// Like [`offline_tracks`](Self::offline_tracks) but ordered by descending
+    /// offline score — `play_count` decayed by how long ago the track was last
+    /// played, matching the auto-cache retention scoring in
+    /// `auto_offline_candidates` (`score = play_count / (1 + days_since/decay)`).
+    /// Tracks with no play history score 0 and sink to the bottom.
+    pub fn offline_tracks_by_score(
+        &self,
+        decay_window_days: u32,
+    ) -> Result<Vec<(String, String, String, Option<String>)>> {
+        let decay = decay_window_days.max(1) as f64;
+        let mut stmt = self.db.prepare(
+            "SELECT o.video_id, COALESCE(p.title, o.video_id), COALESCE(p.artist, ''),
+                    CASE WHEN o.art_path != '' THEN o.art_path ELSE NULL END
+             FROM offline o
+             LEFT JOIN plays p ON o.video_id = p.video_id
+             ORDER BY
+                 COALESCE(p.play_count, 0)
+                   / (1.0 + (MAX(strftime('%s', 'now') - COALESCE(p.last_played, 0), 0) / 86400.0) / ?1)
+                   DESC,
+                 p.last_played DESC",
+        )?;
+        let rows = stmt
+            .query_map([decay], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn cached_ids(&self) -> Result<Vec<String>> {
         let mut stmt = self.db.prepare("SELECT video_id FROM offline")?;
         let ids = stmt

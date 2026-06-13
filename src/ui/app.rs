@@ -378,6 +378,9 @@ pub enum Message {
     // Window / keyboard shell behavior.
     CloseRequested(iced::window::Id),
     ClosePersisted(iced::window::Id),
+    /// External `org.freedesktop.Application.Activate` (daemon reopen / dock
+    /// click): surface and focus the existing window.
+    RaiseRequested,
     FocusSearch,
     RefreshHome,
     ContentScrolled {
@@ -657,6 +660,22 @@ impl App {
             }
             Message::ClosePersisted(window) => iced::window::close(window),
 
+            Message::RaiseRequested => {
+                // Un-minimize, then bring to front and focus. On Wayland the
+                // compositor may refuse self-focus, so also flag for attention
+                // as a fallback (urgency hint / dock highlight).
+                iced::window::oldest().and_then(|window| {
+                    Task::batch([
+                        iced::window::set_mode(window, iced::window::Mode::Windowed),
+                        iced::window::gain_focus(window),
+                        iced::window::request_user_attention(
+                            window,
+                            Some(iced::window::UserAttention::Informational),
+                        ),
+                    ])
+                })
+            }
+
             Message::FocusSearch => {
                 // Ctrl+F (main page only): focus the search entry, select all.
                 if self.screen != Screen::Main {
@@ -843,6 +862,8 @@ impl App {
             iced::time::every(UI_CLIENT_HEARTBEAT_INTERVAL).map(|_| Message::HeartbeatTick),
             iced::time::every(SIDEBAR_HISTORY_INTERVAL).map(|_| Message::HistoryTick),
             iced::window::close_requests().map(Message::CloseRequested),
+            // Remote activation (daemon reopen / GNOME dock) -> raise window.
+            super::raise_subscription(),
             // Press-filtered shortcut listener: non-shortcut keyboard events
             // produce no message at all (no per-keystroke Noop dispatch).
             iced::event::listen_with(map_keyboard_event),

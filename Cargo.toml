@@ -58,7 +58,7 @@ anyhow = "1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Offline cache DB
 rusqlite = { version = "0.34", features = ["bundled"] }

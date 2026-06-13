@@ -765,7 +765,8 @@ fn load_offline_page_data(
     cache: &Arc<Mutex<MusicCache>>,
     settings: &AppSettings,
 ) -> library::OfflineLoadedData {
-    repair_offline_track_metadata(client, cache);
+    repair_offline_track_metadata(client.clone(), cache);
+    repair_offline_playlist_covers(client, cache);
 
     let cache = cache
         .lock()
@@ -776,20 +777,25 @@ fn load_offline_page_data(
         .unwrap_or_default()
         .into_iter()
         .map(|(playlist_id, title, thumbnail_url, subtitle)| {
-            // Drop a stored cover that points at a `file://` path no longer on
-            // disk (cover fetch failed at download time, or the file was
-            // evicted) so the fallback below can recover from a cached track
-            // — without this filter a dead `Some(file://...)` short-circuits
-            // `or_else` and the card shows a letter placeholder.
-            let thumbnail_url = thumbnail_url
-                .filter(|url| offline_thumbnail_present(url))
-                .or_else(|| {
-                    cache
-                        .offline_playlist_track_ids(&playlist_id)
-                        .ok()
-                        .and_then(|ids| ids.first().cloned())
-                        .and_then(|vid| offline_thumbnail_url(&cache, &vid))
-                });
+            // Cover preference: the locally cached playlist cover (works
+            // offline), else the stored remote URL (matches the Playlists
+            // view), else a cached track's art. The `offline_thumbnail_present`
+            // filter drops a stale `file://` so it can't short-circuit the
+            // fallback chain into a letter placeholder.
+            let local_cover = cache.offline_playlist_cover_path(&playlist_id);
+            let thumbnail_url = if local_cover.exists() {
+                Some(format!("file://{}", local_cover.display()))
+            } else {
+                thumbnail_url
+                    .filter(|url| offline_thumbnail_present(url))
+                    .or_else(|| {
+                        cache
+                            .offline_playlist_track_ids(&playlist_id)
+                            .ok()
+                            .and_then(|ids| ids.first().cloned())
+                            .and_then(|vid| offline_thumbnail_url(&cache, &vid))
+                    })
+            };
 
             PlaylistSummary {
                 playlist_id,
@@ -917,6 +923,77 @@ fn repair_offline_track_metadata(
             &artist_string(&track),
             history_thumbnail_candidate(track.thumbnail_url.as_deref()),
         );
+    }
+}
+
+/// Self-healing for offline playlist covers: restores the real (remote) cover
+/// for downloaded playlists whose local cover file is missing and whose stored
+/// URL isn't a usable remote one (e.g. a stale `file://` from an evicted file).
+/// Re-fetches the cover URL from the user's library playlists — the same
+/// source the Playlists view uses — caches the image to disk for offline use,
+/// and persists the remote URL. Skipped entirely when offline or once healed.
+fn repair_offline_playlist_covers(
+    client: Option<Arc<NetworkState>>,
+    cache: &Arc<Mutex<MusicCache>>,
+) {
+    let Some(client) = client else {
+        return;
+    };
+
+    let needing: Vec<String> = {
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .offline_playlists()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(playlist_id, _title, thumbnail_url, _subtitle)| {
+                let local_present = cache.offline_playlist_cover_path(playlist_id).exists();
+                let has_remote = thumbnail_url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("http"));
+                !local_present && !has_remote
+            })
+            .map(|(playlist_id, ..)| playlist_id)
+            .collect()
+    };
+
+    if needing.is_empty() {
+        return;
+    }
+
+    let covers: std::collections::HashMap<String, String> = match client.get_library_playlists() {
+        Ok(playlists) => playlists
+            .into_iter()
+            .filter_map(|playlist| {
+                playlist
+                    .thumbnail_url
+                    .map(|url| (playlist.playlist_id, url))
+            })
+            .collect(),
+        Err(err) => {
+            crate::app_log!("[OFFLINE] cover repair: failed to list library playlists: {err}");
+            return;
+        }
+    };
+
+    for playlist_id in needing {
+        let Some(remote) = covers.get(&playlist_id) else {
+            continue;
+        };
+        // Cache the cover locally (best effort) so it renders offline too.
+        if let Some(bytes) = crate::network::fetch_thumbnail_bytes(remote) {
+            let cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let path = cache.offline_playlist_cover_path(&playlist_id);
+            let _ = std::fs::write(&path, &bytes);
+        }
+        let cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = cache.update_offline_playlist_thumbnail(&playlist_id, remote);
     }
 }
 

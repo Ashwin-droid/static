@@ -2043,18 +2043,20 @@ pub fn download_all_task(
             }
 
             if let Some(meta) = &meta {
-                let cover_art_path = meta.thumbnail_url.as_deref().and_then(|url| {
-                    crate::network::fetch_thumbnail_bytes(url).map(|bytes| {
-                        let art_dir = cache
+                // Cache the cover to disk for offline display, but persist the
+                // remote URL in the DB (not a `file://` path) so it stays
+                // recoverable if the file is later evicted — and matches the
+                // cover the Playlists view shows. The offline page prefers the
+                // local file when present, else this remote URL.
+                if let Some(url) = meta.thumbnail_url.as_deref() {
+                    if let Some(bytes) = crate::network::fetch_thumbnail_bytes(url) {
+                        let path = cache
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .art_dir
-                            .clone();
-                        let path = art_dir.join(format!("playlist_{}.jpg", meta.playlist_id));
+                            .offline_playlist_cover_path(&meta.playlist_id);
                         let _ = std::fs::write(&path, &bytes);
-                        format!("file://{}", path.display())
-                    })
-                });
+                    }
+                }
 
                 let video_ids: Vec<String> =
                     tracks.iter().map(|track| track.video_id.clone()).collect();
@@ -2064,7 +2066,7 @@ pub fn download_all_task(
                 if let Err(err) = guard.store_offline_playlist(
                     &meta.playlist_id,
                     &meta.title,
-                    cover_art_path.as_deref().or(meta.thumbnail_url.as_deref()),
+                    meta.thumbnail_url.as_deref(),
                     meta.subtitle.as_deref(),
                     &video_ids,
                 ) {

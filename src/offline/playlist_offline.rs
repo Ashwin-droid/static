@@ -54,6 +54,28 @@ impl MusicCache {
         Ok(rows)
     }
 
+    /// Conventional on-disk path for a playlist's cached cover art. The file
+    /// may not exist; callers check `.exists()`. Kept in sync with the write
+    /// in `download_all_task` and the offline cover repair.
+    pub fn offline_playlist_cover_path(&self, playlist_id: &str) -> std::path::PathBuf {
+        self.art_dir.join(format!("playlist_{playlist_id}.jpg"))
+    }
+
+    /// Update only the stored (remote) cover URL for an offline playlist,
+    /// leaving its tracks untouched. Used by the offline cover repair to
+    /// restore a recoverable `https://` URL after a stale `file://` was stored.
+    pub fn update_offline_playlist_thumbnail(
+        &self,
+        playlist_id: &str,
+        thumbnail_url: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE offline_playlists SET thumbnail_url = ?2 WHERE playlist_id = ?1",
+            rusqlite::params![playlist_id, thumbnail_url],
+        )?;
+        Ok(())
+    }
+
     /// Check if a playlist has been downloaded offline.
     pub fn is_playlist_offline(&self, playlist_id: &str) -> bool {
         self.db

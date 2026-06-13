@@ -13,6 +13,7 @@ pub use settings_offline::{
     PIPEWIRE_DUCKING_VOLUME_CLI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MAX,
     PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
     PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_allows,
-    coordination_filter_contains, sanitize_coordination_filter_entries,
+    coordination_filter_contains, normalize_coordination_identifier,
+    sanitize_coordination_filter_entries,
 };
 pub use store_offline::MusicCache;

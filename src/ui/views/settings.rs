@@ -1478,10 +1478,19 @@ fn coordination_target_row<'a>(
         } else {
             format!("{} | no stable filter key", target.detail)
         }
-    } else if target.detail.is_empty() {
-        format!("key={}", target.key)
     } else {
-        format!("{} | key={}", target.detail, target.key)
+        let key_part = if target.detail.is_empty() {
+            format!("key={}", target.key)
+        } else {
+            format!("{} | key={}", target.detail, target.key)
+        };
+        // Synthesized configured-but-offline entry (see pipewire_target_snapshots):
+        // flag it so the user knows it is listed even though nothing is playing.
+        if target.active {
+            key_part
+        } else {
+            format!("not currently active | {key_part}")
+        }
     };
 
     let listed = target.filterable && target_is_listed(draft, stack, target);

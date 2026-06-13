@@ -39,7 +39,7 @@ use crate::network::{
 use crate::network_state::NetworkState;
 use crate::offline::{
     AppSettings, CoordinationMode, MusicCache, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    coordination_filter_allows,
+    coordination_filter_allows, normalize_coordination_identifier,
 };
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::playback_engine::PlaybackEngine;
@@ -4635,6 +4635,35 @@ fn pipewire_target_snapshots(state: &DaemonState) -> Vec<CoordinationTargetSnaps
             }
         })
         .collect::<Vec<_>>();
+
+    // Surface configured filter entries that aren't currently live, so the user
+    // can review and clear them (e.g. un-blacklist a stream) without the source
+    // app running. Without this, the chooser only lists live streams and a
+    // previously blacklisted entry can never be toggled back off from the UI.
+    let mut present: std::collections::HashSet<String> = targets
+        .iter()
+        .flat_map(|target| {
+            [
+                normalize_coordination_identifier(&target.key),
+                normalize_coordination_identifier(&target.label),
+            ]
+        })
+        .filter(|identifier| !identifier.is_empty())
+        .collect();
+    for entry in &state.settings.pipewire_filter_list {
+        let normalized = normalize_coordination_identifier(entry);
+        if normalized.is_empty() || !present.insert(normalized) {
+            continue;
+        }
+        targets.push(CoordinationTargetSnapshot {
+            filterable: true,
+            key: entry.clone(),
+            label: entry.clone(),
+            detail: String::new(),
+            active: false,
+        });
+    }
+
     targets.sort_by(|left, right| {
         left.label
             .to_ascii_lowercase()

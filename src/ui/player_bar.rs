@@ -104,6 +104,7 @@ pub enum Msg {
     /// serial (toggle/next/prev/seek/repeat/halt-auto/stop).
     DaemonResult {
         serial: u64,
+        play_request: bool,
         result: Result<PlaybackSnapshot, String>,
     },
     /// `set_volume` finished; drains the pending value (order-preserving).
@@ -836,9 +837,13 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
 
         Msg::SharePressed => {
             let daemon = app.player.daemon.clone();
-            app::blocking(
+            app::blocking_or_timeout(
+                app::DAEMON_TASK_TIMEOUT,
                 move || daemon.copy_share_url().map_err(|err| err.to_string()),
                 |result| pmsg(Msg::ShareCopied(result)),
+                pmsg(Msg::ShareCopied(Err(
+                    "daemon share request timed out".to_owned()
+                ))),
             )
         }
         Msg::ShareCopied(result) => match result {
@@ -871,7 +876,10 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             app.player_bar.sleep_menu_open = false;
             let daemon = app.player.daemon.clone();
             let work_request = request.clone();
-            app::blocking(
+            let result_request = request.clone();
+            let timeout_request = request.clone();
+            app::blocking_or_timeout(
+                app::DAEMON_TASK_TIMEOUT,
                 move || {
                     match work_request {
                         SleepOption::Minutes(minutes) => daemon.set_sleep_timer(minutes),
@@ -882,10 +890,14 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
                 },
                 move |result| {
                     pmsg(Msg::SleepResult {
-                        request: request.clone(),
+                        request: result_request.clone(),
                         result,
                     })
                 },
+                pmsg(Msg::SleepResult {
+                    request: timeout_request,
+                    result: Err("daemon sleep request timed out".to_owned()),
+                }),
             )
         }
         Msg::SleepResult { request, result } => match result {
@@ -910,7 +922,14 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             transport_command(app, false, |daemon| daemon.resume_halt_auto())
         }
 
-        Msg::DaemonResult { serial, result } => {
+        Msg::DaemonResult {
+            serial,
+            play_request,
+            result,
+        } => {
+            if play_request {
+                app.player.clear_play_request_in_flight(serial);
+            }
             if !app.player.is_current_play_request(serial) {
                 return Task::none(); // superseded by a newer play request
             }
@@ -979,16 +998,32 @@ where
     } else {
         app.player.play_request_serial
     };
+    if bump_serial {
+        app.player.mark_play_request_in_flight(serial);
+    }
     let daemon = app.player.daemon.clone();
-    app::blocking(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || command(&daemon).map_err(|err| err.to_string()),
-        move |result| pmsg(Msg::DaemonResult { serial, result }),
+        move |result| {
+            pmsg(Msg::DaemonResult {
+                serial,
+                play_request: bump_serial,
+                result,
+            })
+        },
+        pmsg(Msg::DaemonResult {
+            serial,
+            play_request: bump_serial,
+            result: Err("daemon transport command timed out".to_owned()),
+        }),
     )
 }
 
 fn send_volume_task(app: &App, volume: f64) -> Task<Message> {
     let daemon = app.player.daemon.clone();
-    app::blocking_or(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || {
             daemon
                 .set_volume(volume)
@@ -996,8 +1031,10 @@ fn send_volume_task(app: &App, volume: f64) -> Task<Message> {
                 .map_err(|err| err.to_string())
         },
         |result| pmsg(Msg::VolumeResult(result)),
-        // A panicking worker must still clear `volume_send_in_flight`.
-        pmsg(Msg::VolumeResult(Err("volume worker panicked".to_owned()))),
+        // A stuck worker must still clear `volume_send_in_flight`.
+        pmsg(Msg::VolumeResult(Err(
+            "daemon volume request timed out".to_owned()
+        ))),
     )
 }
 
@@ -1349,7 +1386,8 @@ pub fn maybe_restore_daemon_from_ui_state(app: &mut App) -> Task<Message> {
     let resume_playback = snapshot.current_track.is_some();
     app.player.daemon_recovery_in_flight = true;
 
-    app::blocking_or(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || {
             let restored = if snapshot.paused && snapshot.current_track.is_some() {
                 restore_paused_playback_snapshot_via_daemon(snapshot)
@@ -1359,11 +1397,11 @@ pub fn maybe_restore_daemon_from_ui_state(app: &mut App) -> Task<Message> {
             restored.map_err(|err| err.to_string())
         },
         |result| pmsg(Msg::RecoveryFinished(result)),
-        // A panicking restore must still clear `daemon_recovery_in_flight`,
+        // A stuck restore must still clear `daemon_recovery_in_flight`,
         // otherwise every future poll snapshot would be dropped (GTK cleared
         // the flag before matching on the join result).
         pmsg(Msg::RecoveryFinished(Err(
-            "daemon recovery worker panicked".to_owned(),
+            "daemon recovery worker timed out".to_owned(),
         ))),
     )
 }

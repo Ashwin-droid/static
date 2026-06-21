@@ -737,7 +737,8 @@ fn resume_task(app: &mut App, context: PlaylistContext) -> Task<Message> {
     }
     app.library.resume_in_flight = Some(key.clone());
     let panic_key = key.clone();
-    app::blocking_or(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || {
             let persisted = crate::ipc::load_persisted_playlist_state(&context)
                 .map_err(|err| err.to_string())?
@@ -751,10 +752,10 @@ fn resume_task(app: &mut App, context: PlaylistContext) -> Task<Message> {
                 result,
             })
         },
-        // A panicking restore must still clear `resume_in_flight`.
+        // A stuck restore must still clear `resume_in_flight`.
         Message::Library(Msg::ResumeFinished {
             key: panic_key,
-            result: Err("resume worker panicked".to_owned()),
+            result: Err("daemon resume request timed out".to_owned()),
         }),
     )
 }

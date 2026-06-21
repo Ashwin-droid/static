@@ -70,6 +70,7 @@ const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
 const UI_CLIENT_LEASE_TTL: Duration = Duration::from_secs(20);
+const DBUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
 const DBUS_OBJECT_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_INTERFACE: &str = "org.freedesktop.DBus";
@@ -661,9 +662,16 @@ impl StaticdDbus {
                 reply: reply_tx,
             })
             .map_err(|_| zbus::fdo::Error::Failed("Daemon main loop is unavailable".into()))?;
-        let response = reply_rx
-            .recv()
-            .unwrap_or_else(|_| DaemonResponse::Error("Daemon did not reply".to_string()));
+        let response = match reply_rx.recv_timeout(DBUS_REQUEST_TIMEOUT) {
+            Ok(response) => response,
+            Err(mpsc::RecvTimeoutError::Timeout) => DaemonResponse::Error(format!(
+                "Daemon did not reply within {} seconds",
+                DBUS_REQUEST_TIMEOUT.as_secs()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                DaemonResponse::Error("Daemon did not reply".to_string())
+            }
+        };
         serde_json::to_string(&response)
             .map_err(|err| zbus::fdo::Error::Failed(format!("Failed to encode response: {err}")))
     }

@@ -1170,6 +1170,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::PlayOpFinished { serial, result } => {
+            app.player.clear_play_request_in_flight(serial);
             if !app.player.is_current_play_request(serial) {
                 return Task::none();
             }
@@ -1843,6 +1844,24 @@ pub fn update_menu(app: &mut App, msg: MenuMsg) -> Task<Message> {
 // Shared by sidebar/views — call these instead of talking to the daemon.
 // ---------------------------------------------------------------------------
 
+/// "Play now" from a full track — seeds radio (`start_radio_from_seed`).
+pub fn play_track_radio_task(app: &mut App, seed: Track) -> Task<Message> {
+    let video_id = seed.video_id.clone();
+    let title = seed.title.clone();
+    let artist = artist_string(&seed);
+    let thumbnail_url = seed.thumbnail_url.clone();
+
+    let flush =
+        flush_now_playing_eagerly(app, &video_id, &title, &artist, thumbnail_url.as_deref());
+    let repeat_mode = app.player.repeat_mode;
+    Task::batch([
+        flush,
+        play_op(app, move |daemon| {
+            daemon.start_radio_from_seed(vec![seed], 0, 0, 1, None, repeat_mode, true)
+        }),
+    ])
+}
+
 /// "Play now" from a bare id — seeds radio (`start_radio_from_seed`).
 pub fn play_track_task(
     app: &mut App,
@@ -1867,15 +1886,7 @@ pub fn play_track_task(
         undo_feedback_token: None,
     };
 
-    let flush =
-        flush_now_playing_eagerly(app, &video_id, &title, &artist, thumbnail_url.as_deref());
-    let repeat_mode = app.player.repeat_mode;
-    Task::batch([
-        flush,
-        play_op(app, move |daemon| {
-            daemon.start_radio_from_seed(vec![seed], 0, 0, 1, None, repeat_mode, true)
-        }),
-    ])
+    play_track_radio_task(app, seed)
 }
 
 /// Replace queue with `tracks` at `index` under an optional playlist context
@@ -2226,9 +2237,14 @@ where
     app.queue_panel.op_serial = app.queue_panel.op_serial.wrapping_add(1);
     let serial = app.queue_panel.op_serial;
     let daemon = app.player.daemon.clone();
-    app::blocking(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || command(&daemon).map_err(|err| err.to_string()),
         move |result| qmsg(Msg::QueueOpFinished { serial, result }),
+        qmsg(Msg::QueueOpFinished {
+            serial,
+            result: Err("daemon queue operation timed out".to_owned()),
+        }),
     )
 }
 
@@ -2238,10 +2254,16 @@ where
     F: FnOnce(&DaemonClient) -> anyhow::Result<PlaybackSnapshot> + Send + 'static,
 {
     let serial = app.player.next_play_request_serial();
+    app.player.mark_play_request_in_flight(serial);
     let daemon = app.player.daemon.clone();
-    app::blocking(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || command(&daemon).map_err(|err| err.to_string()),
         move |result| qmsg(Msg::PlayOpFinished { serial, result }),
+        qmsg(Msg::PlayOpFinished {
+            serial,
+            result: Err("daemon playback request timed out".to_owned()),
+        }),
     )
 }
 

@@ -16,8 +16,8 @@ mod widgets;
 #[allow(unused_imports)]
 pub use app::{App, Message};
 
-use iced::futures::Stream;
 use iced::Subscription;
+use iced::futures::Stream;
 use std::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 

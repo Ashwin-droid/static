@@ -2153,9 +2153,14 @@ fn apply_storage_root_task(app: &mut App) -> Task<Message> {
 
 fn fetch_coordination_targets_task(app: &App, serial: u64) -> Task<Message> {
     let daemon = app.player.daemon.clone();
-    app::blocking(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || daemon.coordination_targets().map_err(|err| err.to_string()),
         move |result| Message::Settings(Msg::CoordinationTargetsLoaded { serial, result }),
+        Message::Settings(Msg::CoordinationTargetsLoaded {
+            serial,
+            result: Err("daemon coordination target request timed out".to_owned()),
+        }),
     )
 }
 

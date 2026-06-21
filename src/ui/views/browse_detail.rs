@@ -353,12 +353,13 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             };
             app.browse.resume_in_flight = true;
             let daemon = app.player.daemon.clone();
-            app::blocking_or(
+            app::blocking_or_timeout(
+                app::DAEMON_TASK_TIMEOUT,
                 move || resume_persisted_playlist(&daemon, &context),
                 |result| Message::Browse(Msg::ResumeFinished { result }),
-                // A panicking restore must still clear `resume_in_flight`.
+                // A stuck restore must still clear `resume_in_flight`.
                 Message::Browse(Msg::ResumeFinished {
-                    result: Err("resume worker panicked".to_owned()),
+                    result: Err("daemon resume request timed out".to_owned()),
                 }),
             )
         }

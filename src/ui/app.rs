@@ -33,6 +33,10 @@ use super::{content_loading, player_bar, queue_panel, sidebar, theme, thumbnails
 pub const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// A poll that has been in flight at least this long is considered stuck.
 pub const DAEMON_POLL_STUCK_AFTER: Duration = Duration::from_secs(3);
+/// Max time the UI will wait for a daemon IPC worker before surfacing failure.
+pub const DAEMON_TASK_TIMEOUT: Duration = Duration::from_secs(4);
+/// Max time close waits for resume-state persistence before closing anyway.
+pub const CLOSE_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 /// UI-client lease renewal.
 pub const UI_CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// Sidebar "Recently Played" silent refresh.
@@ -249,6 +253,7 @@ pub struct PlayerModel {
     pub daemon_refresh_started_at: Option<Instant>,
     pub daemon_refresh_serial: u64,
     pub daemon_recovery_in_flight: bool,
+    pub play_request_in_flight: Option<u64>,
 }
 
 impl PlayerModel {
@@ -276,6 +281,7 @@ impl PlayerModel {
             daemon_refresh_started_at: None,
             daemon_refresh_serial: 0,
             daemon_recovery_in_flight: false,
+            play_request_in_flight: None,
         }
     }
 
@@ -344,6 +350,16 @@ impl PlayerModel {
 
     pub fn is_current_play_request(&self, serial: u64) -> bool {
         self.play_request_serial == serial
+    }
+
+    pub fn mark_play_request_in_flight(&mut self, serial: u64) {
+        self.play_request_in_flight = Some(serial);
+    }
+
+    pub fn clear_play_request_in_flight(&mut self, serial: u64) {
+        if self.play_request_in_flight == Some(serial) {
+            self.play_request_in_flight = None;
+        }
     }
 
     pub fn position_millis(&self) -> Option<u64> {
@@ -451,11 +467,56 @@ where
     )
 }
 
+/// Run blocking work with a UI-visible timeout. The worker may continue in
+/// Tokio's blocking pool after the timeout, but the UI receives `on_timeout`
+/// promptly and serial guards ignore any later stale completion.
+pub fn blocking_or_timeout<T, F, M>(
+    timeout: Duration,
+    work: F,
+    map: M,
+    on_timeout: Message,
+) -> Task<Message>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+    M: Fn(T) -> Message + Send + Sync + 'static,
+{
+    Task::perform(
+        async move { tokio::time::timeout(timeout, tokio::task::spawn_blocking(work)).await },
+        move |timed| match timed {
+            Ok(Ok(value)) => map(value),
+            Ok(Err(err)) => {
+                crate::app_log!("[UI] blocking worker failed: {err}");
+                on_timeout.clone()
+            }
+            Err(_) => {
+                crate::app_log!("[UI] blocking worker timed out after {:?}", timeout);
+                on_timeout.clone()
+            }
+        },
+    )
+}
+
 /// Fire a message after a delay (debounces, toast expiry, retry backoff).
 pub fn after(delay: Duration, message: Message) -> Task<Message> {
     Task::perform(async move { tokio::time::sleep(delay).await }, move |_| {
         message.clone()
     })
+}
+
+fn spawn_close_daemon_cleanup(daemon: DaemonClient, client_id: String, shutdown_daemon: bool) {
+    let _ = std::thread::Builder::new()
+        .name("static-ui-close-cleanup".to_owned())
+        .spawn(move || {
+            if let Err(err) = daemon.unregister_ui_client(&client_id) {
+                crate::app_log!("[STATIC] failed to unregister UI client: {err}");
+            }
+            if shutdown_daemon {
+                if let Err(err) = daemon.shutdown() {
+                    crate::app_log!("[STATIC] failed to shut daemon down: {err}");
+                }
+            }
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -495,6 +556,7 @@ pub struct App {
     pub settings_page: views::settings::State,
     pub auth: views::settings::AuthState,
     pub thumbnails: thumbnails::Cache,
+    pub closing: bool,
 }
 
 impl App {
@@ -565,6 +627,7 @@ impl App {
             settings_page: views::settings::State::default(),
             auth: views::settings::AuthState::default(),
             thumbnails: thumbnails::Cache::default(),
+            closing: false,
         };
 
         let mut startup = vec![views::settings::startup_auth_restore_task(
@@ -632,30 +695,30 @@ impl App {
             }
 
             Message::CloseRequested(window) => {
+                if self.closing {
+                    return iced::window::close(window);
+                }
+                self.closing = true;
                 // Shell spec §9: persist resume snapshot, release the UI
                 // lease, shut the daemon down only when paused with a track.
-                // The snapshot payload is built on the UI thread; disk writes
-                // join the existing close-path blocking worker.
+                // The snapshot payload is built on the UI thread. Only resume
+                // persistence blocks window close; daemon IPC cleanup is
+                // best-effort so a wedged daemon cannot pin the UI open.
                 let resume_payload = player_bar::resume_persist_payload(self);
                 let snapshot = self.player.snapshot.clone();
                 let shutdown_daemon = snapshot.paused && snapshot.current_track.is_some();
                 let daemon = self.player.daemon.clone();
                 let client_id = self.ui_client_id.clone();
-                blocking(
+                spawn_close_daemon_cleanup(daemon, client_id, shutdown_daemon);
+                blocking_or_timeout(
+                    CLOSE_PERSIST_TIMEOUT,
                     move || {
                         if let Some(persisted) = resume_payload.as_ref() {
                             player_bar::write_resume_snapshot(persisted);
                         }
-                        if let Err(err) = daemon.unregister_ui_client(&client_id) {
-                            crate::app_log!("[STATIC] failed to unregister UI client: {err}");
-                        }
-                        if shutdown_daemon {
-                            if let Err(err) = daemon.shutdown() {
-                                crate::app_log!("[STATIC] failed to shut daemon down: {err}");
-                            }
-                        }
                     },
                     move |_| Message::ClosePersisted(window),
+                    Message::ClosePersisted(window),
                 )
             }
             Message::ClosePersisted(window) => iced::window::close(window),
@@ -730,6 +793,9 @@ impl App {
     /// 400 ms daemon poll (shell spec §10). Skips when a refresh is already in
     /// flight unless it looks stuck (≥ 3 s), drops stale responses by serial.
     fn poll_daemon(&mut self) -> Task<Message> {
+        if self.player.play_request_in_flight.is_some() {
+            return Task::none();
+        }
         if self.player.daemon_refresh_in_flight {
             let stuck = self
                 .player
@@ -747,9 +813,14 @@ impl App {
         self.player.daemon_refresh_started_at = Some(Instant::now());
 
         let daemon = self.player.daemon.clone();
-        blocking(
+        blocking_or_timeout(
+            DAEMON_TASK_TIMEOUT,
             move || daemon.state().map_err(|err| err.to_string()),
             move |result| Message::DaemonState { serial, result },
+            Message::DaemonState {
+                serial,
+                result: Err("daemon state poll timed out".to_owned()),
+            },
         )
     }
 

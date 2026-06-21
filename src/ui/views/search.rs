@@ -7,8 +7,8 @@
 //! (`render_search_view` + section grids).
 //!
 //! Notes:
-//! - Search track rows use `TrackRowClickBehavior::PlayFromContext` with NO
-//!   playlist context; mixed grids index into the tracks-only list.
+//! - Search track rows use `TrackRowClickBehavior::StartRadio`; mixed grids
+//!   index into the tracks-only list.
 //! - Rendering a result stores `SearchPageCache` on `App.search` and sets
 //!   `content_view = Search`; browse detail opened from here returns to this
 //!   exact search (query, results, scroll) via the back target.
@@ -65,7 +65,7 @@ pub enum Msg {
         query: String,
         result: Result<SearchResult, String>,
     },
-    /// Track row clicked: play the section's contiguous track context. The
+    /// Track row clicked: start radio from the selected song. The
     /// view emits the lean `Section*` forms; these payload-carrying forms are
     /// kept as the direct API for cross-module callers.
     #[allow(dead_code)]
@@ -153,10 +153,10 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             }
         }
 
-        Msg::TrackClicked { tracks, index } => play_track_context(app, tracks, index),
+        Msg::TrackClicked { tracks, index } => start_radio_from_track(app, tracks, index),
         Msg::SectionTrackClicked { section, index } => {
             let tracks = cached_section_tracks(app, section);
-            play_track_context(app, tracks, index)
+            start_radio_from_track(app, tracks, index)
         }
 
         Msg::BrowseRowClicked(card) => {
@@ -246,10 +246,9 @@ pub fn show_cached_page(app: &mut App, cache: SearchPageCache) -> Task<Message> 
 // Click plumbing
 // ---------------------------------------------------------------------------
 
-/// Left-click on a track row: play the contiguous track context (no playlist
-/// context — a context-less queue, views spec §2.4) and prepend the track to
-/// the sidebar recents.
-fn play_track_context(app: &mut App, tracks: Vec<Track>, index: usize) -> Task<Message> {
+/// Left-click on a track row: start radio from the clicked song and prepend
+/// the track to the sidebar recents.
+fn start_radio_from_track(app: &mut App, tracks: Vec<Track>, index: usize) -> Task<Message> {
     let press = release_pending_press(app);
     if press.was_active {
         return Task::none(); // it was a drag, not a click
@@ -265,7 +264,7 @@ fn play_track_context(app: &mut App, tracks: Vec<Track>, index: usize) -> Task<M
         Some(_) => return Task::none(),
     }
     sidebar::add_to_recent(app, &track);
-    queue_panel::play_from_context_task(app, tracks, index, None)
+    queue_panel::play_track_radio_task(app, track)
 }
 
 struct ReleasedPress {

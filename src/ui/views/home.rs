@@ -473,7 +473,8 @@ fn handle_resume_clicked(app: &mut App) -> Task<Message> {
     };
     app.home.resume_in_flight = true;
 
-    app::blocking(
+    app::blocking_or_timeout(
+        app::DAEMON_TASK_TIMEOUT,
         move || match resume.source {
             ResumeSource::Local(snapshot) => {
                 crate::ipc::ensure_daemon_running().map_err(|err| err.to_string())?;
@@ -486,6 +487,9 @@ fn handle_resume_clicked(app: &mut App) -> Task<Message> {
             }
         },
         |result| Message::Home(Msg::ResumeFinished { result }),
+        Message::Home(Msg::ResumeFinished {
+            result: Err("daemon resume request timed out".to_owned()),
+        }),
     )
 }
 

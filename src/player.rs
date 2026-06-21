@@ -7,8 +7,14 @@ macro_rules! eprintln {
 }
 
 pub fn notify_daemon_settings_changed() {
-    match DaemonClient::new().and_then(|client| client.reload_settings()) {
-        Ok(_) => {}
-        Err(err) => eprintln!("[PLAYER] failed to notify staticd about settings changes: {err}"),
-    }
+    let _ = std::thread::Builder::new()
+        .name("static-settings-reload".to_owned())
+        .spawn(
+            || match DaemonClient::new().and_then(|client| client.reload_settings()) {
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("[PLAYER] failed to notify staticd about settings changes: {err}")
+                }
+            },
+        );
 }

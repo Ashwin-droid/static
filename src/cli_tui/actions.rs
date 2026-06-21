@@ -340,16 +340,15 @@ impl InteractiveTui {
                     let TuiSearchStatus::Ready(results) = &view.status else {
                         return Ok(());
                     };
-                    let section_tracks = search_section_tracks(results, card.section_index);
-                    self.play_track_collection(
-                        section_tracks.clone(),
-                        section_tracks
-                            .iter()
-                            .position(|candidate| candidate.video_id == track.video_id)
-                            .unwrap_or(0),
-                        None,
-                        &track,
-                    )?;
+                    if results.sections.get(card.section_index).is_none() {
+                        self.status_line =
+                            "That search section is no longer available.".to_string();
+                        return Ok(());
+                    }
+                    let snapshot = play_track_with_radio(&self.client, track.clone())?;
+                    self.apply_snapshot(snapshot);
+                    self.detail_tab = DetailTab::Queue;
+                    self.status_line = format!("Playing {}", format_track_summary(&track));
                 }
                 TuiContentView::Home
                 | TuiContentView::Playlists(_)

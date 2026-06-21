@@ -1,18 +1,20 @@
 use super::{
-    ActiveTrack, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition, PLAYBACK_START_TIMEOUT,
-    PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision, PendingMprisTransportIntent,
-    PipeWireSuppressionMode, PlaybackSource, PlaybackTransition, PreviousAction, VolumeRamp,
-    VolumeRampCompletion, apply_radio_chips_from_refresh, cache_media_download_retry_delay,
-    current_listened_millis, dedupe_radio_recommendations, effective_queue_len,
-    extend_radio_touched_for_insert, has_reached_track_end, hide_timing_for_track,
-    mpris_app_key_from_bus, mpris_halt_auto_peer_transition, mpris_position_millis_for_track,
-    natural_end_target_index, next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
+    ActiveTrack, DESYNC_PLAYBACK_START_DELAY, MIN_LISTEN_SECS, MprisHaltAutoPeerTransition,
+    PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision,
+    PendingMprisTransportIntent, PipeWireSuppressionMode, PlaybackSource, PlaybackStartMode,
+    PlaybackTransition, PreviousAction, VolumeRamp, VolumeRampCompletion,
+    apply_radio_chips_from_refresh, cache_media_download_retry_delay, current_listened_millis,
+    dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
+    has_reached_track_end, hide_timing_for_track, mpris_app_key_from_bus,
+    mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
+    next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
     pause_request_already_satisfied, pending_mpris_transport_decision,
-    pipewire_unduck_can_replace_volume_ramp, playback_position_confirms_start,
-    playback_start_stalled, prefetch_candidate_indices, previous_action,
-    previous_action_position_millis_for_track, radio_chips_with_replacement,
+    pending_playback_start_is_ready, pipewire_unduck_can_replace_volume_ramp,
+    playback_position_confirms_start, playback_start_stalled, prefetch_candidate_indices,
+    previous_action, previous_action_position_millis_for_track, radio_chips_with_replacement,
     rearm_track_repeat_loops_for_snapshot, remove_cached_if_unwanted_after_playlist_sync,
-    resolve_pipewire_suppression_mode, should_count_paused_idle_for_shutdown,
+    resolve_pending_playback_index, resolve_pipewire_suppression_mode,
+    should_count_paused_idle_for_shutdown, should_desync_playback_start,
     should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
     should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
     should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
@@ -37,7 +39,6 @@ fn test_active_track(started_at: Instant) -> ActiveTrack {
         artist: "Test Artist".to_string(),
         thumb_url: None,
         playback_source: PlaybackSource::RemoteStream,
-        playback_uri: "https://example.test/audio".to_string(),
         reporting_enabled: true,
         rating: SongRating::Indifferent,
         tracking: None,
@@ -391,6 +392,51 @@ fn playback_start_is_marked_stalled_after_timeout_without_progress() {
 fn playback_start_is_not_stalled_once_position_moves() {
     let started_at = Instant::now() - (PLAYBACK_START_TIMEOUT + Duration::from_secs(1));
     assert!(!playback_start_stalled(started_at, false));
+}
+
+#[test]
+fn user_playback_start_desyncs_only_for_normal_play_requests() {
+    assert!(should_desync_playback_start(
+        PlaybackStartMode::Playing,
+        false
+    ));
+    assert!(!should_desync_playback_start(
+        PlaybackStartMode::Playing,
+        true
+    ));
+    assert!(!should_desync_playback_start(
+        PlaybackStartMode::Paused {
+            position_millis: Some(124_056),
+        },
+        false,
+    ));
+}
+
+#[test]
+fn pending_playback_start_waits_for_desync_window() {
+    let now = Instant::now();
+    let due_at = now + DESYNC_PLAYBACK_START_DELAY;
+
+    assert!(!pending_playback_start_is_ready(due_at, true, now));
+    assert!(pending_playback_start_is_ready(due_at, true, due_at));
+}
+
+#[test]
+fn paused_pending_playback_start_does_not_run_when_due() {
+    let now = Instant::now();
+
+    assert!(!pending_playback_start_is_ready(now, false, now));
+}
+
+#[test]
+fn pending_playback_start_follows_track_after_queue_reorder() {
+    let queue = vec![
+        test_track("first"),
+        test_track("second"),
+        test_track("third"),
+    ];
+
+    assert_eq!(resolve_pending_playback_index(&queue, 0, "third"), Some(2));
 }
 
 #[test]

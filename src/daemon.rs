@@ -3203,7 +3203,7 @@ fn stage_play_index_after_desync(
         .get(index)
         .cloned()
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
-    stop_playback(state, false);
+    stop_playback_without_mpris_sync(state, false);
     state.player = PlaybackEngine::new();
     state.probe_context = None;
     state.queue_index = index;
@@ -3330,7 +3330,7 @@ fn play_index_with_startup_retries(
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
     let prepared = prepare_playback(state, &track.video_id)?;
 
-    stop_playback(state, false);
+    stop_playback_without_mpris_sync(state, false);
     state.player = PlaybackEngine::new();
     state.probe_context = None;
 
@@ -3453,6 +3453,14 @@ fn mark_radio_touched_through(state: &mut DaemonState, index: usize) {
 }
 
 fn stop_playback(state: &mut DaemonState, exiting: bool) {
+    stop_playback_inner(state, exiting, true);
+}
+
+fn stop_playback_without_mpris_sync(state: &mut DaemonState, exiting: bool) {
+    stop_playback_inner(state, exiting, false);
+}
+
+fn stop_playback_inner(state: &mut DaemonState, exiting: bool, refresh_mpris: bool) {
     maybe_persist_playback_state(state, true);
     clear_mpris_halt_auto_resume_pending(state);
     state.pending_playback_start = None;
@@ -3473,7 +3481,9 @@ fn stop_playback(state: &mut DaemonState, exiting: bool) {
     state.sponsor_segments_reported.clear();
     state.paused_since = None;
     state.peer_mpris.clear_waiting();
-    sync_mpris(state);
+    if refresh_mpris {
+        sync_mpris(state);
+    }
 }
 
 fn apply_prepared_video_id_to_track(

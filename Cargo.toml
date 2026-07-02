@@ -8,6 +8,7 @@ license = "MIT"
 
 [package.metadata.deb]
 maintainer = "Ashwin Mhaskar"
+features = ["staticfs"]
 depends = "$auto, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad"
 section = "sound"
 priority = "optional"

@@ -939,7 +939,7 @@ fn track_row<'a>(app: &'a App, key: (usize, usize), track: &'a Track) -> Element
     if let Some(duration) = &track.duration {
         content = content.push(
             text(duration)
-                .font(iced::Font::MONOSPACE)
+                .font(theme::FONT_MONO)
                 .size(theme::SIZE_CAPTION)
                 .color(theme::TEXT_DIM),
         );

@@ -63,7 +63,7 @@ impl MusicCache {
 
     /// Update only the stored (remote) cover URL for an offline playlist,
     /// leaving its tracks untouched. Used by the offline cover repair to
-    /// restore a recoverable `https://` URL after a stale `file://` was stored.
+    /// restore a recoverable HTTPS URL after a stale local-file URL was stored.
     pub fn update_offline_playlist_thumbnail(
         &self,
         playlist_id: &str,

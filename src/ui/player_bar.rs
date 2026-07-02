@@ -256,7 +256,7 @@ fn controls_row(app: &App) -> Element<'_, Message> {
 
     let time = container(
         text(time_label_text(app))
-            .font(iced::Font::MONOSPACE)
+            .font(theme::FONT_MONO)
             .size(theme::SIZE_CAPTION)
             .color(theme::TEXT_DIM),
     )

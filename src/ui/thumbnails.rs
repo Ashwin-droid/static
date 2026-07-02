@@ -27,11 +27,11 @@ const NP_ART_MAX: f32 = 40.0;
 
 const COVER_LETTER_FONT: Font = Font {
     weight: iced::font::Weight::ExtraBold,
-    ..Font::DEFAULT
+    ..theme::FONT_UI
 };
 const TRACK_LETTER_FONT: Font = Font {
     weight: iced::font::Weight::Bold,
-    ..Font::DEFAULT
+    ..theme::FONT_UI
 };
 
 pub enum Entry {

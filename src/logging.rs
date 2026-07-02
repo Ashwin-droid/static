@@ -1,6 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, Sender};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
@@ -182,6 +184,40 @@ pub fn current_process_source() -> LogSource {
     }
 }
 
+/// UI-process log delivery is slow and can wedge outright: forwarding is an
+/// untimed D-Bus call into the daemon (which serves requests from its main
+/// loop), and the local fallback resolves the storage root through Secret
+/// Service — another bus round-trip. `app_log!` fires from `update` handlers
+/// on the winit thread, so that work must live on its own thread; callers
+/// only enqueue.
+fn ui_log_sender() -> Option<&'static Sender<String>> {
+    static UI_LOG_TX: OnceLock<Option<Sender<String>>> = OnceLock::new();
+    UI_LOG_TX
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<String>();
+            std::thread::Builder::new()
+                .name("static-ui-logger".to_owned())
+                .spawn(move || {
+                    for message in rx {
+                        forward_or_append_ui_log(message);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+}
+
+fn forward_or_append_ui_log(message: String) {
+    if let Err(err) = crate::ipc::forward_log_message(LogSource::Ui, message.clone()) {
+        let _ = append_log(LogSource::Ui, &message);
+        let _ = append_log(
+            LogSource::Ui,
+            &format!("[LOGGER] failed to forward UI log to daemon: {err}"),
+        );
+    }
+}
+
 pub fn log_current_process_message(message: String) {
     match current_process_source() {
         LogSource::Daemon => {
@@ -193,13 +229,16 @@ pub fn log_current_process_message(message: String) {
             }
         }
         LogSource::Ui => {
-            if let Err(err) = crate::ipc::forward_log_message(LogSource::Ui, message.clone()) {
-                let _ = append_log(LogSource::Ui, &message);
-                let _ = append_log(
-                    LogSource::Ui,
-                    &format!("[LOGGER] failed to forward UI log to daemon: {err}"),
-                );
-            }
+            let message = match ui_log_sender() {
+                Some(tx) => match tx.send(message) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(message)) => message,
+                },
+                None => message,
+            };
+            // Logger thread unavailable (spawn failed or it died): degrade to
+            // the old synchronous path rather than dropping the line.
+            forward_or_append_ui_log(message);
         }
     }
 }

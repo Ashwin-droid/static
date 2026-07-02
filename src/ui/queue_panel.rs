@@ -84,14 +84,8 @@ const LYRICS_UNAVAILABLE: &str =
 const LYRICS_FAILED: &str = "Timed lyrics could not be loaded for this track.";
 const LYRICS_NOT_CONNECTED: &str = "Connect YouTube Music to load synced lyrics.";
 
-const SEMIBOLD: Font = Font {
-    weight: iced::font::Weight::Semibold,
-    ..Font::DEFAULT
-};
-const BOLD: Font = Font {
-    weight: iced::font::Weight::Bold,
-    ..Font::DEFAULT
-};
+const SEMIBOLD: Font = theme::FONT_SEMIBOLD;
+const BOLD: Font = theme::FONT_BOLD;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailPanelView {
@@ -596,7 +590,7 @@ fn queue_row<'a>(
     if let Some(duration) = track.duration.as_deref() {
         body = body.push(
             text(duration)
-                .font(Font::MONOSPACE)
+                .font(theme::FONT_MONO)
                 .size(theme::SIZE_CAPTION)
                 .color(if visual.dimmed {
                     theme::TEXT_GHOST
@@ -740,7 +734,7 @@ fn drop_indicator_row(app: &App) -> Element<'_, Message> {
             if let Some(duration) = preview.duration {
                 body = body.push(
                     text(duration)
-                        .font(Font::MONOSPACE)
+                        .font(theme::FONT_MONO)
                         .size(theme::SIZE_CAPTION)
                         .color(theme::TEXT_FAINT),
                 );

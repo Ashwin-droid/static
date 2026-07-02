@@ -140,17 +140,27 @@ pub const RADIUS_PILL: f32 = 999.0;
 // Font weights (GTK font-weight hierarchy: 600/700/800)
 // ---------------------------------------------------------------------------
 
+/// The embedded UI family (see the `.font(...)` calls in `ui::run`). Every
+/// weight variant must derive from this — `..Font::DEFAULT` means
+/// `Family::SansSerif`, which bypasses the embedded faces and resolves from
+/// system fonts.
+pub const FONT_UI: Font = Font::with_name("Fira Sans");
+
+/// Embedded monospace face for time/duration labels (replaces
+/// `Font::MONOSPACE`, which resolves from system fonts).
+pub const FONT_MONO: Font = Font::with_name("Fira Mono");
+
 pub const FONT_SEMIBOLD: Font = Font {
     weight: iced::font::Weight::Semibold,
-    ..Font::DEFAULT
+    ..FONT_UI
 };
 pub const FONT_BOLD: Font = Font {
     weight: iced::font::Weight::Bold,
-    ..Font::DEFAULT
+    ..FONT_UI
 };
 pub const FONT_HEAVY: Font = Font {
     weight: iced::font::Weight::ExtraBold,
-    ..Font::DEFAULT
+    ..FONT_UI
 };
 
 pub const SIZE_HERO: f32 = 34.0; // settings title

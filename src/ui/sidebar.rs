@@ -128,10 +128,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         text("RECENTLY PLAYED")
             .size(theme::SIZE_CAPTION)
             .color(theme::TEXT_FAINT)
-            .font(iced::Font {
-                weight: iced::font::Weight::Bold,
-                ..iced::Font::DEFAULT
-            }),
+            .font(theme::FONT_BOLD),
     )
     .padding(Padding {
         top: theme::SPACE_LG,

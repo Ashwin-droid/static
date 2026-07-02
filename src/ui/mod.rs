@@ -155,6 +155,16 @@ pub fn run() -> iced::Result {
         .title("Static")
         .theme(|_app: &App| theme::theme())
         .subscription(App::subscription)
+        // Embed the UI family instead of resolving `Family::SansSerif` from
+        // whatever fontdb finds on the system: without this, the family (and
+        // the faces backing the Semibold/ExtraBold weights) varied per
+        // machine/launch, rendering with visibly wrong fonts and metrics.
+        .font(include_bytes!("../../assets/fonts/FiraSans-Regular.ttf").as_slice())
+        .font(include_bytes!("../../assets/fonts/FiraSans-SemiBold.ttf").as_slice())
+        .font(include_bytes!("../../assets/fonts/FiraSans-Bold.ttf").as_slice())
+        .font(include_bytes!("../../assets/fonts/FiraSans-ExtraBold.ttf").as_slice())
+        .font(include_bytes!("../../assets/fonts/FiraMono-Regular.ttf").as_slice())
+        .default_font(theme::FONT_UI)
         .window(iced::window::Settings {
             size: iced::Size::new(1532.0, 760.0),
             min_size: Some(iced::Size::new(1024.0, 600.0)),

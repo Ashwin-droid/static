@@ -245,13 +245,67 @@ pub(crate) fn write_repeat(ctx: &Ctx, line: &str) -> FsResult<()> {
     send(ctx, &DaemonRequest::SetRepeatMode { repeat_mode })
 }
 
-/// playback/next (w). B5: "any write → Next (once per open handle)."
-/// Fired by fs.rs on the first write() of the handle, whatever the bytes.
-pub(crate) fn trigger_next(ctx: &Ctx) -> FsResult<()> {
-    send(ctx, &DaemonRequest::Next)
+/// Renders a queue neighbour of the current track as the same record shape
+/// as playback/track; empty record when the neighbour does not exist.
+fn queue_neighbour_record(snap: &PlaybackSnapshot, offset: isize) -> Vec<(&'static str, String)> {
+    let index = snap.queue_index as isize + offset;
+    if index < 0 {
+        return Vec::new();
+    }
+    let Some(track) = snap.queue.get(index as usize) else {
+        return Vec::new();
+    };
+    vec![
+        ("title", track.title.clone()),
+        ("artist", crate::cli::artist_string(track)),
+        ("video_id", track.video_id.clone()),
+    ]
 }
 
-/// playback/prev (w). B5: "any write → Previous (once per open handle)."
+/// playback/next (rw), read side: record {title, artist, video_id} of the
+/// upcoming queue entry (queue[queue_index+1]); empty when none.
+pub(crate) fn read_next(ctx: &Ctx, mode: FsMode) -> FsResult<Vec<u8>> {
+    let snap = snapshot(ctx)?;
+    Ok(format::record(mode, &queue_neighbour_record(&snap, 1)))
+}
+
+/// playback/prev (rw), read side: record of the previous queue entry
+/// (queue[queue_index-1]); empty when none.
+pub(crate) fn read_prev(ctx: &Ctx, mode: FsMode) -> FsResult<Vec<u8>> {
+    let snap = snapshot(ctx)?;
+    let fields = queue_neighbour_record(&snap, -1);
+    Ok(format::record(
+        mode,
+        &fields
+            .into_iter()
+            .map(|(key, value)| (key, value))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// playback/next write grammar: "skip" (the empty-write token, so
+/// `echo > next` skips forward) → Next; any other line is a free-text
+/// query resolved and inserted at the CLI `queue addNext` slot.
+pub(crate) fn write_next(ctx: &Ctx, line: &str) -> FsResult<()> {
+    if line.eq_ignore_ascii_case("skip") {
+        return send(ctx, &DaemonRequest::Next);
+    }
+    // Resolve+insert is not idempotent: never retried on a rebuilt
+    // connection (same rule as queue/items writes).
+    ctx.with_daemon_once(|client| client.try_resolve_and_queue(line, true))?;
+    Ok(())
+}
+
+/// playback/track + playback/video_id write side: resolve the line (free
+/// text or a bare video id — `resolve_track_input` handles both) and play it
+/// now with a radio tail, exactly like `static exec`.
+pub(crate) fn write_play_query(ctx: &Ctx, line: &str) -> FsResult<()> {
+    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line))?;
+    Ok(())
+}
+
+/// playback/prev (rw), write side. B5: "any write → Previous (once per open
+/// handle)."
 pub(crate) fn trigger_prev(ctx: &Ctx) -> FsResult<()> {
     send(ctx, &DaemonRequest::Previous)
 }

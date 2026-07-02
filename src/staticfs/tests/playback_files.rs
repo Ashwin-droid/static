@@ -1,10 +1,52 @@
 use super::{
     SleepCommand, StateCommand, parse_position_millis, parse_rating_token, parse_repeat_token,
-    parse_sleep_token, parse_state_token, parse_volume_value, rating_label, reveal_lyrics,
+    parse_sleep_token, parse_state_token, parse_volume_value, queue_neighbour_record, rating_label,
+    reveal_lyrics,
 };
-use crate::ipc::RepeatMode;
-use crate::models::{SyncedLyricLine, SyncedLyrics, SyncedLyricsSource};
+use crate::ipc::{PlaybackSnapshot, RepeatMode};
+use crate::models::{Artist, SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track};
 use crate::network::SongRating;
+
+fn queue_track(video_id: &str, title: &str) -> Track {
+    Track {
+        video_id: video_id.to_string(),
+        title: title.to_string(),
+        artists: vec![Artist {
+            name: "Artist".to_string(),
+            id: None,
+        }],
+        album: None,
+        duration: None,
+        thumbnail_url: None,
+        playback_playlist_id: None,
+        playback_params: None,
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
+    }
+}
+
+#[test]
+fn queue_neighbours_render_and_clamp() {
+    let mut snap = PlaybackSnapshot {
+        queue: vec![queue_track("a", "A"), queue_track("b", "B")],
+        queue_index: 0,
+        ..PlaybackSnapshot::default()
+    };
+    // At the head: next exists, prev does not.
+    let next = queue_neighbour_record(&snap, 1);
+    assert_eq!(next[0].1, "B");
+    assert_eq!(next[2].1, "b");
+    assert!(queue_neighbour_record(&snap, -1).is_empty());
+    // At the tail: prev exists, next does not.
+    snap.queue_index = 1;
+    assert!(queue_neighbour_record(&snap, 1).is_empty());
+    assert_eq!(queue_neighbour_record(&snap, -1)[2].1, "a");
+    // Empty queue: neither.
+    snap.queue.clear();
+    snap.queue_index = 0;
+    assert!(queue_neighbour_record(&snap, 1).is_empty());
+    assert!(queue_neighbour_record(&snap, -1).is_empty());
+}
 
 #[test]
 fn state_tokens_map_to_commands() {

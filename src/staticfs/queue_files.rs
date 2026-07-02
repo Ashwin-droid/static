@@ -82,7 +82,7 @@ pub(crate) fn read_queue_items(ctx: &Ctx, mode: FsMode) -> FsResult<Vec<u8>> {
 /// Non-idempotent (a retry could queue the track twice), so no transport
 /// retry: `with_daemon_once`.
 pub(crate) fn write_queue_items(ctx: &Ctx, line: &str) -> FsResult<()> {
-    ctx.with_daemon_once(|client| client.try_resolve_and_queue(line))?;
+    ctx.with_daemon_once(|client| client.try_resolve_and_queue(line, false))?;
     Ok(())
 }
 

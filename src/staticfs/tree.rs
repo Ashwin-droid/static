@@ -127,9 +127,13 @@ impl Node {
             node if node.is_dir() => 0o755,
             // read-write
             Node::PlaybackState
+            | Node::PlaybackTrack
+            | Node::PlaybackVideoId
             | Node::PlaybackPosition
             | Node::PlaybackVolume
             | Node::PlaybackRepeat
+            | Node::PlaybackNext
+            | Node::PlaybackPrev
             | Node::PlaybackRating
             | Node::PlaybackSleep
             | Node::QueueItems
@@ -137,7 +141,7 @@ impl Node {
             | Node::SettingsFsmod
             | Node::SettingsKey(_) => 0o644,
             // write-only
-            Node::PlaybackNext | Node::PlaybackPrev | Node::QueueClear | Node::RadioJump => 0o200,
+            Node::QueueClear | Node::RadioJump => 0o200,
             // read-only
             _ => 0o444,
         }
@@ -151,14 +155,13 @@ impl Node {
         self.perm() & 0o200 != 0
     }
 
-    /// Write-only trigger files: ANY write (even empty/newline-only) fires
-    /// the action once per open handle (contract B3). `radio/jump` is
-    /// write-only too, but line-based, so it is NOT a trigger.
+    /// Trigger files: ANY write (even empty/newline-only) fires the action
+    /// once per open handle (contract B3). `radio/jump` is write-only too,
+    /// but line-based, so it is NOT a trigger. `playback/next` left this set
+    /// when it grew line semantics (queries insert addNext-style); its empty
+    /// write skips via `empty_write_command` instead.
     pub(crate) fn is_trigger(&self) -> bool {
-        matches!(
-            self,
-            Node::PlaybackNext | Node::PlaybackPrev | Node::QueueClear
-        )
+        matches!(self, Node::PlaybackPrev | Node::QueueClear)
     }
 
     /// The command an ENTIRELY empty (after trim) write stands for, if any.
@@ -171,6 +174,9 @@ impl Node {
     pub(crate) fn empty_write_command(&self) -> Option<&'static str> {
         match self {
             Node::PlaybackState => Some("toggle"),
+            // `echo > next` (or a bare "skip" line) skips forward; any other
+            // line is a query queued at the addNext slot.
+            Node::PlaybackNext => Some("skip"),
             _ => None,
         }
     }
@@ -348,6 +354,8 @@ impl Node {
             Node::PlaybackDuration => playback_files::read_duration(ctx, mode),
             Node::PlaybackVolume => playback_files::read_volume(ctx, mode),
             Node::PlaybackRepeat => playback_files::read_repeat(ctx, mode),
+            Node::PlaybackNext => playback_files::read_next(ctx, mode),
+            Node::PlaybackPrev => playback_files::read_prev(ctx, mode),
             Node::PlaybackDucked => playback_files::read_ducked(ctx, mode),
             Node::PlaybackActivePeers => playback_files::read_active_peers(ctx, mode),
             Node::PlaybackRating => playback_files::read_rating(ctx, mode),
@@ -377,6 +385,10 @@ impl Node {
     pub(crate) fn write_line(&self, ctx: &Ctx, line: &str) -> FsResult<()> {
         match self {
             Node::PlaybackState => playback_files::write_state(ctx, line),
+            Node::PlaybackTrack | Node::PlaybackVideoId => {
+                playback_files::write_play_query(ctx, line)
+            }
+            Node::PlaybackNext => playback_files::write_next(ctx, line),
             Node::PlaybackPosition => playback_files::write_position(ctx, line),
             Node::PlaybackVolume => playback_files::write_volume(ctx, line),
             Node::PlaybackRepeat => playback_files::write_repeat(ctx, line),
@@ -395,7 +407,6 @@ impl Node {
     /// handle by `fs.rs`, regardless of the written bytes).
     pub(crate) fn trigger(&self, ctx: &Ctx) -> FsResult<()> {
         match self {
-            Node::PlaybackNext => playback_files::trigger_next(ctx),
             Node::PlaybackPrev => playback_files::trigger_prev(ctx),
             Node::QueueClear => queue_files::trigger_queue_clear(ctx),
             _ => Err(FsError::invalid("this file is not a trigger")),

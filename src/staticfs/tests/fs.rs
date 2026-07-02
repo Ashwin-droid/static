@@ -193,6 +193,6 @@ fn content_len_matches_render_and_write_only_files_are_zero() {
     let fs = test_fs();
     // fsmod is locally readable even in the scaffold: "awk\n" = 4 bytes.
     assert_eq!(fs.content_len(&Node::SettingsFsmod).expect("render"), 4);
-    assert_eq!(fs.content_len(&Node::PlaybackNext).expect("write-only"), 0);
+    assert_eq!(fs.content_len(&Node::QueueClear).expect("write-only"), 0);
     assert_eq!(fs.content_len(&Node::PlaybackDir).expect("dir"), 0);
 }

@@ -42,9 +42,13 @@ fn permissions_match_contract() {
     // read-write
     for node in [
         Node::PlaybackState,
+        Node::PlaybackTrack,
+        Node::PlaybackVideoId,
         Node::PlaybackPosition,
         Node::PlaybackVolume,
         Node::PlaybackRepeat,
+        Node::PlaybackNext,
+        Node::PlaybackPrev,
         Node::PlaybackRating,
         Node::PlaybackSleep,
         Node::QueueItems,
@@ -56,19 +60,12 @@ fn permissions_match_contract() {
         assert!(node.readable() && node.writable(), "{node:?}");
     }
     // write-only
-    for node in [
-        Node::PlaybackNext,
-        Node::PlaybackPrev,
-        Node::QueueClear,
-        Node::RadioJump,
-    ] {
+    for node in [Node::QueueClear, Node::RadioJump] {
         assert_eq!(node.perm(), 0o200, "{node:?}");
         assert!(!node.readable() && node.writable(), "{node:?}");
     }
     // read-only
     for node in [
-        Node::PlaybackTrack,
-        Node::PlaybackVideoId,
         Node::PlaybackDuration,
         Node::PlaybackDucked,
         Node::PlaybackActivePeers,
@@ -86,15 +83,15 @@ fn permissions_match_contract() {
 }
 
 #[test]
-fn triggers_are_exactly_next_prev_clear() {
+fn triggers_are_exactly_prev_clear() {
     let mut all = Vec::new();
     walk_static(&Node::Root, &mut all);
     let triggers: Vec<&Node> = all.iter().filter(|node| node.is_trigger()).collect();
-    assert_eq!(
-        triggers,
-        vec![&Node::PlaybackNext, &Node::PlaybackPrev, &Node::QueueClear]
-    );
+    assert_eq!(triggers, vec![&Node::PlaybackPrev, &Node::QueueClear]);
     assert!(!Node::RadioJump.is_trigger());
+    // next left the trigger set when it grew line semantics; its empty
+    // write skips via the empty-write command instead.
+    assert!(!Node::PlaybackNext.is_trigger());
 }
 
 #[test]
@@ -205,14 +202,14 @@ fn daemon_setting_named_fsmod_is_shadowed_not_listed_twice() {
 }
 
 #[test]
-fn only_playback_state_gives_empty_writes_a_meaning() {
+fn only_state_and_next_give_empty_writes_a_meaning() {
     let mut all = Vec::new();
     walk_static(&Node::Root, &mut all);
     for node in &all {
-        let expected = if *node == Node::PlaybackState {
-            Some("toggle")
-        } else {
-            None
+        let expected = match node {
+            Node::PlaybackState => Some("toggle"),
+            Node::PlaybackNext => Some("skip"),
+            _ => None,
         };
         assert_eq!(node.empty_write_command(), expected, "{node:?}");
     }

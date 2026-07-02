@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     AccessFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    INodeNo, LockOwner, OpenAccMode, OpenFlags, PollEvents, PollFlags, PollNotifier, ReplyAttr,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyPoll, ReplyWrite,
+    ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
 use super::tree::Node;
@@ -582,6 +583,35 @@ impl Filesystem for StaticFs {
         } else {
             reply.data(&[]);
         }
+    }
+
+    /// Regular-file poll semantics: synthetic files are always ready for
+    /// whatever the node's permissions allow (quietly, instead of the
+    /// default's per-call ENOSYS warning). There is no edge-triggered
+    /// "new data" notification here — content changes daemon-side without
+    /// kernel-visible events, so followers must poll (see contract note 6).
+    fn poll(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _ph: PollNotifier,
+        events: PollEvents,
+        _flags: PollFlags,
+        reply: ReplyPoll,
+    ) {
+        let Some(node) = self.node_of(ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let mut ready = PollEvents::empty();
+        if node.readable() {
+            ready |= PollEvents::POLLIN | PollEvents::POLLRDNORM;
+        }
+        if node.writable() {
+            ready |= PollEvents::POLLOUT | PollEvents::POLLWRNORM;
+        }
+        reply.poll(ready & events);
     }
 }
 

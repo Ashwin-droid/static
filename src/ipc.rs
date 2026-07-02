@@ -286,6 +286,10 @@ pub enum DaemonRequest {
     },
     ResolveAndQueue {
         query: String,
+        /// false = CLI `queue addLast` slot (touched boundary), true =
+        /// CLI `queue addNext` slot (right after the current track).
+        #[serde(default)]
+        next: bool,
     },
     ResolveAndPlayRadio {
         query: String,
@@ -961,12 +965,16 @@ impl DaemonClient {
     }
 
     /// `ResolveAndQueue` with the `Rejected`/`Transport` error split.
+    /// `next: false` inserts at the CLI `queue addLast` slot (touched
+    /// boundary), `next: true` at the `queue addNext` slot.
     pub fn try_resolve_and_queue(
         &self,
         query: &str,
+        next: bool,
     ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
         self.try_state_request(&DaemonRequest::ResolveAndQueue {
             query: query.to_string(),
+            next,
         })
     }
 
@@ -1011,7 +1019,7 @@ impl DaemonClient {
     }
 
     pub fn resolve_and_queue(&self, query: &str) -> Result<PlaybackSnapshot> {
-        Ok(self.try_resolve_and_queue(query)?)
+        Ok(self.try_resolve_and_queue(query, false)?)
     }
 
     pub fn resolve_and_play_radio(&self, query: &str) -> Result<PlaybackSnapshot> {

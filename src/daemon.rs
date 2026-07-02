@@ -2029,19 +2029,28 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
-        DaemonRequest::ResolveAndQueue { query } => {
+        DaemonRequest::ResolveAndQueue { query, next } => {
             let track = match ensure_client_loaded(state)
                 .and_then(|client| crate::cli::resolve_track_input(&client, &query, true))
             {
                 Ok(track) => track,
                 Err(err) => return DaemonResponse::Error(err.to_string()),
             };
-            // Same insert slot as CLI `queue addLast` (apply_queue_insert Last).
-            let insert_at = state
-                .radio_virtual_playlist
-                .as_ref()
-                .map(|radio| radio.touched_len.min(state.queue.len()))
-                .unwrap_or(state.queue.len());
+            // Same insert slots as the CLI (apply_queue_insert): `next` is
+            // the `queue addNext` slot, otherwise the `queue addLast` one.
+            let insert_at = if next {
+                if state.queue.is_empty() {
+                    0
+                } else {
+                    state.queue_index.saturating_add(1).min(state.queue.len())
+                }
+            } else {
+                state
+                    .radio_virtual_playlist
+                    .as_ref()
+                    .map(|radio| radio.touched_len.min(state.queue.len()))
+                    .unwrap_or(state.queue.len())
+            };
             insert_into_queue(state, vec![track], insert_at);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))

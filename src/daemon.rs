@@ -30,7 +30,7 @@ use crate::ipc::{
     current_unix_millis, store_persisted_playback_state, store_persisted_playlist_state,
     youtube_music_watch_url,
 };
-use crate::models::{RadioChip, RadioVirtualPlaylist, Track};
+use crate::models::{RadioChip, RadioVirtualPlaylist, SyncedLyrics, Track};
 use crate::network::{
     SongRating, SponsorBlockClient, SponsorSegment, TrackingInfo, default_skip_categories,
     download_media_bytes, fetch_thumbnail_bytes, filter_segments_for_categories,
@@ -269,6 +269,7 @@ struct DaemonState {
     sleep_deadline: Option<Instant>,
     sleep_after_current: bool,
     sleep_shutdown_pending: bool,
+    lyrics_cache: Option<(String, Option<SyncedLyrics>)>,
     ui_clients: HashMap<String, Instant>,
     last_persisted_playback_json: Option<String>,
     last_persisted_playback_at: Option<Instant>,
@@ -609,6 +610,12 @@ fn advance_repeat_mode_for_natural_end(state: &mut DaemonState) -> RepeatMode {
 struct CommandEnvelope {
     request: DaemonRequest,
     reply: mpsc::Sender<DaemonResponse>,
+    /// Set by the D-Bus handler when it stops waiting for the reply
+    /// (timeout/disconnect). The main loop skips abandoned envelopes it has
+    /// not started yet: the caller was already told the request failed, so
+    /// executing it late would run a command twice on retry (e.g. a
+    /// ResolveAndQueue write queueing the same track again).
+    abandoned: Arc<AtomicBool>,
 }
 
 enum BackgroundEvent {
@@ -656,20 +663,31 @@ impl StaticdDbus {
         let request = serde_json::from_str(request_json)
             .map_err(|err| zbus::fdo::Error::Failed(format!("Invalid request: {err}")))?;
         let (reply_tx, reply_rx) = mpsc::channel();
+        let abandoned = Arc::new(AtomicBool::new(false));
         self.command_tx
             .send(CommandEnvelope {
                 request,
                 reply: reply_tx,
+                abandoned: abandoned.clone(),
             })
             .map_err(|_| zbus::fdo::Error::Failed("Daemon main loop is unavailable".into()))?;
+        // Timeout/disconnect answer with `Unavailable`, NOT `Error`: the
+        // request was never validated or rejected by the daemon, so clients
+        // must treat this as a transport failure (staticfs maps it to EIO,
+        // while `Error` means EINVAL). Marking the envelope abandoned keeps
+        // the main loop from executing it late once it unblocks.
         let response = match reply_rx.recv_timeout(DBUS_REQUEST_TIMEOUT) {
             Ok(response) => response,
-            Err(mpsc::RecvTimeoutError::Timeout) => DaemonResponse::Error(format!(
-                "Daemon did not reply within {} seconds",
-                DBUS_REQUEST_TIMEOUT.as_secs()
-            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                abandoned.store(true, Ordering::SeqCst);
+                DaemonResponse::Unavailable(format!(
+                    "Daemon did not reply within {} seconds",
+                    DBUS_REQUEST_TIMEOUT.as_secs()
+                ))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                DaemonResponse::Error("Daemon did not reply".to_string())
+                abandoned.store(true, Ordering::SeqCst);
+                DaemonResponse::Unavailable("Daemon did not reply".to_string())
             }
         };
         serde_json::to_string(&response)
@@ -1025,6 +1043,7 @@ pub fn run() -> Result<()> {
         sleep_deadline: None,
         sleep_after_current: false,
         sleep_shutdown_pending: false,
+        lyrics_cache: None,
         ui_clients: HashMap::new(),
         last_persisted_playback_json: None,
         last_persisted_playback_at: None,
@@ -1083,6 +1102,12 @@ pub fn run() -> Result<()> {
         }
 
         while let Ok(envelope) = command_rx.try_recv() {
+            // The D-Bus handler already answered Unavailable for this
+            // envelope; running it now would execute a command whose caller
+            // was told it never completed.
+            if envelope.abandoned.load(Ordering::SeqCst) {
+                continue;
+            }
             let response = {
                 let mut state = state.borrow_mut();
                 handle_request(&mut state, envelope.request)
@@ -1970,6 +1995,118 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         }
         DaemonRequest::ReloadSettings => {
             reload_settings(state);
+            sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::GetSettings => {
+            let mut pairs = Vec::with_capacity(crate::cli::CONFIG_SPECS.len());
+            for spec in crate::cli::CONFIG_SPECS {
+                match crate::cli::format_config_value(&state.settings, spec.name) {
+                    Ok(value) => pairs.push((spec.name.to_string(), value)),
+                    Err(err) => return DaemonResponse::Error(err.to_string()),
+                }
+            }
+            DaemonResponse::Settings(pairs)
+        }
+        DaemonRequest::SetSetting { key, value } => {
+            // Load fresh settings from the database (not state.settings) so a
+            // concurrent CLI write between daemon reloads is not clobbered.
+            let mut settings = match state.cache.load_settings() {
+                Ok(settings) => settings,
+                Err(err) => {
+                    return DaemonResponse::Error(format!("Failed to load settings: {err}"));
+                }
+            };
+            if let Err(err) = crate::cli::apply_config_value(&mut settings, &key, &value) {
+                return DaemonResponse::Error(err.to_string());
+            }
+            if let Err(err) = state.cache.save_settings(&settings) {
+                return DaemonResponse::Error(format!("Failed to save settings: {err}"));
+            }
+            reload_settings(state);
+            sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::ResolveAndQueue { query } => {
+            let track = match ensure_client_loaded(state)
+                .and_then(|client| crate::cli::resolve_track_input(&client, &query, true))
+            {
+                Ok(track) => track,
+                Err(err) => return DaemonResponse::Error(err.to_string()),
+            };
+            // Same insert slot as CLI `queue addLast` (apply_queue_insert Last).
+            let insert_at = state
+                .radio_virtual_playlist
+                .as_ref()
+                .map(|radio| radio.touched_len.min(state.queue.len()))
+                .unwrap_or(state.queue.len());
+            insert_into_queue(state, vec![track], insert_at);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::ResolveAndPlayRadio { query } => {
+            let track = match ensure_client_loaded(state)
+                .and_then(|client| crate::cli::resolve_track_input(&client, &query, true))
+            {
+                Ok(track) => track,
+                Err(err) => return DaemonResponse::Error(err.to_string()),
+            };
+            // Same call the StartRadioFromSeed arm makes for CLI `exec`
+            // (play_track_with_radio): singleton seed queue, play immediately.
+            match start_radio_from_seed(
+                state,
+                vec![track],
+                0,
+                0,
+                1,
+                None,
+                RepeatMode::Off,
+                true,
+                false,
+            ) {
+                Ok(()) => {
+                    maybe_persist_playback_state(state, true);
+                    DaemonResponse::State(state_snapshot(state))
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
+        DaemonRequest::GetLyrics => {
+            let Some(video_id) = state
+                .active_track
+                .as_ref()
+                .map(|track| track.video_id.clone())
+            else {
+                return DaemonResponse::Error("Nothing is playing".to_string());
+            };
+
+            if let Some((cached_video_id, lyrics)) = state.lyrics_cache.as_ref() {
+                if *cached_video_id == video_id {
+                    return DaemonResponse::Lyrics(lyrics.clone());
+                }
+            }
+
+            match ensure_client_loaded(state).and_then(|client| client.get_synced_lyrics(&video_id))
+            {
+                Ok(lyrics) => {
+                    // Cache "no lyrics" results too, but never failures.
+                    state.lyrics_cache = Some((video_id, lyrics.clone()));
+                    DaemonResponse::Lyrics(lyrics)
+                }
+                Err(err) => DaemonResponse::Error(err.to_string()),
+            }
+        }
+        DaemonRequest::ClearQueue => {
+            stop_playback(state, false);
+            state.probe_context = None;
+            state.queue.clear();
+            state.queue_index = 0;
+            state.radio_virtual_playlist = None;
+            state.playlist_context = None;
+            state.radio_append_in_flight = false;
+            state.last_radio_append_anchor = None;
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
@@ -4797,6 +4934,8 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         probe_restore_position_millis: None,
         sleep_remaining_secs: None,
         sleep_after_current: false,
+        ducked: false,
+        pipewire_pause_active: false,
     };
     rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
     Some(snapshot)
@@ -4840,6 +4979,8 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             .and_then(|probe| probe.position_millis),
         sleep_remaining_secs: sleep_status.remaining_secs,
         sleep_after_current: sleep_status.after_current,
+        ducked: state.ducked,
+        pipewire_pause_active: state.pipewire_pause_active,
     }
 }
 

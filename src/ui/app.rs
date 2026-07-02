@@ -819,9 +819,7 @@ impl App {
             if !PlayerModel::guard_flag_is_stale(self.player.play_request_started_at) {
                 return Task::none();
             }
-            crate::app_log!(
-                "[UI] play request completion never arrived; force-clearing the guard"
-            );
+            crate::app_log!("[UI] play request completion never arrived; force-clearing the guard");
             self.player.play_request_in_flight = None;
             self.player.play_request_started_at = None;
         }

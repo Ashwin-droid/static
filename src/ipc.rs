@@ -12,7 +12,7 @@ use zbus::blocking::{Connection, Proxy};
 use std::os::unix::process::CommandExt;
 
 use crate::logging::LogSource;
-use crate::models::{RadioVirtualPlaylist, Track};
+use crate::models::{RadioVirtualPlaylist, SyncedLyrics, Track};
 use crate::network::SongRating;
 
 pub const DAEMON_BUS_NAME: &str = "com.static.music.staticd";
@@ -79,6 +79,10 @@ pub struct PlaybackSnapshot {
     pub sleep_remaining_secs: Option<u64>,
     #[serde(default)]
     pub sleep_after_current: bool,
+    #[serde(default)]
+    pub ducked: bool,
+    #[serde(default)]
+    pub pipewire_pause_active: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +179,8 @@ impl Default for PlaybackSnapshot {
             probe_restore_position_millis: None,
             sleep_remaining_secs: None,
             sleep_after_current: false,
+            ducked: false,
+            pipewire_pause_active: false,
         }
     }
 }
@@ -273,6 +279,19 @@ pub enum DaemonRequest {
     },
     GetCoordinationTargets,
     ReloadSettings,
+    GetSettings,
+    SetSetting {
+        key: String,
+        value: String,
+    },
+    ResolveAndQueue {
+        query: String,
+    },
+    ResolveAndPlayRadio {
+        query: String,
+    },
+    GetLyrics,
+    ClearQueue,
     Shutdown,
 }
 
@@ -284,7 +303,49 @@ pub enum DaemonResponse {
     CoordinationTargets(CoordinationTargetsSnapshot),
     SleepStatus(SleepStatusSnapshot),
     ShareUrl(String),
+    Settings(Vec<(String, String)>),
+    Lyrics(Option<SyncedLyrics>),
     Error(String),
+    /// The daemon's D-Bus handler gave up waiting for the main loop
+    /// (envelope timeout/disconnect): the request was NOT rejected — it may
+    /// even still execute once the loop unblocks — so clients must treat
+    /// this as a transport-level failure (staticfs: EIO), never as a
+    /// daemon-side validation error (`Error` -> EINVAL). Mapped to an `Err`
+    /// in `send_request_raw_with_connection`, so no response matcher ever
+    /// sees it.
+    Unavailable(String),
+}
+
+/// Error type for `DaemonClient::try_*` methods, distinguishing a request
+/// the daemon received and rejected (validation failure; FUSE maps this to
+/// EINVAL) from a request that never completed (transport failure or a
+/// malformed/unexpected reply; FUSE maps this to EIO).
+// Consumed by the staticfs FUSE layer only, so dead in feature-off builds.
+#[cfg_attr(not(feature = "staticfs"), allow(dead_code))]
+#[derive(Debug)]
+pub enum DaemonCallError {
+    /// The daemon handled the request and answered `DaemonResponse::Error`.
+    Rejected(String),
+    /// The daemon could not be reached, or the reply could not be understood.
+    Transport(anyhow::Error),
+}
+
+impl std::fmt::Display for DaemonCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) => write!(f, "{message}"),
+            Self::Transport(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected(_) => None,
+            Self::Transport(err) => Some(err.as_ref()),
+        }
+    }
 }
 
 fn daemon_connection() -> Result<Connection> {
@@ -310,7 +371,15 @@ fn send_request_raw_with_connection(
     let response_json: String = proxy
         .call("RequestJson", &(request_json.as_str(),))
         .context("staticd D-Bus request failed")?;
-    Ok(serde_json::from_str(&response_json)?)
+    match serde_json::from_str(&response_json)? {
+        // The envelope reply timed out or its channel dropped: the daemon
+        // never answered (though the queued command may still run later).
+        // Surface it as a transport failure so `try_request` classifies it
+        // as `DaemonCallError::Transport` (staticfs: EIO, not EINVAL) and
+        // the plain methods bail with the message.
+        DaemonResponse::Unavailable(message) => bail!(message),
+        response => Ok(response),
+    }
 }
 
 fn send_request_raw(request: &DaemonRequest) -> Result<DaemonResponse> {
@@ -818,6 +887,143 @@ impl DaemonClient {
             DaemonResponse::Error(err) => bail!(err),
             other => bail!("Unexpected daemon response: {other:?}"),
         }
+    }
+}
+
+/// Client surface for the staticfs FUSE layer: connection without daemon
+/// auto-spawn, plus `try_*` methods that keep daemon-side rejections
+/// (`DaemonCallError::Rejected` -> EINVAL) distinguishable from transport
+/// failures (`DaemonCallError::Transport` -> EIO).
+// Consumed by the staticfs FUSE layer only, so dead in feature-off builds.
+#[cfg_attr(not(feature = "staticfs"), allow(dead_code))]
+impl DaemonClient {
+    /// Connect to an already-running daemon WITHOUT auto-spawning one
+    /// (unlike `new()`). Pings the daemon to verify liveness and errors if
+    /// it is not running.
+    pub fn connect_existing() -> Result<Self> {
+        let connection = daemon_connection()?;
+        match send_request_raw_with_connection(&connection, &DaemonRequest::Ping) {
+            Ok(DaemonResponse::Pong) => Ok(Self { connection }),
+            Ok(other) => bail!("Unexpected daemon response to ping: {other:?}"),
+            Err(err) => Err(err.context("Playback daemon is not running")),
+        }
+    }
+
+    /// Send a request, splitting failures into `DaemonCallError::Rejected`
+    /// (the daemon answered `DaemonResponse::Error`) and
+    /// `DaemonCallError::Transport` (the request never completed). Never
+    /// auto-spawns the daemon. Any non-error response is returned as-is.
+    pub fn try_request(
+        &self,
+        request: &DaemonRequest,
+    ) -> std::result::Result<DaemonResponse, DaemonCallError> {
+        match self.request(request) {
+            Ok(DaemonResponse::Error(message)) => Err(DaemonCallError::Rejected(message)),
+            Ok(response) => Ok(response),
+            Err(err) => Err(DaemonCallError::Transport(err)),
+        }
+    }
+
+    /// Like `try_request`, for requests answered with `DaemonResponse::State`.
+    /// An unexpected response variant counts as a transport failure.
+    pub fn try_state_request(
+        &self,
+        request: &DaemonRequest,
+    ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
+        match self.try_request(request)? {
+            DaemonResponse::State(state) => Ok(state),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected daemon response: {other:?}"
+            ))),
+        }
+    }
+
+    /// `GetSettings` with the `Rejected`/`Transport` error split.
+    pub fn try_settings(&self) -> std::result::Result<Vec<(String, String)>, DaemonCallError> {
+        match self.try_request(&DaemonRequest::GetSettings)? {
+            DaemonResponse::Settings(pairs) => Ok(pairs),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected daemon response: {other:?}"
+            ))),
+        }
+    }
+
+    /// `SetSetting` with the `Rejected`/`Transport` error split.
+    pub fn try_set_setting(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
+        self.try_state_request(&DaemonRequest::SetSetting {
+            key: key.to_string(),
+            value: value.to_string(),
+        })
+    }
+
+    /// `ResolveAndQueue` with the `Rejected`/`Transport` error split.
+    pub fn try_resolve_and_queue(
+        &self,
+        query: &str,
+    ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
+        self.try_state_request(&DaemonRequest::ResolveAndQueue {
+            query: query.to_string(),
+        })
+    }
+
+    /// `ResolveAndPlayRadio` with the `Rejected`/`Transport` error split.
+    pub fn try_resolve_and_play_radio(
+        &self,
+        query: &str,
+    ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
+        self.try_state_request(&DaemonRequest::ResolveAndPlayRadio {
+            query: query.to_string(),
+        })
+    }
+
+    /// `GetLyrics` with the `Rejected`/`Transport` error split. `Ok(None)`
+    /// means the daemon looked and found no lyrics for the current track.
+    pub fn try_lyrics(&self) -> std::result::Result<Option<SyncedLyrics>, DaemonCallError> {
+        match self.try_request(&DaemonRequest::GetLyrics)? {
+            DaemonResponse::Lyrics(lyrics) => Ok(lyrics),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected daemon response: {other:?}"
+            ))),
+        }
+    }
+
+    /// `ClearQueue` with the `Rejected`/`Transport` error split.
+    pub fn try_clear_queue(&self) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
+        self.try_state_request(&DaemonRequest::ClearQueue)
+    }
+}
+
+/// Anyhow-flavored convenience wrappers over the `try_*` methods, matching
+/// the existing `DaemonClient` surface for future CLI/UI use. No in-tree
+/// consumer yet (staticfs needs the `try_*` error split), hence the allow.
+#[allow(dead_code)]
+impl DaemonClient {
+    pub fn settings(&self) -> Result<Vec<(String, String)>> {
+        Ok(self.try_settings()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<PlaybackSnapshot> {
+        Ok(self.try_set_setting(key, value)?)
+    }
+
+    pub fn resolve_and_queue(&self, query: &str) -> Result<PlaybackSnapshot> {
+        Ok(self.try_resolve_and_queue(query)?)
+    }
+
+    pub fn resolve_and_play_radio(&self, query: &str) -> Result<PlaybackSnapshot> {
+        Ok(self.try_resolve_and_play_radio(query)?)
+    }
+
+    pub fn lyrics(&self) -> Result<Option<SyncedLyrics>> {
+        Ok(self.try_lyrics()?)
+    }
+
+    pub fn clear_queue(&self) -> Result<PlaybackSnapshot> {
+        Ok(self.try_clear_queue()?)
     }
 }
 

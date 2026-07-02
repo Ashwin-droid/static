@@ -28,7 +28,7 @@ use crate::offline::{
 };
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
-const HELP_TEXT: &str = "\
+const HELP_USAGE: &str = "\
 Static CLI
 
 Usage:
@@ -55,8 +55,9 @@ Usage:
   static config desc [config_name]
   static config get [config_name]
   static config set <config_name> <config_value>
-  static i
+  static i";
 
+const HELP_NOTES: &str = "\
 Notes:
   static without arguments still opens the GTK app.
   static i opens the terminal-native TUI on the alternate screen.
@@ -66,6 +67,17 @@ Notes:
   the GTK settings page disables that control and treats it as CLI-only until it is
   brought back into range.
   Run `static config desc` for detailed behavior, accepted values, and range notes.";
+
+/// `static fs` only exists in staticfs-enabled builds, so its usage line is
+/// spliced into the help text at runtime instead of living in the const.
+fn help_text() -> String {
+    let fs_line = if cfg!(feature = "staticfs") {
+        "\n  static fs [mountpoint]"
+    } else {
+        ""
+    };
+    format!("{HELP_USAGE}{fs_line}\n\n{HELP_NOTES}")
+}
 
 pub fn wants_cli(args: &[String]) -> bool {
     !args.is_empty() && args.first().is_some_and(|arg| arg != "--daemon")
@@ -78,7 +90,7 @@ pub fn run(args: &[String]) -> Result<()> {
 
     match command {
         "help" | "-h" | "--help" => {
-            println!("{HELP_TEXT}");
+            println!("{}", help_text());
             Ok(())
         }
         "like" => run_rate_current_track(SongRating::Like),
@@ -93,9 +105,20 @@ pub fn run(args: &[String]) -> Result<()> {
         "info" => run_info(),
         "coordination" => run_coordination(&args[1..]),
         "config" => run_config(&args[1..]),
+        "fs" => run_fs(&args[1..]),
         "i" => run_interactive_tui(),
-        other => bail!("Unknown CLI command `{other}`.\n\n{HELP_TEXT}"),
+        other => bail!("Unknown CLI command `{other}`.\n\n{}", help_text()),
     }
+}
+
+#[cfg(feature = "staticfs")]
+fn run_fs(args: &[String]) -> Result<()> {
+    crate::staticfs::run_mount(args)
+}
+
+#[cfg(not(feature = "staticfs"))]
+fn run_fs(_args: &[String]) -> Result<()> {
+    bail!("this build of static does not include staticfs; rebuild with --features staticfs")
 }
 
 fn run_rate_current_track(rating: SongRating) -> Result<()> {
@@ -1239,7 +1262,7 @@ pub(crate) fn should_use_local_resume_for_cross_device(
     }
 }
 
-fn resolve_track_input(
+pub(crate) fn resolve_track_input(
     network: &NetworkState,
     input: &str,
     allow_search_fallback: bool,
@@ -1391,7 +1414,7 @@ fn print_config_list(settings: &AppSettings) {
 }
 
 #[derive(Clone, Copy)]
-enum ConfigKind {
+pub(crate) enum ConfigKind {
     Bool,
     U32,
     F64,
@@ -1400,12 +1423,12 @@ enum ConfigKind {
 }
 
 #[derive(Clone, Copy)]
-struct ConfigSpec {
-    name: &'static str,
-    kind: ConfigKind,
+pub(crate) struct ConfigSpec {
+    pub(crate) name: &'static str,
+    pub(crate) kind: ConfigKind,
 }
 
-const CONFIG_SPECS: &[ConfigSpec] = &[
+pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "auto_sync_chromium_cookies",
         kind: ConfigKind::Bool,

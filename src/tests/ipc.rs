@@ -54,6 +54,8 @@ fn persisted_playback_state_round_trips_through_database() {
         probe_restore_position_millis: None,
         sleep_remaining_secs: None,
         sleep_after_current: false,
+        ducked: false,
+        pipewire_pause_active: false,
     };
     let persisted = PersistedPlaybackState {
         snapshot,
@@ -222,6 +224,28 @@ fn play_queue_at_requests_default_to_reporting_when_flag_is_missing() {
         }
         other => panic!("unexpected request variant: {other:?}"),
     }
+}
+
+#[test]
+fn old_snapshots_without_ducking_fields_still_deserialize() {
+    let snapshot = serde_json::from_value::<PlaybackSnapshot>(json!({
+        "current_track": null,
+        "queue": [],
+        "queue_index": 0,
+        "playlist_context": null,
+        "radio_virtual_playlist": null,
+        "repeat_mode": "Off",
+        "paused": true,
+        "volume": 0.5,
+        "position_millis": 1_000,
+        "duration_millis": 2_000,
+        "buffered_fraction": 0.25
+    }))
+    .expect("old snapshot without ducked fields should deserialize");
+
+    assert!(!snapshot.ducked);
+    assert!(!snapshot.pipewire_pause_active);
+    assert!(snapshot.paused);
 }
 
 #[test]

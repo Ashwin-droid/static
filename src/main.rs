@@ -11,6 +11,8 @@ mod offline;
 mod pipewire_monitor;
 mod playback_engine;
 mod player;
+#[cfg(feature = "staticfs")]
+mod staticfs;
 mod ui;
 
 /// Default to INFO but silence `iced_winit`, which logs the full window-icon

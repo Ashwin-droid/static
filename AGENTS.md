@@ -103,6 +103,18 @@ Areas that commonly need parity:
 
 When implementing a feature on one surface, look for the matching concept on the other surface. If you intentionally leave one surface unchanged, call that out.
 
+## staticfs
+
+staticfs is the fourth client: a FUSE filesystem (mounted with `static fs`, default `~/Music/staticfs`) that exposes the daemon as plaintext files. It is a compile-time option — the `staticfs` cargo feature gates all of it, and the deb package builds with it enabled.
+
+The core invariant is that staticfs is a file-shaped proxy with no state of its own. Every read materializes content at `read()` time; every write forwards a command to whoever owns the data. Live state (`playback/`, `settings/`) goes over the existing daemon D-Bus request model; historical stats (`stats/`) are read-only SQL against the shared data.db. Do not add caching or local models beyond the short stats TTL; the daemon and database stay the source of truth.
+
+Rejection is the sysfs model and it must stay genuine: invalid writes fail with EINVAL because the daemon (or the local write grammar) refused them, and there is no disk state a privileged user could force instead. Daemon-rejected and transport-failed calls are deliberately distinct (EINVAL vs EIO); a daemon that is down or too old degrades to EIO, never to silent success. staticfs must never auto-spawn the daemon.
+
+The `settings/` directory listing derives from the daemon's reply, so new settings appear without staticfs changes. Several playback files carry play semantics on write (track/video_id play like `exec`; queue and next writes resolve free text through the daemon's own resolver at the CLI insert slots) — when changing queue or radio behavior, check whether the staticfs write surfaces need parity the same way the GUI/TUI do.
+
+Known limits are intentional: no per-play event log exists, so time-bucketed stats are approximations over `last_played`; and FUSE cannot emit inotify events for daemon-side changes, so followers must poll (uutils tail needs `--use-polling`). Do not "fix" these by adding new persistence or fake notification schemes without a deliberate design.
+
 ## Testing And Validation
 
 This is a Rust project with module-local tests. The crate is binary-oriented, so do not assume a conventional library-test layout.

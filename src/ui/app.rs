@@ -35,6 +35,13 @@ pub const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);
 pub const DAEMON_POLL_STUCK_AFTER: Duration = Duration::from_secs(3);
 /// Max time the UI will wait for a daemon IPC worker before surfacing failure.
 pub const DAEMON_TASK_TIMEOUT: Duration = Duration::from_secs(4);
+/// Escape hatch for in-flight guard flags (`play_request_in_flight`,
+/// `daemon_recovery_in_flight`). Their completion messages are normally
+/// guaranteed by `blocking_or_timeout`, but a completion that never arrives
+/// (observed in the field: a wedged guard silently dropped every poll
+/// snapshot for hours) must not gate the poll pipeline forever. Anything in
+/// flight longer than the worker timeout plus grace is treated as lost.
+pub const GUARD_FLAG_STALE_AFTER: Duration = Duration::from_secs(7);
 /// Max time close waits for resume-state persistence before closing anyway.
 pub const CLOSE_PERSIST_TIMEOUT: Duration = Duration::from_secs(2);
 /// UI-client lease renewal.
@@ -253,7 +260,9 @@ pub struct PlayerModel {
     pub daemon_refresh_started_at: Option<Instant>,
     pub daemon_refresh_serial: u64,
     pub daemon_recovery_in_flight: bool,
+    pub daemon_recovery_started_at: Option<Instant>,
     pub play_request_in_flight: Option<u64>,
+    pub play_request_started_at: Option<Instant>,
 }
 
 impl PlayerModel {
@@ -281,7 +290,9 @@ impl PlayerModel {
             daemon_refresh_started_at: None,
             daemon_refresh_serial: 0,
             daemon_recovery_in_flight: false,
+            daemon_recovery_started_at: None,
             play_request_in_flight: None,
+            play_request_started_at: None,
         }
     }
 
@@ -354,12 +365,23 @@ impl PlayerModel {
 
     pub fn mark_play_request_in_flight(&mut self, serial: u64) {
         self.play_request_in_flight = Some(serial);
+        self.play_request_started_at = Some(Instant::now());
     }
 
     pub fn clear_play_request_in_flight(&mut self, serial: u64) {
         if self.play_request_in_flight == Some(serial) {
             self.play_request_in_flight = None;
+            self.play_request_started_at = None;
         }
+    }
+
+    /// True when a guard flag has outlived any possible completion message
+    /// (see [`GUARD_FLAG_STALE_AFTER`]); `None` counts as stale so a flag can
+    /// never wedge just because its timestamp went missing.
+    fn guard_flag_is_stale(started_at: Option<Instant>) -> bool {
+        started_at
+            .map(|t| t.elapsed() >= GUARD_FLAG_STALE_AFTER)
+            .unwrap_or(true)
     }
 
     pub fn position_millis(&self) -> Option<u64> {
@@ -794,7 +816,14 @@ impl App {
     /// flight unless it looks stuck (≥ 3 s), drops stale responses by serial.
     fn poll_daemon(&mut self) -> Task<Message> {
         if self.player.play_request_in_flight.is_some() {
-            return Task::none();
+            if !PlayerModel::guard_flag_is_stale(self.player.play_request_started_at) {
+                return Task::none();
+            }
+            crate::app_log!(
+                "[UI] play request completion never arrived; force-clearing the guard"
+            );
+            self.player.play_request_in_flight = None;
+            self.player.play_request_started_at = None;
         }
         if self.player.daemon_refresh_in_flight {
             let stuck = self
@@ -842,7 +871,18 @@ impl App {
             }
             Ok(snapshot) => {
                 if self.player.daemon_recovery_in_flight {
-                    return Task::none();
+                    if !PlayerModel::guard_flag_is_stale(self.player.daemon_recovery_started_at) {
+                        return Task::none();
+                    }
+                    // Observed in the field: a recovery whose completion
+                    // message (even the timeout backstop) never arrived kept
+                    // this flag set and silently dropped every poll snapshot
+                    // until the app was restarted.
+                    crate::app_log!(
+                        "[UI] daemon recovery result never arrived; force-clearing the guard"
+                    );
+                    self.player.daemon_recovery_in_flight = false;
+                    self.player.daemon_recovery_started_at = None;
                 }
                 player_bar::apply_remote_snapshot(self, snapshot)
             }

@@ -970,6 +970,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
 
         Msg::RecoveryFinished(result) => {
             app.player.daemon_recovery_in_flight = false;
+            app.player.daemon_recovery_started_at = None;
             match result {
                 Ok(snapshot) => {
                     crate::app_log!(
@@ -1384,7 +1385,9 @@ pub fn maybe_restore_daemon_from_ui_state(app: &mut App) -> Task<Message> {
     }
 
     let resume_playback = snapshot.current_track.is_some();
+    crate::app_log!("[UI] daemon poll failed; attempting staticd recovery from live UI state");
     app.player.daemon_recovery_in_flight = true;
+    app.player.daemon_recovery_started_at = Some(std::time::Instant::now());
 
     app::blocking_or_timeout(
         app::DAEMON_TASK_TIMEOUT,

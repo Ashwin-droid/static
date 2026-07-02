@@ -1487,10 +1487,26 @@ fn artist_string(track: &Track) -> String {
     }
 }
 
+/// A poll failure is not proof of death: a daemon that is merely busy (slow
+/// song start, offline sync) answers a fresh ping once it drains, and
+/// restoring over it would rewind live playback to the UI's stale mirror —
+/// including from a recovery worker that already timed out UI-side and kept
+/// running. If staticd is alive, resync from its truth instead.
+fn resync_if_daemon_alive() -> Option<anyhow::Result<PlaybackSnapshot>> {
+    if crate::ipc::daemon_is_running() {
+        Some(DaemonClient::new().and_then(|client| client.state()))
+    } else {
+        None
+    }
+}
+
 fn restore_playback_snapshot_via_daemon(
     snapshot: PlaybackSnapshot,
     resume_playback: bool,
 ) -> anyhow::Result<PlaybackSnapshot> {
+    if let Some(resynced) = resync_if_daemon_alive() {
+        return resynced;
+    }
     crate::ipc::ensure_daemon_running()?;
     let client = DaemonClient::new()?;
     let queue_index = snapshot
@@ -1537,6 +1553,9 @@ fn restore_playback_snapshot_via_daemon(
 fn restore_paused_playback_snapshot_via_daemon(
     snapshot: PlaybackSnapshot,
 ) -> anyhow::Result<PlaybackSnapshot> {
+    if let Some(resynced) = resync_if_daemon_alive() {
+        return resynced;
+    }
     crate::ipc::ensure_daemon_running()?;
     let client = DaemonClient::new()?;
     let queue_index = snapshot

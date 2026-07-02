@@ -1156,6 +1156,24 @@ fn spawn_synced_lyrics_sync(app: &mut App, video_id: String, session_id: u64) ->
     )
 }
 
+/// Client-restore re-kick: the startup lyrics fetch races cookie validation,
+/// so a track already playing when the GUI launches latches NotConnected
+/// until the next track change. Called when a restored client is installed.
+pub fn retry_lyrics_after_client_restore(app: &mut App) -> Task<Message> {
+    if !matches!(app.queue_panel.lyrics.status, LyricsStatus::NotConnected) {
+        return Task::none();
+    }
+    let Some((video_id, session_id)) = app
+        .player
+        .now_playing
+        .as_ref()
+        .map(|np| (np.video_id.clone(), np.session_id))
+    else {
+        return Task::none();
+    };
+    spawn_synced_lyrics_sync(app, video_id, session_id)
+}
+
 fn reset_lyrics_to_idle(app: &mut App) {
     let lyrics = &mut app.queue_panel.lyrics;
     lyrics.request_serial = lyrics.request_serial.wrapping_add(1);

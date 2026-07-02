@@ -2411,10 +2411,11 @@ fn enter_main(app: &mut App) -> Task<Message> {
 fn stage_restored_client(app: &mut App, client: Arc<NetworkState>) -> Task<Message> {
     app.client = Some(client);
     app.invalidate_home_cache();
+    let lyrics_retry = player_bar::retry_lyrics_after_client_restore(app);
     if app.screen != Screen::Main {
-        return Task::none();
+        return lyrics_retry;
     }
-    let mut tasks = vec![sidebar::load_history_task(app)];
+    let mut tasks = vec![lyrics_retry, sidebar::load_history_task(app)];
     if app.content_view == ContentView::Home && !app.home.loading {
         tasks.push(content_loading::load_home_task(app, false));
     }
@@ -2429,7 +2430,10 @@ fn activate_restored_client(app: &mut App, client: Arc<NetworkState>) -> Task<Me
     } else {
         app.client = Some(client);
         app.invalidate_home_cache();
-        enter_main(app)
+        Task::batch([
+            player_bar::retry_lyrics_after_client_restore(app),
+            enter_main(app),
+        ])
     }
 }
 

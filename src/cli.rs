@@ -1273,19 +1273,31 @@ pub(crate) fn resolve_track_input(
     }
 
     if let Some(video_id) = extract_video_id_from_input(trimmed) {
-        return fetch_track_for_video_id(network, &video_id, Some(trimmed)).or_else(|err| {
-            if allow_search_fallback {
-                resolve_first_search_track(network, trimmed)
-                    .with_context(|| format!("Could not resolve `{trimmed}` directly: {err}"))
-            } else {
-                Err(err)
+        // Explicit URL/id: the id is trusted. Use the radio's track when it
+        // has one, otherwise fabricate a placeholder around the trusted id so
+        // it still plays even when the radio endpoint comes back empty.
+        return match fetch_track_for_video_id(network, &video_id) {
+            Ok(Some(track)) => Ok(track),
+            Ok(None) => Ok(fabricate_track(&video_id, trimmed)),
+            Err(err) => {
+                if allow_search_fallback {
+                    resolve_first_search_track(network, trimmed)
+                        .with_context(|| format!("Could not resolve `{trimmed}` directly: {err}"))
+                } else {
+                    Err(err)
+                }
             }
-        });
+        };
     }
 
     if !trimmed.chars().any(char::is_whitespace) {
-        match fetch_track_for_video_id(network, trimmed, Some(trimmed)) {
-            Ok(track) => return Ok(track),
+        // Speculative: a whitespace-free token *might* be a bare video id.
+        // Accept it only if the radio actually resolves to a track. An empty
+        // radio means it was not a real id, so fall through to the search
+        // fallback instead of fabricating a placeholder row for junk input.
+        match fetch_track_for_video_id(network, trimmed) {
+            Ok(Some(track)) => return Ok(track),
+            Ok(None) => {}
             Err(err) if !allow_search_fallback => return Err(err),
             Err(_) => {}
         }
@@ -1298,11 +1310,10 @@ pub(crate) fn resolve_track_input(
     bail!("Could not resolve `{trimmed}` as a YouTube URL or video id")
 }
 
-fn fetch_track_for_video_id(
-    network: &NetworkState,
-    video_id: &str,
-    fallback_title: Option<&str>,
-) -> Result<Track> {
+/// Fetch the seed track for a video id via its radio. `Ok(None)` means the
+/// radio endpoint succeeded but returned no tracks (e.g. the id was bogus);
+/// callers decide whether to fabricate a placeholder or fall back to search.
+fn fetch_track_for_video_id(network: &NetworkState, video_id: &str) -> Result<Option<Track>> {
     let mut radio = network
         .get_radio(video_id, None, None)
         .with_context(|| format!("Failed to resolve video `{video_id}`"))?;
@@ -1312,19 +1323,25 @@ fn fetch_track_for_video_id(
         .iter()
         .position(|track| track.video_id == video_id)
         .map(|index| radio.tracks.remove(index))
-        .or_else(|| radio.tracks.into_iter().next())
-        .unwrap_or_else(|| Track {
-            video_id: video_id.to_string(),
-            title: fallback_title.unwrap_or(video_id).to_string(),
-            artists: Vec::new(),
-            album: None,
-            duration: None,
-            thumbnail_url: None,
-            playback_playlist_id: None,
-            playback_params: None,
-            not_interested_feedback_token: None,
-            undo_feedback_token: None,
-        }))
+        .or_else(|| radio.tracks.into_iter().next()))
+}
+
+/// Build a minimal placeholder `Track` around a trusted video id when no real
+/// metadata is available. Only used for explicit URL/id input, never for
+/// speculative free-text tokens.
+fn fabricate_track(video_id: &str, fallback_title: &str) -> Track {
+    Track {
+        video_id: video_id.to_string(),
+        title: fallback_title.to_string(),
+        artists: Vec::new(),
+        album: None,
+        duration: None,
+        thumbnail_url: None,
+        playback_playlist_id: None,
+        playback_params: None,
+        not_interested_feedback_token: None,
+        undo_feedback_token: None,
+    }
 }
 
 fn resolve_first_search_track(network: &NetworkState, query: &str) -> Result<Track> {

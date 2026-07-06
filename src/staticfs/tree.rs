@@ -56,11 +56,17 @@ impl TrackField {
 pub(crate) enum Node {
     Root,
 
+    /// Root-level `shutdown` file: read returns a liveness one-liner, writing
+    /// the line "yes" asks the daemon to shut down (which takes this
+    /// filesystem with it, since the daemon hosts the mount).
+    Shutdown,
+
     // playback/ (D-Bus; every read starts from one GetState snapshot)
     PlaybackDir,
     PlaybackState,
     PlaybackTrack,
     PlaybackVideoId,
+    PlaybackVideoName,
     PlaybackPosition,
     PlaybackDuration,
     PlaybackVolume,
@@ -126,9 +132,11 @@ impl Node {
         match self {
             node if node.is_dir() => 0o755,
             // read-write
-            Node::PlaybackState
+            Node::Shutdown
+            | Node::PlaybackState
             | Node::PlaybackTrack
             | Node::PlaybackVideoId
+            | Node::PlaybackVideoName
             | Node::PlaybackPosition
             | Node::PlaybackVolume
             | Node::PlaybackRepeat
@@ -181,13 +189,45 @@ impl Node {
         }
     }
 
+    /// Mount-relative path for human-facing messages (the host's pending
+    /// unmount prompt). Static nodes find their name in the parent's child
+    /// table; dynamic nodes carry it.
+    pub(crate) fn display_path(&self) -> String {
+        if matches!(self, Node::Root) {
+            return String::new();
+        }
+        let name = match self {
+            Node::SettingsKey(key) => key.clone(),
+            Node::StatsTrackDir(video_id) => video_id.clone(),
+            Node::StatsTrackField(_, field) => field.file_name().to_string(),
+            other => other
+                .parent()
+                .static_children()
+                .into_iter()
+                .find(|(_, node)| node == other)
+                .map(|(name, _)| name.to_string())
+                .unwrap_or_default(),
+        };
+        let parent = self.parent().display_path();
+        if parent.is_empty() {
+            name
+        } else {
+            format!("{parent}/{name}")
+        }
+    }
+
     /// Parent directory (for `..` readdir entries). `Root`'s parent is itself.
     pub(crate) fn parent(&self) -> Node {
         match self {
-            Node::Root | Node::PlaybackDir | Node::SettingsDir | Node::StatsDir => Node::Root,
+            Node::Root
+            | Node::Shutdown
+            | Node::PlaybackDir
+            | Node::SettingsDir
+            | Node::StatsDir => Node::Root,
             Node::PlaybackState
             | Node::PlaybackTrack
             | Node::PlaybackVideoId
+            | Node::PlaybackVideoName
             | Node::PlaybackPosition
             | Node::PlaybackDuration
             | Node::PlaybackVolume
@@ -226,11 +266,13 @@ impl Node {
                 ("playback", Node::PlaybackDir),
                 ("settings", Node::SettingsDir),
                 ("stats", Node::StatsDir),
+                ("shutdown", Node::Shutdown),
             ],
             Node::PlaybackDir => vec![
                 ("state", Node::PlaybackState),
                 ("track", Node::PlaybackTrack),
                 ("video_id", Node::PlaybackVideoId),
+                ("video_name", Node::PlaybackVideoName),
                 ("position", Node::PlaybackPosition),
                 ("duration", Node::PlaybackDuration),
                 ("volume", Node::PlaybackVolume),
@@ -347,9 +389,11 @@ impl Node {
     pub(crate) fn read(&self, ctx: &Ctx) -> FsResult<Vec<u8>> {
         let mode = ctx.fsmod();
         match self {
+            Node::Shutdown => playback_files::read_shutdown(ctx, mode),
             Node::PlaybackState => playback_files::read_state(ctx, mode),
             Node::PlaybackTrack => playback_files::read_track(ctx, mode),
             Node::PlaybackVideoId => playback_files::read_video_id(ctx, mode),
+            Node::PlaybackVideoName => playback_files::read_video_name(ctx, mode),
             Node::PlaybackPosition => playback_files::read_position(ctx, mode),
             Node::PlaybackDuration => playback_files::read_duration(ctx, mode),
             Node::PlaybackVolume => playback_files::read_volume(ctx, mode),
@@ -384,10 +428,12 @@ impl Node {
     /// as a command (contract B3 line buffering lives in `fs.rs`).
     pub(crate) fn write_line(&self, ctx: &Ctx, line: &str) -> FsResult<()> {
         match self {
+            Node::Shutdown => playback_files::write_shutdown(ctx, line),
             Node::PlaybackState => playback_files::write_state(ctx, line),
             Node::PlaybackTrack | Node::PlaybackVideoId => {
                 playback_files::write_play_query(ctx, line)
             }
+            Node::PlaybackVideoName => playback_files::write_video_name(ctx, line),
             Node::PlaybackNext => playback_files::write_next(ctx, line),
             Node::PlaybackPosition => playback_files::write_position(ctx, line),
             Node::PlaybackVolume => playback_files::write_volume(ctx, line),

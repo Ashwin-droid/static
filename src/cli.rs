@@ -68,15 +68,8 @@ Notes:
   brought back into range.
   Run `static config desc` for detailed behavior, accepted values, and range notes.";
 
-/// `static fs` only exists in staticfs-enabled builds, so its usage line is
-/// spliced into the help text at runtime instead of living in the const.
 fn help_text() -> String {
-    let fs_line = if cfg!(feature = "staticfs") {
-        "\n  static fs [mountpoint]"
-    } else {
-        ""
-    };
-    format!("{HELP_USAGE}{fs_line}\n\n{HELP_NOTES}")
+    format!("{HELP_USAGE}\n\n{HELP_NOTES}")
 }
 
 pub fn wants_cli(args: &[String]) -> bool {
@@ -105,20 +98,9 @@ pub fn run(args: &[String]) -> Result<()> {
         "info" => run_info(),
         "coordination" => run_coordination(&args[1..]),
         "config" => run_config(&args[1..]),
-        "fs" => run_fs(&args[1..]),
         "i" => run_interactive_tui(),
         other => bail!("Unknown CLI command `{other}`.\n\n{}", help_text()),
     }
-}
-
-#[cfg(feature = "staticfs")]
-fn run_fs(args: &[String]) -> Result<()> {
-    crate::staticfs::run_mount(args)
-}
-
-#[cfg(not(feature = "staticfs"))]
-fn run_fs(_args: &[String]) -> Result<()> {
-    bail!("this build of static does not include staticfs; rebuild with --features staticfs")
 }
 
 fn run_rate_current_track(rating: SongRating) -> Result<()> {
@@ -1344,7 +1326,7 @@ fn fabricate_track(video_id: &str, fallback_title: &str) -> Track {
     }
 }
 
-fn resolve_first_search_track(network: &NetworkState, query: &str) -> Result<Track> {
+pub(crate) fn resolve_first_search_track(network: &NetworkState, query: &str) -> Result<Track> {
     let results = network
         .search(query)
         .with_context(|| format!("Failed to search for `{query}`"))?;
@@ -1553,6 +1535,18 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
     ConfigSpec {
         name: "sponsorblock_categories",
         kind: ConfigKind::StringList,
+    },
+    // staticfs settings only exist in staticfs-enabled builds; the daemon
+    // hot-reloads them (toggling mounts/unmounts the live filesystem).
+    #[cfg(feature = "staticfs")]
+    ConfigSpec {
+        name: "staticfs_enabled",
+        kind: ConfigKind::Bool,
+    },
+    #[cfg(feature = "staticfs")]
+    ConfigSpec {
+        name: "staticfs_mountpoint",
+        kind: ConfigKind::String,
     },
 ];
 
@@ -1857,6 +1851,8 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "pipewire_filter_list" => settings.pipewire_filter_list.join(","),
         "sponsorblock_enabled" => yes_no_bool(settings.sponsorblock_enabled),
         "sponsorblock_categories" => settings.sponsorblock_categories.join(","),
+        "staticfs_enabled" => yes_no_bool(settings.staticfs_enabled),
+        "staticfs_mountpoint" => settings.staticfs_mountpoint.clone(),
         other => return Err(anyhow::anyhow!("Unknown config key `{other}`")),
     })
 }
@@ -1928,6 +1924,8 @@ pub(crate) fn apply_config_value(
             settings.pipewire_filter_list = parse_coordination_filter_list(trimmed)
         }
         "sponsorblock_enabled" => settings.sponsorblock_enabled = parse_bool(trimmed)?,
+        "staticfs_enabled" => settings.staticfs_enabled = parse_bool(trimmed)?,
+        "staticfs_mountpoint" => settings.staticfs_mountpoint = trimmed.to_string(),
         "sponsorblock_categories" => {
             let categories = trimmed
                 .split(',')

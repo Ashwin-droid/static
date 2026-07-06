@@ -143,7 +143,7 @@ pub(crate) fn read_radio_seed(ctx: &Ctx, mode: FsMode) -> FsResult<Vec<u8>> {
 /// Non-idempotent (a retry could restart the radio session), so no
 /// transport retry: `with_daemon_once`.
 pub(crate) fn write_radio_jump(ctx: &Ctx, line: &str) -> FsResult<()> {
-    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line))?;
+    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line, false))?;
     Ok(())
 }
 

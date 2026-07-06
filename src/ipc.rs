@@ -83,6 +83,18 @@ pub struct PlaybackSnapshot {
     pub ducked: bool,
     #[serde(default)]
     pub pipewire_pause_active: bool,
+    /// A staticfs unmount is blocked by open handles and awaiting a
+    /// close-anyway/wait decision (staticfs builds only; pending halt-auto
+    /// pattern: GUI/TUI render controls from this, CLI/fs show nothing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staticfs_unmount_pending: Option<StaticfsUnmountPending>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StaticfsUnmountPending {
+    /// Mount-relative paths of the busy files (or the mountpoint itself when
+    /// something like a shell cwd pins the mount without an open handle).
+    pub busy_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,6 +193,7 @@ impl Default for PlaybackSnapshot {
             sleep_after_current: false,
             ducked: false,
             pipewire_pause_active: false,
+            staticfs_unmount_pending: None,
         }
     }
 }
@@ -293,10 +306,20 @@ pub enum DaemonRequest {
     },
     ResolveAndPlayRadio {
         query: String,
+        /// true = always resolve via search, even when the query looks like
+        /// a bare video id (explicit "this is a song name" intent, e.g. the
+        /// staticfs `playback/video_name` write).
+        #[serde(default)]
+        force_search: bool,
     },
     GetLyrics,
     ClearQueue,
     Shutdown,
+    /// "Close anyway" on a pending staticfs unmount: lazy-detach now.
+    StaticfsUnmountNow,
+    /// "Wait" on a pending staticfs unmount: dismiss the prompt and unmount
+    /// once the last open handle closes.
+    StaticfsUnmountWait,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -789,6 +812,14 @@ impl DaemonClient {
         self.transport_request(DaemonRequest::ResumeHaltAutoResume)
     }
 
+    pub fn staticfs_unmount_now(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::StaticfsUnmountNow)
+    }
+
+    pub fn staticfs_unmount_wait(&self) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::StaticfsUnmountWait)
+    }
+
     pub fn stop(&self) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::Stop)
     }
@@ -979,12 +1010,16 @@ impl DaemonClient {
     }
 
     /// `ResolveAndPlayRadio` with the `Rejected`/`Transport` error split.
+    /// `force_search: true` skips the bare-video-id interpretation and always
+    /// resolves the query via search.
     pub fn try_resolve_and_play_radio(
         &self,
         query: &str,
+        force_search: bool,
     ) -> std::result::Result<PlaybackSnapshot, DaemonCallError> {
         self.try_state_request(&DaemonRequest::ResolveAndPlayRadio {
             query: query.to_string(),
+            force_search,
         })
     }
 
@@ -1023,7 +1058,7 @@ impl DaemonClient {
     }
 
     pub fn resolve_and_play_radio(&self, query: &str) -> Result<PlaybackSnapshot> {
-        Ok(self.try_resolve_and_play_radio(query)?)
+        Ok(self.try_resolve_and_play_radio(query, false)?)
     }
 
     pub fn lyrics(&self) -> Result<Option<SyncedLyrics>> {

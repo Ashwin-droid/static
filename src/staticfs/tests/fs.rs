@@ -26,9 +26,9 @@ fn handle_for(node: Node) -> HandleState {
 fn inode_table_preallocates_static_tree_with_root_at_one() {
     let table = InodeTable::new();
     assert_eq!(table.node(1), Some(Node::Root));
-    // 35 fixed nodes (see tree tests) preallocated at mount.
-    assert_eq!(table.by_ino.len(), 35);
-    assert_eq!(table.by_node.len(), 35);
+    // 37 fixed nodes (see tree tests) preallocated at mount.
+    assert_eq!(table.by_ino.len(), 37);
+    assert_eq!(table.by_node.len(), 37);
     for (ino, node) in &table.by_ino {
         assert_eq!(table.by_node.get(node), Some(ino));
     }

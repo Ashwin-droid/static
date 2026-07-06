@@ -123,6 +123,12 @@ pub struct AppSettings {
     pub pipewire_filter_list: Vec<String>,
     pub sponsorblock_enabled: bool,
     pub sponsorblock_categories: Vec<String>,
+    /// Mount staticfs from the daemon (hot-reloads: toggling mounts/unmounts
+    /// the live filesystem). Only meaningful in staticfs-enabled builds.
+    pub staticfs_enabled: bool,
+    /// staticfs mountpoint override; empty = the default (~/Music/staticfs).
+    /// CLI-only setting (no GUI/TUI card).
+    pub staticfs_mountpoint: String,
 }
 
 impl Default for AppSettings {
@@ -155,6 +161,8 @@ impl Default for AppSettings {
             pipewire_filter_list: Vec::new(),
             sponsorblock_enabled: true,
             sponsorblock_categories: default_skip_categories(),
+            staticfs_enabled: false,
+            staticfs_mountpoint: String::new(),
         }
     }
 }
@@ -316,6 +324,13 @@ impl MusicCache {
                         settings.sponsorblock_categories = sanitize_categories(&categories);
                     }
                 }
+                "staticfs_enabled" => {
+                    settings.staticfs_enabled =
+                        parse_bool_setting(&row.1, settings.staticfs_enabled);
+                }
+                "staticfs_mountpoint" => {
+                    settings.staticfs_mountpoint = row.1;
+                }
                 _ => {}
             }
         }
@@ -439,6 +454,8 @@ impl MusicCache {
                 bool_setting(settings.sponsorblock_enabled),
             ),
             ("sponsorblock_categories", sponsorblock_categories.clone()),
+            ("staticfs_enabled", bool_setting(settings.staticfs_enabled)),
+            ("staticfs_mountpoint", settings.staticfs_mountpoint.clone()),
         ] {
             tx.execute(
                 "INSERT INTO app_settings (key, value) VALUES (?1, ?2)

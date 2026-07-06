@@ -1,11 +1,32 @@
+use std::path::PathBuf;
+
+use super::super::{Ctx, FsError};
 use super::{
     SleepCommand, StateCommand, parse_position_millis, parse_rating_token, parse_repeat_token,
     parse_sleep_token, parse_state_token, parse_volume_value, queue_neighbour_record, rating_label,
-    reveal_lyrics,
+    read_shutdown, reveal_lyrics, write_shutdown,
 };
 use crate::ipc::{PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track};
 use crate::network::SongRating;
+
+#[test]
+fn shutdown_read_is_the_liveness_line_and_write_demands_yes() {
+    let ctx = Ctx::new(PathBuf::from("/nonexistent/static-root"));
+    assert_eq!(
+        read_shutdown(&ctx, crate::staticfs::format::FsMode::default()).unwrap(),
+        b"if you are reading this then its up\n".to_vec()
+    );
+    // Anything but "yes" is rejected locally (EINVAL) without touching the
+    // daemon; the "yes" path itself needs a live daemon, so it is exercised
+    // at runtime rather than here.
+    for junk in ["no", "y", "shutdown", "please"] {
+        assert!(matches!(
+            write_shutdown(&ctx, junk),
+            Err(FsError::Invalid(_))
+        ));
+    }
+}
 
 fn queue_track(video_id: &str, title: &str) -> Track {
     Track {

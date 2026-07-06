@@ -99,6 +99,9 @@ pub enum Msg {
     SleepOptionPicked(SleepOption),
     HaltAutoCancelPressed,
     HaltAutoResumePressed,
+    /// Pending staticfs unmount controls (snapshot-driven, like halt-auto).
+    StaticfsUnmountNowPressed,
+    StaticfsUnmountWaitPressed,
 
     /// Completion of any transport daemon command issued with a play-request
     /// serial (toggle/next/prev/seek/repeat/halt-auto/stop).
@@ -251,6 +254,37 @@ fn controls_row(app: &App) -> Element<'_, Message> {
                 "Resume",
                 true,
                 pmsg(Msg::HaltAutoResumePressed),
+            ));
+    }
+    if let Some(pending) = &snapshot.staticfs_unmount_pending {
+        // A staticfs unmount is blocked by open handles: name the busy file
+        // and offer close-anyway/wait (daemon-side pending state; CLI and
+        // the fs itself deliberately show no prompt).
+        let busy = pending
+            .busy_paths
+            .first()
+            .map(String::as_str)
+            .unwrap_or("staticfs");
+        let extra = pending.busy_paths.len().saturating_sub(1);
+        let label = if extra > 0 {
+            format!("An app is using {busy} (+{extra} more)")
+        } else {
+            format!("An app is using {busy}")
+        };
+        transport = transport
+            .push(
+                container(text(label).size(theme::SIZE_SUB).color(theme::TEXT_DIM))
+                    .padding([0.0, theme::SPACE_SM]),
+            )
+            .push(halt_auto_button(
+                "Wait",
+                false,
+                pmsg(Msg::StaticfsUnmountWaitPressed),
+            ))
+            .push(halt_auto_button(
+                "Close anyway",
+                true,
+                pmsg(Msg::StaticfsUnmountNowPressed),
             ));
     }
 
@@ -922,6 +956,17 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             transport_command(app, false, |daemon| daemon.resume_halt_auto())
         }
 
+        Msg::StaticfsUnmountNowPressed => {
+            // Optimistic clear so the prompt disappears promptly; the next
+            // snapshot re-adds it if the daemon disagrees.
+            app.player.snapshot.staticfs_unmount_pending = None;
+            transport_command(app, false, |daemon| daemon.staticfs_unmount_now())
+        }
+        Msg::StaticfsUnmountWaitPressed => {
+            app.player.snapshot.staticfs_unmount_pending = None;
+            transport_command(app, false, |daemon| daemon.staticfs_unmount_wait())
+        }
+
         Msg::DaemonResult {
             serial,
             play_request,
@@ -1434,6 +1479,7 @@ pub fn maybe_restore_daemon_from_ui_state(app: &mut App) -> Task<Message> {
 fn playback_snapshot_from_ui_state(player: &PlayerModel) -> PlaybackSnapshot {
     let mut snapshot = player.snapshot.clone();
     snapshot.halt_auto_resume_pending = false;
+    snapshot.staticfs_unmount_pending = None;
 
     let use_live_ui_queue = !player.queue.is_empty();
     if use_live_ui_queue {

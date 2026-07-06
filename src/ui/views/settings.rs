@@ -60,6 +60,8 @@ pub enum SettingToggle {
     SponsorblockEnabled,
     PipewireDuckingEnabled,
     AutoSyncChromiumCookies,
+    #[cfg(feature = "staticfs")]
+    StaticfsEnabled,
 }
 
 /// Identifies a numeric setting row (spin/scale controls).
@@ -515,9 +517,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .push(playback_card(draft))
         .push(coordination_card(state, draft))
         .push(sponsorblock_card(draft))
-        .push(offline_card(state, draft))
-        .push(import_card(state, draft))
-        .push(session_card());
+        .push(offline_card(state, draft));
+    #[cfg(feature = "staticfs")]
+    {
+        page = page.push(staticfs_card(draft));
+    }
+    page = page.push(import_card(state, draft)).push(session_card());
 
     page.into()
 }
@@ -774,6 +779,38 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
                 "PipeWire streams",
                 "Start staticd with PipeWire available to discover current streams.",
             ),
+        ],
+    )
+}
+
+#[cfg(feature = "staticfs")]
+fn staticfs_card(draft: &AppSettings) -> Element<'_, Message> {
+    let mountpoint_note = if draft.staticfs_mountpoint.trim().is_empty() {
+        "Mounted at ~/Music/staticfs. The mountpoint is a CLI-only setting \
+         (static config set staticfs_mountpoint <path>)."
+            .to_string()
+    } else {
+        format!(
+            "Mounted at {} (CLI-only setting staticfs_mountpoint).",
+            draft.staticfs_mountpoint.trim()
+        )
+    };
+    settings_card(
+        "staticfs",
+        "Expose the daemon as a filesystem of plaintext files: playback control, settings, \
+         and listening stats. The daemon mounts and unmounts it live when this toggle \
+         changes.",
+        vec![
+            settings_row(
+                "Mount staticfs",
+                "Playback state, queue, radio, settings, and stats become readable and \
+                 writable files.",
+                setting_toggle(draft.staticfs_enabled, true, SettingToggle::StaticfsEnabled),
+            ),
+            text(mountpoint_note)
+                .size(theme::SIZE_SUB)
+                .color(theme::TEXT_DIM)
+                .into(),
         ],
     )
 }
@@ -1901,6 +1938,8 @@ fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
         SettingToggle::SponsorblockEnabled => settings.sponsorblock_enabled,
         SettingToggle::PipewireDuckingEnabled => settings.pipewire_ducking_enabled,
         SettingToggle::AutoSyncChromiumCookies => settings.auto_sync_chromium_cookies,
+        #[cfg(feature = "staticfs")]
+        SettingToggle::StaticfsEnabled => settings.staticfs_enabled,
     }
 }
 
@@ -1916,6 +1955,8 @@ fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
         SettingToggle::SponsorblockEnabled => settings.sponsorblock_enabled = value,
         SettingToggle::PipewireDuckingEnabled => settings.pipewire_ducking_enabled = value,
         SettingToggle::AutoSyncChromiumCookies => settings.auto_sync_chromium_cookies = value,
+        #[cfg(feature = "staticfs")]
+        SettingToggle::StaticfsEnabled => settings.staticfs_enabled = value,
     }
 }
 

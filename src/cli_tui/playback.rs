@@ -48,11 +48,13 @@ impl InteractiveTui {
             rows[0],
         );
 
-        let action_column_width = if self.snapshot.halt_auto_resume_pending {
-            44
-        } else {
-            28
-        };
+        let mut action_column_width = 28;
+        if self.snapshot.halt_auto_resume_pending {
+            action_column_width += 16;
+        }
+        if self.snapshot.staticfs_unmount_pending.is_some() {
+            action_column_width += 13;
+        }
         let control_columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -158,33 +160,25 @@ impl InteractiveTui {
             track_info[1],
         );
 
-        let actions = if self.snapshot.halt_auto_resume_pending {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(8),
-                    Constraint::Length(8),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Length(4),
-                    Constraint::Length(5),
-                    Constraint::Length(4),
-                ])
-                .split(control_columns[2])
-        } else {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Length(5),
-                    Constraint::Length(4),
-                    Constraint::Length(5),
-                    Constraint::Length(4),
-                ])
-                .split(control_columns[2])
-        };
+        let mut action_constraints = Vec::new();
+        if self.snapshot.halt_auto_resume_pending {
+            action_constraints.extend([Constraint::Length(8), Constraint::Length(8)]);
+        }
+        if self.snapshot.staticfs_unmount_pending.is_some() {
+            action_constraints.extend([Constraint::Length(6), Constraint::Length(7)]);
+        }
+        action_constraints.extend([
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(5),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Length(4),
+        ]);
+        let actions = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(action_constraints)
+            .split(control_columns[2]);
 
         let mut action_index = 0;
 
@@ -209,6 +203,31 @@ impl InteractiveTui {
                 true,
                 true,
                 self.player_action_focused_action(TuiAction::ResumeHaltAutoResume),
+            ));
+            action_index += 1;
+        }
+
+        if self.snapshot.staticfs_unmount_pending.is_some() {
+            targets.push(render_action_button(
+                frame,
+                actions[action_index],
+                "wait",
+                TuiAction::StaticfsUnmountWait,
+                theme,
+                false,
+                true,
+                self.player_action_focused_action(TuiAction::StaticfsUnmountWait),
+            ));
+            action_index += 1;
+            targets.push(render_action_button(
+                frame,
+                actions[action_index],
+                "close",
+                TuiAction::StaticfsUnmountNow,
+                theme,
+                true,
+                true,
+                self.player_action_focused_action(TuiAction::StaticfsUnmountNow),
             ));
             action_index += 1;
         }
@@ -307,6 +326,20 @@ impl InteractiveTui {
             .as_ref()
             .map(|track| track.video_id.clone());
 
+        // Surface a newly-appeared pending staticfs unmount in the status
+        // line ("an app is using {file}"); the wait/close buttons render
+        // next to the halt-auto slot.
+        if let Some(pending) = &snapshot.staticfs_unmount_pending {
+            if self.snapshot.staticfs_unmount_pending.as_ref() != Some(pending) {
+                let busy = pending
+                    .busy_paths
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or("staticfs");
+                self.status_line = format!("An app is using {busy} — unmount now or wait?");
+            }
+        }
+
         self.snapshot = snapshot;
         let now = Instant::now();
         self.last_snapshot_at = now;
@@ -331,6 +364,7 @@ impl InteractiveTui {
     pub(in crate::cli_tui) fn playback_snapshot_from_tui_state(&self) -> PlaybackSnapshot {
         let mut snapshot = self.snapshot.clone();
         snapshot.halt_auto_resume_pending = false;
+        snapshot.staticfs_unmount_pending = None;
         snapshot.queue_index = snapshot
             .queue_index
             .min(snapshot.queue.len().saturating_sub(1));
@@ -530,6 +564,8 @@ impl InteractiveTui {
             TuiAction::TogglePause => self.client.toggle_pause(),
             TuiAction::CancelHaltAutoResume => self.client.cancel_halt_auto_resume(),
             TuiAction::ResumeHaltAutoResume => self.client.resume_halt_auto(),
+            TuiAction::StaticfsUnmountWait => self.client.staticfs_unmount_wait(),
+            TuiAction::StaticfsUnmountNow => self.client.staticfs_unmount_now(),
             TuiAction::Previous => self.client.previous(),
             TuiAction::Next => self.client.next(),
             TuiAction::Like => self.client.rate_current_track(SongRating::Like),
@@ -760,6 +796,8 @@ pub(in crate::cli_tui) fn action_label(action: TuiAction) -> &'static str {
         TuiAction::TogglePause => "Toggle",
         TuiAction::CancelHaltAutoResume => "Cancel resume",
         TuiAction::ResumeHaltAutoResume => "Resume now",
+        TuiAction::StaticfsUnmountWait => "Unmount when free",
+        TuiAction::StaticfsUnmountNow => "Unmount now",
         TuiAction::Previous => "Previous",
         TuiAction::Next => "Next",
         TuiAction::Like => "Like",

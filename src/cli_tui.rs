@@ -203,6 +203,8 @@ enum TuiAction {
     TogglePause,
     CancelHaltAutoResume,
     ResumeHaltAutoResume,
+    StaticfsUnmountWait,
+    StaticfsUnmountNow,
     Previous,
     Next,
     Like,

@@ -21,6 +21,26 @@ fn send(ctx: &Ctx, request: &DaemonRequest) -> FsResult<()> {
     Ok(())
 }
 
+/// Root `shutdown` file, read side: a static liveness one-liner. The daemon
+/// hosts this mount in-process, so being able to read the file at all means
+/// the daemon is up — no probe needed.
+pub(crate) fn read_shutdown(_ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
+    Ok(format::scalar("if you are reading this then its up"))
+}
+
+/// Root `shutdown` file, write side: the exact line "yes" asks the daemon to
+/// shut down over D-Bus (taking this filesystem with it); anything else is
+/// EINVAL. Deliberately strict — this is the sysfs model's "write the magic
+/// token" pattern for a destructive action.
+pub(crate) fn write_shutdown(ctx: &Ctx, line: &str) -> FsResult<()> {
+    if !line.eq_ignore_ascii_case("yes") {
+        return Err(FsError::invalid(
+            "write \"yes\" to shut the daemon down (this unmounts staticfs too)",
+        ));
+    }
+    send(ctx, &DaemonRequest::Shutdown)
+}
+
 /// playback/state write grammar (pure; `line` is trimmed and non-empty).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StateCommand {
@@ -300,7 +320,27 @@ pub(crate) fn write_next(ctx: &Ctx, line: &str) -> FsResult<()> {
 /// text or a bare video id — `resolve_track_input` handles both) and play it
 /// now with a radio tail, exactly like `static exec`.
 pub(crate) fn write_play_query(ctx: &Ctx, line: &str) -> FsResult<()> {
-    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line))?;
+    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line, false))?;
+    Ok(())
+}
+
+/// playback/video_name (rw), read side: scalar human-readable title of the
+/// current track. Empty when nothing playing.
+pub(crate) fn read_video_name(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
+    let snap = snapshot(ctx)?;
+    let title = snap
+        .current_track
+        .map(|track| track.title)
+        .unwrap_or_default();
+    Ok(format::scalar(&title))
+}
+
+/// playback/video_name write side: like `track`/`video_id` writes (resolve
+/// and play now with a radio tail), except the line is ALWAYS resolved via
+/// search — writing here states explicit "this is a song name" intent, so a
+/// whitespace-free line is never treated as a bare video id.
+pub(crate) fn write_video_name(ctx: &Ctx, line: &str) -> FsResult<()> {
+    ctx.with_daemon_once(|client| client.try_resolve_and_play_radio(line, true))?;
     Ok(())
 }
 

@@ -19,10 +19,12 @@ fn static_tree_contains_every_fixed_node() {
     let mut all = Vec::new();
     walk_static(&Node::Root, &mut all);
     // 8 fixed dirs (root, playback, queue, radio, settings, stats, top,
-    // tracks) + 14 playback files + 4 queue files + 3 radio files + fsmod +
-    // overview + 4 top files = 35 fixed nodes.
-    assert_eq!(all.len(), 35);
+    // tracks) + shutdown + 15 playback files + 4 queue files + 3 radio files
+    // + fsmod + overview + 4 top files = 37 fixed nodes.
+    assert_eq!(all.len(), 37);
     for node in [
+        Node::Shutdown,
+        Node::PlaybackVideoName,
         Node::PlaybackLyrics,
         Node::PlaybackSleep,
         Node::QueueClear,
@@ -36,14 +38,34 @@ fn static_tree_contains_every_fixed_node() {
 }
 
 #[test]
+fn display_paths_walk_up_to_the_mount_root() {
+    assert_eq!(Node::Shutdown.display_path(), "shutdown");
+    assert_eq!(
+        Node::PlaybackVideoName.display_path(),
+        "playback/video_name"
+    );
+    assert_eq!(Node::QueueItems.display_path(), "playback/queue/items");
+    assert_eq!(
+        Node::SettingsKey("prefetch_ahead".to_string()).display_path(),
+        "settings/prefetch_ahead"
+    );
+    assert_eq!(
+        Node::StatsTrackField("abc123".to_string(), TrackField::PlayCount).display_path(),
+        "stats/tracks/abc123/play_count"
+    );
+}
+
+#[test]
 fn permissions_match_contract() {
     assert_eq!(Node::Root.perm(), 0o755);
     assert_eq!(Node::PlaybackDir.perm(), 0o755);
     // read-write
     for node in [
+        Node::Shutdown,
         Node::PlaybackState,
         Node::PlaybackTrack,
         Node::PlaybackVideoId,
+        Node::PlaybackVideoName,
         Node::PlaybackPosition,
         Node::PlaybackVolume,
         Node::PlaybackRepeat,

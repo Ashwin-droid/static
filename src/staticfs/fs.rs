@@ -113,6 +113,9 @@ pub(crate) struct StaticFs {
     mount_time: SystemTime,
     uid: u32,
     gid: u32,
+    /// Open-path mirror for the mount host's "an app is using {file}"
+    /// pending-unmount prompt. `None` outside daemon hosting (tests).
+    open_tracker: Option<super::host::OpenPathTracker>,
 }
 
 impl StaticFs {
@@ -126,7 +129,16 @@ impl StaticFs {
             // SAFETY-free libc calls: geteuid/getegid cannot fail.
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
+            open_tracker: None,
         }
+    }
+
+    /// Daemon-hosted mount: mirror open file paths into `tracker` so the
+    /// host can name the busy files when an unmount is refused.
+    pub(crate) fn with_tracker(ctx: Ctx, tracker: super::host::OpenPathTracker) -> Self {
+        let mut fs = Self::new(ctx);
+        fs.open_tracker = Some(tracker);
+        fs
     }
 
     fn node_of(&self, ino: INodeNo) -> Option<Node> {
@@ -358,6 +370,12 @@ impl Filesystem for StaticFs {
             return;
         }
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        if let Some(tracker) = &self.open_tracker {
+            tracker
+                .lock()
+                .expect("open tracker mutex poisoned")
+                .insert(fh, node.display_path());
+        }
         self.handles
             .lock()
             .expect("handle table mutex poisoned")
@@ -491,6 +509,12 @@ impl Filesystem for StaticFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        if let Some(tracker) = &self.open_tracker {
+            tracker
+                .lock()
+                .expect("open tracker mutex poisoned")
+                .remove(&fh.0);
+        }
         let mut handles = self.handles.lock().expect("handle table mutex poisoned");
         if let Some(mut handle) = handles.remove(&fh.0) {
             // flush is not guaranteed; process any unterminated remainder

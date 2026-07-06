@@ -274,6 +274,9 @@ struct DaemonState {
     last_persisted_playback_json: Option<String>,
     last_persisted_playback_at: Option<Instant>,
     shutting_down: Cell<bool>,
+    /// In-daemon staticfs mount host (the daemon owns the FUSE driver).
+    #[cfg(feature = "staticfs")]
+    staticfs_host: crate::staticfs::host::HostHandle,
 }
 
 struct ExternalMprisCoordinator {
@@ -1048,11 +1051,14 @@ pub fn run() -> Result<()> {
         last_persisted_playback_json: None,
         last_persisted_playback_at: None,
         shutting_down: Cell::new(false),
+        #[cfg(feature = "staticfs")]
+        staticfs_host: crate::staticfs::host::HostHandle::spawn(),
     }));
 
     {
         let mut state = state.borrow_mut();
         schedule_offline_cache_sync(&mut state);
+        sync_staticfs_host(&state);
     }
 
     {
@@ -1142,7 +1148,23 @@ fn request_daemon_shutdown(state: &mut DaemonState, exiting: bool) {
     state.sleep_after_current = false;
     state.sleep_shutdown_pending = false;
     stop_playback(state, exiting);
+    // Daemon death takes staticfs with it: unmount (clean, else lazy).
+    #[cfg(feature = "staticfs")]
+    state.staticfs_host.shutdown();
     state.shutting_down.set(true);
+}
+
+/// Pushes the current staticfs settings at the mount host (hot reload:
+/// toggling `staticfs_enabled` mounts/unmounts the live filesystem, changing
+/// `staticfs_mountpoint` remounts). No-op without the staticfs feature.
+fn sync_staticfs_host(state: &DaemonState) {
+    #[cfg(feature = "staticfs")]
+    state.staticfs_host.set_desired(
+        state.settings.staticfs_enabled,
+        Some(state.settings.staticfs_mountpoint.clone()),
+    );
+    #[cfg(not(feature = "staticfs"))]
+    let _ = state;
 }
 
 fn remaining_sleep_secs(deadline: Instant, now: Instant) -> u64 {
@@ -2055,10 +2077,19 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
-        DaemonRequest::ResolveAndPlayRadio { query } => {
-            let track = match ensure_client_loaded(state)
-                .and_then(|client| crate::cli::resolve_track_input(&client, &query, true))
-            {
+        DaemonRequest::ResolveAndPlayRadio {
+            query,
+            force_search,
+        } => {
+            // force_search states explicit "this is a song name" intent:
+            // skip the bare-video-id interpretation entirely.
+            let track = match ensure_client_loaded(state).and_then(|client| {
+                if force_search {
+                    crate::cli::resolve_first_search_track(&client, &query)
+                } else {
+                    crate::cli::resolve_track_input(&client, &query, true)
+                }
+            }) {
                 Ok(track) => track,
                 Err(err) => return DaemonResponse::Error(err.to_string()),
             };
@@ -2119,6 +2150,30 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::StaticfsUnmountNow => {
+            #[cfg(feature = "staticfs")]
+            {
+                state.staticfs_host.unmount_now();
+                // The host clears the pending state asynchronously; strip it
+                // from the immediate reply so the prompt cannot flicker back.
+                let mut snapshot = state_snapshot(state);
+                snapshot.staticfs_unmount_pending = None;
+                DaemonResponse::State(snapshot)
+            }
+            #[cfg(not(feature = "staticfs"))]
+            DaemonResponse::Error("this build of static does not include staticfs".to_string())
+        }
+        DaemonRequest::StaticfsUnmountWait => {
+            #[cfg(feature = "staticfs")]
+            {
+                state.staticfs_host.unmount_wait();
+                let mut snapshot = state_snapshot(state);
+                snapshot.staticfs_unmount_pending = None;
+                DaemonResponse::State(snapshot)
+            }
+            #[cfg(not(feature = "staticfs"))]
+            DaemonResponse::Error("this build of static does not include staticfs".to_string())
         }
         DaemonRequest::Shutdown => {
             request_daemon_shutdown(state, true);
@@ -3855,6 +3910,7 @@ fn reload_settings(state: &mut DaemonState) {
             refresh_sponsorblock_for_current_track(state);
             prefetch_upcoming(state);
             schedule_offline_cache_sync(state);
+            sync_staticfs_host(state);
         }
         Err(err) => eprintln!("[STATICD] failed to reload settings: {err}"),
     }
@@ -4945,6 +5001,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         sleep_after_current: false,
         ducked: false,
         pipewire_pause_active: false,
+        staticfs_unmount_pending: None,
     };
     rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
     Some(snapshot)
@@ -4990,6 +5047,13 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         sleep_after_current: sleep_status.after_current,
         ducked: state.ducked,
         pipewire_pause_active: state.pipewire_pause_active,
+        #[cfg(feature = "staticfs")]
+        staticfs_unmount_pending: state
+            .staticfs_host
+            .pending_unmount()
+            .map(|busy_paths| crate::ipc::StaticfsUnmountPending { busy_paths }),
+        #[cfg(not(feature = "staticfs"))]
+        staticfs_unmount_pending: None,
     }
 }
 

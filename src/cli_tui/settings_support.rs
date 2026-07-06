@@ -972,6 +972,7 @@ pub(in crate::cli_tui) fn current_boolean_setting(settings: &AppSettings, key: &
         "prefer_local_cache_on_playback" => settings.prefer_local_cache_on_playback,
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled,
         "sponsorblock_enabled" => settings.sponsorblock_enabled,
+        "staticfs_enabled" => settings.staticfs_enabled,
         _ => false,
     }
 }
@@ -1309,6 +1310,18 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
             title: "Coordination".to_string(),
             subtitle: "How Static reacts to other media and audio streams.".to_string(),
             fields: coordination_fields,
+        },
+        #[cfg(feature = "staticfs")]
+        TuiSettingsSection {
+            title: "staticfs".to_string(),
+            subtitle: "Expose the daemon as a filesystem of plaintext files.".to_string(),
+            fields: vec![toggle_setting_field(
+                settings,
+                "staticfs_enabled",
+                "Mount staticfs",
+                "Playback, settings, and stats as files at ~/Music/staticfs; mounts and \
+                 unmounts live. Mountpoint is CLI-only (staticfs_mountpoint).",
+            )],
         },
         TuiSettingsSection {
             title: "Import & Filtering".to_string(),

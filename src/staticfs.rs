@@ -2,9 +2,10 @@
 //! local stats database as plaintext files (contract Part B).
 //!
 //! Module layout mirrors the repo's `foo.rs` + `foo/` convention:
-//! - `staticfs.rs` (this file): `run_mount`, mount options, signal handling,
-//!   tracing init, plus the shared seams every slice codes against (`Ctx`,
-//!   `FsError`/`FsResult`).
+//! - `staticfs.rs` (this file): mount options, stale-mount recovery, plus
+//!   the shared seams every slice codes against (`Ctx`, `FsError`/`FsResult`).
+//! - `staticfs/host.rs`: the in-daemon mount host (the daemon owns the FUSE
+//!   driver; there is no `static fs` command).
 //! - `staticfs/fs.rs`: the `fuser::Filesystem` implementation.
 //! - `staticfs/tree.rs`: the complete node model and read/write dispatch.
 //! - `staticfs/format.rs`, `staticfs/playback_files.rs`,
@@ -15,15 +16,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
-use fuser::{Config, MountOption, SessionACL, spawn_mount2};
-use signal_hook::consts::signal::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
+use anyhow::Result;
+use fuser::{Config, MountOption, SessionACL};
 
 use crate::ipc::{DaemonCallError, DaemonClient};
 
 pub(crate) mod format;
 mod fs;
+pub mod host;
 pub(crate) mod playback_files;
 pub(crate) mod queue_files;
 pub(crate) mod settings_files;
@@ -178,20 +178,7 @@ impl Ctx {
     }
 }
 
-/// The CLI path never calls `main::init_tracing`, so the mount installs its
-/// own subscriber (same `EnvFilter` default pattern as src/main.rs).
-fn init_tracing() {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-fn default_mountpoint() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join("Music").join("staticfs"))
-}
-
-/// Stale-mount recovery: a previous staticfs process that died uncleanly
+/// Stale-mount recovery: a previous staticfs session that died uncleanly
 /// leaves the mountpoint disconnected (opening it errors with ENOTCONN);
 /// `fusermount3 -u` clears it before we remount.
 fn recover_stale_mount(mountpoint: &Path) {
@@ -277,81 +264,6 @@ fn mount_config(auto_unmount: bool) -> Config {
         config.acl = SessionACL::RootAndOwner;
     }
     config
-}
-
-/// `static fs [mountpoint]` — mounts staticfs in the foreground and blocks
-/// until the filesystem is unmounted (SIGINT/SIGTERM trigger a clean
-/// unmount; external `fusermount3 -u` also ends the session).
-pub fn run_mount(args: &[String]) -> Result<()> {
-    init_tracing();
-
-    let mountpoint = match args.first() {
-        Some(raw) => PathBuf::from(raw),
-        None => default_mountpoint()?,
-    };
-
-    recover_stale_mount(&mountpoint);
-    std::fs::create_dir_all(&mountpoint).with_context(|| {
-        format!(
-            "Failed to create the mountpoint directory {}",
-            mountpoint.display()
-        )
-    })?;
-    if is_live_staticfs_mount(&mountpoint) {
-        bail!(
-            "staticfs is already mounted at {}; unmount it first with `fusermount3 -u {}`",
-            mountpoint.display(),
-            mountpoint.display()
-        );
-    }
-
-    // Resolve the storage root exactly once, before mounting anything (the
-    // keyring lookup behind configured storage roots may block).
-    let static_root = crate::logging::static_root();
-
-    let make_fs = || fs::StaticFs::new(Ctx::new(static_root.clone()));
-
-    // Prefer AutoUnmount (kernel drops the mount if this process dies), but
-    // it maps to allow_other, which most systems reject for regular users
-    // unless /etc/fuse.conf enables user_allow_other — fall back to a plain
-    // owner-only mount in that case. Signal handling below still guarantees
-    // a clean unmount on SIGINT/SIGTERM.
-    let session = match spawn_mount2(make_fs(), &mountpoint, &mount_config(true)) {
-        Ok(session) => session,
-        Err(err) => {
-            tracing::warn!("mounting with auto_unmount failed ({err}); retrying without it");
-            spawn_mount2(make_fs(), &mountpoint, &mount_config(false))
-                .with_context(|| format!("Failed to mount staticfs at {}", mountpoint.display()))?
-        }
-    };
-
-    println!("{}", mountpoint.display());
-
-    let mut signals =
-        Signals::new([SIGINT, SIGTERM]).context("Failed to install signal handlers")?;
-    let signal_mountpoint = mountpoint.clone();
-    std::thread::spawn(move || {
-        for _ in signals.forever() {
-            tracing::info!("signal received; unmounting staticfs");
-            let unmounted = Command::new("fusermount3")
-                .arg("-u")
-                .arg(&signal_mountpoint)
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if !unmounted {
-                let _ = Command::new("fusermount3")
-                    .args(["-u", "-z"])
-                    .arg(&signal_mountpoint)
-                    .status();
-            }
-        }
-    });
-
-    session
-        .join()
-        .context("staticfs session ended with an error")?;
-    Ok(())
 }
 
 #[cfg(test)]

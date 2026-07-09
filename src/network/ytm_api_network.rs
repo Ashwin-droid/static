@@ -90,6 +90,14 @@ static WEB_REMIX_MEDIA_PROBE_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|
         .expect("WEB_REMIX media probe client should build")
 });
 
+static VR_OAUTH_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("VR OAuth client should build")
+});
+
 static WEB_REMIX_POT_PROVIDER_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1654,6 +1662,8 @@ impl YtMusicClient {
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to build HTTP client")?;
 
@@ -1739,6 +1749,8 @@ impl YtMusicClient {
     async fn fetch_ytm_web_profile(&self) -> Result<YtmWebProfile> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to build YTM web profile HTTP client")?;
         let req = http
@@ -3151,6 +3163,8 @@ impl YtMusicClient {
         eprintln!("[VISITOR] fetching visitorData from youtube.com...");
         let clean = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .unwrap();
         let page = clean
@@ -3230,6 +3244,8 @@ impl YtMusicClient {
         let client = reqwest::Client::builder()
             .cookie_provider(jar)
             .redirect(reqwest::redirect::Policy::limited(5))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .context("Failed to build Android VR HTTP client")?;
         let watch_url =
@@ -3769,7 +3785,7 @@ impl YtMusicClient {
             "grant_type": "refresh_token",
         });
 
-        let resp = reqwest::Client::new()
+        let resp = VR_OAUTH_CLIENT
             .post(VR_OAUTH_TOKEN_URL)
             .header("content-type", "application/json")
             .json(&body)
@@ -3813,7 +3829,7 @@ impl YtMusicClient {
                 "device_model": "ANDROID_VR",
             });
 
-            let resp = reqwest::Client::new()
+            let resp = VR_OAUTH_CLIENT
                 .post(VR_OAUTH_DEVICE_CODE_URL)
                 .header("content-type", "application/json")
                 .json(&body)
@@ -3853,7 +3869,7 @@ impl YtMusicClient {
                 "grant_type": "http://oauth.net/grant_type/device/1.0",
             });
 
-            let resp = reqwest::Client::new()
+            let resp = VR_OAUTH_CLIENT
                 .post(VR_OAUTH_TOKEN_URL)
                 .header("content-type", "application/json")
                 .json(&body)

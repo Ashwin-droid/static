@@ -930,7 +930,11 @@ fn offline_eviction_warning_message(impact: usize, key: &str) -> String {
 }
 
 fn run_interactive_tui() -> Result<()> {
-    bootstrap_headless_saved_session();
+    // Cookie validation is a network round-trip; on a barely-alive connection
+    // it must not gate opening the TUI. Warming it here still helps: the
+    // bootstrap runs behind a Once, so background content loaders calling
+    // saved_network_state() wait for this validation instead of repeating it.
+    std::thread::spawn(bootstrap_headless_saved_session);
     crate::cli_tui::run()
 }
 

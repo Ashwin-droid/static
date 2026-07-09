@@ -231,7 +231,7 @@ struct DaemonState {
     player: PlaybackEngine,
     cache: MusicCache,
     settings: AppSettings,
-    client: Option<Rc<NetworkState>>,
+    client: Option<Arc<NetworkState>>,
     client_cookie_fingerprint: Option<u64>,
     queue: Vec<Track>,
     queue_index: usize,
@@ -624,6 +624,7 @@ struct CommandEnvelope {
 enum BackgroundEvent {
     TrackingReady {
         video_id: String,
+        attempt: u8,
         tracking: Option<TrackingInfo>,
     },
     PrefetchFinished {
@@ -2184,11 +2185,44 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
 
 fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
     match event {
-        BackgroundEvent::TrackingReady { video_id, tracking } => {
+        BackgroundEvent::TrackingReady {
+            video_id,
+            attempt,
+            tracking,
+        } => {
+            let tracking_ready = tracking.is_some();
             if let Some(active) = state.active_track.as_mut() {
-                if active.video_id == video_id {
+                if active.video_id == video_id && active.tracking.is_none() {
                     active.tracking = tracking;
                 }
+            }
+
+            let still_needs_tracking = state
+                .active_track
+                .as_ref()
+                .is_some_and(|track| track.video_id == video_id && track.tracking.is_none());
+            if let Some(retry_delay) =
+                tracking_retry_delay(tracking_ready, still_needs_tracking, attempt)
+            {
+                // The failed attempt may have used a stale auth client; drop
+                // it so the retry bootstraps from a freshly built one.
+                state.client = None;
+                state.client_cookie_fingerprint = None;
+
+                let next_attempt = attempt + 1;
+                eprintln!(
+                    "[TRACKING] scheduling retry {} for {} in {}s",
+                    next_attempt + 1,
+                    video_id,
+                    retry_delay.as_secs()
+                );
+                state
+                    .deferred_actions
+                    .push_back(DeferredAction::StartPlaybackTracking {
+                        video_id,
+                        attempt: next_attempt,
+                        not_before: Instant::now() + retry_delay,
+                    });
             }
         }
         BackgroundEvent::PrefetchFinished { video_id } => {
@@ -3875,7 +3909,7 @@ fn cookie_fingerprint(cookie: &str) -> u64 {
     hasher.finish()
 }
 
-fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<NetworkState>> {
+fn ensure_client_loaded(state: &mut DaemonState) -> Result<Arc<NetworkState>> {
     let cookie = get_cookie().ok_or_else(|| anyhow!("No saved cookie available"))?;
     let fingerprint = cookie_fingerprint(&cookie);
 
@@ -3889,7 +3923,7 @@ fn ensure_client_loaded(state: &mut DaemonState) -> Result<Rc<NetworkState>> {
         state.client_cookie_fingerprint = None;
     }
 
-    let client = Rc::new(NetworkState::from_cookie(&cookie)?);
+    let client = Arc::new(NetworkState::from_cookie(&cookie)?);
     state.client = Some(client.clone());
     state.client_cookie_fingerprint = Some(fingerprint);
     Ok(client)
@@ -4324,46 +4358,28 @@ fn maybe_run_deferred_action(state: &mut DaemonState) {
     match action {
         DeferredAction::StartPlaybackTracking {
             video_id, attempt, ..
-        } => {
-            let tracking = start_playback_tracking_with_retry(state, &video_id, attempt);
-            let tracking_ready = tracking.is_some();
-            let _ = state.background_tx.send(BackgroundEvent::TrackingReady {
-                video_id: video_id.clone(),
-                tracking,
-            });
-
-            if !tracking_ready
-                && state
-                    .active_track
-                    .as_ref()
-                    .is_some_and(|track| track.video_id == video_id)
-                && attempt < 2
-            {
-                let next_attempt = attempt + 1;
-                let retry_delay = Duration::from_secs(next_attempt as u64 * 2);
-                eprintln!(
-                    "[TRACKING] scheduling retry {} for {} in {}s",
-                    next_attempt + 1,
-                    video_id,
-                    retry_delay.as_secs()
-                );
-                state
-                    .deferred_actions
-                    .push_back(DeferredAction::StartPlaybackTracking {
-                        video_id,
-                        attempt: next_attempt,
-                        not_before: Instant::now() + retry_delay,
-                    });
-            }
-        }
+        } => spawn_playback_tracking(state, video_id, attempt),
     }
 }
 
-fn start_playback_tracking_with_retry(
-    state: &mut DaemonState,
-    video_id: &str,
+const TRACKING_MAX_ATTEMPTS: u8 = 3;
+
+fn tracking_retry_delay(
+    tracking_ready: bool,
+    still_needs_tracking: bool,
     attempt: u8,
-) -> Option<TrackingInfo> {
+) -> Option<Duration> {
+    if tracking_ready || !still_needs_tracking || attempt + 1 >= TRACKING_MAX_ATTEMPTS {
+        return None;
+    }
+    Some(Duration::from_secs((attempt as u64 + 1) * 2))
+}
+
+/// Bootstraps YouTube watchtime tracking on a background thread. Tracking is
+/// best-effort telemetry: it must never hold up the daemon loop, so playback
+/// (especially cache-backed playback) starts regardless of network health and
+/// the result arrives later as BackgroundEvent::TrackingReady.
+fn spawn_playback_tracking(state: &mut DaemonState, video_id: String, attempt: u8) {
     let current_attempt = attempt + 1;
     let session_started_at = state
         .active_track
@@ -4371,16 +4387,6 @@ fn start_playback_tracking_with_retry(
         .filter(|track| track.video_id == video_id)
         .map(|track| track.started_at)
         .unwrap_or_else(Instant::now);
-
-    let client = match ensure_client_loaded(state) {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!(
-                "[TRACKING] attempt {current_attempt} for {video_id} could not load auth client: {err}"
-            );
-            return None;
-        }
-    };
 
     let queued_track = state
         .queue
@@ -4397,48 +4403,41 @@ fn start_playback_tracking_with_retry(
         });
     let playback_params = queued_track.and_then(|track| track.playback_params.clone());
 
-    if let Some(tracking) = client.start_playback_tracking(
-        video_id,
-        session_started_at,
-        playback_playlist_id.as_deref(),
-        playback_params.as_deref(),
-    ) {
-        if current_attempt > 1 {
-            eprintln!(
-                "[TRACKING] recovered telemetry bootstrap for {video_id} on attempt {current_attempt}"
-            );
-        }
-        return Some(tracking);
-    }
-
-    eprintln!(
-        "[TRACKING] attempt {current_attempt} for {video_id} returned no watchtime tracker; refreshing auth client"
-    );
-    state.client = None;
-    state.client_cookie_fingerprint = None;
-
-    let refreshed_client = match ensure_client_loaded(state) {
-        Ok(client) => client,
+    let client = match ensure_client_loaded(state) {
+        Ok(client) => Some(client),
         Err(err) => {
             eprintln!(
-                "[TRACKING] attempt {current_attempt} for {video_id} could not refresh auth client: {err}"
+                "[TRACKING] attempt {current_attempt} for {video_id} could not load auth client: {err}"
             );
-            return None;
+            None
         }
     };
 
-    let tracking = refreshed_client.start_playback_tracking(
-        video_id,
-        session_started_at,
-        playback_playlist_id.as_deref(),
-        playback_params.as_deref(),
-    );
-    if tracking.is_none() {
-        eprintln!(
-            "[TRACKING] attempt {current_attempt} for {video_id} still produced no watchtime tracker after client refresh"
-        );
-    }
-    tracking
+    let background_tx = state.background_tx.clone();
+    std::thread::spawn(move || {
+        let tracking = client.and_then(|client| {
+            client.start_playback_tracking(
+                &video_id,
+                session_started_at,
+                playback_playlist_id.as_deref(),
+                playback_params.as_deref(),
+            )
+        });
+        match &tracking {
+            Some(_) if current_attempt > 1 => eprintln!(
+                "[TRACKING] recovered telemetry bootstrap for {video_id} on attempt {current_attempt}"
+            ),
+            None => eprintln!(
+                "[TRACKING] attempt {current_attempt} for {video_id} produced no watchtime tracker"
+            ),
+            _ => {}
+        }
+        let _ = background_tx.send(BackgroundEvent::TrackingReady {
+            video_id,
+            attempt,
+            tracking,
+        });
+    });
 }
 
 fn maybe_extend_radio_queue(state: &mut DaemonState) {

@@ -19,7 +19,7 @@ use super::{
     should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
     should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
     should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
-    volume_ramp_is_complete,
+    tracking_retry_delay, volume_ramp_is_complete,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
@@ -520,6 +520,25 @@ fn offline_cache_failures_retry_only_before_playback_really_starts() {
         PlaybackSource::RemoteStream,
         true
     ));
+}
+
+#[test]
+fn tracking_retries_back_off_while_the_track_still_lacks_a_tracker() {
+    assert_eq!(
+        tracking_retry_delay(false, true, 0),
+        Some(Duration::from_secs(2))
+    );
+    assert_eq!(
+        tracking_retry_delay(false, true, 1),
+        Some(Duration::from_secs(4))
+    );
+    assert_eq!(tracking_retry_delay(false, true, 2), None);
+}
+
+#[test]
+fn tracking_does_not_retry_once_resolved_or_irrelevant() {
+    assert_eq!(tracking_retry_delay(true, true, 0), None);
+    assert_eq!(tracking_retry_delay(false, false, 0), None);
 }
 
 #[test]

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use anyhow::{Context, anyhow, bail};
 use pbkdf2::pbkdf2_hmac;
-use rusqlite::Connection as SqliteConnection;
+use rusqlite::{Connection as SqliteConnection, OpenFlags};
 use sha1::Sha1;
 use zbus::{
     blocking::{Connection as ZbusConnection, Proxy as ZbusProxy},
@@ -42,7 +42,13 @@ pub fn store_cookie(cookie: &str) -> Result<(), SecretStoreError> {
 }
 
 pub fn get_cookie() -> Option<String> {
-    get_secret(KEYRING_USER).ok().flatten()
+    match get_secret(KEYRING_USER) {
+        Ok(cookie) => cookie,
+        Err(err) => {
+            crate::app_log!("[AUTH] failed to read saved cookie: {err}");
+            None
+        }
+    }
 }
 
 pub fn delete_cookie() {
@@ -438,19 +444,25 @@ pub fn candidate_chromium_cookie_paths() -> Vec<PathBuf> {
     candidates
 }
 
-pub fn newest_existing_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+pub fn existing_chromium_cookie_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+    paths.sort_by(|left, right| {
+        let left_modified = std::fs::metadata(left)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let right_modified = std::fs::metadata(right)
+            .and_then(|meta| meta.modified())
+            .ok();
+        right_modified
+            .cmp(&left_modified)
+            .then_with(|| left.cmp(right))
+    });
     paths
-        .into_iter()
-        .filter(|path| path.is_file())
-        .max_by_key(|path| {
-            std::fs::metadata(path)
-                .and_then(|meta| meta.modified())
-                .ok()
-        })
 }
 
-pub fn chromium_safe_storage_password() -> anyhow::Result<String> {
+fn chromium_safe_storage_passwords() -> anyhow::Result<Vec<String>> {
     let connection = ZbusConnection::session().context("Failed to open session bus")?;
+    let mut passwords = Vec::new();
 
     for schema in [
         "chrome_libsecret_os_crypt_password_v2",
@@ -520,14 +532,20 @@ pub fn chromium_safe_storage_password() -> anyhow::Result<String> {
                 &(vec![object_path.clone()], session),
             )?;
             let reply: HashMap<OwnedObjectPath, SecretResponse> = secrets.body().deserialize()?;
-            if let Some(secret) = reply.get(&object_path).map(|entry| &entry.2) {
-                return String::from_utf8(secret.clone())
-                    .context("Invalid Chromium secret encoding");
+            if let Some(secret) = reply.get(&object_path).map(|entry| &entry.2)
+                && let Ok(password) = String::from_utf8(secret.clone())
+                && !passwords.contains(&password)
+            {
+                passwords.push(password);
             }
         }
     }
 
-    Err(anyhow::anyhow!("No Chromium safe-storage secret found"))
+    if passwords.is_empty() {
+        Err(anyhow!("No Chromium safe-storage secret found"))
+    } else {
+        Ok(passwords)
+    }
 }
 
 pub fn chromium_cookie_key(password: &str) -> [u8; 16] {
@@ -574,71 +592,215 @@ pub fn decrypt_chromium_cookie(
     None
 }
 
-pub fn load_cookie_from_chromium_profile(settings: &AppSettings) -> anyhow::Result<Option<String>> {
-    let db_path = if settings.chromium_cookie_path.trim().is_empty() {
-        match newest_existing_path(candidate_chromium_cookie_paths()) {
-            Some(path) => path,
-            None => return Ok(None),
+fn chromium_cookie_keys() -> Vec<[u8; 16]> {
+    let mut passwords = match chromium_safe_storage_passwords() {
+        Ok(passwords) => passwords,
+        Err(err) => {
+            crate::app_log!("[AUTH] Chromium safe-storage keys unavailable: {err}");
+            Vec::new()
         }
+    };
+    passwords.push("peanuts".to_string());
+    passwords.push(String::new());
+
+    let mut seen = std::collections::HashSet::new();
+    passwords
+        .into_iter()
+        .map(|password| chromium_cookie_key(&password))
+        .filter(|key| seen.insert(*key))
+        .collect()
+}
+
+fn load_cookie_from_chromium_db(
+    db_path: &Path,
+    keys: &[[u8; 16]],
+) -> anyhow::Result<Option<String>> {
+    let conn = SqliteConnection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open Chromium cookie DB {}", db_path.display()))?;
+    let mut stmt = conn.prepare(
+        "SELECT host_key, name, value, CAST(encrypted_value AS BLOB)
+         FROM cookies
+         WHERE host_key LIKE '%youtube.com%'
+         ORDER BY CASE WHEN host_key LIKE '%music.youtube.com%' THEN 0 ELSE 1 END, host_key DESC, name ASC",
+    )?;
+
+    let mut rows = stmt.query([])?;
+    let mut seen = std::collections::HashSet::new();
+    let mut cookie_pairs = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        let value: String = row.get(2)?;
+        let encrypted_value: Vec<u8> = row.get(3)?;
+        let Some(decrypted) = decrypt_chromium_cookie(value, encrypted_value, keys) else {
+            continue;
+        };
+        if decrypted.is_empty() || !seen.insert(name.clone()) {
+            continue;
+        }
+        cookie_pairs.push((name, decrypted));
+    }
+
+    if cookie_pairs.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        cookie_pairs
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    ))
+}
+
+fn load_cookies_from_chromium_paths(
+    paths: impl IntoIterator<Item = PathBuf>,
+    keys: &[[u8; 16]],
+) -> anyhow::Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut cookies = Vec::new();
+    let mut errors = Vec::new();
+
+    for path in paths {
+        match load_cookie_from_chromium_db(&path, keys) {
+            Ok(Some(cookie)) if seen.insert(cookie.clone()) => cookies.push(cookie),
+            Ok(_) => {}
+            Err(err) => {
+                crate::app_log!(
+                    "[AUTH] skipped Chromium cookie profile {}: {err}",
+                    path.display()
+                );
+                errors.push(format!("{}: {err}", path.display()));
+            }
+        }
+    }
+
+    if cookies.is_empty() && !errors.is_empty() {
+        bail!(
+            "No Chromium cookie profile could be read ({})",
+            errors.join("; ")
+        );
+    }
+
+    Ok(cookies)
+}
+
+pub fn load_cookies_from_chromium_profiles(settings: &AppSettings) -> anyhow::Result<Vec<String>> {
+    let paths = if settings.chromium_cookie_path.trim().is_empty() {
+        existing_chromium_cookie_paths(candidate_chromium_cookie_paths())
     } else {
         let path = PathBuf::from(settings.chromium_cookie_path.trim());
         if !path.is_file() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        path
+        vec![path]
     };
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
 
-    let temp_db =
-        std::env::temp_dir().join(format!("static-edge-cookies-{}.db", uuid::Uuid::new_v4()));
-    std::fs::copy(&db_path, &temp_db)
-        .with_context(|| format!("Failed to copy Edge cookie DB from {}", db_path.display()))?;
+    load_cookies_from_chromium_paths(paths, &chromium_cookie_keys())
+}
 
-    let result = (|| -> anyhow::Result<Option<String>> {
-        let password = chromium_safe_storage_password()?;
-        let keys = [
-            chromium_cookie_key(&password),
-            chromium_cookie_key("peanuts"),
-            chromium_cookie_key(""),
-        ];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes::cipher::BlockEncryptMut;
+    use std::time::Duration;
 
-        let conn = SqliteConnection::open(&temp_db)?;
-        let mut stmt = conn.prepare(
-            "SELECT host_key, name, value, CAST(encrypted_value AS BLOB)
-             FROM cookies
-             WHERE host_key LIKE '%youtube.com%'
-             ORDER BY CASE WHEN host_key LIKE '%music.youtube.com%' THEN 0 ELSE 1 END, host_key DESC, name ASC",
-        )?;
+    type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
 
-        let mut rows = stmt.query([])?;
-        let mut seen = std::collections::HashSet::new();
-        let mut cookie_pairs = Vec::new();
+    struct TestDir(PathBuf);
 
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            let value: String = row.get(2)?;
-            let encrypted_value: Vec<u8> = row.get(3)?;
-            let Some(decrypted) = decrypt_chromium_cookie(value, encrypted_value, &keys) else {
-                continue;
-            };
-            if decrypted.is_empty() || !seen.insert(name.clone()) {
-                continue;
-            }
-            cookie_pairs.push((name, decrypted));
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "static-session-network-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
         }
+    }
 
-        if cookie_pairs.is_empty() {
-            return Ok(None);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
 
-        Ok(Some(
-            cookie_pairs
-                .into_iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("; "),
-        ))
-    })();
+    fn create_cookie_db(path: &Path, cookie_value: &str) {
+        let conn = SqliteConnection::open(path).expect("create cookie database");
+        conn.execute_batch(
+            "CREATE TABLE cookies (
+                host_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                encrypted_value BLOB NOT NULL
+            );",
+        )
+        .expect("create cookies table");
+        conn.execute(
+            "INSERT INTO cookies (host_key, name, value, encrypted_value)
+             VALUES ('.youtube.com', 'SAPISID', ?1, X'')",
+            [cookie_value],
+        )
+        .expect("insert cookie");
+    }
 
-    let _ = std::fs::remove_file(&temp_db);
-    result
+    #[test]
+    fn existing_cookie_paths_keep_every_profile_newest_first() {
+        let dir = TestDir::new();
+        let older = dir.0.join("older");
+        let newer = dir.0.join("newer");
+        std::fs::write(&older, b"older").expect("write older file");
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&newer, b"newer").expect("write newer file");
+
+        assert_eq!(
+            existing_chromium_cookie_paths([older.clone(), newer.clone()]),
+            vec![newer, older]
+        );
+    }
+
+    #[test]
+    fn chromium_cookie_decryption_tries_every_key() {
+        let correct_key = chromium_cookie_key("edge secret");
+        let wrong_key = chromium_cookie_key("chrome secret");
+        let plaintext = b"session-cookie";
+        let cipher = Aes128CbcEnc::new(&correct_key.into(), &[b' '; 16].into());
+        let mut buffer = plaintext.to_vec();
+        buffer.resize(plaintext.len() + 16, 0);
+        let encrypted = cipher
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, plaintext.len())
+            .expect("encrypt test cookie");
+        let mut value = b"v11".to_vec();
+        value.extend_from_slice(encrypted);
+
+        assert_eq!(
+            decrypt_chromium_cookie(String::new(), value, &[wrong_key, correct_key]),
+            Some("session-cookie".to_string())
+        );
+    }
+
+    #[test]
+    fn chromium_cookie_loading_keeps_candidates_from_multiple_profiles() {
+        let dir = TestDir::new();
+        let chrome = dir.0.join("chrome-cookies");
+        let edge = dir.0.join("edge-cookies");
+        create_cookie_db(&chrome, "chrome-session");
+        create_cookie_db(&edge, "edge-session");
+
+        assert_eq!(
+            load_cookies_from_chromium_paths([chrome, edge], &[]).expect("load profiles"),
+            vec![
+                "SAPISID=chrome-session".to_string(),
+                "SAPISID=edge-session".to_string()
+            ]
+        );
+    }
 }

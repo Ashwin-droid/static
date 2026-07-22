@@ -2401,21 +2401,35 @@ pub fn update_auth(app: &mut App, msg: AuthMsg) -> Task<Message> {
                             .to_string(),
                     );
                 }
-                stage_restored_client(app, client)
+                let store = app::blocking(
+                    move || {
+                        if let Some(cookie) = cookie
+                            && let Err(err) = crate::network::store_cookie(&cookie)
+                        {
+                            crate::app_log!("[AUTH] failed to store Chromium cookie: {err}");
+                        }
+                    },
+                    |_| Message::Noop,
+                );
+                Task::batch([store, stage_restored_client(app, client)])
             }
             Some(RestoreOutcome::Rejected) => {
+                let status = "Chromium cookies were rejected by YouTube Music. Sign in again or choose the active browser profile.";
+                app.settings_page.status = Some(status.to_string());
                 if manual {
-                    app.settings_page.status =
-                        Some("Chromium cookie was rejected by YouTube Music.".to_string());
+                    Task::none()
+                } else {
+                    app.show_toast("YouTube Music session expired — check Settings")
                 }
-                Task::none()
             }
             None => {
+                let status = "No usable YouTube Music cookies found. Sign in with a Chromium browser or set its cookie path.";
+                app.settings_page.status = Some(status.to_string());
                 if manual {
-                    app.settings_page.status =
-                        Some("No YouTube Music cookies found in the Chromium profile.".to_string());
+                    Task::none()
+                } else {
+                    app.show_toast("YouTube Music session unavailable — check Settings")
                 }
-                Task::none()
             }
         },
     }
@@ -2486,15 +2500,21 @@ fn chromium_restore_task(app: &App, manual: bool) -> Task<Message> {
     }
     let settings = app.settings.clone();
     app::blocking(
-        move || match crate::network::load_cookie_from_chromium_profile(&settings) {
-            Ok(Some(cookie)) => {
-                let outcome = restore_outcome(NetworkState::validate_cookie(
-                    cookie.clone(),
-                    "Chromium cookie auto-sync",
-                ));
-                (Some(outcome), Some(cookie))
+        move || match crate::network::load_cookies_from_chromium_profiles(&settings) {
+            Ok(cookies) => {
+                let candidate_count = cookies.len();
+                let restored = restore_chromium_candidates(cookies);
+                match &restored.0 {
+                    None => {
+                        crate::app_log!("[AUTH] Chromium cookie auto-sync found no usable cookies")
+                    }
+                    Some(RestoreOutcome::Rejected) => crate::app_log!(
+                        "[AUTH] Chromium cookie auto-sync rejected all {candidate_count} candidates"
+                    ),
+                    _ => {}
+                }
+                restored
             }
-            Ok(None) => (None, None),
             Err(err) => {
                 crate::app_log!("[AUTH] Chromium cookie auto-sync failed: {err}");
                 (None, None)
@@ -2508,6 +2528,24 @@ fn chromium_restore_task(app: &App, manual: bool) -> Task<Message> {
             })
         },
     )
+}
+
+fn restore_chromium_candidates(cookies: Vec<String>) -> (Option<RestoreOutcome>, Option<String>) {
+    let mut rejected = false;
+    for (index, cookie) in cookies.into_iter().enumerate() {
+        let source = format!("Chromium cookie auto-sync candidate {}", index + 1);
+        match restore_outcome(NetworkState::validate_cookie(cookie.clone(), &source)) {
+            RestoreOutcome::Authenticated(client) => {
+                return (Some(RestoreOutcome::Authenticated(client)), Some(cookie));
+            }
+            RestoreOutcome::Deferred(client) => {
+                return (Some(RestoreOutcome::Deferred(client)), Some(cookie));
+            }
+            RestoreOutcome::Rejected => rejected = true,
+        }
+    }
+
+    (rejected.then_some(RestoreOutcome::Rejected), None)
 }
 
 fn restore_outcome(outcome: NetworkValidationOutcome) -> RestoreOutcome {

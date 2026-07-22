@@ -14,7 +14,7 @@ use crate::models::{Artist, CrossDeviceQueue, HomeItem, SearchResult, Track};
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, download_media_bytes,
     extract_video_id_from_input, fetch_thumbnail_bytes, get_cookie, get_storage_root,
-    load_cookie_from_chromium_profile, sanitize_categories, store_cookie,
+    load_cookies_from_chromium_profiles, sanitize_categories, store_cookie,
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{
@@ -976,16 +976,19 @@ fn bootstrap_headless_saved_session_inner() {
         return;
     }
 
-    let chromium_cookie = match load_cookie_from_chromium_profile(&settings) {
-        Ok(Some(cookie)) if !cookie.trim().is_empty() => cookie,
-        Ok(_) | Err(_) => return,
+    let chromium_cookies = match load_cookies_from_chromium_profiles(&settings) {
+        Ok(cookies) => cookies,
+        Err(_) => return,
     };
 
-    match NetworkState::validate_cookie(chromium_cookie.clone(), "Chromium cookie auto-sync") {
-        NetworkValidationOutcome::Authenticated(_) | NetworkValidationOutcome::Deferred(_) => {
-            let _ = store_cookie(&chromium_cookie);
+    for cookie in chromium_cookies {
+        match NetworkState::validate_cookie(cookie.clone(), "Chromium cookie auto-sync") {
+            NetworkValidationOutcome::Authenticated(_) | NetworkValidationOutcome::Deferred(_) => {
+                let _ = store_cookie(&cookie);
+                return;
+            }
+            NetworkValidationOutcome::Rejected => {}
         }
-        NetworkValidationOutcome::Rejected => {}
     }
 }
 

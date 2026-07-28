@@ -11,15 +11,16 @@ use super::{
     pause_request_already_satisfied, pending_mpris_transport_decision,
     pending_playback_start_is_ready, pipewire_unduck_can_replace_volume_ramp,
     playback_position_confirms_start, playback_start_stalled, prefetch_candidate_indices,
-    previous_action, previous_action_position_millis_for_track, radio_chips_with_replacement,
-    rearm_track_repeat_loops_for_snapshot, remove_cached_if_unwanted_after_playlist_sync,
-    resolve_pending_playback_index, resolve_pipewire_suppression_mode,
-    should_count_paused_idle_for_shutdown, should_desync_playback_start,
-    should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
-    should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
-    should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-    should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
-    tracking_retry_delay, volume_ramp_is_complete,
+    previous_action, previous_action_position_millis_for_track, promote_untouched_pick,
+    radio_chips_with_replacement, radio_pick_weights, rearm_track_repeat_loops_for_snapshot,
+    remove_cached_if_unwanted_after_playlist_sync, resolve_pending_playback_index,
+    resolve_pipewire_suppression_mode, restore_order, should_count_paused_idle_for_shutdown,
+    should_desync_playback_start, should_emit_live_mpris_seeked_hint,
+    should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
+    should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
+    should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+    should_wait_for_radio_extension_at_natural_end, title_similarity, tracking_retry_delay,
+    volume_ramp_is_complete, weighted_index,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
@@ -1123,4 +1124,353 @@ fn live_mpris_seeked_hint_skips_intra_second_updates() {
         Some(1_050),
         Some(1_240)
     ));
+}
+
+fn video_ids(tracks: &[Track]) -> Vec<&str> {
+    tracks.iter().map(|track| track.video_id.as_str()).collect()
+}
+
+#[test]
+fn restore_order_rebuilds_pre_shuffle_order_and_appends_newcomers() {
+    let original = vec![
+        test_track("a"),
+        test_track("b"),
+        test_track("c"),
+        test_track("d"),
+    ];
+    // Shuffled remainder, one track played away ("a"), one newcomer appended ("x").
+    let shuffled = vec![
+        test_track("d"),
+        test_track("x"),
+        test_track("b"),
+        test_track("c"),
+    ];
+
+    let restored = restore_order(shuffled, &original);
+
+    assert_eq!(video_ids(&restored), vec!["b", "c", "d", "x"]);
+}
+
+#[test]
+fn restore_order_matches_duplicates_positionally_and_stays_stable() {
+    let original = vec![test_track("a"), test_track("b"), test_track("a")];
+    let shuffled = vec![test_track("a"), test_track("a"), test_track("b")];
+
+    let restored = restore_order(shuffled, &original);
+
+    assert_eq!(video_ids(&restored), vec!["a", "b", "a"]);
+}
+
+fn test_track_by(video_id: &str, title: &str, artist: &str) -> Track {
+    let mut track = test_track(video_id);
+    track.title = title.to_string();
+    track.artists = vec![Artist {
+        name: artist.to_string(),
+        id: None,
+    }];
+    track
+}
+
+#[test]
+fn radio_shuffle_pick_promotes_untouched_track_to_target() {
+    let mut queue = vec![
+        test_track("a"),
+        test_track("b"),
+        test_track("c"),
+        test_track("d"),
+        test_track("e"),
+        test_track("f"),
+    ];
+
+    let moved = promote_untouched_pick(&mut queue, true, Some(2), 1, Some(2), |_, _| 2);
+
+    assert!(moved);
+    // History keeps true play order; the picked track lands at the advance
+    // target and the rest of the untouched tail keeps its stable order.
+    assert_eq!(video_ids(&queue), vec!["a", "b", "e", "c", "d", "f"]);
+}
+
+#[test]
+fn radio_shuffle_pick_draws_from_untouched_candidates_against_played_history() {
+    let mut queue = vec![
+        test_track("a"),
+        test_track("b"),
+        test_track("c"),
+        test_track("d"),
+        test_track("e"),
+    ];
+    let mut seen: Option<(Vec<String>, Vec<String>)> = None;
+
+    promote_untouched_pick(
+        &mut queue,
+        true,
+        Some(2),
+        1,
+        Some(2),
+        |candidates, history| {
+            seen = Some((
+                candidates
+                    .iter()
+                    .map(|track| track.video_id.clone())
+                    .collect(),
+                history.iter().map(|track| track.video_id.clone()).collect(),
+            ));
+            0
+        },
+    );
+
+    // The pick is drawn from exactly the untouched region [touched_len, queue.len())
+    // — newly appended radio suggestions are immediately eligible — against the
+    // played prefix in play order (current track last).
+    let (candidates, history) = seen.expect("pick closure must run");
+    assert_eq!(candidates, vec!["c", "d", "e"]);
+    assert_eq!(history, vec!["a", "b"]);
+}
+
+#[test]
+fn radio_shuffle_pick_leaves_touched_prefix_targets_alone() {
+    let mut queue = vec![test_track("a"), test_track("b"), test_track("c")];
+    let before = video_ids(&queue)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    // Repeat-All prefix loops, repeat-One, and forward through replayed history
+    // land inside the touched prefix and pass through untouched.
+    let moved = promote_untouched_pick(&mut queue, true, Some(2), 0, Some(1), |_, _| {
+        unreachable!("touched-prefix targets must not draw a pick")
+    });
+
+    assert!(!moved);
+    assert_eq!(video_ids(&queue), before);
+}
+
+#[test]
+fn radio_shuffle_pick_passes_playlist_queues_and_disabled_shuffle_through() {
+    let mut queue = vec![test_track("a"), test_track("b"), test_track("c")];
+
+    // Playlist queues (no radio touched length) never pick.
+    assert!(!promote_untouched_pick(
+        &mut queue,
+        true,
+        None,
+        0,
+        Some(1),
+        |_, _| { unreachable!("playlist queues must not draw a pick") }
+    ));
+    // Shuffle off never picks.
+    assert!(!promote_untouched_pick(
+        &mut queue,
+        false,
+        Some(1),
+        0,
+        Some(1),
+        |_, _| { unreachable!("disabled shuffle must not draw a pick") }
+    ));
+    // A target beyond the queue never picks.
+    assert!(!promote_untouched_pick(
+        &mut queue,
+        true,
+        Some(1),
+        0,
+        Some(3),
+        |_, _| { unreachable!("out-of-range targets must not draw a pick") }
+    ));
+    // No advance target never picks.
+    assert!(!promote_untouched_pick(
+        &mut queue,
+        true,
+        Some(1),
+        0,
+        None,
+        |_, _| { unreachable!("a stopped advance must not draw a pick") }
+    ));
+    assert_eq!(video_ids(&queue), vec!["a", "b", "c"]);
+}
+
+#[test]
+fn title_similarity_treats_release_variants_as_the_same_song() {
+    fn track(title: &str, artist: &str) -> Track {
+        test_track_by(&format!("id-{title}-{artist}"), title, artist)
+    }
+
+    let original = track("UNETHICAL", "Faouzia");
+    // Real YouTube diversity: uploader-prefixed covers, lyrics videos, orchestral
+    // uploads — the original artist rides in the TITLE while the uploader holds the
+    // credit.
+    assert_eq!(
+        title_similarity(
+            &original,
+            &track("Faouzia - Unethical (MAPHRA Vocal Cover)", "MAPHRA")
+        ),
+        1.0
+    );
+    assert_eq!(
+        title_similarity(
+            &original,
+            &track("Faouzia - UNETHICAL (Lyrics)", "Addicted Lyrics")
+        ),
+        1.0
+    );
+    assert_eq!(
+        title_similarity(
+            &original,
+            &track(
+                "Faouzia – UNETHICAL | Emotional Cinematic Orchestra Version",
+                "Orchestra Infinity"
+            )
+        ),
+        1.0
+    );
+    // Plain release variants without artist prefixes.
+    assert_eq!(
+        title_similarity(&track("Aurora", "X"), &track("Aurora - Remix", "Y")),
+        1.0
+    );
+    assert_eq!(
+        title_similarity(&track("Aurora", "X"), &track("Aurora (Nightcore)", "Y")),
+        1.0
+    );
+    // Same title, genuinely different songs: intentional collision — spacing them
+    // is cheap.
+    assert_eq!(
+        title_similarity(
+            &track("RUNWAY", "Blaq Tuxedo"),
+            &track("runway", "Slowdrift")
+        ),
+        1.0
+    );
+    // Near-miss titles and unrelated titles do not repel.
+    assert_eq!(
+        title_similarity(&track("Runaway", "AURORA"), &track("Runway", "milet")),
+        0.0
+    );
+    assert!(
+        title_similarity(
+            &track("Aurora", "X"),
+            &track("Completely Different Song", "Y")
+        ) < 0.2
+    );
+    assert_eq!(
+        title_similarity(&track("", "X"), &track("Aurora", "Y")),
+        0.0
+    );
+    // Instrument words are not descriptors: "Piano Man" must not fuse with
+    // "Rocket Man".
+    assert!(
+        title_similarity(
+            &track("Piano Man", "Billy Joel"),
+            &track("Rocket Man", "Elton John")
+        ) < 1.0
+    );
+}
+
+#[test]
+fn radio_pick_weights_repel_recent_creators_and_similar_titles() {
+    let history = vec![
+        test_track_by("h1", "Old Song", "Old Band"),
+        test_track_by("h2", "Aurora", "Nova"),
+    ];
+    let candidates = vec![
+        test_track_by("sameArtist", "Fresh Title", "Nova"),
+        test_track_by("sameTitle", "Aurora - Remix", "Someone Else"),
+        test_track_by("fresh", "Unrelated", "New Band"),
+    ];
+
+    let weights = radio_pick_weights(&candidates, &history);
+
+    // The fresh candidate must beat both repelled ones; all stay strictly pickable.
+    assert!(weights[2] > weights[0]);
+    assert!(weights[2] > weights[1]);
+    assert!(weights.iter().all(|weight| *weight > 0.0));
+
+    // A repulsion further back in history weighs less than one just played.
+    let reversed: Vec<Track> = history.iter().rev().cloned().collect();
+    let older_hit = radio_pick_weights(&candidates, &reversed);
+    assert!(older_hit[0] > weights[0]);
+}
+
+#[test]
+fn history_aware_repulsion_decays_per_song_of_age() {
+    fn track(id: &str, title: &str) -> Track {
+        test_track_by(id, title, &format!("artist-{id}"))
+    }
+
+    // History {a, b} (b just played), candidates {a remix, b remix, c}:
+    // c is untouched by repulsion, a's force decayed one step below b's.
+    let history = vec![track("a", "a"), track("b", "b")];
+    let candidates = vec![
+        track("ar", "a - remix"),
+        track("br", "b - remix"),
+        track("c", "c"),
+    ];
+    let weights = radio_pick_weights(&candidates, &history);
+    assert!(weights[2] > weights[0]);
+    assert!(weights[0] > weights[1]);
+    // One decay step of 0.05 on the title component (0.5 weight) = 0.025 exactly.
+    assert!((weights[0] - weights[1] - 0.025).abs() < 1e-9);
+
+    // Beyond the decay horizon, old plays exert no repulsion at all.
+    let fillers: Vec<Track> = (0..25)
+        .map(|index| track(&format!("f{index}"), &format!("filler {index}")))
+        .collect();
+    let mut ancient = vec![track("a", "a")];
+    ancient.extend(fillers.iter().cloned());
+    let candidate = vec![track("ar", "a - remix")];
+    let faded = radio_pick_weights(&candidate, &ancient);
+    let fresh = radio_pick_weights(&candidate, &fillers);
+    assert!((fresh[0] - faded[0]).abs() < 1e-9);
+}
+
+#[test]
+fn weighted_index_samples_proportionally_never_maximises() {
+    let weights = [1.0, 3.0];
+    assert_eq!(weighted_index(&weights, 0.0), 0);
+    assert_eq!(weighted_index(&weights, 0.24), 0);
+    // A low-weight candidate is still reachable — the roll decides, not the maximum.
+    assert_eq!(weighted_index(&weights, 0.26), 1);
+    assert_eq!(weighted_index(&weights, 0.999), 1);
+    assert_eq!(weighted_index(&[0.0, 0.0], 0.7), 1);
+}
+
+#[test]
+fn radio_shuffle_pick_with_live_rng_keeps_history_and_queue_membership() {
+    // The production picker (weighted sample over the untouched candidates) must
+    // never disturb the touched prefix and must keep the queue a permutation; the
+    // touched length itself is passed by value, so enabling shuffle and picking
+    // can never grow it — only the ordinary advance bookkeeping does.
+    let touched_len = 3;
+    for _ in 0..64 {
+        let mut queue: Vec<Track> = ["a", "b", "c", "d", "e", "f", "g"]
+            .iter()
+            .map(|id| test_track(id))
+            .collect();
+        let mut untouched: Vec<String> = queue[touched_len..]
+            .iter()
+            .map(|track| track.video_id.clone())
+            .collect();
+
+        promote_untouched_pick(
+            &mut queue,
+            true,
+            Some(touched_len),
+            touched_len - 1,
+            Some(touched_len),
+            |candidates, history| {
+                use rand::RngExt;
+                let weights = radio_pick_weights(candidates, history);
+                weighted_index(&weights, rand::rng().random::<f64>())
+            },
+        );
+
+        assert_eq!(video_ids(&queue[..touched_len]), vec!["a", "b", "c"]);
+        assert!(untouched.contains(&queue[touched_len].video_id));
+        let mut remaining: Vec<String> = queue[touched_len..]
+            .iter()
+            .map(|track| track.video_id.clone())
+            .collect();
+        remaining.sort();
+        untouched.sort();
+        assert_eq!(remaining, untouched);
+    }
 }

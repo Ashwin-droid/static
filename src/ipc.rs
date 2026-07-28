@@ -64,6 +64,8 @@ pub struct PlaybackSnapshot {
     pub repeat_mode: RepeatMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track_repeat_loops_left: Option<u32>,
+    #[serde(default)]
+    pub shuffle: bool,
     pub paused: bool,
     pub volume: f64,
     pub position_millis: Option<u64>,
@@ -181,6 +183,7 @@ impl Default for PlaybackSnapshot {
             radio_virtual_playlist: None,
             repeat_mode: RepeatMode::Off,
             track_repeat_loops_left: None,
+            shuffle: false,
             paused: false,
             volume: 1.0,
             position_millis: None,
@@ -269,6 +272,9 @@ pub enum DaemonRequest {
     },
     SetRepeatMode {
         repeat_mode: RepeatMode,
+    },
+    SetShuffle {
+        enabled: bool,
     },
     ActivateRadioChip {
         chip_index: usize,
@@ -842,6 +848,10 @@ impl DaemonClient {
 
     pub fn set_repeat_mode(&self, repeat_mode: RepeatMode) -> Result<PlaybackSnapshot> {
         self.transport_request(DaemonRequest::SetRepeatMode { repeat_mode })
+    }
+
+    pub fn set_shuffle(&self, enabled: bool) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::SetShuffle { enabled })
     }
 
     pub fn activate_radio_chip(&self, chip_index: usize) -> Result<PlaybackSnapshot> {

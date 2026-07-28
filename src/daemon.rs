@@ -239,6 +239,11 @@ struct DaemonState {
     radio_virtual_playlist: Option<RadioVirtualPlaylist>,
     repeat_mode: RepeatMode,
     track_repeat_loops_left: Option<u32>,
+    shuffle: bool,
+    /// Pre-shuffle queue order; set on shuffle-on for playlist queues, cleared on
+    /// shuffle-off and any genuine queue replacement. Daemon-session state only —
+    /// never persisted, so after a restart disabling just keeps the current order.
+    unshuffled_order: Option<Vec<Track>>,
     active_track: Option<ActiveTrack>,
     pending_playback_start: Option<PendingPlaybackStart>,
     probe_context: Option<ProbeRestoreState>,
@@ -880,6 +885,13 @@ impl DaemonMprisBridge {
 
         {
             let state = state.clone();
+            player.connect_set_shuffle(move |_, enabled| {
+                set_shuffle(&mut state.borrow_mut(), enabled);
+            });
+        }
+
+        {
+            let state = state.clone();
             player.connect_set_volume(move |_, volume| {
                 let mut state = state.borrow_mut();
                 set_logical_volume(&mut state, volume);
@@ -919,6 +931,7 @@ impl DaemonMprisBridge {
             RepeatMode::All => MprisLoopStatus::Playlist,
             RepeatMode::One => MprisLoopStatus::Track,
         };
+        let shuffle = snapshot.shuffle;
         let queue_len = effective_queue_len(
             snapshot.queue.len(),
             snapshot.repeat_mode,
@@ -946,6 +959,7 @@ impl DaemonMprisBridge {
         glib::spawn_future_local(async move {
             let _ = bridge.player.set_playback_status(playback_status).await;
             let _ = bridge.player.set_loop_status(loop_status).await;
+            let _ = bridge.player.set_shuffle(shuffle).await;
             let _ = bridge.player.set_can_go_next(can_go_next).await;
             let _ = bridge.player.set_can_go_previous(can_go_previous).await;
             let _ = bridge.player.set_can_seek(can_seek).await;
@@ -1017,6 +1031,8 @@ pub fn run() -> Result<()> {
         radio_virtual_playlist: None,
         repeat_mode: RepeatMode::Off,
         track_repeat_loops_left: None,
+        shuffle: false,
+        unshuffled_order: None,
         active_track: None,
         pending_playback_start: None,
         probe_context: None,
@@ -1505,6 +1521,7 @@ fn start_radio_from_seed(
     let (queue, radio_virtual_playlist) =
         radio_queue_from_seed(state, queue, seed_index, prefix_len)?;
     let index = index.min(queue.len().saturating_sub(1));
+    state.unshuffled_order = None;
 
     if play {
         pause_other_mpris_players(state);
@@ -1784,6 +1801,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.queue_index = index.min(state.queue.len().saturating_sub(1));
             state.playlist_context = playlist_context;
             state.radio_virtual_playlist = radio_virtual_playlist;
+            state.unshuffled_order = None;
             state.radio_append_in_flight = false;
             state.last_radio_append_anchor = None;
             state.pending_playback_start = None;
@@ -1955,6 +1973,11 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.repeat_mode = repeat_mode;
             reset_track_repeat_budget_for_current_track(state);
             sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
+        DaemonRequest::SetShuffle { enabled } => {
+            set_shuffle(state, enabled);
             maybe_persist_playback_state(state, true);
             DaemonResponse::State(state_snapshot(state))
         }
@@ -2146,6 +2169,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             state.queue_index = 0;
             state.radio_virtual_playlist = None;
             state.playlist_context = None;
+            state.unshuffled_order = None;
             state.radio_append_in_flight = false;
             state.last_radio_append_anchor = None;
             sync_mpris(state);
@@ -2418,7 +2442,14 @@ fn maintain_playback(state: &mut DaemonState) {
                 .as_ref()
                 .map(|radio| radio.touched_len),
         );
-        match natural_end_target_index(queue_len, state.queue_index, repeat_mode) {
+        // Radio-shuffle pick applies to natural advancement too; repeat-One and
+        // repeat-All prefix-loop targets fall inside the touched region and pass
+        // through untouched.
+        let target = promote_random_untouched_pick(
+            state,
+            natural_end_target_index(queue_len, state.queue_index, repeat_mode),
+        );
+        match target {
             Some(target) => {
                 let budget_mode = if repeat_mode == RepeatMode::One && target == state.queue_index {
                     TrackRepeatBudgetMode::PreserveCurrent
@@ -2491,6 +2522,7 @@ fn play_queue_at(
         stop_playback(state, false);
         return Ok(());
     }
+    invalidate_unshuffled_order_for_new_queue(state, &queue);
     state.queue = queue;
     state.queue_index = index.min(state.queue.len().saturating_sub(1));
     state.playlist_context = playlist_context;
@@ -2530,6 +2562,7 @@ fn play_queue_at_for_user_action(
         return Ok(());
     }
 
+    invalidate_unshuffled_order_for_new_queue(state, &queue);
     state.queue = queue;
     state.queue_index = index.min(state.queue.len().saturating_sub(1));
     state.playlist_context = playlist_context;
@@ -2706,7 +2739,11 @@ fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result
 }
 
 fn advance_queue_for_user_action(state: &mut DaemonState, forward: bool) -> Result<()> {
-    match queue_target_index(state, forward) {
+    let mut target = queue_target_index(state, forward);
+    if forward {
+        target = promote_random_untouched_pick(state, target);
+    }
+    match target {
         Some(index) => {
             pause_other_mpris_players(state);
             stage_play_index_after_desync(
@@ -2806,6 +2843,367 @@ fn should_wait_for_radio_extension_at_natural_end(
     radio_append_in_flight: bool,
 ) -> bool {
     radio_append_in_flight && has_radio_queue && queue_len > 0 && queue_index + 1 == queue_len
+}
+
+/// Two shuffle semantics, chosen by queue kind (a visible toggle must round-trip,
+/// unlike the one-way pre-submit shuffle the Play All buttons do):
+///
+/// - Playlist queues: classic eager shuffle of the unplayed tail, with the pre-shuffle
+///   order snapshotted so disabling actually unshuffles.
+/// - Radio queues: the order is never rearranged and `touched_len` stays put; instead
+///   each forward advance picks a *random* untouched track (see
+///   [`promote_random_untouched_pick`]). This composes with the endlessly expanding
+///   radio tail — new appends are immediately eligible — and disabling is trivially
+///   lossless.
+fn set_shuffle(state: &mut DaemonState, enabled: bool) {
+    if state.shuffle == enabled {
+        return;
+    }
+
+    if enabled && state.queue.len() > 1 && state.radio_virtual_playlist.is_none() {
+        state.unshuffled_order = Some(state.queue.clone());
+        let tail_start = state.queue_index.saturating_add(1).min(state.queue.len());
+        use rand::seq::SliceRandom;
+        state.queue[tail_start..].shuffle(&mut rand::rng());
+    }
+
+    if !enabled && let Some(original) = state.unshuffled_order.take() {
+        let tail_start = state.queue_index.saturating_add(1).min(state.queue.len());
+        if tail_start < state.queue.len() {
+            // History and the current track stay anchored; only the unplayed tail
+            // returns to its pre-shuffle relative order (mid-shuffle appends keep
+            // their spot at the end).
+            let tail = state.queue.split_off(tail_start);
+            state.queue.extend(restore_order(tail, &original));
+        }
+    }
+
+    state.shuffle = enabled;
+    // Defensive clamp only: the ordinary advance bookkeeping already marks the playing
+    // index touched, so this never grows `touched_len` in practice.
+    mark_radio_touched_through(state, state.queue_index);
+    state.last_radio_append_anchor = None;
+    prefetch_upcoming(state);
+    sync_mpris(state);
+}
+
+/// Reorders `tracks` to their relative order in `original` (matched by video id,
+/// duplicates positionally). Tracks absent from `original` — e.g. tracks queued while
+/// shuffled — keep their current relative order after all known tracks. Stable, so
+/// disabling shuffle restores the pre-shuffle listening order without inventing one
+/// for newcomers.
+fn restore_order(tracks: Vec<Track>, original: &[Track]) -> Vec<Track> {
+    let mut positions: HashMap<&str, VecDeque<usize>> = HashMap::new();
+    for (index, track) in original.iter().enumerate() {
+        positions
+            .entry(track.video_id.as_str())
+            .or_default()
+            .push_back(index);
+    }
+
+    let mut keyed: Vec<(usize, Track)> = tracks
+        .into_iter()
+        .map(|track| {
+            let position = positions
+                .get_mut(track.video_id.as_str())
+                .and_then(VecDeque::pop_front)
+                .unwrap_or(usize::MAX);
+            (position, track)
+        })
+        .collect();
+    keyed.sort_by_key(|(position, _)| *position);
+    keyed.into_iter().map(|(_, track)| track).collect()
+}
+
+// Radio-shuffle pick distribution: a floor keeps every candidate reachable so
+// low-probability candidates stay pickable. Recomputed at every advance from the
+// live history so listening stays fresh:
+//   0.5  creator repulsion — candidates by recently played artists are pushed down
+//   0.5  title repulsion   — "a", "a - remix", "a (nightcore)" variants of recent titles
+
+const RADIO_PICK_CREATOR_WEIGHT: f64 = 0.5;
+const RADIO_PICK_TITLE_WEIGHT: f64 = 0.5;
+
+/// History-aware repulsion decay: every song of distance from the latest played track
+/// weakens that track's repulsive force by this step (just-played = full force 1.0, one
+/// before = 0.95, ...). Forces reach zero after 1/decay songs, so scanning the last
+/// ceil(1/decay) history entries is exactly equivalent to scanning the entire history.
+const RADIO_PICK_REPULSION_DECAY: f64 = 0.05;
+
+/// Weight floor so no candidate is ever unpickable.
+const RADIO_PICK_MIN_WEIGHT: f64 = 0.02;
+
+/// Per-candidate categorical weights for the radio-shuffle pick. `history` is the
+/// played prefix in play order (current track last); every history track repels, with
+/// force decaying by [`RADIO_PICK_REPULSION_DECAY`] per song of age.
+fn radio_pick_weights(candidates: &[Track], history: &[Track]) -> Vec<f64> {
+    let horizon = (1.0 / RADIO_PICK_REPULSION_DECAY).ceil() as usize;
+    let recent = &history[history.len().saturating_sub(horizon)..];
+    candidates
+        .iter()
+        .map(|candidate| {
+            let candidate_artists = artist_keys(candidate);
+            let mut creator_penalty: f64 = 0.0;
+            let mut title_penalty: f64 = 0.0;
+            for (index, played) in recent.iter().enumerate() {
+                let force =
+                    (1.0 - RADIO_PICK_REPULSION_DECAY * (recent.len() - 1 - index) as f64).max(0.0);
+                if !candidate_artists.is_empty()
+                    && !candidate_artists.is_disjoint(&artist_keys(played))
+                {
+                    creator_penalty = creator_penalty.max(force);
+                }
+                title_penalty = title_penalty.max(force * title_similarity(candidate, played));
+            }
+            (RADIO_PICK_CREATOR_WEIGHT * (1.0 - creator_penalty)
+                + RADIO_PICK_TITLE_WEIGHT * (1.0 - title_penalty))
+                .max(RADIO_PICK_MIN_WEIGHT)
+        })
+        .collect()
+}
+
+/// Samples a categorical index from `weights` using `roll` in `[0, 1)` — always a
+/// sample, never a maximiser. A zero total falls back to a uniform pick.
+fn weighted_index(weights: &[f64], roll: f64) -> usize {
+    assert!(!weights.is_empty(), "Cannot sample from empty weights");
+    let total: f64 = weights.iter().sum();
+    if total <= 0.0 {
+        return ((roll * weights.len() as f64) as usize).min(weights.len() - 1);
+    }
+    let mut remaining = roll.clamp(0.0, 1.0 - 1e-12) * total;
+    for (index, weight) in weights.iter().enumerate() {
+        remaining -= weight;
+        if remaining < 0.0 {
+            return index;
+        }
+    }
+    weights.len() - 1
+}
+
+/// Similarity in `[0, 1]` tuned for release-variant detection across real YouTube
+/// titles ("UNETHICAL" vs "Faouzia - Unethical (MAPHRA Vocal Cover)"). Both titles
+/// are reduced to core tokens by stripping the union of BOTH tracks' artist-name
+/// tokens (uploader formats carry the original artist in the title while the
+/// uploader holds the credit — only the union removes the prefix) plus the
+/// [`DESCRIPTOR_TOKENS`] stoplist. Non-empty cores compare by containment (the
+/// smaller core fully inside the larger → 1.0) then Jaccard; a degenerate empty
+/// core falls back to base-title equality then raw-token Jaccard.
+fn title_similarity(a: &Track, b: &Track) -> f64 {
+    if a.title.trim().is_empty() || b.title.trim().is_empty() {
+        return 0.0;
+    }
+    let mut strip = artist_title_tokens(a);
+    strip.extend(artist_title_tokens(b));
+    let core = |title: &str| -> HashSet<String> {
+        title_tokens(title)
+            .into_iter()
+            .filter(|token| !strip.contains(token) && !DESCRIPTOR_TOKENS.contains(&token.as_str()))
+            .collect()
+    };
+    let core_a = core(&a.title);
+    let core_b = core(&b.title);
+    if !core_a.is_empty() && !core_b.is_empty() {
+        let shared = core_a.intersection(&core_b).count();
+        if shared == core_a.len().min(core_b.len()) {
+            return 1.0;
+        }
+        return shared as f64 / (core_a.len() + core_b.len() - shared) as f64;
+    }
+    let base_a = base_title(&a.title);
+    if !base_a.is_empty() && base_a == base_title(&b.title) {
+        return 1.0;
+    }
+    let tokens_a = title_tokens(&a.title);
+    let tokens_b = title_tokens(&b.title);
+    if tokens_a.is_empty() || tokens_b.is_empty() {
+        return 0.0;
+    }
+    let shared = tokens_a.intersection(&tokens_b).count() as f64;
+    shared / (tokens_a.len() as f64 + tokens_b.len() as f64 - shared)
+}
+
+fn artist_title_tokens(track: &Track) -> HashSet<String> {
+    track
+        .artists
+        .iter()
+        .flat_map(|artist| title_tokens(&artist.name))
+        .collect()
+}
+
+/// Production/upload descriptors that say how a recording was made or packaged,
+/// never which song it is. Instrument and genre words are deliberately absent —
+/// they appear in genuine song names ("Piano Man") and stripping them would fuse
+/// unrelated titles.
+const DESCRIPTOR_TOKENS: &[&str] = &[
+    "remix",
+    "mix",
+    "flip",
+    "mashup",
+    "bootleg",
+    "edit",
+    "extended",
+    "version",
+    "ver",
+    "cover",
+    "covered",
+    "karaoke",
+    "instrumental",
+    "acoustic",
+    "unplugged",
+    "live",
+    "performance",
+    "session",
+    "sessions",
+    "orchestral",
+    "orchestra",
+    "symphonic",
+    "cinematic",
+    "emotional",
+    "epic",
+    "nightcore",
+    "sped",
+    "slowed",
+    "reverb",
+    "8d",
+    "remaster",
+    "remastered",
+    "lyric",
+    "lyrics",
+    "lyrical",
+    "official",
+    "video",
+    "audio",
+    "music",
+    "mv",
+    "visualizer",
+    "visualiser",
+    "hq",
+    "hd",
+    "4k",
+    "8k",
+    "vocal",
+    "vocals",
+    "feat",
+    "ft",
+    "featuring",
+    "prod",
+    "by",
+];
+
+fn base_title(title: &str) -> String {
+    let lower = title.to_lowercase().trim().to_string();
+    let cut = [" - ", " – ", " — ", "(", "[", "|", " // ", " ~"]
+        .iter()
+        .filter_map(|delimiter| lower.find(delimiter).filter(|index| *index > 0))
+        .min()
+        .unwrap_or(lower.len());
+    lower[..cut]
+        .trim()
+        .trim_end_matches(['-', '~', '–'])
+        .to_string()
+}
+
+fn title_tokens(title: &str) -> HashSet<String> {
+    title
+        .to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn artist_keys(track: &Track) -> HashSet<String> {
+    track
+        .artists
+        .iter()
+        .filter_map(|artist| {
+            let name = artist.name.trim().to_lowercase();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Radio-shuffle pick core: when a forward advance target lands in the untouched
+/// region of a shuffled radio queue, move the candidate chosen by `pick_offset`
+/// (called with the untouched candidates `[touched_len, queue_len)` and the played
+/// history `[0, queue_index]`, returning an offset into the candidates) to the target
+/// position. Targets inside the touched prefix (repeat-All prefix loops, repeat-One,
+/// forward through replayed history) pass through untouched, as do playlist queues
+/// (`radio_touched_len` = None). Returns whether a track actually moved.
+fn promote_untouched_pick(
+    queue: &mut Vec<Track>,
+    shuffle: bool,
+    radio_touched_len: Option<usize>,
+    queue_index: usize,
+    target: Option<usize>,
+    pick_offset: impl FnOnce(&[Track], &[Track]) -> usize,
+) -> bool {
+    let Some(touched_len) = radio_touched_len else {
+        return false;
+    };
+    let Some(target) = target else {
+        return false;
+    };
+    if !shuffle || target < touched_len || target >= queue.len() {
+        return false;
+    }
+
+    let candidates = &queue[touched_len..];
+    let history = &queue[..queue_index.saturating_add(1).min(queue.len())];
+    let pick = touched_len + pick_offset(candidates, history);
+    if pick == target {
+        return false;
+    }
+    let track = queue.remove(pick);
+    queue.insert(target, track);
+    true
+}
+
+/// Radio-shuffle pick: promote a randomly sampled untouched track to the forward
+/// advance target (user Next and natural track end alike), then advance into it
+/// normally — `touched_len` grows only through the ordinary advance bookkeeping.
+/// The sample is categorical, not uniform and not a maximiser — [`radio_pick_weights`]
+/// recomputes the distribution at every advance (creator repulsion 0.5, similar-title
+/// repulsion 0.5) and every candidate keeps a floor probability. History keeps true
+/// play order and the upcoming list keeps its stable order. Returns the target
+/// unchanged.
+fn promote_random_untouched_pick(state: &mut DaemonState, target: Option<usize>) -> Option<usize> {
+    let moved = promote_untouched_pick(
+        &mut state.queue,
+        state.shuffle,
+        state
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.touched_len),
+        state.queue_index,
+        target,
+        |candidates, history| {
+            use rand::RngExt;
+            let weights = radio_pick_weights(candidates, history);
+            weighted_index(&weights, rand::rng().random::<f64>())
+        },
+    );
+    if moved {
+        // The tail composition changed; stale append bookkeeping must not block
+        // radio extension.
+        state.last_radio_append_anchor = None;
+    }
+    target
+}
+
+/// Queue-jump commands (queue row taps, resume restores) resubmit the live queue at a
+/// new index; only a genuinely different track-id sequence invalidates the unshuffle
+/// snapshot.
+fn invalidate_unshuffled_order_for_new_queue(state: &mut DaemonState, queue: &[Track]) {
+    let same_queue = state.queue.len() == queue.len()
+        && state
+            .queue
+            .iter()
+            .zip(queue)
+            .all(|(current, incoming)| current.video_id == incoming.video_id);
+    if !same_queue {
+        state.unshuffled_order = None;
+    }
 }
 
 fn hide_timing_for_track(track: &ActiveTrack) -> bool {
@@ -4440,6 +4838,11 @@ fn spawn_playback_tracking(state: &mut DaemonState, video_id: String, attempt: u
     });
 }
 
+/// Radio tails top up once this few upcoming tracks remain (was: only on the very
+/// last track) so the weighted shuffle always has a pool to sample from and gapless
+/// advancement never races the fetch.
+const RADIO_EXTEND_MIN_UPCOMING: usize = 5;
+
 fn maybe_extend_radio_queue(state: &mut DaemonState) {
     if state.radio_append_in_flight
         || state.radio_virtual_playlist.is_none()
@@ -4449,8 +4852,11 @@ fn maybe_extend_radio_queue(state: &mut DaemonState) {
     }
 
     let Some(anchor_video_id) = ({
-        let idx = state.queue_index;
-        if state.queue.is_empty() || idx + 1 != state.queue.len() {
+        let upcoming = state
+            .queue
+            .len()
+            .saturating_sub(state.queue_index.saturating_add(1));
+        if state.queue.is_empty() || upcoming > RADIO_EXTEND_MIN_UPCOMING {
             None
         } else {
             state.queue.last().map(|track| track.video_id.clone())
@@ -4975,6 +5381,9 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         track_repeat_loops_left: state.track_repeat_loops_left,
+        // The shuffle flag and unshuffle snapshot are daemon-session state; a
+        // restored queue starts unshuffled and disabling keeps the current order.
+        shuffle: false,
         paused: state.probe_context.is_some()
             || (has_current_track(state) && is_logically_paused(state)),
         volume: logical_volume(state),
@@ -5023,6 +5432,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         radio_virtual_playlist: state.radio_virtual_playlist.clone(),
         repeat_mode: state.repeat_mode,
         track_repeat_loops_left: state.track_repeat_loops_left,
+        shuffle: state.shuffle,
         paused: is_logically_paused(state),
         volume: logical_volume(state),
         position_millis: (!hide_timing)

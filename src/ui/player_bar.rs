@@ -89,6 +89,7 @@ pub enum Msg {
     SeekReleased,
     VolumeChanged(f64),
     RepeatPressed,
+    ShufflePressed,
     LikePressed,
     DislikePressed,
     SharePressed,
@@ -393,6 +394,14 @@ fn controls_row(app: &App) -> Element<'_, Message> {
     .spacing(theme::SPACE_XS)
     .align_y(Alignment::Center);
 
+    let shuffle = np_icon_button(
+        icons::shuffle(),
+        18.0,
+        Some(pmsg(Msg::ShufflePressed)),
+        app.player.shuffle,
+        theme::SPACE_SM,
+    );
+
     let repeat_icon = match app.player.repeat_mode {
         RepeatMode::One => icons::repeat_one(),
         _ => icons::repeat(),
@@ -417,12 +426,13 @@ fn controls_row(app: &App) -> Element<'_, Message> {
                 bottom: 0.0,
                 left: theme::SPACE_LG,
             }),
-            container(repeat).padding(Padding {
+            container(shuffle).padding(Padding {
                 top: 0.0,
                 right: 0.0,
                 bottom: 0.0,
                 left: theme::SPACE_MD,
             }),
+            repeat,
         ]
         .spacing(0)
         .align_y(Alignment::Center)
@@ -852,6 +862,12 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             transport_command(app, false, move |daemon| daemon.set_repeat_mode(mode))
         }
 
+        Msg::ShufflePressed => {
+            let enabled = !app.player.shuffle;
+            app.player.shuffle = enabled;
+            transport_command(app, false, move |daemon| daemon.set_shuffle(enabled))
+        }
+
         Msg::LikePressed => {
             let next = if current_rating(app) == SongRating::Like {
                 SongRating::Indifferent
@@ -1277,6 +1293,7 @@ pub fn apply_remote_snapshot(app: &mut App, snapshot: PlaybackSnapshot) -> Task<
     }
 
     app.player.repeat_mode = snapshot.repeat_mode;
+    app.player.shuffle = snapshot.shuffle;
 
     match snapshot.current_track.as_ref() {
         Some(track) => {

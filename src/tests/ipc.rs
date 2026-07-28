@@ -44,6 +44,7 @@ fn persisted_playback_state_round_trips_through_database() {
         radio_virtual_playlist: None,
         repeat_mode: RepeatMode::All,
         track_repeat_loops_left: Some(3),
+        shuffle: false,
         paused: true,
         volume: 0.75,
         position_millis: Some(12_345),

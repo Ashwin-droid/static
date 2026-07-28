@@ -243,6 +243,7 @@ pub struct PlayerModel {
     pub radio_append_in_flight: bool,
     pub last_radio_append_anchor: Option<String>,
     pub repeat_mode: RepeatMode,
+    pub shuffle: bool,
 
     // Transport UI state.
     pub volume: f64,
@@ -280,6 +281,7 @@ impl PlayerModel {
             radio_append_in_flight: false,
             last_radio_append_anchor: None,
             repeat_mode: RepeatMode::Off,
+            shuffle: false,
             volume,
             is_seeking: false,
             seek_preview: None,

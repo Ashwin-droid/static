@@ -45,6 +45,7 @@ fn persisted_playback_state_round_trips_through_database() {
         repeat_mode: RepeatMode::All,
         track_repeat_loops_left: Some(3),
         shuffle: false,
+        up_next: None,
         paused: true,
         volume: 0.75,
         position_millis: Some(12_345),
@@ -247,6 +248,7 @@ fn old_snapshots_without_ducking_fields_still_deserialize() {
 
     assert!(!snapshot.ducked);
     assert!(!snapshot.pipewire_pause_active);
+    assert!(snapshot.up_next.is_none());
     assert!(snapshot.paused);
 }
 

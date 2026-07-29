@@ -69,6 +69,14 @@ const MPRIS_PENDING_POSITION_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
+/// Connectivity cache freshness for the offline radio-shuffle advance fallback.
+/// Desktop has no synchronous connectivity oracle (Android parity: the port asks
+/// ConnectivityManager at advance time), so a background TCP probe against the
+/// streaming endpoint refreshes a cached verdict every few seconds while a
+/// shuffled radio queue is playing; the advance path only ever reads the cache
+/// and never blocks on the network.
+const CONNECTIVITY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const CONNECTIVITY_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const UI_CLIENT_LEASE_TTL: Duration = Duration::from_secs(20);
 const DBUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const DBUS_SERVICE: &str = "org.freedesktop.DBus";
@@ -244,6 +252,20 @@ struct DaemonState {
     /// shuffle-off and any genuine queue replacement. Daemon-session state only —
     /// never persisted, so after a restart disabling just keeps the current order.
     unshuffled_order: Option<Vec<Track>>,
+    /// Pre-decided radio-shuffle pick (video id) for the NEXT forward advance,
+    /// decided when a track starts so the prefetch worker downloads it first and
+    /// the snapshot can advertise it as "Next up". Consumed (and cleared) by
+    /// [`promote_random_untouched_pick`]; re-decided/validated by
+    /// [`refresh_shuffle_up_next`] from [`prefetch_upcoming`], which every queue
+    /// mutation and track start already funnels through. Daemon-session state
+    /// only — never persisted (Android parity: PlaybackService.shuffleUpNextId).
+    shuffle_up_next: Option<String>,
+    /// Last connectivity probe verdict (see [`maybe_probe_connectivity`]),
+    /// optimistically `true` until a probe fails so the offline advance
+    /// restriction only engages on positive evidence of being offline.
+    online: bool,
+    last_connectivity_probe_at: Option<Instant>,
+    connectivity_probe_in_flight: bool,
     active_track: Option<ActiveTrack>,
     pending_playback_start: Option<PendingPlaybackStart>,
     probe_context: Option<ProbeRestoreState>,
@@ -634,6 +656,9 @@ enum BackgroundEvent {
     },
     PrefetchFinished {
         video_id: String,
+    },
+    ConnectivityProbeFinished {
+        online: bool,
     },
     SponsorSegmentsReady {
         video_id: String,
@@ -1033,6 +1058,10 @@ pub fn run() -> Result<()> {
         track_repeat_loops_left: None,
         shuffle: false,
         unshuffled_order: None,
+        shuffle_up_next: None,
+        online: true,
+        last_connectivity_probe_at: None,
+        connectivity_probe_in_flight: false,
         active_track: None,
         pending_playback_start: None,
         probe_context: None,
@@ -2252,6 +2281,10 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
         BackgroundEvent::PrefetchFinished { video_id } => {
             state.prefetch_in_flight.remove(&video_id);
         }
+        BackgroundEvent::ConnectivityProbeFinished { online } => {
+            state.connectivity_probe_in_flight = false;
+            state.online = online;
+        }
         BackgroundEvent::SponsorSegmentsReady { video_id, segments } => {
             if state
                 .active_track
@@ -2339,6 +2372,7 @@ fn maintain_playback(state: &mut DaemonState) {
     poll_pipewire_streams(state);
     maybe_unduck_for_pipewire(state);
     maybe_duck_for_pipewire(state);
+    maybe_probe_connectivity(state);
     advance_volume_ramp(state);
     if state.shutting_down.get() {
         return;
@@ -2445,10 +2479,21 @@ fn maintain_playback(state: &mut DaemonState) {
         // Radio-shuffle pick applies to natural advancement too; repeat-One and
         // repeat-All prefix-loop targets fall inside the touched region and pass
         // through untouched.
-        let target = promote_random_untouched_pick(
+        let target = match promote_random_untouched_pick(
             state,
             natural_end_target_index(queue_len, state.queue_index, repeat_mode),
-        );
+        ) {
+            Ok(target) => target,
+            Err(err) => {
+                // Offline with nothing cached: stopping is the only honest
+                // outcome for an unattended track end (the daemon has no push
+                // error channel; user-initiated Next surfaces the message
+                // through `DaemonResponse::Error`).
+                eprintln!("[DAEMON] cannot advance at track end: {err}");
+                stop_playback(state, false);
+                return;
+            }
+        };
         match target {
             Some(target) => {
                 let budget_mode = if repeat_mode == RepeatMode::One && target == state.queue_index {
@@ -2741,7 +2786,7 @@ fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result
 fn advance_queue_for_user_action(state: &mut DaemonState, forward: bool) -> Result<()> {
     let mut target = queue_target_index(state, forward);
     if forward {
-        target = promote_random_untouched_pick(state, target);
+        target = promote_random_untouched_pick(state, target)?;
     }
     match target {
         Some(index) => {
@@ -3159,36 +3204,178 @@ fn promote_untouched_pick(
     true
 }
 
-/// Radio-shuffle pick: promote a randomly sampled untouched track to the forward
-/// advance target (user Next and natural track end alike), then advance into it
-/// normally — `touched_len` grows only through the ordinary advance bookkeeping.
-/// The sample is categorical, not uniform and not a maximiser — [`radio_pick_weights`]
-/// recomputes the distribution at every advance (creator repulsion 0.5, similar-title
-/// repulsion 0.5) and every candidate keeps a floor probability. History keeps true
-/// play order and the upcoming list keeps its stable order. Returns the target
-/// unchanged.
-fn promote_random_untouched_pick(state: &mut DaemonState, target: Option<usize>) -> Option<usize> {
+/// Radio-shuffle pick: promote the pre-decided untouched track (see
+/// [`DaemonState::shuffle_up_next`]) to the forward advance target (user Next
+/// and natural track end alike), then advance into it normally — `touched_len`
+/// grows only through the ordinary advance bookkeeping. The sample is
+/// categorical, not uniform and not a maximiser — [`radio_pick_weights`]
+/// recomputes the distribution once per track (creator repulsion 0.5,
+/// similar-title repulsion 0.5, at decision time in
+/// [`refresh_shuffle_up_next`]) and every candidate keeps a floor probability.
+/// History keeps true play order and the upcoming list keeps its stable order.
+/// The consumed pick is cleared — the next track start re-decides it, keeping
+/// the per-advance "recalculated every time" semantics. Errs only when offline
+/// with nothing cached (see [`resolve_shuffle_advance_pick`]), leaving both the
+/// queue and the stored pick untouched. Returns the target unchanged.
+fn promote_random_untouched_pick(
+    state: &mut DaemonState,
+    target: Option<usize>,
+) -> Result<Option<usize>> {
+    let Some(touched_len) = state
+        .radio_virtual_playlist
+        .as_ref()
+        .map(|radio| radio.touched_len)
+    else {
+        return Ok(target);
+    };
+    let Some(target_index) = target else {
+        return Ok(target);
+    };
+    if !state.shuffle || target_index < touched_len || target_index >= state.queue.len() {
+        return Ok(target);
+    }
+
+    let offset = {
+        use rand::RngExt;
+        let candidates = &state.queue[touched_len..];
+        let history = &state.queue[..state.queue_index.saturating_add(1).min(state.queue.len())];
+        resolve_shuffle_advance_pick(
+            candidates,
+            history,
+            state.shuffle_up_next.as_deref(),
+            state.online,
+            |track| audio_is_cached(&state.cache, &track.video_id),
+            rand::rng().random::<f64>(),
+        )?
+    };
+    state.shuffle_up_next = None;
     let moved = promote_untouched_pick(
         &mut state.queue,
         state.shuffle,
-        state
-            .radio_virtual_playlist
-            .as_ref()
-            .map(|radio| radio.touched_len),
+        Some(touched_len),
         state.queue_index,
         target,
-        |candidates, history| {
-            use rand::RngExt;
-            let weights = radio_pick_weights(candidates, history);
-            weighted_index(&weights, rand::rng().random::<f64>())
-        },
+        |_, _| offset,
     );
     if moved {
         // The tail composition changed; stale append bookkeeping must not block
         // radio extension.
         state.last_radio_append_anchor = None;
     }
-    target
+    Ok(target)
+}
+
+/// Resolves the untouched-region offset a forward radio-shuffle advance
+/// promotes: the pre-decided pick when it is still among `candidates` (its
+/// prefetch has had the whole track to land), else a fresh weighted sample.
+/// Offline (and only offline), the sampleable pool shrinks to candidates whose
+/// audio is already cached — which normally includes the pre-decided pick
+/// itself. With nothing cached the advance fails loudly rather than starting a
+/// song that cannot stream.
+fn resolve_shuffle_advance_pick(
+    candidates: &[Track],
+    history: &[Track],
+    predecided_id: Option<&str>,
+    online: bool,
+    is_cached: impl Fn(&Track) -> bool,
+    roll: f64,
+) -> Result<usize> {
+    let predecided =
+        predecided_id.and_then(|id| candidates.iter().position(|track| track.video_id == id));
+    if online {
+        return Ok(predecided
+            .unwrap_or_else(|| weighted_index(&radio_pick_weights(candidates, history), roll)));
+    }
+    if let Some(offset) = predecided
+        && is_cached(&candidates[offset])
+    {
+        return Ok(offset);
+    }
+    let cached_mask: Vec<bool> = candidates.iter().map(&is_cached).collect();
+    cached_restricted_pick_offset(candidates, history, &cached_mask, roll)
+        .ok_or_else(|| anyhow!("You're offline and none of the upcoming songs are cached"))
+}
+
+/// Offline radio-shuffle fallback: the weighted sample restricted to candidates
+/// whose audio is already cached (`cached_mask` aligned with `candidates`).
+/// Weights are recomputed over the cached subset only, so repulsion still
+/// shapes the restricted distribution. Returns the offset within `candidates`,
+/// or None when nothing startable is cached — the caller's cue to fail loudly
+/// instead of picking a song that cannot play.
+fn cached_restricted_pick_offset(
+    candidates: &[Track],
+    history: &[Track],
+    cached_mask: &[bool],
+    roll: f64,
+) -> Option<usize> {
+    let positions: Vec<usize> = cached_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &cached)| cached.then_some(index))
+        .collect();
+    if positions.is_empty() {
+        return None;
+    }
+    let cached_candidates: Vec<Track> = positions
+        .iter()
+        .map(|&position| candidates[position].clone())
+        .collect();
+    let weights = radio_pick_weights(&cached_candidates, history);
+    Some(positions[weighted_index(&weights, roll)])
+}
+
+/// Whether `video_id` can start without the network: the permanent audio cache
+/// or the temp prefetch cache — the same stores [`prepare_playback`] checks
+/// before resolving a remote stream.
+fn audio_is_cached(cache: &MusicCache, video_id: &str) -> bool {
+    cache.is_cached(video_id) || cache.get_temp_audio(video_id).is_some()
+}
+
+/// Decides (or re-validates) the radio-shuffle pick for the NEXT advance. A
+/// still-valid pick is kept — its prefetch may already be underway — while an
+/// absent or invalidated one (consumed by an advance, removed from the queue,
+/// shuffle/radio turned off) is re-sampled from the current untouched region,
+/// keeping the per-track "recalculated every time" semantics of the original
+/// advance-time sample.
+fn refresh_shuffle_up_next(state: &mut DaemonState) {
+    use rand::RngExt;
+    state.shuffle_up_next = refresh_shuffle_up_next_id(
+        &state.queue,
+        state.shuffle,
+        state
+            .radio_virtual_playlist
+            .as_ref()
+            .map(|radio| radio.touched_len),
+        state.queue_index,
+        state.shuffle_up_next.take(),
+        rand::rng().random::<f64>(),
+    );
+}
+
+/// Pure core of [`refresh_shuffle_up_next`]: `current` survives while still in
+/// the untouched region `[touched_len, queue_len)`; otherwise `roll` samples a
+/// fresh pick from [`radio_pick_weights`] over the untouched candidates
+/// (history = the queue up to and including `queue_index`). Shuffle off, no
+/// radio, or an empty untouched region clear the pick.
+fn refresh_shuffle_up_next_id(
+    queue: &[Track],
+    shuffle: bool,
+    radio_touched_len: Option<usize>,
+    queue_index: usize,
+    current: Option<String>,
+    roll: f64,
+) -> Option<String> {
+    let touched_len =
+        radio_touched_len.filter(|&touched_len| shuffle && touched_len < queue.len())?;
+    let candidates = &queue[touched_len..];
+    if let Some(id) = current
+        && candidates.iter().any(|track| track.video_id == id)
+    {
+        return Some(id);
+    }
+    let history = &queue[..queue_index.saturating_add(1).min(queue.len())];
+    let weights = radio_pick_weights(candidates, history);
+    Some(candidates[weighted_index(&weights, roll)].video_id.clone())
 }
 
 /// Queue-jump commands (queue row taps, resume restores) resubmit the live queue at a
@@ -5203,22 +5390,74 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
     }
 }
 
+/// Keeps the cached connectivity verdict fresh while an offline-restricted
+/// radio-shuffle advance is possible (shuffled radio queue with a current
+/// track). The probe itself runs on a background thread; this hot-path hook
+/// only checks the throttle and reads/writes daemon state.
+fn maybe_probe_connectivity(state: &mut DaemonState) {
+    let relevant =
+        state.shuffle && state.radio_virtual_playlist.is_some() && has_current_track(state);
+    if !relevant
+        || state.connectivity_probe_in_flight
+        || state
+            .last_connectivity_probe_at
+            .is_some_and(|probed_at| probed_at.elapsed() < CONNECTIVITY_PROBE_INTERVAL)
+    {
+        return;
+    }
+
+    state.connectivity_probe_in_flight = true;
+    state.last_connectivity_probe_at = Some(Instant::now());
+    let background_tx = state.background_tx.clone();
+    std::thread::spawn(move || {
+        let online = probe_connectivity();
+        let _ = background_tx.send(BackgroundEvent::ConnectivityProbeFinished { online });
+    });
+}
+
+/// One short TCP handshake against the streaming endpoint. DNS resolution
+/// happens on this background thread too, so a dead resolver counts as offline
+/// instead of stalling anything.
+fn probe_connectivity() -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(addrs) = ("music.youtube.com", 443).to_socket_addrs() else {
+        return false;
+    };
+    // Two attempts bound the worst case; the timeout applies per handshake.
+    addrs
+        .take(2)
+        .any(|addr| TcpStream::connect_timeout(&addr, CONNECTIVITY_PROBE_TIMEOUT).is_ok())
+}
+
 fn prefetch_upcoming(state: &mut DaemonState) {
+    // Every queue mutation and track start funnels through here, so this is the
+    // single decision point for the pre-announced shuffle pick — decided BEFORE
+    // the prefetch-enabled gate (the pick also feeds the snapshot's "Next up"
+    // hint) and BEFORE the candidate list so its download always leads the batch.
+    refresh_shuffle_up_next(state);
     if !state.settings.prefetch_enabled {
         return;
     }
 
     let prefetch_ahead = state.settings.prefetch_ahead.clamp(1, 12) as usize;
-    let to_fetch = prefetch_candidate_indices(state.queue.len(), state.queue_index, prefetch_ahead)
-        .into_iter()
-        .filter_map(|index| state.queue.get(index))
-        .filter(|track| {
-            !state.cache.is_cached(&track.video_id)
-                && state.cache.get_temp_audio(&track.video_id).is_none()
-                && !state.prefetch_in_flight.contains(&track.video_id)
-        })
-        .map(|track| track.video_id.clone())
-        .collect::<Vec<_>>();
+    let up_next_index = state
+        .shuffle_up_next
+        .as_deref()
+        .and_then(|id| state.queue.iter().position(|track| track.video_id == id));
+    let to_fetch = prefetch_candidate_indices(
+        state.queue.len(),
+        state.queue_index,
+        prefetch_ahead,
+        up_next_index,
+    )
+    .into_iter()
+    .filter_map(|index| state.queue.get(index))
+    .filter(|track| {
+        !audio_is_cached(&state.cache, &track.video_id)
+            && !state.prefetch_in_flight.contains(&track.video_id)
+    })
+    .map(|track| track.video_id.clone())
+    .collect::<Vec<_>>();
 
     if to_fetch.is_empty() {
         return;
@@ -5261,7 +5500,7 @@ fn prefetch_upcoming(state: &mut DaemonState) {
         };
 
         for video_id in to_fetch {
-            if cache.is_cached(&video_id) || cache.get_temp_audio(&video_id).is_some() {
+            if audio_is_cached(&cache, &video_id) {
                 let _ = background_tx.send(BackgroundEvent::PrefetchFinished { video_id });
                 continue;
             }
@@ -5282,18 +5521,28 @@ fn prefetch_candidate_indices(
     queue_len: usize,
     queue_index: usize,
     prefetch_ahead: usize,
+    up_next_index: Option<usize>,
 ) -> Vec<usize> {
     if queue_len == 0 {
         return Vec::new();
     }
 
     let mut indices = Vec::new();
+    // The pre-decided radio-shuffle pick downloads first: it is the one song
+    // guaranteed to play next, and the offline advance fallback depends on it
+    // being cached by the time the current song ends. An out-of-range pick
+    // (stale after a queue mutation) is ignored, not crashed on.
+    if let Some(up_next) = up_next_index.filter(|&index| index < queue_len) {
+        indices.push(up_next);
+    }
     if queue_index > 0 {
         indices.push(queue_index - 1);
     }
 
     let start = queue_index.saturating_add(1);
     indices.extend(start..start.saturating_add(prefetch_ahead).min(queue_len));
+    let mut seen = HashSet::new();
+    indices.retain(|index| seen.insert(*index));
     indices
 }
 
@@ -5384,6 +5633,9 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         // The shuffle flag and unshuffle snapshot are daemon-session state; a
         // restored queue starts unshuffled and disabling keeps the current order.
         shuffle: false,
+        // The pre-decided pick is daemon-session state like the shuffle flag; a
+        // restored queue re-decides on its first track start.
+        up_next: None,
         paused: state.probe_context.is_some()
             || (has_current_track(state) && is_logically_paused(state)),
         volume: logical_volume(state),
@@ -5433,6 +5685,20 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         repeat_mode: state.repeat_mode,
         track_repeat_loops_left: state.track_repeat_loops_left,
         shuffle: state.shuffle,
+        // Repeat-One and radio prefix loops (repeat-All) never advance into the
+        // untouched region, so advertising the pick there would promise a song
+        // that won't play next.
+        up_next: state
+            .shuffle_up_next
+            .as_deref()
+            .filter(|_| state.repeat_mode == RepeatMode::Off)
+            .and_then(|id| {
+                state
+                    .queue
+                    .iter()
+                    .find(|track| track.video_id == id)
+                    .cloned()
+            }),
         paused: is_logically_paused(state),
         volume: logical_volume(state),
         position_millis: (!hide_timing)

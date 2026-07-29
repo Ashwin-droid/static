@@ -3,18 +3,19 @@ use super::{
     PLAYBACK_START_TIMEOUT, PREVIOUS_TRACK_THRESHOLD_MILLIS, PendingMprisTransportDecision,
     PendingMprisTransportIntent, PipeWireSuppressionMode, PlaybackSource, PlaybackStartMode,
     PlaybackTransition, PreviousAction, VolumeRamp, VolumeRampCompletion,
-    apply_radio_chips_from_refresh, cache_media_download_retry_delay, current_listened_millis,
-    dedupe_radio_recommendations, effective_queue_len, extend_radio_touched_for_insert,
-    has_reached_track_end, hide_timing_for_track, mpris_app_key_from_bus,
-    mpris_halt_auto_peer_transition, mpris_position_millis_for_track, natural_end_target_index,
-    next_repeat_state_after_natural_end, note_sponsorblock_auto_skip,
-    pause_request_already_satisfied, pending_mpris_transport_decision,
+    apply_radio_chips_from_refresh, cache_media_download_retry_delay,
+    cached_restricted_pick_offset, current_listened_millis, dedupe_radio_recommendations,
+    effective_queue_len, extend_radio_touched_for_insert, has_reached_track_end,
+    hide_timing_for_track, mpris_app_key_from_bus, mpris_halt_auto_peer_transition,
+    mpris_position_millis_for_track, natural_end_target_index, next_repeat_state_after_natural_end,
+    note_sponsorblock_auto_skip, pause_request_already_satisfied, pending_mpris_transport_decision,
     pending_playback_start_is_ready, pipewire_unduck_can_replace_volume_ramp,
     playback_position_confirms_start, playback_start_stalled, prefetch_candidate_indices,
     previous_action, previous_action_position_millis_for_track, promote_untouched_pick,
     radio_chips_with_replacement, radio_pick_weights, rearm_track_repeat_loops_for_snapshot,
-    remove_cached_if_unwanted_after_playlist_sync, resolve_pending_playback_index,
-    resolve_pipewire_suppression_mode, restore_order, should_count_paused_idle_for_shutdown,
+    refresh_shuffle_up_next_id, remove_cached_if_unwanted_after_playlist_sync,
+    resolve_pending_playback_index, resolve_pipewire_suppression_mode,
+    resolve_shuffle_advance_pick, restore_order, should_count_paused_idle_for_shutdown,
     should_desync_playback_start, should_emit_live_mpris_seeked_hint,
     should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
     should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
@@ -204,12 +205,33 @@ fn sponsorblock_skip_offset_records_each_segment_once() {
 
 #[test]
 fn prefetch_candidates_include_previous_before_upcoming() {
-    assert_eq!(prefetch_candidate_indices(6, 3, 2), vec![2, 4, 5]);
+    assert_eq!(prefetch_candidate_indices(6, 3, 2, None), vec![2, 4, 5]);
 }
 
 #[test]
 fn prefetch_candidates_do_not_wrap_before_queue_start() {
-    assert_eq!(prefetch_candidate_indices(3, 0, 2), vec![1, 2]);
+    assert_eq!(prefetch_candidate_indices(3, 0, 2, None), vec![1, 2]);
+}
+
+#[test]
+fn prefetch_candidates_lead_with_the_pre_decided_shuffle_pick() {
+    // The pick downloads first; previous and the queue-order look-ahead follow,
+    // deduped (Android parity: PlaybackLogic.prefetchCandidateIndices).
+    assert_eq!(
+        prefetch_candidate_indices(10, 3, 3, Some(8)),
+        vec![8, 2, 4, 5, 6]
+    );
+    assert_eq!(
+        prefetch_candidate_indices(10, 3, 3, Some(4)),
+        vec![4, 2, 5, 6]
+    );
+    // An out-of-range pick (stale after a queue mutation) is ignored, not
+    // crashed on.
+    assert_eq!(
+        prefetch_candidate_indices(10, 3, 3, Some(12)),
+        vec![2, 4, 5, 6]
+    );
+    assert_eq!(prefetch_candidate_indices(10, 3, 3, None), vec![2, 4, 5, 6]);
 }
 
 #[test]
@@ -1286,6 +1308,118 @@ fn radio_shuffle_pick_passes_playlist_queues_and_disabled_shuffle_through() {
         |_, _| { unreachable!("a stopped advance must not draw a pick") }
     ));
     assert_eq!(video_ids(&queue), vec!["a", "b", "c"]);
+}
+
+#[test]
+fn offline_pick_restricts_the_sample_to_cached_candidates() {
+    fn track(id: &str) -> Track {
+        test_track_by(id, &format!("t-{id}"), &format!("artist-{id}"))
+    }
+    let candidates = [track("a"), track("b"), track("c"), track("d")];
+    let history = [track("h")];
+
+    // Only cached positions are samplable, whatever the roll says.
+    let cached_mask = [false, true, false, true];
+    assert_eq!(
+        cached_restricted_pick_offset(&candidates, &history, &cached_mask, 0.0),
+        Some(1)
+    );
+    assert_eq!(
+        cached_restricted_pick_offset(&candidates, &history, &cached_mask, 0.999),
+        Some(3)
+    );
+    // Nothing cached -> None, the caller's cue to fail loudly instead of
+    // picking a song that cannot play.
+    assert_eq!(
+        cached_restricted_pick_offset(&candidates, &history, &[false; 4], 0.5),
+        None
+    );
+    // Single cached candidate always wins.
+    assert_eq!(
+        cached_restricted_pick_offset(&candidates, &history, &[false, false, true, false], 0.7),
+        Some(2)
+    );
+}
+
+#[test]
+fn advance_uses_the_stored_pick_and_falls_back_to_a_fresh_sample() {
+    fn track(id: &str) -> Track {
+        test_track_by(id, &format!("t-{id}"), &format!("artist-{id}"))
+    }
+    let candidates = [track("a"), track("b"), track("c")];
+    let history = [track("h")];
+
+    // Online, the pre-decided pick wins regardless of the roll (which would
+    // land on offset 0) — the advance consumes exactly what was announced.
+    let pick = resolve_shuffle_advance_pick(&candidates, &history, Some("c"), true, |_| false, 0.0);
+    assert_eq!(pick.unwrap(), 2);
+    // A vanished pick (removed from the queue) falls back to a fresh sample.
+    let pick =
+        resolve_shuffle_advance_pick(&candidates, &history, Some("zz"), true, |_| false, 0.0);
+    assert_eq!(pick.unwrap(), 0);
+    // Offline, a cached pre-decided pick is used directly...
+    let pick = resolve_shuffle_advance_pick(
+        &candidates,
+        &history,
+        Some("c"),
+        false,
+        |track| track.video_id == "c",
+        0.0,
+    );
+    assert_eq!(pick.unwrap(), 2);
+    // ...an uncached one falls back to the cached-restricted sample...
+    let pick = resolve_shuffle_advance_pick(
+        &candidates,
+        &history,
+        Some("c"),
+        false,
+        |track| track.video_id == "a",
+        0.9,
+    );
+    assert_eq!(pick.unwrap(), 0);
+    // ...and nothing cached fails loudly with the user-facing message.
+    let err = resolve_shuffle_advance_pick(&candidates, &history, Some("c"), false, |_| false, 0.5)
+        .unwrap_err();
+    assert!(err.to_string().contains("offline"));
+}
+
+#[test]
+fn next_track_start_redecides_the_consumed_pick_but_keeps_a_valid_one() {
+    let queue = vec![
+        test_track("a"),
+        test_track("b"),
+        test_track("c"),
+        test_track("d"),
+    ];
+
+    // Consumed by an advance (no stored pick) -> the next track start samples a
+    // fresh pick from the untouched region.
+    let picked = refresh_shuffle_up_next_id(&queue, true, Some(2), 1, None, 0.0)
+        .expect("untouched region must yield a pick");
+    assert!(queue[2..].iter().any(|track| track.video_id == picked));
+    // A still-valid pick is kept — its prefetch may already be underway.
+    assert_eq!(
+        refresh_shuffle_up_next_id(&queue, true, Some(2), 1, Some("d".to_owned()), 0.9),
+        Some("d".to_owned())
+    );
+    // A stale pick (no longer in the untouched region) is re-sampled, not kept.
+    assert_ne!(
+        refresh_shuffle_up_next_id(&queue, true, Some(2), 1, Some("a".to_owned()), 0.0),
+        Some("a".to_owned())
+    );
+    // Shuffle off, playlist queues, and an empty untouched region clear the pick.
+    assert_eq!(
+        refresh_shuffle_up_next_id(&queue, false, Some(2), 1, Some("d".to_owned()), 0.0),
+        None
+    );
+    assert_eq!(
+        refresh_shuffle_up_next_id(&queue, true, None, 1, Some("d".to_owned()), 0.0),
+        None
+    );
+    assert_eq!(
+        refresh_shuffle_up_next_id(&queue, true, Some(4), 1, Some("d".to_owned()), 0.0),
+        None
+    );
 }
 
 #[test]

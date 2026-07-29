@@ -66,6 +66,13 @@ pub struct PlaybackSnapshot {
     pub track_repeat_loops_left: Option<u32>,
     #[serde(default)]
     pub shuffle: bool,
+    /// Pre-decided radio-shuffle pick advertised as a "Next up" hint (populated
+    /// only while shuffle + radio are active and repeat is Off — repeat-One and
+    /// repeat-All prefix loops never reach the untouched region). UI hint only:
+    /// MPRIS metadata and the queue order stay untouched until the advance
+    /// actually happens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_next: Option<Track>,
     pub paused: bool,
     pub volume: f64,
     pub position_millis: Option<u64>,
@@ -184,6 +191,7 @@ impl Default for PlaybackSnapshot {
             repeat_mode: RepeatMode::Off,
             track_repeat_loops_left: None,
             shuffle: false,
+            up_next: None,
             paused: false,
             volume: 1.0,
             position_millis: None,

@@ -45,6 +45,7 @@ const PROGRESS_TROUGH_HOVER: f32 = 4.0;
 const PROGRESS_KNOB_RADIUS: f32 = 6.0;
 const VOLUME_SLIDER_WIDTH: f32 = 90.0;
 const VOLUME_KNOB_RADIUS: f32 = 5.0;
+const UP_NEXT_HINT_MAX_WIDTH: f32 = 200.0;
 const SLEEP_PANEL_WIDTH: f32 = 220.0;
 const SLEEP_CUSTOM_MIN: u32 = 1;
 const SLEEP_CUSTOM_MAX: u32 = 360;
@@ -414,26 +415,24 @@ fn controls_row(app: &App) -> Element<'_, Message> {
         theme::SPACE_SM,
     );
 
+    let mut bar = row![transport, time, info, actions];
+    if let Some(track) = app.player.snapshot.up_next.as_ref().filter(|_| has_track) {
+        bar = bar.push(up_next_hint(&track.title));
+    }
     container(
-        row![
-            transport,
-            time,
-            info,
-            actions,
-            container(volume).padding(Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: theme::SPACE_LG,
-            }),
-            container(shuffle).padding(Padding {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: theme::SPACE_MD,
-            }),
-            repeat,
-        ]
+        bar.push(container(volume).padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: theme::SPACE_LG,
+        }))
+        .push(container(shuffle).padding(Padding {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: theme::SPACE_MD,
+        }))
+        .push(repeat)
         .spacing(0)
         .align_y(Alignment::Center)
         .width(Length::Fill),
@@ -628,6 +627,31 @@ fn np_icon_button(
         btn = btn.on_press(message);
     }
     btn.into()
+}
+
+/// Subtle advertisement of the daemon's pre-decided radio-shuffle pick
+/// (snapshot `up_next`; populated only for shuffle + radio with repeat Off).
+/// Purely informational: the queue order stays untouched until the advance
+/// actually happens, and the full title rides in a hover tooltip like the
+/// other clipped bar text.
+fn up_next_hint(title: &str) -> Element<'static, Message> {
+    let label = format!("Next up · {title}");
+    let clipped: Element<'static, Message> = container(
+        text(label.clone())
+            .size(theme::SIZE_CAPTION)
+            .color(theme::TEXT_DIM)
+            .wrapping(text::Wrapping::None),
+    )
+    .max_width(UP_NEXT_HINT_MAX_WIDTH)
+    .clip(true)
+    .padding(Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: theme::SPACE_LG,
+    })
+    .into();
+    with_tooltip(clipped, label)
 }
 
 /// Marquee approximation (contract §9): single-line clipped text with the full
@@ -998,7 +1022,10 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
                 Ok(snapshot) => apply_remote_snapshot(app, snapshot),
                 Err(err) => {
                     crate::app_log!("[UI] transport daemon command failed: {err}");
-                    Task::none()
+                    // Failed user actions surface as a toast, not just a log
+                    // line — the offline radio-shuffle advance in particular
+                    // must tell the user why nothing happened.
+                    app.show_toast(err)
                 }
             }
         }

@@ -141,7 +141,7 @@ impl InteractiveTui {
     pub(in crate::cli_tui) fn initialize_terminal_images(&mut self) {
         let (picker, queried_stdio) = match Picker::from_query_stdio() {
             Ok(picker) => (picker, true),
-            Err(_) => (Picker::from_fontsize((10, 20)), false),
+            Err(_) => (Picker::halfblocks(), false),
         };
 
         self.thumbnail_mode_label = if queried_stdio {

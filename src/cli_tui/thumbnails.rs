@@ -38,7 +38,10 @@ impl InteractiveTui {
     pub(in crate::cli_tui) fn thumbnail_font_size(&self) -> (u16, u16) {
         self.thumbnail_picker
             .as_ref()
-            .map(Picker::font_size)
+            .map(|picker| {
+                let font = picker.font_size();
+                (font.width, font.height)
+            })
             .unwrap_or((10, 20))
     }
 

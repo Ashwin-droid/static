@@ -1228,13 +1228,18 @@ pub(crate) fn cross_device_singleton_matches_local_resume(
             })
 }
 
+/// The remote queue only outranks the local snapshot when its lastWatchTimestamp is STRICTLY
+/// newer than the local save. Queue registration rides best-effort network calls, so a session
+/// played offline leaves the account queue holding this machine's own previous session: it
+/// differs from the local snapshot but predates it, and must not be offered back as if another
+/// device had played it. A tied or missing remote timestamp cannot prove otherwise, so local wins.
 pub(crate) fn local_resume_is_newer_than_cross_device(
     queue: &CrossDeviceQueue,
     local_resume: &PersistedPlaybackState,
 ) -> bool {
     queue
         .last_watch_timestamp_millis
-        .is_some_and(|remote_timestamp| local_resume.saved_at_unix_millis > remote_timestamp)
+        .is_none_or(|remote_timestamp| local_resume.saved_at_unix_millis >= remote_timestamp)
 }
 
 pub(crate) fn should_use_local_resume_for_cross_device(

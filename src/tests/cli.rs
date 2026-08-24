@@ -207,3 +207,26 @@ fn older_local_resume_does_not_override_remote_cross_device_queue() {
         Some(&local)
     ));
 }
+
+#[test]
+fn tied_remote_timestamp_keeps_local_resume() {
+    let queue = test_cross_device_queue("PLSeq4utvoqwDKLWx1H_2h7gGXUsGR9Q5A", 0);
+    let local = test_resume("different-local-track", 1_778_904_892_070);
+
+    assert!(should_use_local_resume_for_cross_device(
+        Some(&queue),
+        Some(&local)
+    ));
+}
+
+#[test]
+fn undated_remote_queue_cannot_outrank_local_resume() {
+    let mut queue = test_cross_device_queue("PLSeq4utvoqwDKLWx1H_2h7gGXUsGR9Q5A", 0);
+    queue.last_watch_timestamp_millis = None;
+    let local = test_resume("different-local-track", 1);
+
+    assert!(should_use_local_resume_for_cross_device(
+        Some(&queue),
+        Some(&local)
+    ));
+}

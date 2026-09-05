@@ -8,14 +8,21 @@ playlists. Listen again pin/unpin controls send account updates to YouTube Music
 
 | Action | GUI | TUI |
 | --- | --- | --- |
-| Create empty playlist | Your Playlists → Create playlist | Playlists → P: Create |
-| Save radio | Save radio as playlist above the queue | S: Save radio beside the queue controls |
+| Create empty playlist | Your Playlists → New playlist | Playlists → P: Create |
+| Save radio | "Save as playlist" in the radio strip under the queue tabs | S: Save radio beside the queue controls |
 | Add song | Song context menu → Add to playlist | Song context menu → Add to playlist |
-| Create playlist containing a song | Enter a new name in the destination picker | N in the destination picker |
-| Remove songs | Edit playlist → select rows → Remove selected songs | P: Edit → Space to select → Delete |
-| Reorder | Edit playlist → Up / Down | P: Edit → [ / ] |
-| Delete playlist | Edit playlist → Delete playlist → named confirmation | P: Edit → D → type DELETE → Enter |
-| Pin / unpin Listen again | Song menu or playlist editor → remote pin toggle | Song/queue menu, or L / U in playlist editor |
+| Create playlist containing a song | Type a name in the picker's "start a new one" field | N in the destination picker |
+| Remove songs | Right-click a row on the playlist page → Remove from playlist | P: Edit → Space to select → Delete |
+| Reorder | Drag a row on the playlist page and drop it on the row it should replace (downwards lands after it, upwards before it) | P: Edit → [ / ] |
+| Delete playlist | Right-click the playlist card, or Delete on the playlist page → confirmation dialog | P: Edit → D → type DELETE → Enter |
+| Pin / unpin Listen again | Song menu, playlist-card menu, or Pin/Unpin on the playlist page | Song/queue menu, or L / U in playlist editor |
+
+In the GUI the playlist page itself is the editor: there is no separate edit
+mode. Rows only reorder or remove on the account's own playlists (the page
+loads the occurrence list in the background after the tracks); other people's
+playlists stay read-only. A drag that leaves the page still drops into the
+queue as before. Moves and removals apply locally once YouTube Music confirms
+the edit; a rejected edit reloads the playlist.
 
 Radio saving sends the daemon snapshot's complete current queue in order. It
 does not replace the queue or change radio mode. YouTube can deduplicate repeated

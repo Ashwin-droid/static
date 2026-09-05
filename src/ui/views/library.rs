@@ -316,8 +316,9 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
                         vec![thumbnails::ensure_all(app, urls.iter().map(String::as_str))];
                     if non_empty {
                         tasks.push(check_resume_task(context));
-                        tasks.push(check_download_state_task(app, playlist_id));
+                        tasks.push(check_download_state_task(app, playlist_id.clone()));
                     }
+                    tasks.push(super::super::playlists::page_opened(app, &playlist_id));
                     Task::batch(tasks)
                 }
                 Err(err) => {
@@ -404,6 +405,11 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         } => play_track_context(app, tracks, index, context),
 
         Msg::PageTrackClicked { page, index } => {
+            if page == Page::PlaylistDetail {
+                if let Some(task) = super::super::playlists::drop_on_row(app, index) {
+                    return task; // a reorder drag landed on this row
+                }
+            }
             let (tracks, context) = page_play_data(app, page);
             play_track_context(app, tracks, index, context)
         }
@@ -831,10 +837,13 @@ fn playlists_view(app: &App) -> Element<'_, Message> {
         LoadState::Failed(err) => status_view(err.clone()),
         LoadState::Ready(playlists) => {
             let page = column![
-                widgets::section_header("Your Playlists"),
-                button(text("Create playlist"))
-                    .style(theme::secondary_button)
-                    .on_press(Message::Playlists(super::super::playlists::Msg::Create))
+                row![
+                    widgets::section_header("Your Playlists"),
+                    Space::new().width(Length::Fill),
+                    super::super::playlists::create_button(),
+                ]
+                .align_y(iced::Alignment::Center)
+                .width(Length::Fill)
             ]
             .spacing(theme::SPACE_LG)
             .width(Length::Fill);
@@ -851,6 +860,7 @@ fn playlists_view(app: &App) -> Element<'_, Message> {
                         playlist,
                         QueuePlaylistSource::Remote,
                         Msg::PlaylistOpened(playlist.clone()),
+                        Some(super::super::playlists::card_menu_message(playlist)),
                         true,
                     )
                 })
@@ -879,11 +889,15 @@ fn playlist_detail_view(app: &App) -> Element<'_, Message> {
             let mut page = column![
                 back_button("\u{2190} Back to Playlists", Msg::BackToPlaylists),
                 widgets::section_header(&detail.title),
-                super::super::playlists::edit_button(detail.playlist_id.clone()),
             ]
             .spacing(theme::SPACE_LG)
             .width(Length::Fill);
             if tracks.is_empty() {
+                let controls = super::super::playlists::page_controls(app);
+                if !controls.is_empty() {
+                    page = page
+                        .push(iced::widget::Row::with_children(controls).spacing(theme::SPACE_MD));
+                }
                 return page.push(empty_state("This playlist is empty.")).into();
             }
             page = page.push(count_label(format!("{} tracks", tracks.len())));
@@ -893,13 +907,12 @@ fn playlist_detail_view(app: &App) -> Element<'_, Message> {
                 Some(playlist_detail_context(detail)),
                 Some(detail.playlist_id.as_str()),
             ));
-            page.push(track_grid(
+            super::super::playlists::track_pointer(page.push(track_grid(
                 app,
                 tracks,
                 Page::PlaylistDetail,
                 Hover::PlaylistDetailRow,
-            ))
-            .into()
+            )))
         }
     }
 }
@@ -937,6 +950,7 @@ fn offline_view(app: &App) -> Element<'_, Message> {
                                 playlist_id: playlist.playlist_id.clone(),
                                 title: playlist.title.clone(),
                             },
+                            None,
                             false,
                         )
                     })
@@ -962,6 +976,7 @@ fn offline_view(app: &App) -> Element<'_, Message> {
                             page: Page::Offline,
                             index,
                         },
+                        None,
                     ));
                 }
                 page = page.push(list);
@@ -1115,6 +1130,12 @@ fn play_controls<'a>(
         controls = controls.push(download);
     }
 
+    if page == Page::PlaylistDetail {
+        for control in super::super::playlists::page_controls(app) {
+            controls = controls.push(control);
+        }
+    }
+
     controls.into()
 }
 
@@ -1151,6 +1172,7 @@ fn track_grid<'a>(
             hover_key(index),
             track,
             Msg::PageTrackClicked { page, index },
+            (page == Page::PlaylistDetail).then_some(index),
         )
     });
     while let Some(left) = cells.next() {
@@ -1174,9 +1196,40 @@ fn track_grid<'a>(
 /// tooltip (marquee stand-in), ellipsized artist, optional duration. The row
 /// is a queue drag source; the click rides on release; right-click opens the
 /// shared track menu (Play next / Add to queue / Jump to / Probe / feedback /
-/// download — owned by queue_panel).
-fn track_row<'a>(app: &'a App, hover: Hover, track: &'a Track, click: Msg) -> Element<'a, Message> {
+/// download — owned by queue_panel). `playlist_index` marks a row of the
+/// playlist page: its press doubles as the reorder drag source and its menu
+/// carries "Remove from playlist".
+fn track_row<'a>(
+    app: &'a App,
+    hover: Hover,
+    track: &'a Track,
+    click: Msg,
+    playlist_index: Option<usize>,
+) -> Element<'a, Message> {
     let hovered = app.library.hovered == Some(hover);
+    let drop = match playlist_index {
+        Some(index) => super::super::playlists::row_drop(app, index, hovered),
+        None => theme::RowDrop::None,
+    };
+    let (press, menu) = match playlist_index {
+        Some(index) => (
+            super::super::playlists::row_press(index, track),
+            super::super::playlists::row_menu(index, track),
+        ),
+        None => (
+            Message::Queue(queue_panel::Msg::DragStarted {
+                payload: QueueDragPayload::Track {
+                    track: track.clone(),
+                },
+                position: Point::ORIGIN,
+            }),
+            Message::TrackMenu(queue_panel::MenuMsg::Open {
+                track: track.clone(),
+                queue_index: None,
+                anchor: Point::ORIGIN,
+            }),
+        ),
+    };
     let art = thumbnails::view_thumb(
         app,
         track.thumbnail_url.as_deref(),
@@ -1206,21 +1259,12 @@ fn track_row<'a>(app: &'a App, hover: Hover, track: &'a Track, click: Msg) -> El
         container(content)
             .padding([theme::SPACE_SM, theme::SPACE_MD])
             .width(Length::Fill)
-            .style(theme::row_surface(hovered)),
+            .style(theme::row_surface_drop(hovered, drop)),
     )
     .interaction(iced::mouse::Interaction::Pointer)
-    .on_press(Message::Queue(queue_panel::Msg::DragStarted {
-        payload: QueueDragPayload::Track {
-            track: track.clone(),
-        },
-        position: Point::ORIGIN,
-    }))
+    .on_press(press)
     .on_release(Message::Library(click))
-    .on_right_press(Message::TrackMenu(queue_panel::MenuMsg::Open {
-        track: track.clone(),
-        queue_index: None,
-        anchor: Point::ORIGIN,
-    }))
+    .on_right_press(menu)
     .on_enter(Message::Library(Msg::Hovered(hover)))
     .on_exit(Message::Library(Msg::Unhovered(hover)))
     .into()
@@ -1237,6 +1281,7 @@ fn playlist_card<'a>(
     playlist: &'a PlaylistSummary,
     source: QueuePlaylistSource,
     click: Msg,
+    menu: Option<Message>,
     tooltip_title: bool,
 ) -> Element<'a, Message> {
     let hovered = app.library.hovered == Some(hover);
@@ -1277,7 +1322,7 @@ fn playlist_card<'a>(
         .spacing(theme::SPACE_SM)
         .width(Length::Fixed(CARD_ART_SIZE));
 
-    mouse_area(
+    let mut area = mouse_area(
         container(body)
             .padding(theme::SPACE_MD)
             .style(theme::card_surface(hovered)),
@@ -1295,8 +1340,11 @@ fn playlist_card<'a>(
     }))
     .on_release(Message::Library(click))
     .on_enter(Message::Library(Msg::Hovered(hover)))
-    .on_exit(Message::Library(Msg::Unhovered(hover)))
-    .into()
+    .on_exit(Message::Library(Msg::Unhovered(hover)));
+    if let Some(menu) = menu {
+        area = area.on_right_press(menu);
+    }
+    area.into()
 }
 
 /// Horizontal card rail (GTK `build_horizontal_cards_scroll`): the page itself

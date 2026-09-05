@@ -187,6 +187,11 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         Msg::BackPressed => navigate_back(app),
 
         Msg::TrackClicked(index) => {
+            if app.browse.page_type == Some(HomeBrowsePageType::Playlist) {
+                if let Some(task) = super::super::playlists::drop_on_row(app, index) {
+                    return task; // a reorder drag landed on this row
+                }
+            }
             let press = release_pending_press(app);
             if press.was_active {
                 return Task::none(); // it was a drag, not a click
@@ -486,8 +491,15 @@ fn tracks_loaded(app: &mut App, serial: u64, tracks: Vec<Track>) -> Task<Message
         thumb_urls.iter().map(String::as_str),
     ));
     tasks.push(probe_collection_meta_task(
-        app, serial, context, page_type, browse_id,
+        app,
+        serial,
+        context,
+        page_type,
+        browse_id.clone(),
     ));
+    if page_type == HomeBrowsePageType::Playlist {
+        tasks.push(super::super::playlists::page_opened(app, &browse_id));
+    }
     Task::batch(tasks)
 }
 
@@ -798,12 +810,15 @@ fn tracks_page<'a>(app: &'a App, tracks: &'a [Track]) -> Element<'a, Message> {
         .spacing(theme::SPACE_LG)
         .width(Length::Fill);
 
-    if state.page_type == Some(HomeBrowsePageType::Playlist) {
-        if let Some(id) = &state.browse_id {
-            page = page.push(super::super::playlists::edit_button(id.clone()));
-        }
-    }
+    let playlist_page = state.page_type == Some(HomeBrowsePageType::Playlist);
     if tracks.is_empty() {
+        if playlist_page {
+            let controls = super::super::playlists::page_controls(app);
+            if !controls.is_empty() {
+                page =
+                    page.push(iced::widget::Row::with_children(controls).spacing(theme::SPACE_MD));
+            }
+        }
         return page
             .push(empty_label("No playable tracks found for this page."))
             .into();
@@ -814,19 +829,33 @@ fn tracks_page<'a>(app: &'a App, tracks: &'a [Track]) -> Element<'a, Message> {
             .size(theme::SIZE_BODY)
             .color(theme::TEXT_DIM),
     );
-    page = page.push(play_controls(state));
+    page = page.push(play_controls(app));
 
     let cells = tracks
         .iter()
         .enumerate()
-        .map(|(index, track)| track_row(app, (0, index), track, Msg::TrackClicked(index)))
+        .map(|(index, track)| {
+            track_row(
+                app,
+                (0, index),
+                track,
+                Msg::TrackClicked(index),
+                playlist_page.then_some(index),
+            )
+        })
         .collect();
-    page.push(two_col_grid(cells)).into()
+    let page = page.push(two_col_grid(cells));
+    if playlist_page {
+        super::super::playlists::track_pointer(page)
+    } else {
+        page.into()
+    }
 }
 
 /// Resume (when persisted) / Play All / Shuffle / Download All controls
 /// (library spec §6.1). Download appears only for Playlist/Album pages.
-fn play_controls(state: &State) -> Element<'static, Message> {
+fn play_controls(app: &App) -> Element<'_, Message> {
+    let state = &app.browse;
     let mut controls = row![]
         .spacing(theme::SPACE_MD)
         .align_y(iced::Alignment::Center);
@@ -861,6 +890,12 @@ fn play_controls(state: &State) -> Element<'static, Message> {
             ("Download All", Some(Msg::DownloadAll))
         };
         controls = controls.push(control_button(icons::download(), label, msg));
+    }
+
+    if state.page_type == Some(HomeBrowsePageType::Playlist) {
+        for control in super::super::playlists::page_controls(app) {
+            controls = controls.push(control);
+        }
     }
 
     controls.into()
@@ -1035,6 +1070,7 @@ fn section_track_grid<'a>(
                     section: section_index,
                     item: item_index,
                 },
+                None,
             )),
             HomeItem::BrowseCard(_) => None,
         })
@@ -1099,8 +1135,32 @@ fn track_row<'a>(
     key: (usize, usize),
     track: &'a Track,
     click: Msg,
+    playlist_index: Option<usize>,
 ) -> Element<'a, Message> {
     let hovered = app.browse.hovered_item == Some(key);
+    let drop = match playlist_index {
+        Some(index) => super::super::playlists::row_drop(app, index, hovered),
+        None => theme::RowDrop::None,
+    };
+    let (press, menu) = match playlist_index {
+        Some(index) => (
+            super::super::playlists::row_press(index, track),
+            super::super::playlists::row_menu(index, track),
+        ),
+        None => (
+            Message::Queue(queue_panel::Msg::DragStarted {
+                payload: QueueDragPayload::Track {
+                    track: track.clone(),
+                },
+                position: Point::ORIGIN,
+            }),
+            Message::TrackMenu(queue_panel::MenuMsg::Open {
+                track: track.clone(),
+                queue_index: None,
+                anchor: Point::ORIGIN,
+            }),
+        ),
+    };
     let art = thumbnails::view_thumb(
         app,
         track.thumbnail_url.as_deref(),
@@ -1130,21 +1190,12 @@ fn track_row<'a>(
         container(content)
             .padding([theme::SPACE_SM, theme::SPACE_MD])
             .width(Length::Fill)
-            .style(theme::row_surface(hovered)),
+            .style(theme::row_surface_drop(hovered, drop)),
     )
     .interaction(iced::mouse::Interaction::Pointer)
-    .on_press(Message::Queue(queue_panel::Msg::DragStarted {
-        payload: QueueDragPayload::Track {
-            track: track.clone(),
-        },
-        position: Point::ORIGIN,
-    }))
+    .on_press(press)
     .on_release(Message::Browse(click))
-    .on_right_press(Message::TrackMenu(queue_panel::MenuMsg::Open {
-        track: track.clone(),
-        queue_index: None,
-        anchor: Point::ORIGIN,
-    }))
+    .on_right_press(menu)
     .on_enter(Message::Browse(Msg::ItemHovered {
         section: key.0,
         item: key.1,

@@ -692,28 +692,14 @@ impl App {
     }
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
-        if super::playlists::is_open(self)
+        if super::playlists::dialog_open(self)
             && matches!(message, Message::FocusSearch | Message::RefreshHome)
         {
             return Task::none();
         }
         match message {
             Message::ListenAgain(msg) => super::listen_again::update(self, msg),
-            Message::Playlists(msg) => {
-                let opening = matches!(
-                    msg,
-                    super::playlists::Msg::Create
-                        | super::playlists::Msg::SaveRadio
-                        | super::playlists::Msg::AddTrack(_)
-                        | super::playlists::Msg::Edit(_)
-                );
-                let task = super::playlists::update(self, msg);
-                if opening {
-                    Task::batch([task, iced::widget::operation::focus("playlist-name")])
-                } else {
-                    task
-                }
-            }
+            Message::Playlists(msg) => super::playlists::update(self, msg),
             Message::PollTick => self.poll_daemon(),
             Message::DaemonState { serial, result } => self.handle_daemon_state(serial, result),
 
@@ -1111,10 +1097,12 @@ impl App {
         // The track context menu is modal for the whole window (GTK popovers
         // auto-dismissed on any outside click anywhere): the dim + dismiss
         // overlay must cover the sidebar, queue panel and player bar too.
-        if super::playlists::is_open(self) {
+        if let Some(layer) = super::playlists::overlay(self) {
             iced::widget::Stack::new()
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .push(body)
-                .push(iced::widget::opaque(super::playlists::layer(self)))
+                .push(layer)
                 .into()
         } else if self.track_menu.is_some() {
             iced::widget::Stack::new()

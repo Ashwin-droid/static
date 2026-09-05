@@ -413,6 +413,7 @@ pub fn danger_button(_t: &Theme, status: button::Status) -> button::Style {
     let bg = match status {
         button::Status::Hovered => ca(255, 100, 100, 0.28),
         button::Status::Pressed => ca(255, 100, 100, 0.36),
+        button::Status::Disabled => ca(255, 100, 100, 0.06),
         _ => ca(255, 100, 100, 0.16),
     };
     let mut style = base_button(bg, c(255, 200, 200), RADIUS_XL);
@@ -421,6 +422,10 @@ pub fn danger_button(_t: &Theme, status: button::Status) -> button::Style {
         width: 1.0,
         radius: RADIUS_XL.into(),
     };
+    if matches!(status, button::Status::Disabled) {
+        style.text_color = ca(255, 200, 200, 0.4);
+        style.border.color = ca(255, 100, 100, 0.15);
+    }
     style
 }
 
@@ -489,6 +494,43 @@ pub fn row_surface(hovered: bool) -> impl Fn(&Theme) -> container::Style {
             radius: RADIUS_LG.into(),
         },
         ..container::Style::default()
+    }
+}
+
+/// Drag-and-drop role of a content-grid row while a playlist reorder drag is
+/// active (see `playlists::row_drop`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RowDrop {
+    None,
+    /// The row being dragged.
+    Lifted,
+    /// The row the drag would land on.
+    Target,
+}
+
+/// [`row_surface`] with the reorder-drag roles layered on top: the lifted row
+/// fades, the target row takes a solid accent outline.
+pub fn row_surface_drop(hovered: bool, drop: RowDrop) -> impl Fn(&Theme) -> container::Style {
+    move |t| match drop {
+        RowDrop::None => row_surface(hovered)(t),
+        RowDrop::Lifted => container::Style {
+            background: Some(Background::Color(ACCENT_BG_GHOST)),
+            border: Border {
+                color: ACCENT_BORDER,
+                width: 1.0,
+                radius: RADIUS_LG.into(),
+            },
+            ..container::Style::default()
+        },
+        RowDrop::Target => container::Style {
+            background: Some(Background::Color(ACCENT_BG_FAINT)),
+            border: Border {
+                color: ACCENT_SOFT,
+                width: 2.0,
+                radius: RADIUS_LG.into(),
+            },
+            ..container::Style::default()
+        },
     }
 }
 

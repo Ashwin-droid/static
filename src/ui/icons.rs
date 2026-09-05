@@ -1,4 +1,4 @@
-//! The 14 bundled SVG icons, loaded once into `iced::widget::svg::Handle`s.
+//! The bundled SVG icons, loaded once into `iced::widget::svg::Handle`s.
 //!
 //! Same inventory as the GTK shell (shell spec §3.10). Handles are cheap to
 //! clone (`Arc` internally); call sites should clone freely.
@@ -34,3 +34,6 @@ icon!(shuffle, "shuffle.svg");
 icon!(download, "download.svg");
 icon!(sleep, "sleep.svg");
 icon!(share, "share.svg");
+icon!(pin, "pin.svg");
+icon!(trash, "trash.svg");
+icon!(plus, "plus.svg");

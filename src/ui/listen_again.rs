@@ -1,10 +1,6 @@
 //! Remote Listen again pins. UI state mirrors the server; writes go to YouTube.
-use super::{
-    app::{self, App, ContentView, Message},
-    theme,
-};
+use super::app::{self, App, ContentView, Message};
 use crate::models::ListenAgainTarget;
-use iced::widget::{button, column, text};
 use iced::{Element, Task};
 use std::collections::HashMap;
 
@@ -37,12 +33,6 @@ fn key(target: &ListenAgainTarget) -> String {
             format!("playlist:{}", id.strip_prefix("VL").unwrap_or(id))
         }
     }
-}
-pub fn busy(app: &App, target: &ListenAgainTarget) -> bool {
-    app.listen_again
-        .entries
-        .get(&key(target))
-        .is_some_and(|state| state.busy)
 }
 pub fn load(app: &mut App, target: ListenAgainTarget) -> Task<Message> {
     update(app, Msg::Load(target))
@@ -120,6 +110,9 @@ pub fn update(app: &mut App, value: Msg) -> Task<Message> {
                 return Task::none();
             };
             state.busy = true;
+            // The write reports through a toast; the menu it came from closes.
+            app.track_menu = None;
+            app.playlists.dismiss_menu();
             let client = app.app_client();
             let request_target = target.clone();
             let panic_target = target.clone();
@@ -157,13 +150,23 @@ pub fn update(app: &mut App, value: Msg) -> Task<Message> {
                     state.pinned = Some(pinned);
                     state.error = None;
                     app.invalidate_home_cache();
+                    let toast = app.show_toast(if pinned {
+                        "Pinned to Listen again."
+                    } else {
+                        "Unpinned from Listen again."
+                    });
                     if app.content_view == ContentView::Home {
-                        return super::content_loading::load_home_task(app, true);
+                        return Task::batch([
+                            toast,
+                            super::content_loading::load_home_task(app, true),
+                        ]);
                     }
+                    return toast;
                 }
                 Err(error) => {
                     // Keep the last confirmed value, but require a new remote read.
-                    state.error = Some(error);
+                    state.error = Some(error.clone());
+                    return app.show_toast(error);
                 }
             }
         }
@@ -177,40 +180,84 @@ fn desired_pin(state: &PinState) -> Option<bool> {
         state.pinned.map(|p| !p)
     }
 }
-pub fn control(app: &App, target: ListenAgainTarget, enabled: bool) -> Element<'static, Message> {
-    let Some(state) = app.listen_again.entries.get(&key(&target)) else {
-        return button(text("Load Listen again pin").size(theme::SIZE_SUB))
-            .style(theme::secondary_button)
-            .on_press_maybe(enabled.then(|| msg(Msg::Load(target))))
-            .into();
+/// Label + action for the current pin state, shared by the menu row and the
+/// page button. `None` action means inert.
+fn presentation(app: &App, target: &ListenAgainTarget) -> (Presentation, Option<Msg>) {
+    let Some(state) = app.listen_again.entries.get(&key(target)) else {
+        return (Presentation::Loading, None);
     };
-    let label = if state.busy && state.pinned.is_none() {
-        "Loading Listen again…"
-    } else if state.busy {
-        "Updating Listen again…"
-    } else if state.pinned == Some(true) {
-        "Unpin from Listen again"
-    } else {
-        "Pin to Listen again"
-    };
-    let mut body = column![
-        button(text(label).size(theme::SIZE_SUB))
-            .style(theme::secondary_button)
-            .on_press_maybe(
-                (enabled && desired_pin(state).is_some())
-                    .then(|| msg(Msg::Toggle(target.clone(), state.serial)))
-            )
-    ]
-    .spacing(6);
-    if let Some(error) = &state.error {
-        body = body.push(text(format!("Listen again: {error}")).size(theme::SIZE_CAPTION));
-        body = body.push(
-            button(text("Reload pin state").size(theme::SIZE_SUB))
-                .style(theme::secondary_button)
-                .on_press_maybe((enabled && !state.busy).then(|| msg(Msg::Load(target)))),
+    if state.busy {
+        return (
+            if state.pinned.is_none() {
+                Presentation::Loading
+            } else {
+                Presentation::Updating
+            },
+            None,
         );
     }
-    body.into()
+    if state.error.is_some() {
+        // A failed write keeps the last confirmed value but demands a fresh
+        // read; a failed read means the item cannot be pinned from here.
+        return if state.pinned.is_some() {
+            (Presentation::Retry, Some(Msg::Load(target.clone())))
+        } else {
+            (Presentation::Unavailable, None)
+        };
+    }
+    match state.pinned {
+        Some(true) => (
+            Presentation::Pinned,
+            Some(Msg::Toggle(target.clone(), state.serial)),
+        ),
+        Some(false) => (
+            Presentation::Unpinned,
+            Some(Msg::Toggle(target.clone(), state.serial)),
+        ),
+        None => (Presentation::Loading, None),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Presentation {
+    Loading,
+    Updating,
+    Pinned,
+    Unpinned,
+    Retry,
+    Unavailable,
+}
+
+/// Context-menu row: "Pin to Listen again" / "Unpin from Listen again".
+pub fn menu_item(app: &App, target: ListenAgainTarget) -> Element<'static, Message> {
+    let (presentation, action) = presentation(app, &target);
+    let label = match presentation {
+        Presentation::Loading => "Pin to Listen again",
+        Presentation::Updating => "Updating Listen again\u{2026}",
+        Presentation::Pinned => "Unpin from Listen again",
+        Presentation::Unpinned => "Pin to Listen again",
+        Presentation::Retry => "Reload Listen again pin",
+        Presentation::Unavailable => "Listen again unavailable",
+    };
+    super::queue_panel::menu_action(label, action.map(msg), false)
+}
+
+/// Page-control button: "Pin" / "Unpin" beside Play All. Hidden while the pin
+/// state is unknown or the item cannot be pinned.
+pub fn page_button(app: &App, target: ListenAgainTarget) -> Option<Element<'static, Message>> {
+    let (presentation, action) = presentation(app, &target);
+    let label = match presentation {
+        Presentation::Loading | Presentation::Unavailable => return None,
+        Presentation::Updating => "Updating\u{2026}",
+        Presentation::Pinned => "Unpin",
+        Presentation::Unpinned => "Pin",
+        Presentation::Retry => "Reload pin",
+    };
+    Some(super::playlists::control_button(
+        super::icons::pin(),
+        label,
+        action.map(msg),
+    ))
 }
 
 #[cfg(test)]

@@ -152,6 +152,9 @@ pub struct TrackMenu {
     feedback: FeedbackPhase,
     /// `None` while the blocking `is_pinned_offline` probe is in flight.
     pinned_offline: Option<bool>,
+    /// Set when opened from a row of the playlist page on screen (enables
+    /// "Remove from playlist" for that occurrence).
+    pub playlist_entry: Option<usize>,
 }
 
 /// Playlist metadata for "Download All" (queue_actions spec §9.3).
@@ -347,12 +350,8 @@ pub fn view(app: &App) -> Element<'_, Message> {
     };
 
     let mut content = column![header_row(app)];
-    if app.player.is_radio_queue() {
-        content = content.push(
-            button(text("Save radio as playlist"))
-                .style(theme::secondary_button)
-                .on_press(Message::Playlists(super::playlists::Msg::SaveRadio)),
-        );
+    if app.player.is_radio_queue() && app.queue_panel.mode == DetailPanelView::Queue {
+        content = content.push(radio_strip(app));
     }
     let content = content.push(body).width(Length::Fill).height(Length::Fill);
 
@@ -395,6 +394,30 @@ fn header_row(app: &App) -> Element<'_, Message> {
             left: theme::SPACE_XL,
         })
         .into()
+}
+
+/// Slim "Radio · N songs — Save as playlist" strip under the header while a
+/// radio queue is active.
+fn radio_strip(app: &App) -> Element<'_, Message> {
+    container(
+        row![
+            text(format!("Radio \u{b7} {} songs", app.player.queue.len()))
+                .size(theme::SIZE_SUB)
+                .color(theme::TEXT_DIM),
+            Space::new().width(Length::Fill),
+            super::playlists::save_radio_button(),
+        ]
+        .spacing(theme::SPACE_SM)
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(Padding {
+        top: 0.0,
+        right: theme::SPACE_XL,
+        bottom: theme::SPACE_SM,
+        left: theme::SPACE_XL,
+    })
+    .into()
 }
 
 fn tab_button(
@@ -970,6 +993,9 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::DragStarted { payload, position } => {
+            // A fresh press is never a playlist reorder source until the
+            // playlist page says so (`playlists::Msg::RowPressed`).
+            app.playlists.clear_drag_source();
             let mut tasks = Vec::new();
             if let Some(url) = queue_preview_data_for_payload(app, &payload)
                 .and_then(|preview| preview.thumbnail_url)
@@ -1486,10 +1512,9 @@ pub fn context_menu_layer(app: &App) -> Element<'_, Message> {
         )),
     }
 
-    items.push(super::listen_again::control(
+    items.push(super::listen_again::menu_item(
         app,
         crate::models::ListenAgainTarget::Track(menu.track.video_id.clone()),
-        true,
     ));
     items.push(menu_action(
         "Add to playlist",
@@ -1498,6 +1523,12 @@ pub fn context_menu_layer(app: &App) -> Element<'_, Message> {
         ))),
         false,
     ));
+    if let Some(item) = menu
+        .playlist_entry
+        .and_then(|index| super::playlists::remove_menu_item(app, index))
+    {
+        items.push(item);
+    }
     items.push(menu_action("Share", Some(mmsg(MenuMsg::Share)), false));
 
     if let Some(index) = menu.queue_index {
@@ -1562,7 +1593,7 @@ fn menu_header<'a>(app: &'a App, menu: &'a TrackMenu) -> Element<'a, Message> {
     .into()
 }
 
-fn menu_action(
+pub(super) fn menu_action(
     label: &'static str,
     on_press: Option<Message>,
     danger: bool,
@@ -1604,6 +1635,7 @@ pub fn update_menu(app: &mut App, msg: MenuMsg) -> Task<Message> {
                 anchor,
                 feedback,
                 pinned_offline: None,
+                playlist_entry: None,
             });
 
             let cache = app.cache.clone();
@@ -2626,7 +2658,7 @@ fn history_thumbnail_candidate(url: Option<&str>) -> Option<&str> {
     url.filter(|value| !value.starts_with("file://"))
 }
 
-fn artist_string(track: &Track) -> String {
+pub(super) fn artist_string(track: &Track) -> String {
     if track.artists.is_empty() {
         "Unknown artist".to_owned()
     } else {

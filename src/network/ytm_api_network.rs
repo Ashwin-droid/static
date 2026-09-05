@@ -25,8 +25,9 @@ macro_rules! eprintln {
 }
 
 use crate::models::{
-    BrowseSectionsPage, CrossDeviceQueue, HomeItem, HomePage, PlaylistSummary, RadioQueue,
-    SearchResult, SyncedLyricLine, SyncedLyrics, SyncedLyricsSource, Track,
+    BrowseSectionsPage, CrossDeviceQueue, HomeItem, HomePage, PlaylistEditor, PlaylistEntry,
+    PlaylistSummary, RadioQueue, SearchResult, SyncedLyricLine, SyncedLyrics, SyncedLyricsSource,
+    Track,
 };
 
 use crate::network_parser as parsers;
@@ -2065,28 +2066,19 @@ impl YtMusicClient {
     }
 
     pub fn get_playlist(&self, playlist_id: &str) -> Result<Vec<Track>> {
-        self.rt.block_on(async {
-            let mut body = Self::client_context();
-            let browse_id = if playlist_id.starts_with("VL") {
-                playlist_id.to_string()
-            } else {
-                format!("VL{playlist_id}")
-            };
-            body["browseId"] = json!(browse_id);
-
-            let resp = self
-                .post(&format!("{YTM_BASE_URL}/browse?{YTM_PARAMS}"))
-                .json(&body)
-                .send()
-                .await
-                .context("Failed to fetch playlist")?;
-
-            let json: Value = resp
-                .json()
-                .await
-                .context("Failed to parse playlist response")?;
-            parsers::parse_playlist_tracks(&json)
-        })
+        let playlist_id = normalized_playlist_id(playlist_id)?;
+        let response =
+            self.playlist_request("browse", json!({"browseId": format!("VL{playlist_id}")}))?;
+        if parsers::shared_parser::has_playlist_shelf(&response) {
+            return Ok(self
+                .playlist_editor_from_response(playlist_id, &response)?
+                .entries
+                .into_iter()
+                .map(|entry| entry.track)
+                .collect());
+        }
+        // Liked Music and other legacy browse pages use ordinary music shelves.
+        parsers::parse_playlist_tracks(&response)
     }
 
     pub fn get_browse_tracks(&self, browse_id: &str) -> Result<Vec<Track>> {
@@ -3971,3 +3963,425 @@ pub fn extract_video_id_from_input(input: &str) -> Option<String> {
 #[cfg(test)]
 #[path = "../tests/network_ytm_api_network.rs"]
 mod tests;
+
+impl YtMusicClient {
+    fn playlist_request(&self, endpoint: &str, fields: Value) -> Result<Value> {
+        self.rt.block_on(async {
+            let mut body = Self::client_context();
+            for (key, value) in fields.as_object().context("Invalid playlist request")? {
+                body[key] = value.clone();
+            }
+            let response = self
+                .post(&format!("{YTM_BASE_URL}/{endpoint}?{YTM_PARAMS}"))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| anyhow::anyhow!("Playlist request failed: {error}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let payload = response.json::<Value>().await.ok();
+                let detail = payload
+                    .as_ref()
+                    .and_then(|value| value.pointer("/error/message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("request rejected");
+                bail!("Playlist request rejected (HTTP {status}): {detail}");
+            }
+            let response: Value = response.json().await.context("Invalid playlist response")?;
+            check_playlist_response(&response)?;
+            Ok(response)
+        })
+    }
+
+    pub fn get_editable_playlists(&self) -> Result<Vec<PlaylistSummary>> {
+        // The picker requires a source context even when only listing destinations.
+        // Liked Music is available for every account; this read does not copy its songs.
+        let response = self.playlist_request(
+            "playlist/get_add_to_playlist",
+            json!({"playlistId": "LM", "excludeWatchLater": false}),
+        )?;
+        Ok(parsers::shared_parser::parse_editable_playlists(&response))
+    }
+
+    pub fn get_playlist_editor(&self, playlist_id: &str) -> Result<PlaylistEditor> {
+        let playlist_id = normalized_playlist_id(playlist_id)?;
+        let response =
+            self.playlist_request("browse", json!({"browseId": format!("VL{playlist_id}")}))?;
+        if !parsers::shared_parser::has_playlist_page(&response) {
+            bail!("Playlist is unavailable, deleted, or inaccessible to this account");
+        }
+        self.playlist_editor_from_response(playlist_id, &response)
+    }
+
+    fn playlist_editor_from_response(
+        &self,
+        playlist_id: &str,
+        response: &Value,
+    ) -> Result<PlaylistEditor> {
+        let (mut editor, mut continuation) =
+            parsers::shared_parser::parse_playlist_editor_page(response, playlist_id);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(token) = continuation {
+            if !seen.insert(token.clone()) {
+                bail!("Playlist returned a repeated continuation; reload before editing");
+            }
+            let response = self.playlist_request("browse", json!({"continuation": token}))?;
+            let (page, next) =
+                parsers::shared_parser::parse_playlist_editor_page(&response, playlist_id);
+            editor.entries.extend(page.entries);
+            continuation = next;
+        }
+        Ok(editor)
+    }
+
+    pub fn create_playlist(&self, title: &str, video_ids: &[String]) -> Result<String> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("Playlist title cannot be empty");
+        }
+        validate_playlist_video_ids(video_ids)?;
+        let mut fields = json!({"title": title, "params": "KAA%3D"});
+        if !video_ids.is_empty() {
+            fields["videoIds"] = json!(video_ids);
+        }
+        let response = self.playlist_request("playlist/create", fields)?;
+        let id = response["playlistId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .context("Create playlist response did not contain a playlist ID")?;
+        // Creating a populated playlist can return before browse sees its rows.
+        // Retry only these reads, never the creation request.
+        for delay in [0, 100, 250, 500, 1_000, 2_000] {
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            let page = self
+                .playlist_request("browse", json!({"browseId": format!("VL{id}")}))
+                .with_context(|| {
+                    format!(
+                        "Created playlist {id}, but could not refresh it; reopen it before retrying"
+                    )
+                })?;
+            if parsers::shared_parser::has_playlist_page(&page) {
+                return Ok(id);
+            }
+        }
+        bail!(
+            "Created playlist {id}, but it is not readable yet; reopen it instead of creating another copy"
+        )
+    }
+
+    pub fn add_playlist_tracks(&self, playlist_id: &str, video_ids: &[String]) -> Result<()> {
+        validate_playlist_video_ids(video_ids)?;
+        if video_ids.is_empty() {
+            bail!("Select at least one song to add");
+        }
+        let actions: Vec<_> = video_ids
+            .iter()
+            .map(|id| json!({"action": "ACTION_ADD_VIDEO", "addedVideoId": id}))
+            .collect();
+        self.edit_playlist(playlist_id, actions)
+    }
+
+    pub fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
+        let playlist_id = normalized_playlist_id(playlist_id)?;
+        let response =
+            self.playlist_request("playlist/delete", json!({"playlistId": playlist_id}))?;
+        if let Some(status) = response.get("status") {
+            if status.as_str() != Some("STATUS_SUCCEEDED") {
+                bail!("Playlist deletion was not confirmed; reload before retrying");
+            }
+        }
+        // The delete endpoint need not return the edit endpoint's status field.
+        // Confirm removal through the account's fresh editable-playlist listing.
+        let remaining = self.get_editable_playlists().context(
+            "Deletion submitted, but verification failed; reload playlists before retrying",
+        )?;
+        if remaining.iter().any(|item| item.playlist_id == playlist_id) {
+            bail!("Playlist deletion was not confirmed; reload before retrying");
+        }
+        Ok(())
+    }
+
+    pub fn remove_playlist_entries(
+        &self,
+        playlist_id: &str,
+        entries: &[PlaylistEntry],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            bail!("Select at least one playlist entry to remove");
+        }
+        let actions: Result<Vec<_>> = entries.iter().map(|entry| {
+            let id = entry.set_video_id.as_deref().filter(|id| !id.trim().is_empty())
+                .context("Playlist entry has no set-video ID; reload the playlist before editing")?;
+            if entry.track.video_id.trim().is_empty() { bail!("Playlist entry has no video ID"); }
+            Ok(json!({"action": "ACTION_REMOVE_VIDEO", "setVideoId": id, "removedVideoId": entry.track.video_id}))
+        }).collect();
+        self.edit_playlist(playlist_id, actions?)
+    }
+
+    pub fn move_playlist_entry(
+        &self,
+        playlist_id: &str,
+        set_video_id: &str,
+        before_set_video_id: Option<&str>,
+    ) -> Result<()> {
+        let action = playlist_move_action(set_video_id, before_set_video_id)?;
+        self.edit_playlist(playlist_id, vec![action])
+    }
+
+    fn edit_playlist(&self, playlist_id: &str, actions: Vec<Value>) -> Result<()> {
+        let playlist_id = normalized_playlist_id(playlist_id)?;
+        let response = self.playlist_request(
+            "browse/edit_playlist",
+            json!({"playlistId": playlist_id, "actions": actions}),
+        )?;
+        check_playlist_edit_success(&response)
+    }
+}
+
+fn normalized_playlist_id(id: &str) -> Result<&str> {
+    let id = id.trim().strip_prefix("VL").unwrap_or(id.trim());
+    if id.is_empty() {
+        bail!("Playlist ID cannot be empty");
+    }
+    Ok(id)
+}
+
+fn validate_playlist_video_ids(ids: &[String]) -> Result<()> {
+    if ids.iter().any(|id| id.trim().is_empty()) {
+        bail!("Song IDs cannot be empty");
+    }
+    Ok(())
+}
+
+fn playlist_move_action(id: &str, before: Option<&str>) -> Result<Value> {
+    if id.trim().is_empty() || before.is_some_and(|id| id.trim().is_empty()) {
+        bail!("Playlist entry has no set-video ID; reload the playlist before editing");
+    }
+    if before == Some(id) {
+        bail!("Cannot move a playlist entry before itself");
+    }
+    let mut action = json!({"action": "ACTION_MOVE_VIDEO_BEFORE", "setVideoId": id});
+    if let Some(before) = before {
+        action["movedSetVideoIdSuccessor"] = json!(before);
+    }
+    Ok(action)
+}
+
+fn check_playlist_edit_success(value: &Value) -> Result<()> {
+    if value["status"].as_str() != Some("STATUS_SUCCEEDED") {
+        bail!(
+            "YouTube Music did not confirm the playlist edit ({})",
+            value["status"].as_str().unwrap_or("missing status")
+        );
+    }
+    check_playlist_response(value)
+}
+
+fn check_playlist_response(value: &Value) -> Result<()> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        bail!(
+            "YouTube Music rejected the playlist request: {}",
+            error["message"].as_str().unwrap_or("unknown error")
+        );
+    }
+    match value {
+        Value::Object(map) => {
+            if let Some(status) = map.get("status").and_then(Value::as_str) {
+                if status.contains("FAIL") || status.contains("ERROR") || status.contains("DENIED")
+                {
+                    bail!("YouTube Music rejected the playlist request ({status})");
+                }
+            }
+            for value in map.values() {
+                check_playlist_response(value)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                check_playlist_response(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod playlist_mutation_tests {
+    use super::*;
+
+    #[test]
+    fn move_uses_entry_identity_and_optional_successor() {
+        assert_eq!(
+            playlist_move_action("entry-one", Some("entry-two")).unwrap(),
+            json!({"action": "ACTION_MOVE_VIDEO_BEFORE", "setVideoId": "entry-one", "movedSetVideoIdSuccessor": "entry-two"})
+        );
+        assert!(
+            playlist_move_action("entry-one", None)
+                .unwrap()
+                .get("movedSetVideoIdSuccessor")
+                .is_none()
+        );
+        assert!(playlist_move_action("entry-one", Some("entry-one")).is_err());
+        assert!(playlist_move_action("", None).is_err());
+    }
+
+    #[test]
+    fn playlist_requests_reject_api_and_nested_action_failures() {
+        assert!(check_playlist_edit_success(&json!({"status": "STATUS_SUCCEEDED"})).is_ok());
+        assert!(check_playlist_edit_success(&json!({})).is_err());
+        assert!(check_playlist_edit_success(&json!({"status": "STATUS_UNKNOWN"})).is_err());
+        assert!(check_playlist_response(&json!({"error": {"message": "Forbidden"}})).is_err());
+        assert!(
+            check_playlist_response(&json!({"results": [{"status": "STATUS_FAILED"}]})).is_err()
+        );
+        assert_eq!(normalized_playlist_id("VLPLmine").unwrap(), "PLmine");
+        assert!(normalized_playlist_id("VL").is_err());
+    }
+}
+
+impl YtMusicClient {
+    pub fn get_listen_again_pin(
+        &self,
+        target: &crate::models::ListenAgainTarget,
+    ) -> Result<crate::models::ListenAgainPin> {
+        use crate::models::ListenAgainTarget;
+        match target {
+            ListenAgainTarget::Playlist(id) => {
+                normalized_playlist_id(id)?;
+            }
+            ListenAgainTarget::Track(id) if id.trim().is_empty() => {
+                bail!("Song ID cannot be empty")
+            }
+            _ => {}
+        }
+        // Queue menus can lag behind the Listen again cards after pin feedback.
+        let mut page =
+            self.playlist_request("browse", json!({"browseId":"FEmusic_listen_again"}))?;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if let Some(pin) = parsers::shared_parser::parse_listen_again_card_pin(&page, target) {
+                return Ok(pin);
+            }
+            let Some(token) = parsers::shared_parser::listen_again_continuation(&page) else {
+                break;
+            };
+            if !seen.insert(token.clone()) {
+                bail!(
+                    "YouTube Music repeated the Listen again continuation; reload to check pin state"
+                );
+            }
+            page = self.playlist_request("browse", json!({"continuation":token}))?;
+        }
+        // Absence is not an unpin signal: some pinned playlists are omitted here.
+        let response = match target {
+            ListenAgainTarget::Playlist(id) => self.playlist_request(
+                "browse",
+                json!({"browseId":format!("VL{}",normalized_playlist_id(id)?)}),
+            )?,
+            ListenAgainTarget::Track(id) => {
+                if id.trim().is_empty() {
+                    bail!("Song ID cannot be empty");
+                }
+                self.playlist_request("next", json!({"videoId":id,"playlistId":format!("RDAMVM{id}"),"isAudioOnly":true,"tunerSettingValue":"AUTOMIX_SETTING_NORMAL"}))?
+            }
+        };
+        parsers::shared_parser::parse_listen_again_pin(&response, target)
+            .context("YouTube Music did not provide Listen again pin controls for this item")
+    }
+
+    pub fn set_listen_again_pin(
+        &self,
+        target: &crate::models::ListenAgainTarget,
+        pinned: bool,
+    ) -> Result<()> {
+        let current = self.get_listen_again_pin(target)?;
+        if current.pinned == pinned {
+            return Ok(());
+        }
+        let token = if pinned {
+            current.pin_token
+        } else {
+            current.unpin_token
+        };
+        let response = self.playlist_request(
+            "feedback",
+            json!({
+                "feedbackTokens":[token],
+                "isFeedbackTokenUnencrypted":false,
+                "shouldMerge":false
+            }),
+        )?;
+        check_listen_again_feedback(&response)?;
+        let mut observed = current.pinned;
+        // Feedback acknowledgement can precede the updated browse/card state.
+        // Poll reads only; repeating feedback can toggle or duplicate an action.
+        for delay in [0, 250, 500, 1_000, 2_000, 4_000] {
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            observed = self.get_listen_again_pin(target)?.pinned;
+            if observed == pinned {
+                return Ok(());
+            }
+        }
+        check_listen_again_pin_state(pinned, observed)
+    }
+}
+
+fn check_listen_again_feedback(response: &Value) -> Result<()> {
+    let responses = response["feedbackResponses"]
+        .as_array()
+        .context("YouTube Music did not confirm processing the Listen again pin request")?;
+    if responses.len() != 1 || responses[0]["isProcessed"].as_bool() != Some(true) {
+        bail!("YouTube Music did not process the Listen again pin request");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod listen_again_feedback_tests {
+    use super::*;
+
+    #[test]
+    fn confirmed_pin_and_unpin_succeed_but_stuck_unpin_is_reported() {
+        assert!(check_listen_again_pin_state(true, true).is_ok());
+        assert!(check_listen_again_pin_state(false, false).is_ok());
+        let error = check_listen_again_pin_state(false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("accepted the unpin request but still reports this item as pinned"));
+        assert!(check_listen_again_pin_state(true, false).is_err());
+    }
+
+    #[test]
+    fn pin_requires_explicit_single_token_processing_confirmation() {
+        assert!(
+            check_listen_again_feedback(&json!({"feedbackResponses":[{"isProcessed":true}]}))
+                .is_ok()
+        );
+        assert!(
+            check_listen_again_feedback(&json!({"feedbackResponses":[{"isProcessed":false}]}))
+                .is_err()
+        );
+        assert!(check_listen_again_feedback(&json!({"feedbackResponses":[]})).is_err());
+        assert!(check_listen_again_feedback(&json!({})).is_err());
+    }
+}
+
+fn check_listen_again_pin_state(requested: bool, observed: bool) -> Result<()> {
+    if requested == observed {
+        return Ok(());
+    }
+    if !requested {
+        bail!(
+            "YouTube Music accepted the unpin request but still reports this item as pinned. This also occurs on YouTube Music; reload to check again."
+        );
+    }
+    bail!(
+        "YouTube Music accepted the pin request but has not confirmed this item as pinned; reload to check again."
+    )
+}

@@ -67,7 +67,7 @@ impl InteractiveTui {
         self.push_content_snapshot();
         self.content_view = TuiContentView::Playlists(TuiCollectionPageView {
             title: "Your Playlists".to_string(),
-            subtitle: "Library playlists from YouTube Music".to_string(),
+            subtitle: "Library playlists from YouTube Music · P: create playlist".to_string(),
             status: TuiCollectionPageStatus::Loading,
         });
         self.home_selected = 0;

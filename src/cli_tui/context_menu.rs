@@ -55,11 +55,38 @@ impl InteractiveTui {
         }
     }
 
+    fn push_listen_again_context_items(&self, items: &mut Vec<ContextMenuItem>, track: &Track) {
+        for pinned in [true, false] {
+            items.push(ContextMenuItem {
+                label: if pinned {
+                    "Pin to Listen again"
+                } else {
+                    "Unpin from Listen again"
+                }
+                .into(),
+                hint: "YouTube Music".into(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::SetListenAgainPin {
+                    target: ListenAgainTarget::Track(track.video_id.clone()),
+                    pinned,
+                },
+            });
+        }
+    }
+
     pub(in crate::cli_tui) fn context_menu_track_items(
         &self,
         track: &Track,
     ) -> Vec<ContextMenuItem> {
         let mut items = vec![
+            ContextMenuItem {
+                label: "Add to playlist".into(),
+                hint: "choose playlist".into(),
+                tone: ContextMenuTone::Default,
+                action: ContextMenuAction::AddToPlaylist {
+                    track: track.clone(),
+                },
+            },
             ContextMenuItem {
                 label: "Play now".to_string(),
                 hint: "start radio".to_string(),
@@ -105,6 +132,7 @@ impl InteractiveTui {
                 track: track.clone(),
             },
         });
+        self.push_listen_again_context_items(&mut items, track);
         self.push_feedback_context_items(&mut items, track);
 
         items
@@ -150,6 +178,15 @@ impl InteractiveTui {
                         track: track.clone(),
                     },
                 });
+                items.push(ContextMenuItem {
+                    label: "Add to playlist".into(),
+                    hint: "choose playlist".into(),
+                    tone: ContextMenuTone::Default,
+                    action: ContextMenuAction::AddToPlaylist {
+                        track: track.clone(),
+                    },
+                });
+                self.push_listen_again_context_items(&mut items, &track);
                 self.push_feedback_context_items(&mut items, &track);
                 if *index != self.snapshot.queue_index {
                     items.push(ContextMenuItem {
@@ -525,6 +562,14 @@ impl InteractiveTui {
         action: ContextMenuAction,
     ) -> Result<()> {
         match action {
+            ContextMenuAction::SetListenAgainPin { target, pinned } => {
+                self.set_remote_listen_again_pin(target, pinned);
+                Ok(())
+            }
+            ContextMenuAction::AddToPlaylist { track } => {
+                self.choose_playlist(track);
+                Ok(())
+            }
             ContextMenuAction::PlayTrackNow { track } => self.play_track_now(track),
             ContextMenuAction::PlayQueueNow { index } => self.play_queue_index_now(index),
             ContextMenuAction::JumpToTrackRadio { track } => self.jump_to_track_radio_seed(track),

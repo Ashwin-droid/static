@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::models::{
     Artist, BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem,
-    HomePage, HomeSection, PlaylistSummary, RadioChip, RadioQueue, SearchResult, Track,
+    HomePage, HomeSection, PlaylistEditor, PlaylistEntry, PlaylistSummary, RadioChip, RadioQueue,
+    SearchResult, Track,
 };
 
 /// Navigate a JSON path and collect items from musicShelfRenderer / musicCarouselShelfRenderer.
@@ -1404,5 +1405,481 @@ fn find_continuation_token(value: &Value) -> Option<String> {
         }
         Value::Array(items) => items.iter().find_map(find_continuation_token),
         _ => None,
+    }
+}
+
+/// Parse only the playlist's own shelf; recommendation shelves are not entries.
+pub(crate) fn parse_playlist_editor_page(
+    json: &Value,
+    playlist_id: &str,
+) -> (PlaylistEditor, Option<String>) {
+    let mut shelves = Vec::new();
+    collect_named_values(json, "musicPlaylistShelfRenderer", &mut shelves);
+    if let Some(shelf) = json.pointer("/continuationContents/musicPlaylistShelfContinuation") {
+        shelves.push(shelf);
+    }
+    let mut entries = Vec::new();
+    let mut continuation = None;
+    for shelf in shelves {
+        append_playlist_entries(shelf.get("contents"), &mut entries);
+        continuation = continuation.or_else(|| find_playlist_continuation(shelf));
+    }
+    // Newer browse responses append playlist rows using an action continuation.
+    for key in ["onResponseReceivedActions", "onResponseReceivedEndpoints"] {
+        if let Some(actions) = json[key].as_array() {
+            for action in actions {
+                if let Some(items) =
+                    action.pointer("/appendContinuationItemsAction/continuationItems")
+                {
+                    append_playlist_entries(Some(items), &mut entries);
+                    continuation = continuation.or_else(|| find_playlist_continuation(items));
+                }
+            }
+        }
+    }
+    let mut headers = Vec::new();
+    for key in [
+        "musicEditablePlaylistDetailHeaderRenderer",
+        "musicResponsiveHeaderRenderer",
+        "musicDetailHeaderRenderer",
+    ] {
+        collect_named_values(json, key, &mut headers);
+    }
+    let mut editable_headers = Vec::new();
+    collect_named_values(
+        json,
+        "musicEditablePlaylistDetailHeaderRenderer",
+        &mut editable_headers,
+    );
+    let editable = !editable_headers.is_empty()
+        || headers.iter().any(|header| {
+            header["editHeader"].is_object() || header["isEditable"].as_bool() == Some(true)
+        })
+        || json["isEditable"].as_bool() == Some(true)
+        || {
+            let mut menus = Vec::new();
+            collect_named_values(json, "playlistEditorEndpoint", &mut menus);
+            !menus.is_empty()
+        };
+    let title = headers
+        .iter()
+        .find_map(|header| header.get("title").and_then(playlist_text))
+        .unwrap_or_else(|| playlist_id.to_owned());
+    (
+        PlaylistEditor {
+            playlist_id: playlist_id.to_owned(),
+            title,
+            editable,
+            entries,
+        },
+        continuation,
+    )
+}
+
+fn append_playlist_entries(items: Option<&Value>, entries: &mut Vec<PlaylistEntry>) {
+    let Some(items) = items.and_then(Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(renderer) = item.get("musicResponsiveListItemRenderer") else {
+            continue;
+        };
+        let mut renderer = renderer.clone();
+        if let Some(id) = renderer.pointer("/playlistItemData/videoId").cloned() {
+            renderer["navigationEndpoint"]["watchEndpoint"]["videoId"] = id;
+        }
+        let Some(track) = parse_track_from_renderer(&renderer) else {
+            continue;
+        };
+        let set_video_id = renderer
+            .pointer("/playlistItemData/playlistSetVideoId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        entries.push(PlaylistEntry {
+            track,
+            set_video_id,
+        });
+    }
+}
+
+fn collect_named_values<'a>(value: &'a Value, name: &str, found: &mut Vec<&'a Value>) {
+    match value {
+        Value::Object(map) => {
+            for (key, value) in map {
+                if key == name {
+                    found.push(value);
+                } else {
+                    collect_named_values(value, name, found);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_named_values(item, name, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn playlist_text(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value["simpleText"].as_str().map(str::to_owned))
+        .or_else(|| value["runs"].as_array().map(|runs| join_runs(runs)))
+}
+
+pub(crate) fn parse_editable_playlists(json: &Value) -> Vec<PlaylistSummary> {
+    let mut renderers = Vec::new();
+    collect_named_values(json, "playlistAddToOptionRenderer", &mut renderers);
+    renderers
+        .into_iter()
+        .filter(|renderer| renderer["isEditable"].as_bool() != Some(false))
+        .filter_map(|renderer| {
+            Some(PlaylistSummary {
+                playlist_id: renderer["playlistId"].as_str()?.to_owned(),
+                title: playlist_text(&renderer["title"])?,
+                thumbnail_url: renderer
+                    .pointer("/thumbnail/thumbnails")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.last())
+                    .and_then(|item| item["url"].as_str())
+                    .map(str::to_owned),
+                subtitle: playlist_text(&renderer["shortBylineText"]),
+            })
+        })
+        .collect()
+}
+
+fn find_playlist_continuation(value: &Value) -> Option<String> {
+    let mut commands = Vec::new();
+    collect_named_values(value, "continuationCommand", &mut commands);
+    commands
+        .iter()
+        .find_map(|command| command["token"].as_str().map(str::to_owned))
+        .or_else(|| find_continuation_token(value))
+}
+
+#[cfg(test)]
+mod playlist_editor_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn row(set_id: &str) -> Value {
+        json!({"musicResponsiveListItemRenderer": {
+            "playlistItemData": {"videoId": "same-video", "playlistSetVideoId": set_id},
+            "flexColumns": [{"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Song"}]}}}]
+        }})
+    }
+
+    #[test]
+    fn editor_preserves_duplicate_entries_and_excludes_suggestions() {
+        let response = json!({
+            "header": {"musicEditablePlaylistDetailHeaderRenderer": {"header": {"musicResponsiveHeaderRenderer": {"title": {"runs": [{"text": "My playlist"}]}}}}},
+            "contents": [{"musicPlaylistShelfRenderer": {"playlistId": "PLtest", "contentsReorderable": true, "contentsMultiSelectable": true, "contents": [row("one"), row("two")], "continuations": [{"nextContinuationData": {"continuation": "next"}}]}},
+                         {"musicShelfRenderer": {"contents": [row("suggestion")]}}]
+        });
+        let (editor, token) = parse_playlist_editor_page(&response, "PLtest");
+        assert!(editor.editable);
+        assert_eq!(editor.title, "My playlist");
+        assert_eq!(editor.entries.len(), 2);
+        assert_eq!(editor.entries[0].set_video_id.as_deref(), Some("one"));
+        assert_eq!(editor.entries[1].set_video_id.as_deref(), Some("two"));
+        assert_eq!(token.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn editor_parses_both_continuation_shapes() {
+        let legacy = json!({"continuationContents": {"musicPlaylistShelfContinuation": {"contents": [row("three")]}}});
+        assert_eq!(
+            parse_playlist_editor_page(&legacy, "PLtest")
+                .0
+                .entries
+                .len(),
+            1
+        );
+        let actions = json!({"onResponseReceivedActions": [{"appendContinuationItemsAction": {"continuationItems": [row("four"), {"continuationItemRenderer": {"continuationEndpoint": {"continuationCommand": {"token": "next-page"}}}}]}}]});
+        let (editor, next) = parse_playlist_editor_page(&actions, "PLtest");
+        assert_eq!(editor.entries.len(), 1);
+        assert_eq!(next.as_deref(), Some("next-page"));
+        assert!(!editor.editable);
+    }
+
+    #[test]
+    fn editable_picker_uses_captured_option_renderer() {
+        let response = json!({"contents": [{"addToPlaylistRenderer": {"playlists": [{"playlistAddToOptionRenderer": {"playlistId": "PLmine", "title": {"runs": [{"text": "Mine"}]}, "shortBylineText": {"runs": [{"text": "39"}, {"text": " tracks"}]}}}]}}]});
+        let playlists = parse_editable_playlists(&response);
+        assert_eq!(playlists.len(), 1);
+        assert_eq!(playlists[0].playlist_id, "PLmine");
+        assert_eq!(playlists[0].subtitle.as_deref(), Some("39 tracks"));
+    }
+}
+
+/// Ordinary playlist playback shares editor parsing, including duplicates and pagination.
+pub(crate) fn has_playlist_shelf(json: &Value) -> bool {
+    let mut shelves = Vec::new();
+    collect_named_values(json, "musicPlaylistShelfRenderer", &mut shelves);
+    !shelves.is_empty()
+}
+
+pub(crate) fn parse_listen_again_pin(
+    json: &Value,
+    target: &crate::models::ListenAgainTarget,
+) -> Option<crate::models::ListenAgainPin> {
+    use crate::models::ListenAgainTarget;
+    if let Some(pin) = parse_listen_again_card_pin(json, target) {
+        return Some(pin);
+    }
+    let mut scopes = Vec::new();
+    match target {
+        ListenAgainTarget::Playlist(_) => {
+            for key in [
+                "musicEditablePlaylistDetailHeaderRenderer",
+                "musicResponsiveHeaderRenderer",
+                "musicDetailHeaderRenderer",
+            ] {
+                collect_named_values(json, key, &mut scopes);
+            }
+        }
+        ListenAgainTarget::Track(video_id) => {
+            collect_named_values(json, "playlistPanelVideoRenderer", &mut scopes);
+            scopes.retain(|renderer| renderer["videoId"].as_str() == Some(video_id));
+        }
+    }
+    for scope in scopes {
+        let mut toggles = Vec::new();
+        collect_named_values(scope, "toggleMenuServiceItemRenderer", &mut toggles);
+        if let Some(pin) = toggles.into_iter().find_map(parse_listen_again_toggle) {
+            return Some(pin);
+        }
+    }
+    None
+}
+
+pub(crate) fn parse_listen_again_card_pin(
+    json: &Value,
+    target: &crate::models::ListenAgainTarget,
+) -> Option<crate::models::ListenAgainPin> {
+    use crate::models::ListenAgainTarget;
+    let mut cards = Vec::new();
+    for key in ["musicTwoRowItemRenderer", "musicResponsiveListItemRenderer"] {
+        collect_named_values(json, key, &mut cards);
+    }
+    for card in cards {
+        let endpoint = card.get("navigationEndpoint")
+            .or_else(|| card.pointer("/flexColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/navigationEndpoint"));
+        let matches = match target {
+            ListenAgainTarget::Track(id) => {
+                endpoint
+                    .and_then(|e| e.pointer("/watchEndpoint/videoId"))
+                    .or_else(|| card.pointer("/playlistItemData/videoId"))
+                    .and_then(Value::as_str)
+                    == Some(id.as_str())
+            }
+            ListenAgainTarget::Playlist(id) => endpoint
+                .and_then(|e| e.pointer("/browseEndpoint/browseId"))
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| {
+                    candidate.strip_prefix("VL").unwrap_or(candidate)
+                        == id.strip_prefix("VL").unwrap_or(id)
+                }),
+        };
+        if !matches {
+            continue;
+        }
+        // Only this card's own menu can authorize an action on its target.
+        let Some(menu) = card.get("menu") else {
+            continue;
+        };
+        let mut toggles = Vec::new();
+        collect_named_values(menu, "toggleMenuServiceItemRenderer", &mut toggles);
+        if let Some(pin) = toggles.into_iter().find_map(parse_listen_again_toggle) {
+            return Some(pin);
+        }
+    }
+    None
+}
+
+pub(crate) fn listen_again_continuation(json: &Value) -> Option<String> {
+    find_playlist_continuation(json)
+}
+
+fn parse_listen_again_toggle(toggle: &Value) -> Option<crate::models::ListenAgainPin> {
+    let default_icon = toggle
+        .pointer("/defaultIcon/iconType")
+        .and_then(Value::as_str);
+    let toggled_icon = toggle
+        .pointer("/toggledIcon/iconType")
+        .and_then(Value::as_str);
+    let (pinned, reversed) = match (default_icon, toggled_icon) {
+        (Some("KEEP"), Some("KEEP_OFF")) => (false, false),
+        (Some("KEEP_OFF"), Some("KEEP")) => (true, true),
+        _ => return None,
+    };
+    let default_token = toggle
+        .pointer("/defaultServiceEndpoint/feedbackEndpoint/feedbackToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())?;
+    let toggled_token = toggle
+        .pointer("/toggledServiceEndpoint/feedbackEndpoint/feedbackToken")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())?;
+    Some(crate::models::ListenAgainPin {
+        pinned: toggle["isToggled"]
+            .as_bool()
+            .map(|toggled| if toggled { !pinned } else { pinned })
+            .unwrap_or(pinned),
+        pin_token: if reversed {
+            toggled_token
+        } else {
+            default_token
+        }
+        .to_owned(),
+        unpin_token: if reversed {
+            default_token
+        } else {
+            toggled_token
+        }
+        .to_owned(),
+    })
+}
+
+#[cfg(test)]
+mod listen_again_pin_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn toggle(default: &str, toggled: &str) -> Value {
+        json!({"defaultIcon":{"iconType":default},"toggledIcon":{"iconType":toggled},
+            "defaultServiceEndpoint":{"feedbackEndpoint":{"feedbackToken":"default-token"}},
+            "toggledServiceEndpoint":{"feedbackEndpoint":{"feedbackToken":"toggled-token"}}})
+    }
+
+    #[test]
+    fn pin_tokens_follow_both_server_toggle_orientations() {
+        let pin = parse_listen_again_toggle(&toggle("KEEP", "KEEP_OFF")).unwrap();
+        assert!(!pin.pinned);
+        assert_eq!(pin.pin_token, "default-token");
+        assert_eq!(pin.unpin_token, "toggled-token");
+        let pin = parse_listen_again_toggle(&toggle("KEEP_OFF", "KEEP")).unwrap();
+        assert!(pin.pinned);
+        assert_eq!(pin.pin_token, "toggled-token");
+        assert_eq!(pin.unpin_token, "default-token");
+        let mut toggled = toggle("KEEP", "KEEP_OFF");
+        toggled["isToggled"] = json!(true);
+        assert!(parse_listen_again_toggle(&toggled).unwrap().pinned);
+    }
+
+    #[test]
+    fn unrelated_or_incomplete_toggles_are_not_pin_actions() {
+        assert!(parse_listen_again_toggle(&toggle("LIBRARY_ADD", "LIBRARY_SAVED")).is_none());
+        let mut incomplete = toggle("KEEP", "KEEP_OFF");
+        incomplete["toggledServiceEndpoint"] = Value::Null;
+        assert!(parse_listen_again_toggle(&incomplete).is_none());
+    }
+
+    #[test]
+    fn exact_listen_again_card_overrides_stale_queue_state() {
+        let response = json!({"cards":[
+            {"musicTwoRowItemRenderer":{"navigationEndpoint":{"watchEndpoint":{"videoId":"other"}},"menu":{"toggleMenuServiceItemRenderer":toggle("KEEP","KEEP_OFF")}}},
+            {"musicTwoRowItemRenderer":{"navigationEndpoint":{"watchEndpoint":{"videoId":"selected"}},"menu":{"toggleMenuServiceItemRenderer":toggle("KEEP_OFF","KEEP")}}}
+        ], "queue":{"playlistPanelVideoRenderer":{"videoId":"selected","menu":{"toggleMenuServiceItemRenderer":toggle("KEEP","KEEP_OFF")}}}});
+        assert!(
+            parse_listen_again_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Track("selected".into())
+            )
+            .unwrap()
+            .pinned
+        );
+        assert!(
+            parse_listen_again_card_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Track("absent".into())
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn playlist_and_responsive_cards_match_only_own_navigation() {
+        let response = json!({"cards":[
+            {"musicTwoRowItemRenderer":{"navigationEndpoint":{"browseEndpoint":{"browseId":"VLPLmine"}},"menu":{"toggleMenuServiceItemRenderer":toggle("KEEP_OFF","KEEP")}}},
+            {"musicResponsiveListItemRenderer":{"flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"navigationEndpoint":{"watchEndpoint":{"videoId":"song"}}}]}}}],"menu":{"toggleMenuServiceItemRenderer":toggle("KEEP_OFF","KEEP")}}}
+        ]});
+        assert!(
+            parse_listen_again_card_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Playlist("PLmine".into())
+            )
+            .unwrap()
+            .pinned
+        );
+        assert!(
+            parse_listen_again_card_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Track("song".into())
+            )
+            .unwrap()
+            .pinned
+        );
+        assert!(
+            parse_listen_again_card_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Track("PLmine".into())
+            )
+            .is_none()
+        );
+        assert!(
+            parse_listen_again_card_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Playlist("other".into())
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn track_lookup_does_not_use_neighboring_queue_tokens() {
+        let response = json!({"contents":[{"playlistPanelVideoRenderer":{"videoId":"other", "menu":{"toggleMenuServiceItemRenderer":toggle("KEEP","KEEP_OFF")}}}]});
+        assert!(
+            parse_listen_again_pin(
+                &response,
+                &crate::models::ListenAgainTarget::Track("selected".into())
+            )
+            .is_none()
+        );
+    }
+}
+
+pub(crate) fn has_playlist_page(json: &Value) -> bool {
+    if has_playlist_shelf(json) {
+        return true;
+    }
+    let mut headers = Vec::new();
+    for key in [
+        "musicEditablePlaylistDetailHeaderRenderer",
+        "musicResponsiveHeaderRenderer",
+        "musicDetailHeaderRenderer",
+    ] {
+        collect_named_values(json, key, &mut headers);
+    }
+    !headers.is_empty()
+}
+
+#[cfg(test)]
+mod playlist_availability_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unavailable_browse_is_distinct_from_empty_playlist() {
+        assert!(!has_playlist_page(
+            &json!({"alerts":[{"alertRenderer":{"type":"ERROR","text":{"simpleText":"Unavailable"}}}]})
+        ));
+        assert!(has_playlist_page(
+            &json!({"header":{"musicEditablePlaylistDetailHeaderRenderer":{"header":{"musicResponsiveHeaderRenderer":{"title":{"runs":[{"text":"Empty"}]}}}}}})
+        ));
     }
 }

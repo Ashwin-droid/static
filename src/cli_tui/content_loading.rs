@@ -36,6 +36,9 @@ impl InteractiveTui {
     pub(in crate::cli_tui) fn drain_background_events(&mut self) {
         while let Ok(event) = self.background_rx.try_recv() {
             match event {
+                TuiBackgroundEvent::PlaylistOperation(result) => {
+                    self.finish_playlist_operation(result)
+                }
                 TuiBackgroundEvent::HomeLoaded(Ok(page)) => {
                     self.home_loading_more = false;
                     self.home_status = HomeFeedStatus::Ready(page);

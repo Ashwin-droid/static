@@ -35,6 +35,16 @@ impl InteractiveTui {
                 Constraint::Length(15),
             ])
             .split(rows[0]);
+        if self.snapshot.radio_virtual_playlist.is_some() {
+            targets.push(ClickTarget {
+                rect: tab_columns[2],
+                kind: ClickTargetKind::SaveRadioPlaylist,
+            });
+            frame.render_widget(
+                Paragraph::new("S: Save radio").style(Style::default().fg(theme.text)),
+                tab_columns[2],
+            );
+        }
         for (area, tab, label) in [
             (tab_columns[0], DetailTab::Queue, "Up Next"),
             (tab_columns[1], DetailTab::Lyrics, "Lyrics"),

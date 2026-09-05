@@ -113,3 +113,96 @@ fn signed_fill_does_not_extend_partially_clipped_cards() {
     assert_eq!(buffer[(1, 2)].bg, Color::Red);
     assert_ne!(buffer[(1, 3)].bg, Color::Red);
 }
+
+#[test]
+fn playlist_reorder_targets_occurrences_and_accounts_for_removal() {
+    let editor = PlaylistEditor {
+        playlist_id: "PLtest".into(),
+        title: "Test".into(),
+        editable: true,
+        entries: ["first", "second", "third"]
+            .into_iter()
+            .map(|id| crate::models::PlaylistEntry {
+                track: sample_track("duplicate"),
+                set_video_id: Some(id.into()),
+            })
+            .collect(),
+    };
+    assert_eq!(
+        playlist_edit::playlist_move_ids(&editor, 0, true),
+        Some(("first".into(), Some("third".into())))
+    );
+    assert_eq!(
+        playlist_edit::playlist_move_ids(&editor, 1, true),
+        Some(("second".into(), None))
+    );
+    assert_eq!(
+        playlist_edit::playlist_move_ids(&editor, 2, false),
+        Some(("third".into(), Some("second".into())))
+    );
+    assert_eq!(playlist_edit::playlist_move_ids(&editor, 0, false), None);
+    assert_eq!(playlist_edit::playlist_move_ids(&editor, 2, true), None);
+    let mut missing = editor.clone();
+    missing.entries[2].set_video_id = None;
+    assert_eq!(playlist_edit::playlist_move_ids(&missing, 0, true), None);
+}
+
+#[test]
+fn playlist_refresh_keeps_selected_occurrence_through_consecutive_moves() {
+    let original = PlaylistEditor {
+        playlist_id: "PLtest".into(),
+        title: "Test".into(),
+        editable: true,
+        entries: ["first", "second", "third"]
+            .into_iter()
+            .map(|id| crate::models::PlaylistEntry {
+                track: sample_track("duplicate"),
+                set_video_id: Some(id.into()),
+            })
+            .collect(),
+    };
+    let mut moved = original.clone();
+    moved.entries.swap(0, 1);
+    let selected = playlist_edit::refreshed_playlist_selection(&original, 0, &moved);
+    assert_eq!(selected, 1);
+    assert_eq!(
+        playlist_edit::playlist_move_ids(&moved, selected, true),
+        Some(("first".into(), None))
+    );
+    let mut moved_again = moved.clone();
+    moved_again.entries.swap(1, 2);
+    assert_eq!(
+        playlist_edit::refreshed_playlist_selection(&moved, selected, &moved_again),
+        2
+    );
+    let mut removed = moved_again.clone();
+    removed.entries.pop();
+    assert_eq!(
+        playlist_edit::refreshed_playlist_selection(&moved_again, 2, &removed),
+        1
+    );
+    removed.entries.clear();
+    assert_eq!(
+        playlist_edit::refreshed_playlist_selection(&moved_again, 2, &removed),
+        0
+    );
+}
+
+#[test]
+fn deleting_playlist_requires_explicit_confirmation_and_editable_target() {
+    let mut editor = PlaylistEditor {
+        playlist_id: "PLtest".into(),
+        title: "Delete me".into(),
+        editable: true,
+        entries: vec![],
+    };
+    for buffer in ["", "D", "DELET", "delete", "DELETE ", "Delete me"] {
+        assert!(!playlist_edit::playlist_delete_confirmed(&editor, buffer));
+    }
+    assert!(playlist_edit::playlist_delete_confirmed(&editor, "DELETE"));
+    editor.editable = false;
+    assert!(!playlist_edit::playlist_delete_confirmed(&editor, "DELETE"));
+    editor.editable = true;
+    editor.playlist_id.clear();
+    assert!(!playlist_edit::playlist_delete_confirmed(&editor, "DELETE"));
+}

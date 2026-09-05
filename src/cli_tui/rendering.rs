@@ -203,6 +203,7 @@ impl InteractiveTui {
         click_targets.extend(self.render_player_bar(frame, player_area, &theme, &mut layout));
         self.rendered_context_menu = self.render_context_menu(frame, area, &theme);
         self.rendered_help_rect = self.render_help_popup(frame, area, &theme);
+        self.render_playlist_dialog(frame, area, &theme);
 
         (click_targets, layout)
     }
@@ -715,6 +716,39 @@ impl InteractiveTui {
                     .alignment(Alignment::Right),
                 header_columns[1],
             );
+        }
+
+        let playlist_action = match &self.content_view {
+            TuiContentView::Playlists(_) => Some("[P: Create]"),
+            TuiContentView::PlaylistDetail(view)
+                if view.kind == TuiTrackPageKind::RemotePlaylist =>
+            {
+                Some("[P: Edit]")
+            }
+            _ => None,
+        };
+        if let Some(label) = playlist_action {
+            let action_area = Rect::new(
+                header_inner.right().saturating_sub(12),
+                header_inner.y,
+                12.min(header_inner.width),
+                header_inner.height,
+            );
+            frame.render_widget(Clear, action_area);
+            frame.render_widget(
+                Paragraph::new(label)
+                    .style(
+                        Style::default()
+                            .fg(theme.accent_glow)
+                            .bg(theme.content_alt_bg),
+                    )
+                    .alignment(Alignment::Right),
+                action_area,
+            );
+            targets.push(ClickTarget {
+                rect: action_area,
+                kind: ClickTargetKind::PlaylistPageAction,
+            });
         }
 
         let feed_block = Block::default()

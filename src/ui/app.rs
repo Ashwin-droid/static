@@ -433,6 +433,9 @@ pub enum Message {
     },
     Noop,
 
+    Playlists(super::playlists::Msg),
+    ListenAgain(super::listen_again::Msg),
+
     // Per-area messages.
     Playback(player_bar::Msg),
     Sidebar(sidebar::Msg),
@@ -570,6 +573,8 @@ pub struct App {
     pub track_menu: Option<queue_panel::TrackMenu>,
 
     // Per-area state (owned by the respective implementation files).
+    pub playlists: super::playlists::State,
+    pub listen_again: super::listen_again::State,
     pub player_bar: player_bar::State,
     pub sidebar: sidebar::State,
     pub queue_panel: queue_panel::State,
@@ -641,6 +646,8 @@ impl App {
             toast: None,
             toast_serial: 0,
             track_menu: None,
+            playlists: super::playlists::State::default(),
+            listen_again: super::listen_again::State::default(),
             player_bar: player_bar::State::default(),
             sidebar: sidebar::State::default(),
             queue_panel: queue_panel::State::default(),
@@ -685,7 +692,28 @@ impl App {
     }
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
+        if super::playlists::is_open(self)
+            && matches!(message, Message::FocusSearch | Message::RefreshHome)
+        {
+            return Task::none();
+        }
         match message {
+            Message::ListenAgain(msg) => super::listen_again::update(self, msg),
+            Message::Playlists(msg) => {
+                let opening = matches!(
+                    msg,
+                    super::playlists::Msg::Create
+                        | super::playlists::Msg::SaveRadio
+                        | super::playlists::Msg::AddTrack(_)
+                        | super::playlists::Msg::Edit(_)
+                );
+                let task = super::playlists::update(self, msg);
+                if opening {
+                    Task::batch([task, iced::widget::operation::focus("playlist-name")])
+                } else {
+                    task
+                }
+            }
             Message::PollTick => self.poll_daemon(),
             Message::DaemonState { serial, result } => self.handle_daemon_state(serial, result),
 
@@ -1083,7 +1111,12 @@ impl App {
         // The track context menu is modal for the whole window (GTK popovers
         // auto-dismissed on any outside click anywhere): the dim + dismiss
         // overlay must cover the sidebar, queue panel and player bar too.
-        if self.track_menu.is_some() {
+        if super::playlists::is_open(self) {
+            iced::widget::Stack::new()
+                .push(body)
+                .push(iced::widget::opaque(super::playlists::layer(self)))
+                .into()
+        } else if self.track_menu.is_some() {
             iced::widget::Stack::new()
                 .width(Length::Fill)
                 .height(Length::Fill)

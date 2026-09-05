@@ -69,6 +69,8 @@ impl InteractiveTui {
             drag_state: None,
             context_menu: None,
             rendered_context_menu: RenderedContextMenu::default(),
+            playlist_dialog: None,
+            playlist_busy: false,
             help_visible: false,
             rendered_help_rect: None,
         };

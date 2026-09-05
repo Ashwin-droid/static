@@ -830,9 +830,14 @@ fn playlists_view(app: &App) -> Element<'_, Message> {
         LoadState::Idle | LoadState::Loading => status_view("Loading playlists...".to_owned()),
         LoadState::Failed(err) => status_view(err.clone()),
         LoadState::Ready(playlists) => {
-            let page = column![widgets::section_header("Your Playlists")]
-                .spacing(theme::SPACE_LG)
-                .width(Length::Fill);
+            let page = column![
+                widgets::section_header("Your Playlists"),
+                button(text("Create playlist"))
+                    .style(theme::secondary_button)
+                    .on_press(Message::Playlists(super::super::playlists::Msg::Create))
+            ]
+            .spacing(theme::SPACE_LG)
+            .width(Length::Fill);
             if playlists.is_empty() {
                 return page.push(empty_state("No playlists found.")).into();
             }
@@ -874,6 +879,7 @@ fn playlist_detail_view(app: &App) -> Element<'_, Message> {
             let mut page = column![
                 back_button("\u{2190} Back to Playlists", Msg::BackToPlaylists),
                 widgets::section_header(&detail.title),
+                super::super::playlists::edit_button(detail.playlist_id.clone()),
             ]
             .spacing(theme::SPACE_LG)
             .width(Length::Fill);

@@ -5,7 +5,9 @@
 mod app;
 mod content_loading;
 mod icons;
+mod listen_again;
 mod player_bar;
+mod playlists;
 mod queue_panel;
 mod sidebar;
 mod theme;

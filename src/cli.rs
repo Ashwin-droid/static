@@ -10,7 +10,9 @@ use crate::ipc::{
     PlaybackSnapshot, PlaylistContext, PlaylistContextSource, RepeatMode, SleepStatusSnapshot,
     daemon_is_running, load_persisted_playback_state,
 };
-use crate::models::{Artist, CrossDeviceQueue, HomeItem, SearchResult, Track};
+use crate::models::{
+    Artist, CrossDeviceQueue, HomeItem, ListenAgainTarget, PlaylistEditor, SearchResult, Track,
+};
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_cookie, download_media_bytes,
     extract_video_id_from_input, fetch_thumbnail_bytes, get_cookie, get_storage_root,
@@ -36,6 +38,8 @@ Usage:
   static like
   static dislike
   static neutral
+  static pin [ytm/yt url | video id | search term]
+  static unpin [ytm/yt url | video id | search term]
   static resume
   static sleep [minutes|after|song|off]
   static share
@@ -43,6 +47,16 @@ Usage:
   static queue get
   static queue addNext <ytm/yt url | video id | search term>
   static queue addLast <ytm/yt url | video id | search term>
+  static playlist list
+  static playlist show <playlist id>
+  static playlist create <title>
+  static playlist delete <playlist id> [--yes]
+  static playlist pin <playlist id>
+  static playlist unpin <playlist id>
+  static playlist from-radio <title>
+  static playlist add <playlist id> <ytm/yt url | video id | search term>
+  static playlist remove <playlist id> <position> [position ...]
+  static playlist move <playlist id> <from position> <to position>
   static offline list
   static offline add <ytm/yt url | video id | search term>
   static offline remove <ytm/yt url | video id>
@@ -66,6 +80,10 @@ Notes:
   That is a feature, not a bug: when a saved value sits outside the UI-safe range,
   the GTK settings page disables that control and treats it as CLI-only until it is
   brought back into range.
+  Playlist positions are 1-based, including duplicate song occurrences.
+  Pin/unpin update YouTube Music Listen again; no song input uses the current song.
+  Playlist deletion is permanent and requires --yes after the playlist ID.
+  New playlists are private. `from-radio` saves the live radio queue in order.
   Run `static config desc` for detailed behavior, accepted values, and range notes.";
 
 fn help_text() -> String {
@@ -89,11 +107,14 @@ pub fn run(args: &[String]) -> Result<()> {
         "like" => run_rate_current_track(SongRating::Like),
         "dislike" => run_rate_current_track(SongRating::Dislike),
         "neutral" => run_rate_current_track(SongRating::Indifferent),
+        "pin" => run_listen_again_pin(&args[1..], true),
+        "unpin" => run_listen_again_pin(&args[1..], false),
         "resume" => run_resume(),
         "sleep" => run_sleep(&args[1..]),
         "share" => run_share(),
         "exec" => run_exec(&args[1..]),
         "queue" => run_queue(&args[1..]),
+        "playlist" => run_playlist(&args[1..]),
         "offline" => run_offline(&args[1..]),
         "info" => run_info(),
         "coordination" => run_coordination(&args[1..]),
@@ -115,6 +136,28 @@ fn run_rate_current_track(rating: SongRating) -> Result<()> {
         rating_label(rating),
         track.title,
         track.artist
+    );
+    Ok(())
+}
+
+fn run_listen_again_pin(args: &[String], pinned: bool) -> Result<()> {
+    let network = saved_network_state()?;
+    let (video_id, title) = if args.is_empty() {
+        let track = DaemonClient::connect_existing()?
+            .state()?
+            .current_track
+            .ok_or_else(|| anyhow::anyhow!("No song is currently playing"))?;
+        (track.video_id, track.title)
+    } else {
+        let input = join_required_input(args, "Listen again song")?;
+        let track = resolve_track_input(&network, &input, true)?;
+        (track.video_id, track.title)
+    };
+    network.set_listen_again_pin(&ListenAgainTarget::Track(video_id), pinned)?;
+    println!(
+        "{} {title} {} YouTube Music Listen again",
+        if pinned { "Pinned" } else { "Unpinned" },
+        if pinned { "in" } else { "from" }
     );
     Ok(())
 }
@@ -293,6 +336,178 @@ fn run_queue_insert(mode: QueueInsertMode, args: &[String]) -> Result<()> {
     );
     if updated.queue.is_empty() {
         println!("Queue is still empty.");
+    }
+    Ok(())
+}
+
+fn playlist_position(raw: &str, len: usize) -> Result<usize> {
+    let position = raw
+        .parse::<usize>()
+        .with_context(|| format!("Invalid playlist position `{raw}`"))?;
+    if position == 0 || position > len {
+        bail!("Playlist position must be between 1 and {len}; got {position}");
+    }
+    Ok(position - 1)
+}
+
+// The remote operation inserts before a successor. Resolve that successor after
+// removing the moving occurrence so downward moves land at the requested index.
+fn playlist_move_successor(len: usize, from: usize, to: usize) -> Option<usize> {
+    (0..len).filter(|index| *index != from).nth(to)
+}
+
+fn require_editable_playlist(editor: &PlaylistEditor) -> Result<()> {
+    if !editor.editable {
+        bail!("Playlist `{}` is read-only", editor.title);
+    }
+    Ok(())
+}
+
+fn playlist_delete_confirmed(args: &[String]) -> Result<bool> {
+    match args {
+        [id] if !id.trim().is_empty() && !id.starts_with('-') => Ok(false),
+        [id, flag] if !id.trim().is_empty() && !id.starts_with('-') && flag == "--yes" => Ok(true),
+        _ => bail!("Usage: static playlist delete <playlist id> [--yes]"),
+    }
+}
+
+fn run_playlist(args: &[String]) -> Result<()> {
+    let command = args.first().map(String::as_str).unwrap_or("list");
+    match command {
+        "list" if args.len() <= 1 => {
+            for playlist in saved_network_state()?.get_editable_playlists()? {
+                println!("{}  {}", playlist.playlist_id, playlist.title);
+            }
+        }
+        "delete" => {
+            let confirmed = playlist_delete_confirmed(&args[1..])?;
+            let network = saved_network_state()?;
+            let editor = network.get_playlist_editor(&args[1])?;
+            require_editable_playlist(&editor)?;
+            if !confirmed {
+                println!(
+                    "Permanently delete playlist \"{}\" ({}) and all its playlist entries?",
+                    editor.title, editor.playlist_id
+                );
+                println!(
+                    "This cannot be undone. To confirm, run: static playlist delete {} --yes",
+                    editor.playlist_id
+                );
+                return Ok(());
+            }
+            network.delete_playlist(&editor.playlist_id)?;
+            println!(
+                "Deleted playlist: {} ({})",
+                editor.title, editor.playlist_id
+            );
+        }
+        "pin" | "unpin" if args.len() == 2 => {
+            let pinned = command == "pin";
+            saved_network_state()?
+                .set_listen_again_pin(&ListenAgainTarget::Playlist(args[1].clone()), pinned)?;
+            println!(
+                "{} playlist {} {} YouTube Music Listen again",
+                if pinned { "Pinned" } else { "Unpinned" },
+                args[1],
+                if pinned { "in" } else { "from" }
+            );
+        }
+        "show" if args.len() == 2 => {
+            let editor = saved_network_state()?.get_playlist_editor(&args[1])?;
+            println!(
+                "{} ({}){}",
+                editor.title,
+                editor.playlist_id,
+                if editor.editable { "" } else { " [read-only]" }
+            );
+            for (index, entry) in editor.entries.iter().enumerate() {
+                println!("{}. {}", index + 1, format_track_summary(&entry.track));
+            }
+        }
+        "create" | "from-radio" => {
+            let title = join_required_input(&args[1..], "playlist title")?;
+            let video_ids = if command == "from-radio" {
+                let snapshot = DaemonClient::connect_existing()?.state()?;
+                if snapshot.radio_virtual_playlist.is_none() || snapshot.queue.is_empty() {
+                    bail!("Start a radio before creating a playlist from it");
+                }
+                snapshot
+                    .queue
+                    .into_iter()
+                    .map(|track| track.video_id)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let id = saved_network_state()?.create_playlist(&title, &video_ids)?;
+            println!("Created private playlist: {title} ({id})");
+        }
+        "add" if args.len() >= 3 => {
+            let input = join_required_input(&args[2..], "playlist song")?;
+            let network = saved_network_state()?;
+            let editor = network.get_playlist_editor(&args[1])?;
+            require_editable_playlist(&editor)?;
+            let track = resolve_track_input(&network, &input, true)?;
+            network.add_playlist_tracks(&editor.playlist_id, &[track.video_id.clone()])?;
+            println!("Added {} to {}", format_track_summary(&track), editor.title);
+        }
+        "remove" if args.len() >= 3 => {
+            let network = saved_network_state()?;
+            let editor = network.get_playlist_editor(&args[1])?;
+            require_editable_playlist(&editor)?;
+            let mut seen = HashSet::new();
+            let mut entries = Vec::new();
+            for raw in &args[2..] {
+                let index = playlist_position(raw, editor.entries.len())?;
+                let entry = &editor.entries[index];
+                if entry.set_video_id.as_deref().is_none_or(str::is_empty) {
+                    bail!(
+                        "Playlist position {} has no editable occurrence ID",
+                        index + 1
+                    );
+                }
+                if seen.insert(index) {
+                    entries.push(entry.clone());
+                }
+            }
+            network.remove_playlist_entries(&editor.playlist_id, &entries)?;
+            println!("Removed {} song(s) from {}", entries.len(), editor.title);
+        }
+        "move" if args.len() == 4 => {
+            let network = saved_network_state()?;
+            let editor = network.get_playlist_editor(&args[1])?;
+            require_editable_playlist(&editor)?;
+            let from = playlist_position(&args[2], editor.entries.len())?;
+            let to = playlist_position(&args[3], editor.entries.len())?;
+            if from == to {
+                println!("Song is already at position {}", to + 1);
+                return Ok(());
+            }
+            let occurrence_id = |index: usize| -> Result<&str> {
+                editor.entries[index]
+                    .set_video_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Playlist position {} has no editable occurrence ID",
+                            index + 1
+                        )
+                    })
+            };
+            let moving = occurrence_id(from)?;
+            let before = playlist_move_successor(editor.entries.len(), from, to)
+                .map(occurrence_id)
+                .transpose()?;
+            network.move_playlist_entry(&editor.playlist_id, moving, before)?;
+            println!(
+                "Moved position {} to {} in {}",
+                from + 1,
+                to + 1,
+                editor.title
+            );
+        }
+        _ => bail!("Invalid playlist command.\n\n{}", help_text()),
     }
     Ok(())
 }

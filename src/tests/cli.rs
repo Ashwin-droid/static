@@ -230,3 +230,74 @@ fn undated_remote_queue_cannot_outrank_local_resume() {
         Some(&local)
     ));
 }
+
+#[test]
+fn playlist_positions_reject_zero_out_of_range_and_non_numbers() {
+    assert_eq!(super::playlist_position("1", 3).unwrap(), 0);
+    assert_eq!(super::playlist_position("3", 3).unwrap(), 2);
+    for raw in ["0", "4", "-1", "song"] {
+        assert!(super::playlist_position(raw, 3).is_err());
+    }
+    assert!(super::playlist_position("1", 0).is_err());
+}
+
+#[test]
+fn playlist_moves_use_successor_in_queue_after_removal() {
+    // Exhaust every source/destination pair, including first and last slots.
+    for len in 1..=8 {
+        for from in 0..len {
+            for to in 0..len {
+                let successor = super::playlist_move_successor(len, from, to);
+                let mut reordered: Vec<_> = (0..len).filter(|index| *index != from).collect();
+                let insertion = successor
+                    .map(|next| reordered.iter().position(|index| *index == next).unwrap())
+                    .unwrap_or(reordered.len());
+                reordered.insert(insertion, from);
+                assert_eq!(reordered[to], from);
+                assert_eq!(reordered.len(), len);
+            }
+        }
+    }
+}
+
+#[test]
+fn playlist_help_explains_occurrences_and_radio() {
+    let help = super::help_text();
+    assert!(help.contains("static playlist from-radio <title>"));
+    assert!(help.contains("Playlist positions are 1-based"));
+    assert!(help.contains("New playlists are private"));
+}
+
+#[test]
+fn playlist_deletion_requires_exact_explicit_confirmation_flag() {
+    let args = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(!super::playlist_delete_confirmed(&args(&["PLtest"])).unwrap());
+    assert!(super::playlist_delete_confirmed(&args(&["PLtest", "--yes"])).unwrap());
+    for values in [
+        vec![],
+        vec![""],
+        vec!["--yes"],
+        vec!["--yes", "PLtest"],
+        vec!["PLtest", "yes"],
+        vec!["PLtest", "--yes=true"],
+        vec!["PLtest", "--yes", "extra"],
+    ] {
+        assert!(super::playlist_delete_confirmed(&args(&values)).is_err());
+    }
+}
+
+#[test]
+fn playlist_delete_and_listen_again_help_describe_server_actions() {
+    let help = super::help_text();
+    assert!(help.contains("static playlist delete <playlist id> [--yes]"));
+    assert!(help.contains("Playlist deletion is permanent"));
+    assert!(help.contains("static playlist pin <playlist id>"));
+    assert!(help.contains("static playlist unpin <playlist id>"));
+    assert!(help.contains("static pin [ytm/yt url | video id | search term]"));
+    assert!(help.contains("Pin/unpin update YouTube Music Listen again"));
+}

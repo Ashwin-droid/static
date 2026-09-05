@@ -134,6 +134,14 @@ impl InteractiveTui {
         kind: &ClickTargetKind,
     ) -> Result<()> {
         match kind {
+            ClickTargetKind::PlaylistPageAction => {
+                self.playlist_page_action();
+                Ok(())
+            }
+            ClickTargetKind::SaveRadioPlaylist => {
+                self.create_playlist_prompt(true);
+                Ok(())
+            }
             ClickTargetKind::Action(action) => self.run_action(*action),
             ClickTargetKind::Nav(nav) => self.handle_nav(*nav),
             ClickTargetKind::SearchBox => {

@@ -46,7 +46,8 @@ use crate::ipc::{
 };
 use crate::models::{
     BrowseSectionsPage, CrossDeviceQueue, HomeBrowseCard, HomeBrowsePageType, HomeItem, HomePage,
-    PlaylistSummary, RadioChip, SearchResult, SyncedLyrics, Track,
+    ListenAgainTarget, PlaylistEditor, PlaylistSummary, RadioChip, SearchResult, SyncedLyrics,
+    Track,
 };
 use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
@@ -79,6 +80,7 @@ mod input;
 mod lifecycle;
 mod page_builders;
 mod playback;
+mod playlist_edit;
 mod queue_drag;
 mod rendering;
 mod search;
@@ -534,6 +536,7 @@ struct TuiSettingsConfirmation {
 }
 
 enum TuiBackgroundEvent {
+    PlaylistOperation(Result<playlist_edit::PlaylistReply, String>),
     HomeLoaded(Result<HomePage, String>),
     CrossDeviceQueueLoaded(Result<Option<CrossDeviceQueue>, String>),
     HomeAppended {
@@ -574,6 +577,8 @@ enum TuiBackgroundEvent {
 
 #[derive(Clone)]
 enum ClickTargetKind {
+    PlaylistPageAction,
+    SaveRadioPlaylist,
     Action(TuiAction),
     Nav(TuiNavItem),
     SearchBox,
@@ -625,6 +630,13 @@ struct TuiDragState {
 
 #[derive(Clone)]
 enum ContextMenuAction {
+    SetListenAgainPin {
+        target: ListenAgainTarget,
+        pinned: bool,
+    },
+    AddToPlaylist {
+        track: Track,
+    },
     PlayTrackNow {
         track: Track,
     },
@@ -844,6 +856,8 @@ struct InteractiveTui {
     drag_state: Option<TuiDragState>,
     context_menu: Option<ContextMenuState>,
     rendered_context_menu: RenderedContextMenu,
+    playlist_dialog: Option<playlist_edit::PlaylistDialog>,
+    playlist_busy: bool,
     help_visible: bool,
     rendered_help_rect: Option<Rect>,
 }

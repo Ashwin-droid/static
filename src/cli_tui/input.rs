@@ -7,6 +7,10 @@ impl InteractiveTui {
         key_event: crossterm::event::KeyEvent,
     ) -> Result<bool> {
         let code = key_event.code;
+        if self.playlist_dialog.is_some() {
+            self.playlist_dialog_key(code);
+            return Ok(false);
+        }
 
         if let Some(edit) = self.settings_text_edit.clone() {
             match code {
@@ -135,6 +139,8 @@ impl InteractiveTui {
 
         match code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('P') => self.playlist_page_action(),
+            KeyCode::Char('S') => self.create_playlist_prompt(true),
             KeyCode::Char('h') => {
                 self.help_visible = true;
             }
@@ -204,6 +210,9 @@ impl InteractiveTui {
     }
 
     pub(in crate::cli_tui) fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.playlist_dialog.is_some() {
+            return Ok(());
+        }
         if self.settings_confirmation.is_some() {
             self.status_line =
                 "Confirm the settings warning with Enter, or cancel with Esc.".to_string();

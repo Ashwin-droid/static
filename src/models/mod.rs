@@ -92,6 +92,37 @@ pub struct PlaylistSummary {
     pub subtitle: Option<String>,
 }
 
+/// One occurrence of a song in a remote playlist. Duplicate songs have distinct
+/// set-video IDs; mutations must address the occurrence, not just the song.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEntry {
+    pub track: Track,
+    pub set_video_id: Option<String>,
+}
+
+/// Fresh remote playlist data used by editors independently of playback state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEditor {
+    pub playlist_id: String,
+    pub title: String,
+    pub editable: bool,
+    pub entries: Vec<PlaylistEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListenAgainTarget {
+    Track(String),
+    Playlist(String),
+}
+
+/// Server-provided commands for the account's Listen again pin, not offline storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListenAgainPin {
+    pub pinned: bool,
+    pub pin_token: String,
+    pub unpin_token: String,
+}
+
 /// A single filter chip from a radio queue (e.g. "All", "Discover", "J-pop").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RadioChip {

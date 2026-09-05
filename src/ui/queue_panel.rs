@@ -346,9 +346,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
         DetailPanelView::Lyrics => lyrics_page(app),
     };
 
-    let content = column![header_row(app), body]
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let mut content = column![header_row(app)];
+    if app.player.is_radio_queue() {
+        content = content.push(
+            button(text("Save radio as playlist"))
+                .style(theme::secondary_button)
+                .on_press(Message::Playlists(super::playlists::Msg::SaveRadio)),
+        );
+    }
+    let content = content.push(body).width(Length::Fill).height(Length::Fill);
 
     mouse_area(content)
         .on_move(|position| qmsg(Msg::PointerMoved(position)))
@@ -1480,6 +1486,18 @@ pub fn context_menu_layer(app: &App) -> Element<'_, Message> {
         )),
     }
 
+    items.push(super::listen_again::control(
+        app,
+        crate::models::ListenAgainTarget::Track(menu.track.video_id.clone()),
+        true,
+    ));
+    items.push(menu_action(
+        "Add to playlist",
+        Some(Message::Playlists(super::playlists::Msg::AddTrack(
+            menu.track.clone(),
+        ))),
+        false,
+    ));
     items.push(menu_action("Share", Some(mmsg(MenuMsg::Share)), false));
 
     if let Some(index) = menu.queue_index {
@@ -1590,7 +1608,11 @@ pub fn update_menu(app: &mut App, msg: MenuMsg) -> Task<Message> {
 
             let cache = app.cache.clone();
             let probe_video_id = video_id.clone();
-            app::blocking(
+            let pin_task = super::listen_again::load(
+                app,
+                crate::models::ListenAgainTarget::Track(video_id.clone()),
+            );
+            let offline_task = app::blocking(
                 move || {
                     cache
                         .lock()
@@ -1603,7 +1625,8 @@ pub fn update_menu(app: &mut App, msg: MenuMsg) -> Task<Message> {
                         pinned,
                     })
                 },
-            )
+            );
+            Task::batch([pin_task, offline_task])
         }
 
         MenuMsg::Dismiss => {

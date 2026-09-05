@@ -798,6 +798,11 @@ fn tracks_page<'a>(app: &'a App, tracks: &'a [Track]) -> Element<'a, Message> {
         .spacing(theme::SPACE_LG)
         .width(Length::Fill);
 
+    if state.page_type == Some(HomeBrowsePageType::Playlist) {
+        if let Some(id) = &state.browse_id {
+            page = page.push(super::super::playlists::edit_button(id.clone()));
+        }
+    }
     if tracks.is_empty() {
         return page
             .push(empty_label("No playable tracks found for this page."))

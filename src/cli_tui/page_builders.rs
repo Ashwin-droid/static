@@ -22,7 +22,14 @@ pub(in crate::cli_tui) fn build_track_page_document(
                 title: view.title.clone(),
                 subtitle: view.subtitle.clone(),
                 meta: "Loading songs...".to_string(),
-                hint: Some("Press b or Backspace to go back".to_string()),
+                hint: Some(
+                    if view.kind == TuiTrackPageKind::RemotePlaylist {
+                        "P: edit playlist · b: back"
+                    } else {
+                        "Press b or Backspace to go back"
+                    }
+                    .to_string(),
+                ),
                 thumbnail_url: view.thumbnail_url.clone(),
                 accent: true,
             });
@@ -42,7 +49,14 @@ pub(in crate::cli_tui) fn build_track_page_document(
                 title: view.title.clone(),
                 subtitle: view.subtitle.clone(),
                 meta: "This page could not be loaded".to_string(),
-                hint: Some("Press b or Backspace to go back".to_string()),
+                hint: Some(
+                    if view.kind == TuiTrackPageKind::RemotePlaylist {
+                        "P: edit playlist · b: back"
+                    } else {
+                        "Press b or Backspace to go back"
+                    }
+                    .to_string(),
+                ),
                 thumbnail_url: view.thumbnail_url.clone(),
                 accent: false,
             });
@@ -62,7 +76,14 @@ pub(in crate::cli_tui) fn build_track_page_document(
                 title: view.title.clone(),
                 subtitle: view.subtitle.clone(),
                 meta: track_count_label(tracks.len()),
-                hint: Some("Press b or Backspace to go back".to_string()),
+                hint: Some(
+                    if view.kind == TuiTrackPageKind::RemotePlaylist {
+                        "P: edit playlist · b: back"
+                    } else {
+                        "Press b or Backspace to go back"
+                    }
+                    .to_string(),
+                ),
                 thumbnail_url: view.thumbnail_url.clone(),
                 accent: true,
             });

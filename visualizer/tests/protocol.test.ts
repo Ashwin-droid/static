@@ -69,15 +69,18 @@ test('history is bounded at 350 frames, advances only on new sequence, and freez
   assert.equal(history.append(frame(20_001), false), true);
 });
 
-test('new generation clears previous song, including on pause; stale generations cannot return', () => {
+test('new songs keep previous FFT history while rejecting stale generations', () => {
   const history = new FrequencyHistory(30);
   history.append(frame(10), false);
   history.append(frame(11), false);
   history.append(frame(0, 2), false);
-  assert.equal(history.samples[0][MAX_HISTORY - 2], 0);
+  assert.equal(history.samples[0][MAX_HISTORY - 2], 0.5);
   assert.equal(history.samples[0][MAX_HISTORY - 1], 0.5);
   assert.equal(history.append(frame(12, 1), false), false);
+  const beforePause = history.samples[0].slice();
   history.append(frame(0, 3), true);
+  assert.deepEqual(history.samples[0], beforePause);
+  history.clear();
   assert.ok(history.samples.every(row => row.every(value => value === 0)));
 });
 
@@ -113,4 +116,41 @@ test('cartridge status distinguishes volatile memory from saved disk files', () 
   for (const message of [{ ...ready, storage: 'disk' }, { ...ready, storage: undefined }, { ...ready, storage: 'cloud' }, { ...ready, path: 123 }, { ...ready, path: undefined }]) {
     assert.equal(parseMessage(JSON.stringify(message)), null);
   }
+});
+
+
+test('reconnect resets producer counters without erasing visible history', () => {
+  const history = new FrequencyHistory(30);
+  const allocation = history.samples[0];
+  history.append(frame(100, 50, 0.75), false);
+  history.resetStream();
+  assert.equal(history.samples[0][MAX_HISTORY - 1], 0.75);
+  assert.ok(history.append(frame(0, 1, 0.25), false));
+  assert.equal(history.samples[0], allocation);
+  assert.equal(history.samples[0][MAX_HISTORY - 2], 0.75);
+  assert.equal(history.samples[0][MAX_HISTORY - 1], 0.25);
+});
+
+test('each FFT time-column keeps its birth colours and carries the transition forward', () => {
+  const yellow = { line1: '#ffff00', line2: '#ff0000' };
+  const halfway = { line1: '#808080', line2: '#800080' };
+  const blue = { line1: '#0000ff', line2: '#0000ff' };
+  const history = new FrequencyHistory(30, yellow);
+  const colorAllocation = history.line1Colors.buffer;
+  history.append(frame(0, 1, 0.8), false, yellow);
+  history.append(frame(0, 2, 0.5), false, halfway);
+  history.append(frame(1, 2, 0.2), false, blue);
+  assert.deepEqual([...history.line1Colors.slice(-3)], [0xffff00, 0x808080, 0x0000ff]);
+  assert.deepEqual([...history.line2Colors.slice(-3)], [0xff0000, 0x800080, 0x0000ff]);
+  const before = history.line1Colors.slice();
+  assert.ok(!history.append(frame(2, 2), true, yellow));
+  assert.deepEqual(history.line1Colors, before);
+  history.resetStream();
+  assert.deepEqual(history.line1Colors, before);
+  for (let i = 0; i < 500; i++) history.append(frame(i, 1), false, blue);
+  assert.equal(history.line1Colors.buffer, colorAllocation);
+  assert.ok(history.line1Colors.every(color => color === 0x0000ff));
+  history.clear(yellow);
+  assert.ok(history.line1Colors.every(color => color === 0xffff00));
+  assert.ok(history.samples.every(row => row.every(value => value === 0)));
 });

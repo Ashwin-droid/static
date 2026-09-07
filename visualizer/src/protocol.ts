@@ -1,5 +1,5 @@
 import { parseCoverTheme } from './theme-state';
-import type { ThemePreset } from './themes';
+import { presets, type ThemePreset } from './themes';
 
 export const MAX_HISTORY = 350;
 export const MIN_BANDS = 8;
@@ -85,27 +85,54 @@ export function parseMessage(raw: unknown): ServerMessage | null {
 /** A fixed allocation: at most 128 bands × 350 float samples. */
 export class FrequencyHistory {
   readonly samples: Float32Array[];
+  /** Immutable-at-birth palette endpoints for each time column, packed as RGB. */
+  readonly line1Colors = new Uint32Array(MAX_HISTORY);
+  readonly line2Colors = new Uint32Array(MAX_HISTORY);
+  private lastLine1: number;
+  private lastLine2: number;
   generation: number | null = null;
   sequence = -1;
   revision = 0;
-  constructor(readonly bands: number) {
+  constructor(readonly bands: number, colors = presets[0].graphTheme) {
     if (!Number.isInteger(bands) || bands < MIN_BANDS || bands > MAX_BANDS) throw new RangeError('Bands must be 8 to 128');
     this.samples = Array.from({ length: bands }, () => new Float32Array(MAX_HISTORY));
+    this.lastLine1 = Number.parseInt(colors.line1.slice(1), 16);
+    this.lastLine2 = Number.parseInt(colors.line2.slice(1), 16);
+    this.line1Colors.fill(this.lastLine1);
+    this.line2Colors.fill(this.lastLine2);
   }
-  clear() {
+  clear(colors?: ThemePreset['graphTheme']) {
+    if (colors) {
+      this.lastLine1 = Number.parseInt(colors.line1.slice(1), 16);
+      this.lastLine2 = Number.parseInt(colors.line2.slice(1), 16);
+    }
     this.samples.forEach(row => row.fill(0));
+    this.line1Colors.fill(this.lastLine1);
+    this.line2Colors.fill(this.lastLine2);
     this.revision++;
   }
-  append(frame: AudioFrame, paused: boolean): boolean {
+  /** A reconnected producer may restart its counters; visible history remains. */
+  resetStream() {
+    this.generation = null;
+    this.sequence = -1;
+  }
+  append(frame: AudioFrame, paused: boolean, colors?: ThemePreset['graphTheme']): boolean {
     if (this.generation !== null && frame.generation < this.generation) return false;
     if (frame.generation !== this.generation) {
-      this.clear();
       this.generation = frame.generation;
       this.sequence = -1;
     }
     if (frame.sequence <= this.sequence || frame.bands.length !== this.bands) return false;
     this.sequence = frame.sequence;
     if (paused) return false;
+    if (colors) {
+      this.lastLine1 = Number.parseInt(colors.line1.slice(1), 16);
+      this.lastLine2 = Number.parseInt(colors.line2.slice(1), 16);
+    }
+    this.line1Colors.copyWithin(0, 1);
+    this.line2Colors.copyWithin(0, 1);
+    this.line1Colors[MAX_HISTORY - 1] = this.lastLine1;
+    this.line2Colors[MAX_HISTORY - 1] = this.lastLine2;
     this.samples.forEach((row, i) => {
       row.copyWithin(0, 1);
       row[MAX_HISTORY - 1] = frame.bands[i];

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { HardDrive, Music, Pause, Play, RotateCcw, SkipBack, SkipForward, Sliders, Volume2, Maximize, Minimize } from 'lucide-react';
 import { Visualizer } from './Visualizer';
 import { initialCamera } from './view-controls';
@@ -34,6 +34,16 @@ export function App() {
   const [themeSelection, setThemeSelection] = useState(initialThemeSelection);
   const themeSelectionRef = useRef(themeSelection);
   const theme = activeTheme(themeSelection);
+  const displayedTheme = useRef<ThemePreset>(theme);
+  const paintTheme = (next: ThemePreset) => {
+    const element = host.current;
+    if (!element) return;
+    element.style.setProperty('--primary', next.uiTheme.primary);
+    element.style.setProperty('--secondary', next.uiTheme.secondary);
+    element.style.setProperty('--visualizer-background', next.uiTheme.background);
+    element.style.setProperty('--graph-start', next.graphTheme.line1);
+    element.style.setProperty('--graph-end', next.graphTheme.line2);
+  };
   const changeTheme = (action: ThemeAction) => {
     const next = selectTheme(themeSelectionRef.current, action);
     if (next === themeSelectionRef.current) return;
@@ -69,7 +79,7 @@ export function App() {
       bands: () => bandsRef.current,
       onStatus: value => {
         setStatus(value);
-        if (value === 'connected') history.current = new FrequencyHistory(bandsRef.current);
+        if (value === 'connected') history.current.resetStream();
         if ((value === 'disconnected' || value === 'unavailable') && request.current) {
           clearRequest();
           setNotice('Connection lost during cartridge creation. A completed cartridge remains with the playback daemon; check staticfs if enabled.');
@@ -77,7 +87,7 @@ export function App() {
       },
       onMessage: message => {
         switch (message.type) {
-          case 'audio': history.current.append(message.frame, stateRef.current.paused || !stateRef.current.current_track); break;
+          case 'audio': history.current.append(message.frame, stateRef.current.paused || !stateRef.current.current_track, displayedTheme.current.graphTheme); break;
           case 'state':
             stateRef.current = message.state;
             setState(message.state);
@@ -113,7 +123,7 @@ export function App() {
     const next = Math.max(8, Math.min(128, Math.round(value)));
     bandsRef.current = next;
     setBands(next);
-    history.current = new FrequencyHistory(next);
+    history.current = new FrequencyHistory(next, displayedTheme.current.graphTheme);
     if (status === 'connected') send({ type: 'configure', bands: next });
   };
   const changeVolume = (value: number) => {
@@ -127,11 +137,12 @@ export function App() {
     setCartridge(null);
     try {
       const screenshot = capture.current();
+      const capturedTheme = displayedTheme.current;
       // A 1280 x 720 PNG normally stays well below this limit. Refuse noisy oversized captures.
       if (screenshot.length > 3_500_000) throw new Error('The screenshot is too large. Use a smaller window and try again.');
       const id = crypto.randomUUID();
       if (!send({ type: 'cartridge', id, video_id: state.current_track.video_id, screenshot,
-        metadata: { uiTheme: theme.uiTheme, graphTheme: theme.graphTheme, cameraControls: view.current,
+        metadata: { uiTheme: capturedTheme.uiTheme, graphTheme: capturedTheme.graphTheme, cameraControls: view.current,
           lineSpacing: spacing, fftSize: bands, timestamp: Date.now() } })) return;
       request.current = id;
       setBusy(true);
@@ -148,19 +159,16 @@ export function App() {
     const previous = activeTheme(themeSelectionRef.current);
     changeTheme({ type: 'manual', theme: { ...previous, name: '', [group]: { ...previous[group], [key]: value } } as ThemePreset });
   };
-  const style = { '--primary': theme.uiTheme.primary, '--secondary': theme.uiTheme.secondary,
-    background: `linear-gradient(to bottom, ${theme.uiTheme.background}, #000000)` } as CSSProperties;
-
   const showControls = !fullscreen.active || fullscreen.controls;
-  return <main ref={host} className={`app${fullscreen.active ? ' is-fullscreen' : ''}`} data-controls={showControls} style={style}>
+  return <main ref={host} className={`app${fullscreen.active ? ' is-fullscreen' : ''}`} data-controls={showControls}>
     <header className="topline" hidden={!showControls}><span>STATIC <span className="muted">/ echo trace</span></span><div className="window-actions"><span className="connection" data-connected={connected}>{connected ? 'Connected to Static' : 'Disconnected'}</span><button className="fullscreen-button" onClick={() => void fullscreenController.current?.toggle()} aria-label={fullscreen.active ? 'Exit fullscreen' : 'Enter fullscreen'} title={fullscreen.active ? 'Exit fullscreen (Escape / F11)' : 'Fullscreen (F11)'}>{fullscreen.active ? <Minimize size={16} /> : <Maximize size={16} />}</button></div></header>
     {fullscreen.active && <button className="controls-reveal" title={showControls ? 'Hide controls' : 'Show controls'} aria-label={showControls ? 'Hide controls' : 'Show controls'} aria-expanded={showControls} aria-controls="visualizer-controls" onClick={() => fullscreenController.current?.toggleControls()}><Sliders size={16} /></button>}
     {!connected && <div className="connection-banner" role="status" hidden={!showControls}>
       {status === 'connecting' ? 'Connecting to Static…' : status === 'disconnected' ? 'Connection lost. Reconnecting…' : 'Open the visualiser from Static to connect.'}
       {status === 'unavailable' && <button onClick={() => location.reload()}>Retry</button>}
     </div>}
-    <Visualizer historyRef={history} captureRef={capture} viewRef={view} graphTheme={theme.graphTheme}
-      background={theme.uiTheme.background} lineSpacing={spacing} numBands={bands} />
+    <Visualizer historyRef={history} captureRef={capture} viewRef={view} theme={theme}
+      displayedThemeRef={displayedTheme} onThemeFrame={paintTheme} lineSpacing={spacing} numBands={bands} />
     <section id="visualizer-controls" className="controls" aria-label="Visualiser controls" hidden={!showControls}>
       <div className="panel">
         <div className="tabs" role="tablist" aria-label="Controls">
@@ -193,7 +201,7 @@ export function App() {
               <input id="spacing" type="range" min="0.1" max="5" step="0.1" value={spacing} onChange={event => setSpacing(Number(event.target.value))} />
               <label htmlFor="bands">Frequency bands <output>{bands}</output></label>
               <input id="bands" type="range" min="8" max="128" step="1" value={bands} onChange={event => changeBands(Number(event.target.value))} />
-              <button onClick={() => history.current.clear()}><RotateCcw size={14} />Clear traces</button>
+              <button onClick={() => history.current.clear(displayedTheme.current.graphTheme)}><RotateCcw size={14} />Clear traces</button>
             </div>
             <div className="theme-controls"><h2>Theme</h2>
               <select aria-label="Theme preset" value={themeSelection.mode === 'cover' ? 'cover-art' : theme.name} onChange={event => {
@@ -202,7 +210,7 @@ export function App() {
               }}>
                 <option value="cover-art">Cover art</option><option value="" disabled>Custom colours</option>{presets.map(preset => <option key={preset.name}>{preset.name}</option>)}
               </select>
-              {themeSelection.mode === 'cover' && <p className="theme-hint">{themeSelection.cover ? 'Colours from the current song’s cover.' : 'Using Purple Dream while cover colours are unavailable.'}</p>}
+              {themeSelection.mode === 'cover' && <p className="theme-hint">{themeSelection.cover ? 'Colours from the current song’s cover.' : themeSelection.lastCover ? 'Keeping the previous cover colours until new ones arrive.' : 'Using Purple Dream while cover colours are unavailable.'}</p>}
               <div className="colors">{([
                 ['uiTheme', 'primary', 'Primary UI'], ['uiTheme', 'secondary', 'Secondary UI'], ['uiTheme', 'background', 'Background'],
                 ['graphTheme', 'line1', 'Graph start'], ['graphTheme', 'line2', 'Graph end'],

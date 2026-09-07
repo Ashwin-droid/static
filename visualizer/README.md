@@ -4,9 +4,9 @@ Local adaptation of [Ashwin-droid/echo-trace-visions](https://github.com/Ashwin-
 
 Static bundles `dist/` into its Rust binary and opens this page in a separate local window. All scripts, styles and fonts are local. There are no CDN requests or remote site frames. System fonts are used.
 
-The daemon owns playback and analysis. The page receives bounded frequency values through a local authenticated WSS connection, and sends playback controls back to Static. It does not load, decode, analyse or play audio. History has a fixed allocation of at most 128 bands by 350 samples, advances only on fresh frame sequences, freezes while paused, and resets on playback generation changes. Dragging and theme changes remain available while paused.
+The daemon owns playback and analysis. The page receives bounded frequency values through a local authenticated WSS connection, and sends playback controls back to Static. It does not load, decode, analyse or play audio. History has a fixed allocation of at most 128 bands by 350 samples, advances only on fresh frame sequences, freezes while paused, and keeps the previous song’s traces across track changes and reconnects. Old samples roll out naturally; Clear traces or changing the band count clears the history. Dragging and theme changes remain available while paused.
 
-The default Cover art theme follows the current song. Rust extracts its palette and sends five RGB colours; the page never downloads or decodes cover images. Purple Dream is the fallback when a palette is pending or unavailable. Selecting any of the twelve presets or editing a colour keeps that manual choice across songs. Select Cover art again to follow the current artwork. Cartridges include the colours currently displayed.
+The default Cover art theme follows the current song. Rust extracts its palette and sends five RGB colours; the page never downloads or decodes cover images. The last valid cover palette stays visible while a new palette is pending or unavailable. Purple Dream is used only before the first valid cover palette. Selecting any of the twelve presets or editing a colour keeps that manual choice across songs. Select Cover art again to follow the current artwork. Cartridges include the colours currently displayed.
 
 Cartridge creation captures a PNG of the view, at most 1280 by 720, and sends that screenshot plus visual preferences and the selected video ID. Rust prepares the artwork and embeds the audio. The returned download is an ordinary browser download streamed from Rust, without fetching the cartridge into a JavaScript blob. Its storage status and, when available, its filesystem path are shown alongside it. Original browser cartridge import code is intentionally absent.
 
@@ -14,7 +14,8 @@ Cartridge creation captures a PNG of the view, at most 1280 by 720, and sends th
 
 The Camera panel is replaced by gestures on the visualiser itself:
 
-- Drag with the left mouse button to orbit the view.
+- Drag with the left mouse button to rotate the view.
+- Hold W/S to move forward/backward, A/D to strafe left/right, and Q/E to move down/up. Movement follows the view direction, with Q/E using the scene’s vertical axis. It stops when you release the keys or focus a control.
 - Shift-drag or right-drag to pan; middle-drag or the scroll wheel zooms.
 - Double-click to reset. A focused canvas also supports arrow-key panning and Home to reset.
 - Touch uses one finger to rotate and two fingers to pan and pinch-zoom.
@@ -73,3 +74,10 @@ The client reconnects with capped exponential backoff, at most eight consecutive
 ## Validation
 
 The unit tests exercise protocol validation, fixed memory history, stale/duplicate frame rejection, track generation changes, pause behavior, boosted volume snapshots, download origin restrictions, socket backpressure, connection timeout and cleanup. Browser checks should also cover the native window's certificate trust, audible playback driving the traces, pause freezing them, camera/theme changes, volume control, and a cartridge download through the Rust service.
+
+
+## Colour transitions
+
+Every valid palette change blends the colour used for newly arriving FFT points, UI colours and the background over three seconds. Existing trace points keep their recorded colours, so the transition becomes a visible gradient segment along each trace. Red, green and blue each interpolate independently from their old 0–255 value to their new value on every animation frame, with no intermediate stages. Yellow fading to blue therefore passes smoothly through grey. An interrupted fade starts its next transition from the current on-screen blend. The existing animation loop drives the fade without rendering the React controls on every frame.
+
+Missing or delayed artwork keeps the previous cover palette indefinitely; only a valid new palette starts another transition. Cartridge images preserve the multi-colour trace history and the currently displayed background blend.

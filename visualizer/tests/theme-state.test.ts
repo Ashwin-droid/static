@@ -17,7 +17,7 @@ test('cover mode starts with fallback and uses only the current song palette', (
   assert.equal(selectTheme(state, { type: 'track', videoId: 'song-a' }), state);
   state = selectTheme(state, { type: 'track', videoId: 'song-b' });
   assert.equal(state.cover, null);
-  assert.equal(activeTheme(state), presets[0]);
+  assert.deepEqual(activeTheme(state), cover);
   assert.equal(selectTheme(state, { type: 'cover', videoId: 'song-a', theme: cover }), state);
 });
 
@@ -42,18 +42,18 @@ test('custom colours survive artwork refresh; returning to cover mode applies it
   assert.equal(activeTheme(state), custom);
   assert.equal(state.cover, null);
   state = selectTheme(state, { type: 'automatic' });
-  assert.equal(activeTheme(state), presets[0]);
+  assert.deepEqual(activeTheme(state), cover);
   state = selectTheme(state, { type: 'cover', videoId: 'song-a', theme: cover });
   assert.deepEqual(activeTheme(state), cover);
 });
 
-test('same-song invalidation clears stale artwork and stopped playback clears colours', () => {
+test('missing artwork and stopped playback keep the last valid cover colours', () => {
   let state = selectTheme(startSong(), { type: 'cover', videoId: 'song-a', theme: cover });
   state = selectTheme(state, { type: 'cover', videoId: 'song-a', theme: null });
-  assert.equal(activeTheme(state), presets[0]);
+  assert.deepEqual(activeTheme(state), cover);
   state = selectTheme(state, { type: 'cover', videoId: 'song-a', theme: cover });
   state = selectTheme(state, { type: 'track', videoId: null });
-  assert.equal(activeTheme(state), presets[0]);
+  assert.deepEqual(activeTheme(state), cover);
   assert.equal(selectTheme(state, { type: 'cover', videoId: null, theme: cover }), state);
 });
 
@@ -64,4 +64,18 @@ test('invalid palettes cannot change the active theme', () => {
     { ...cover, uiTheme: { ...cover.uiTheme, background: '#12345678' } },
     { ...cover, uiTheme: { ...cover.uiTheme, primary: 'url(https://example.invalid)' } },
   ]) assert.equal(selectTheme(state, { type: 'cover', videoId: 'song-a', theme }), state);
+});
+
+
+test('several songs without a new palette never replace the last known colours', () => {
+  let state = selectTheme(startSong(), { type: 'cover', videoId: 'song-a', theme: cover });
+  for (const videoId of ['song-b', 'song-c']) {
+    state = selectTheme(state, { type: 'track', videoId });
+    state = selectTheme(state, { type: 'cover', videoId, theme: null });
+    assert.deepEqual(activeTheme(state), cover);
+  }
+  const stale = { ...cover, graphTheme: { line1: '#000000', line2: '#ffffff' } };
+  assert.equal(selectTheme(state, { type: 'cover', videoId: 'song-b', theme: stale }), state);
+  state = selectTheme(state, { type: 'cover', videoId: 'song-c', theme: stale });
+  assert.deepEqual(activeTheme(state), stale);
 });

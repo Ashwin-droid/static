@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { PerspectiveCamera, Vector3 } from 'three';
 import { attachViewControls, initialCamera, type CameraControls } from '../src/view-controls';
 
+class Document extends EventTarget {
+  hidden = false;
+  defaultView = new EventTarget();
+}
 class Canvas extends EventTarget {
+  ownerDocument = new Document();
   clientWidth = 1000;
   clientHeight = 600;
   style = { touchAction: 'auto' };
@@ -19,7 +24,7 @@ class Canvas extends EventTarget {
 function input(canvas: Canvas, type: string, properties: Record<string, unknown> = {}) {
   const event = new Event(type, { cancelable: true });
   Object.assign(event, { pointerId: 1, pointerType: 'mouse', button: 0, clientX: 100, clientY: 100,
-    pageX: 100, pageY: 100, ctrlKey: false, metaKey: false, shiftKey: false, ...properties });
+    pageX: 100, pageY: 100, key: '', ctrlKey: false, metaKey: false, shiftKey: false, ...properties });
   canvas.dispatchEvent(event);
   return event;
 }
@@ -27,9 +32,11 @@ function setup() {
   const canvas = new Canvas();
   const camera = new PerspectiveCamera(75, 1000 / 600, 0.1, 1000);
   let view: CameraControls = initialCamera();
-  const controls = attachViewControls(camera, canvas as unknown as HTMLElement, next => { view = next; });
+  let now = 0;
+  const controls = attachViewControls(camera, canvas as unknown as HTMLElement, next => { view = next; }, () => now);
+  const advance = (milliseconds: number) => { now += milliseconds; controls.update(); };
   const settle = () => { for (let i = 0; i < 120; i++) controls.update(); };
-  return { canvas, camera, controls, settle, view: () => view };
+  return { canvas, camera, controls, settle, advance, view: () => view };
 }
 function near(a: number, b: number) { assert.ok(Math.abs(a - b) < 1e-6, `${a} != ${b}`); }
 
@@ -106,4 +113,72 @@ test('two-finger drag pans and pinches to zoom; cancellation and disposal remove
   input(s.canvas, 'pointermove', { clientX: 500 });
   input(s.canvas, 'wheel', { deltaY: -100 });
   assert.ok(s.camera.position.equals(before));
+});
+
+test('WASD moves relative to the view while Q/E moves vertically, without zooming', () => {
+  for (const [key, axis, direction] of [
+    ['w', 'forward', 1], ['s', 'forward', -1], ['a', 'right', -1], ['d', 'right', 1], ['q', 'vertical', -1], ['e', 'vertical', 1],
+  ] as const) {
+    const s = setup();
+    const start = s.camera.position.clone();
+    const expected = axis === 'forward' ? s.camera.getWorldDirection(new Vector3())
+      : axis === 'right' ? new Vector3(1, 0, 0).applyQuaternion(s.camera.quaternion) : new Vector3(0, 1, 0);
+    expected.multiplyScalar(direction * 30);
+    assert.ok(input(s.canvas, 'keydown', { key }).defaultPrevented);
+    for (let i = 0; i < 60; i++) s.advance(1000 / 60);
+    input(s.canvas, 'keyup', { key });
+    assert.ok(s.camera.position.clone().sub(start).distanceTo(expected) < 1e-6);
+    near(s.view().distance, 60);
+    const stopped = s.camera.position.clone();
+    s.advance(100);
+    assert.ok(s.camera.position.distanceTo(stopped) < 1e-6);
+    s.controls.dispose();
+  }
+});
+
+test('keyboard motion follows mouse rotation, is frame-rate independent and normalizes diagonals', () => {
+  for (const fps of [30, 60, 120]) {
+    const s = setup();
+    input(s.canvas, 'pointerdown');
+    input(s.canvas, 'pointermove', { clientX: 260, clientY: 140 });
+    input(s.canvas, 'pointerup');
+    s.settle();
+    const start = s.camera.position.clone();
+    const expected = s.camera.getWorldDirection(new Vector3()).multiplyScalar(30);
+    input(s.canvas, 'keydown', { key: 'w', code: 'KeyW' });
+    for (let i = 0; i < fps; i++) s.advance(1000 / fps);
+    assert.ok(s.camera.position.clone().sub(start).distanceTo(expected) < 1e-4);
+    input(s.canvas, 'keydown', { key: 'd', code: 'KeyD' });
+    const diagonalStart = s.camera.position.clone();
+    for (let i = 0; i < fps; i++) s.advance(1000 / fps);
+    near(s.camera.position.distanceTo(diagonalStart), 30);
+    s.controls.dispose();
+  }
+});
+
+test('blur, hidden windows, reset and disposal stop movement; shortcuts do not move the view', () => {
+  for (const stop of ['canvas', 'window', 'hidden', 'reset', 'dispose']) {
+    const s = setup();
+    input(s.canvas, 'keydown', { key: 'w' });
+    s.advance(16);
+    if (stop === 'canvas') s.canvas.dispatchEvent(new Event('blur'));
+    if (stop === 'window') s.canvas.ownerDocument.defaultView.dispatchEvent(new Event('blur'));
+    if (stop === 'hidden') { s.canvas.ownerDocument.hidden = true; s.canvas.ownerDocument.dispatchEvent(new Event('visibilitychange')); }
+    if (stop === 'reset') s.controls.reset();
+    if (stop === 'dispose') s.controls.dispose();
+    const position = s.camera.position.clone();
+    s.advance(10_000);
+    assert.ok(s.camera.position.distanceTo(position) < 1e-6);
+    s.controls.dispose();
+  }
+  const s = setup();
+  for (const modifier of ['ctrlKey', 'altKey', 'metaKey', 'isComposing']) {
+    assert.ok(!input(s.canvas, 'keydown', { key: 's', [modifier]: true }).defaultPrevented);
+    s.advance(100);
+  }
+  near(new Vector3(s.view().position.x, s.view().position.y, s.view().position.z).length(), 0);
+  input(s.canvas, 'keydown', { key: 'w' });
+  s.advance(10_000);
+  near(new Vector3(s.view().position.x, s.view().position.y, s.view().position.z).length(), 3);
+  s.controls.dispose();
 });

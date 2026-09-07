@@ -1,4 +1,4 @@
-:root { font-family: ui-sans-serif, system-ui, sans-serif; color: #fff; background: #090418; color-scheme: dark; font-synthesis: none; }
+:root { font-family: ui-sans-serif, system-ui, sans-serif; color: #fff; background: #090418; color-scheme: dark; font-synthesis: none; --primary: #9b87f5; --secondary: #8E2DE2; --visualizer-background: #090418; --graph-start: #4A00E0; --graph-end: #8E2DE2; }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; }
@@ -8,7 +8,7 @@ button { display: inline-flex; align-items: center; justify-content: center; gap
 button:hover:enabled { background: color-mix(in srgb, var(--primary) 20%, transparent); }
 button:disabled { opacity: .4; cursor: default; }
 button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
-.app { display: flex; flex-direction: column; width: 100%; height: 100dvh; min-height: 420px; }
+.app { display: flex; flex-direction: column; width: 100%; height: 100dvh; min-height: 420px; background: linear-gradient(to bottom, var(--visualizer-background), #000); }
 .topline { display: flex; justify-content: space-between; gap: 16px; font-size: 11px; letter-spacing: .1em; padding: 14px 20px 8px; color: var(--primary); }
 .window-actions { display: flex; align-items: center; gap: 12px; }
 .fullscreen-button { border: none; padding: 0; width: 22px; height: 22px; background: transparent; }
@@ -24,7 +24,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .connection[data-connected=true]::before { background: #72d0aa; }
 .connection-banner { text-align: center; background: #342414; color: #f1d8b4; padding: 7px 12px; font-size: 12px; }
 .connection-banner button { margin-left: 12px; color: inherit; padding: 2px 8px; }
-.visualizer { position: relative; flex: 1; width: 100%; min-height: 160px; overflow: hidden; }
+.visualizer { position: relative; flex: 1; width: 100%; min-height: 160px; overflow: hidden; background: linear-gradient(to bottom, color-mix(in srgb, var(--graph-start) 6.2745%, transparent), color-mix(in srgb, var(--graph-end) 1.9608%, transparent)); }
 .visualizer canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 .visualizer canvas.dragging { cursor: grabbing; }
 .gesture-hint { position: absolute; bottom: 9px; left: 20px; right: 20px; font-size: 10px; color: var(--primary); opacity: .55; pointer-events: none; user-select: none; }

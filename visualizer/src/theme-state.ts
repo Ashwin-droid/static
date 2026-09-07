@@ -18,6 +18,7 @@ export interface ThemeSelection {
   videoId: string | null;
   mode: 'cover' | 'manual';
   cover: ThemePreset | null;
+  lastCover: ThemePreset | null;
   manual: ThemePreset;
 }
 export type ThemeAction =
@@ -26,8 +27,8 @@ export type ThemeAction =
   | { type: 'automatic' }
   | { type: 'manual'; theme: ThemePreset };
 
-export const initialThemeSelection = (): ThemeSelection => ({ videoId: null, mode: 'cover', cover: null, manual: presets[0] });
-export const activeTheme = (state: ThemeSelection): ThemePreset => state.mode === 'cover' ? state.cover ?? presets[0] : state.manual;
+export const initialThemeSelection = (): ThemeSelection => ({ videoId: null, mode: 'cover', cover: null, lastCover: null, manual: presets[0] });
+export const activeTheme = (state: ThemeSelection): ThemePreset => state.mode === 'cover' ? state.cover ?? state.lastCover ?? presets[0] : state.manual;
 
 export function selectTheme(state: ThemeSelection, action: ThemeAction): ThemeSelection {
   switch (action.type) {
@@ -38,7 +39,7 @@ export function selectTheme(state: ThemeSelection, action: ThemeAction): ThemeSe
       if (action.theme === null) return state.cover === null ? state : { ...state, cover: null };
       if (action.videoId === null) return state;
       const cover = parseCoverTheme(action.theme);
-      return cover ? { ...state, cover } : state;
+      return cover ? { ...state, cover, lastCover: cover } : state;
     }
     case 'automatic': return state.mode === 'cover' ? state : { ...state, mode: 'cover' };
     case 'manual': return { ...state, mode: 'manual', manual: action.theme };

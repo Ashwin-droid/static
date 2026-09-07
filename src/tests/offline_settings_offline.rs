@@ -104,6 +104,7 @@ fn gain_settings_default_to_unmodified_playback() {
     assert_eq!(settings.max_volume(), 1.0);
     assert_eq!(settings.dgain_flatten_percent, 50.0);
     assert_eq!(settings.dgain_ra_seconds, 15.0);
+    assert_eq!(settings.dgain_change_lazyness, 50.0);
 }
 
 #[test]
@@ -124,6 +125,7 @@ fn gain_settings_survive_reopening_the_store_and_sanitize_corrupt_numbers() {
         xdgain_enabled: true,
         dgain_flatten_percent: 37.5,
         dgain_ra_seconds: 0.5,
+        dgain_change_lazyness: 72.5,
         ..initial
     };
     cache.save_settings(&settings).unwrap();
@@ -136,6 +138,7 @@ fn gain_settings_survive_reopening_the_store_and_sanitize_corrupt_numbers() {
     assert!(loaded.xdgain_enabled);
     assert_eq!(loaded.dgain_flatten_percent, 37.5);
     assert_eq!(loaded.dgain_ra_seconds, 0.5);
+    assert_eq!(loaded.dgain_change_lazyness, 72.5);
 
     for (flatten, seconds, expected_flatten, expected_seconds) in [
         ("NaN", "inf", 50.0, 15.0),

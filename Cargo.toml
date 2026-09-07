@@ -50,6 +50,18 @@ image = "0.25"
 dbus = "0.9"
 gstreamer = "0.25"
 gstreamer-play = "0.25"
+rustfft = "6"
+axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.14"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+include_dir = "0.7"
+base64 = "0.22"
+ab_glyph = "0.2"
+material-colors = "0.4.2"
 mpris = "2"
 mpris-server = "0.9"
 pipewire = "0.8"

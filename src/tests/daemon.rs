@@ -1642,3 +1642,113 @@ fn radio_shuffle_pick_with_live_rng_keeps_history_and_queue_membership() {
         assert_eq!(remaining, untouched);
     }
 }
+
+#[test]
+fn cartridge_mountpoint_is_only_advertised_when_staticfs_is_enabled_in_this_build() {
+    let mut settings = AppSettings::default();
+    settings.staticfs_enabled = false;
+    assert_eq!(super::visualization_staticfs_mountpoint(&settings), None);
+    settings.staticfs_enabled = true;
+    settings.staticfs_mountpoint = "/tmp/custom-staticfs".into();
+    #[cfg(feature = "staticfs")]
+    assert_eq!(
+        super::visualization_staticfs_mountpoint(&settings),
+        Some(std::path::PathBuf::from("/tmp/custom-staticfs"))
+    );
+    #[cfg(not(feature = "staticfs"))]
+    assert_eq!(super::visualization_staticfs_mountpoint(&settings), None);
+}
+
+#[test]
+fn memory_cartridge_requests_publish_atomically_and_survive_disabling_staticfs() {
+    use crate::ipc::{DaemonRequest as Request, DaemonResponse as Response};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let mut store = crate::cartridges::CartridgeStore::default();
+    assert!(matches!(
+        super::handle_cartridge_request(
+            &mut store,
+            false,
+            Request::BeginCartridgeUpload {
+                name: "song.png".into()
+            }
+        ),
+        Response::Error(_)
+    ));
+    let Response::CartridgeUpload(id) = super::handle_cartridge_request(
+        &mut store,
+        true,
+        Request::BeginCartridgeUpload {
+            name: "song.png".into(),
+        },
+    ) else {
+        panic!("upload not started")
+    };
+    let data = b"PNG\0\xff---AUDIO-START---song---METADATA-END---";
+    assert!(matches!(
+        super::handle_cartridge_request(
+            &mut store,
+            true,
+            Request::AppendCartridgeUpload {
+                id: id.clone(),
+                data_base64: STANDARD.encode(data)
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(store.list().is_empty());
+    // Turning the mount off never converts an in-progress memory export to disk.
+    let Response::CartridgeCommitted(info) =
+        super::handle_cartridge_request(&mut store, false, Request::CommitCartridgeUpload { id })
+    else {
+        panic!("upload not committed")
+    };
+    assert_eq!(info.size, data.len() as u64);
+    let Response::CartridgeChunk(Some(encoded)) = super::handle_cartridge_request(
+        &mut store,
+        false,
+        Request::ReadMemoryCartridge {
+            name: "song.png".into(),
+            offset: 3,
+            size: u32::MAX,
+        },
+    ) else {
+        panic!("memory cartridge unavailable for saving")
+    };
+    assert_eq!(STANDARD.decode(encoded).unwrap(), data[3..]);
+    assert!(matches!(
+        super::handle_cartridge_request(
+            &mut store,
+            false,
+            Request::RemoveMemoryCartridge {
+                name: "song.png".into()
+            }
+        ),
+        Response::CartridgeRemoved(true)
+    ));
+    assert!(store.list().is_empty());
+}
+
+#[test]
+fn invalid_memory_cartridge_chunks_abort_without_publishing_partial_data() {
+    use crate::ipc::{DaemonRequest as Request, DaemonResponse as Response};
+    let mut store = crate::cartridges::CartridgeStore::default();
+    for invalid in [
+        "not base64!".to_owned(),
+        "A".repeat(crate::cartridges::CHUNK_BASE64_MAX + 4),
+    ] {
+        let id = store.begin("bad.png".into()).unwrap();
+        assert!(matches!(
+            super::handle_cartridge_request(
+                &mut store,
+                true,
+                Request::AppendCartridgeUpload {
+                    id: id.clone(),
+                    data_base64: invalid
+                }
+            ),
+            Response::Error(_)
+        ));
+        assert!(store.commit(&id).is_err());
+        assert!(store.list().is_empty());
+    }
+}

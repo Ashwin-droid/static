@@ -114,6 +114,7 @@ pub struct AppSettings {
     pub dgain_enabled: bool,
     pub dgain_flatten_percent: f64,
     pub dgain_ra_seconds: f64,
+    pub dgain_change_lazyness: f64,
     pub xdgain_enabled: bool,
     pub other_mpris_mode: CoordinationMode,
     pub other_mpris_halt_auto_resume_secs: u32,
@@ -157,6 +158,7 @@ impl Default for AppSettings {
             dgain_enabled: false,
             dgain_flatten_percent: 50.0,
             dgain_ra_seconds: 15.0,
+            dgain_change_lazyness: 50.0,
             xdgain_enabled: false,
             other_mpris_mode: CoordinationMode::HaltAuto,
             other_mpris_halt_auto_resume_secs: 0,
@@ -298,6 +300,14 @@ impl MusicCache {
                 "dgain_ra_seconds" => {
                     settings.dgain_ra_seconds =
                         parse_f64_setting_in_range(&row.1, settings.dgain_ra_seconds, 0.1, 120.0);
+                }
+                "dgain_change_lazyness" => {
+                    settings.dgain_change_lazyness = parse_f64_setting_in_range(
+                        &row.1,
+                        settings.dgain_change_lazyness,
+                        0.0,
+                        100.0,
+                    );
                 }
                 "xdgain_enabled" => {
                     settings.xdgain_enabled = parse_bool_setting(&row.1, settings.xdgain_enabled);
@@ -459,6 +469,10 @@ impl MusicCache {
                 settings.dgain_flatten_percent.to_string(),
             ),
             ("dgain_ra_seconds", settings.dgain_ra_seconds.to_string()),
+            (
+                "dgain_change_lazyness",
+                settings.dgain_change_lazyness.to_string(),
+            ),
             ("xdgain_enabled", bool_setting(settings.xdgain_enabled)),
             (
                 "other_mpris_mode",

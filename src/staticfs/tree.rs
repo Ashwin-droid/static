@@ -3,7 +3,10 @@
 //! dynamic-children hooks (settings keys, stats track dirs) and read/write
 //! dispatch into the owning slice functions.
 
-use super::{Ctx, FsError, FsResult, playback_files, queue_files, settings_files, stats_files};
+use super::{
+    Ctx, FsError, FsResult, cartridge_files, playback_files, queue_files, settings_files,
+    stats_files,
+};
 
 /// Per-track read-only files under `stats/tracks/{video_id}/` (contract B5).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -55,6 +58,8 @@ impl TrackField {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Node {
     Root,
+    CartridgesDir,
+    Cartridge(String),
 
     /// Root-level `shutdown` file: read returns a liveness one-liner, writing
     /// the line "yes" asks the daemon to shut down (which takes this
@@ -115,6 +120,7 @@ impl Node {
         matches!(
             self,
             Node::Root
+                | Node::CartridgesDir
                 | Node::PlaybackDir
                 | Node::QueueDir
                 | Node::RadioDir
@@ -127,7 +133,7 @@ impl Node {
     }
 
     /// Contract B3 permissions: read-write 0644, read-only 0444,
-    /// write-only 0200, directories 0755.
+    /// write-only 0200, directories 0755. Cartridge files support unlink only.
     pub(crate) fn perm(&self) -> u16 {
         match self {
             node if node.is_dir() => 0o755,
@@ -197,6 +203,7 @@ impl Node {
             return String::new();
         }
         let name = match self {
+            Node::Cartridge(name) => name.clone(),
             Node::SettingsKey(key) => key.clone(),
             Node::StatsTrackDir(video_id) => video_id.clone(),
             Node::StatsTrackField(_, field) => field.file_name().to_string(),
@@ -220,10 +227,12 @@ impl Node {
     pub(crate) fn parent(&self) -> Node {
         match self {
             Node::Root
+            | Node::CartridgesDir
             | Node::Shutdown
             | Node::PlaybackDir
             | Node::SettingsDir
             | Node::StatsDir => Node::Root,
+            Node::Cartridge(_) => Node::CartridgesDir,
             Node::PlaybackState
             | Node::PlaybackTrack
             | Node::PlaybackVideoId
@@ -263,6 +272,7 @@ impl Node {
     pub(crate) fn static_children(&self) -> Vec<(&'static str, Node)> {
         match self {
             Node::Root => vec![
+                ("cartridges", Node::CartridgesDir),
                 ("playback", Node::PlaybackDir),
                 ("settings", Node::SettingsDir),
                 ("stats", Node::StatsDir),
@@ -321,6 +331,10 @@ impl Node {
     ///   (all rows, incl. metadata-only).
     pub(crate) fn children(&self, ctx: &Ctx) -> FsResult<Vec<(String, Node)>> {
         match self {
+            Node::CartridgesDir => Ok(cartridge_files::names(ctx)?
+                .into_iter()
+                .map(|name| (name.clone(), Node::Cartridge(name)))
+                .collect()),
             Node::SettingsDir => Ok(settings_dir_entries(settings_files::settings_keys(ctx)?)),
             Node::StatsTracksDir => Ok(stats_files::stats_track_ids(ctx)?
                 .into_iter()
@@ -355,6 +369,10 @@ impl Node {
             return Ok(node);
         }
         match self {
+            Node::CartridgesDir => {
+                cartridge_files::metadata(ctx, name)?;
+                Ok(Node::Cartridge(name.to_owned()))
+            }
             Node::SettingsDir => {
                 if settings_files::settings_keys(ctx)?
                     .iter()
@@ -381,6 +399,21 @@ impl Node {
             },
             _ => Err(FsError::NotFound),
         }
+    }
+
+    /// Read a requested byte range. Large binary cartridges never materialize
+    /// their full audio payload; text files retain their live snapshot semantics.
+    pub(crate) fn read_range(&self, ctx: &Ctx, offset: u64, size: u32) -> FsResult<Vec<u8>> {
+        if let Node::Cartridge(name) = self {
+            return cartridge_files::read_range(ctx, name, offset, size);
+        }
+        let bytes = self.read(ctx)?;
+        if offset >= bytes.len() as u64 {
+            return Ok(Vec::new());
+        }
+        let start = offset as usize;
+        let end = bytes.len().min(start.saturating_add(size as usize));
+        Ok(bytes[start..end].to_vec())
     }
 
     /// Read dispatch: regenerate this file's full current content. `fs.rs`

@@ -1,3 +1,4 @@
+mod cartridges;
 mod cli;
 mod cli_tui;
 mod daemon;
@@ -14,6 +15,7 @@ mod player;
 #[cfg(feature = "staticfs")]
 mod staticfs;
 mod ui;
+mod visualizer;
 
 /// Default to INFO but silence `iced_winit`, which logs the full window-icon
 /// RGBA buffer at INFO on every launch (tens of MB of stderr). `RUST_LOG`, when
@@ -27,6 +29,15 @@ fn init_tracing() {
 
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+
+    if args.get(1).is_some_and(|arg| arg == "visualizer") {
+        init_tracing();
+        if let Err(err) = visualizer::run() {
+            eprintln!("Visualizer: {err:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if args.get(1).is_some_and(|arg| arg == "--daemon") {
         init_tracing();

@@ -1006,6 +1006,7 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
     match key {
         "dgain_flatten_percent" => settings.dgain_flatten_percent,
         "dgain_ra_seconds" => settings.dgain_ra_seconds,
+        "dgain_change_lazyness" => settings.dgain_change_lazyness,
         "auto_release_track_loops_after" => settings.auto_release_track_loops_after as f64,
         "listen_again_cache_days" => settings.listen_again_cache_days as f64,
         "offline_cache_target" => settings.offline_cache_target as f64,
@@ -1026,6 +1027,12 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
 pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSettingMeta> {
     match key {
         "dgain_flatten_percent" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 100.0,
+            step: 1.0,
+            integer: false,
+        }),
+        "dgain_change_lazyness" => Some(NumericSettingMeta {
             min: 0.0,
             max: 100.0,
             step: 1.0,
@@ -1270,6 +1277,12 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     "dgain_flatten_percent",
                     "dGain flatten %",
                     "Allowed variation: 0% follows the average; 50% allows 2/3–1.5×; 100% allows 0.5–2×.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "dgain_change_lazyness",
+                    "dGain change lazyness",
+                    "Higher values resist small, frequent gain changes. Lower values track loudness more closely.",
                 )?,
                 stepper_setting_field(
                     settings,

@@ -64,6 +64,7 @@ Usage:
   static offline unpin <ytm/yt url | video id>
   static offline play [ytm/yt url | video id]
   static info
+  static visualizer
   static coordination list
   static config list
   static config desc [config_name]
@@ -1738,6 +1739,10 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::F64,
     },
     ConfigSpec {
+        name: "dgain_change_lazyness",
+        kind: ConfigKind::F64,
+    },
+    ConfigSpec {
         name: "xdgain_enabled",
         kind: ConfigKind::Bool,
     },
@@ -1855,6 +1860,7 @@ fn config_description(name: &str) -> String {
             .to_string(),
         "dgain_ra_seconds" => "Rolling loudness average window for dGain, in seconds.\nAccepted range: 0.1-120. Default: 15."
             .to_string(),
+        "dgain_change_lazyness" => "Penalty for changing dGain: higher values resist small, frequent gain changes; lower values follow the rolling loudness target more closely. Works with lookahead; clipping protection stays active.\nAccepted range: 0-100%. Default: 50%.".to_string(),
         "xdgain_enabled" => format!(
             "Matches song loudness to the first song actually played while xdGain is enabled, using its first 3 audible seconds as the reference. Resuming a playlist uses the song you resume.\nThe virtual gain offset carries across songs in this daemon session, independently of master volume. Offsets are bounded to -36 through +24 dB.\nRequires dGain. Disabling dGain suspends xdGain; toggling xdGain off resets its reference.\nDefault: off.\n{}",
             bool_values_note("enable cross-song gain", "disable cross-song gain")
@@ -2111,6 +2117,7 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "dgain_enabled" => yes_no_bool(settings.dgain_enabled),
         "dgain_flatten_percent" => settings.dgain_flatten_percent.to_string(),
         "dgain_ra_seconds" => settings.dgain_ra_seconds.to_string(),
+        "dgain_change_lazyness" => settings.dgain_change_lazyness.to_string(),
         "xdgain_enabled" => yes_no_bool(settings.xdgain_enabled),
         "other_mpris_mode" => settings.other_mpris_mode.as_str().to_string(),
         "other_mpris_halt_auto_resume_secs" => {
@@ -2175,6 +2182,9 @@ pub(crate) fn apply_config_value(
         }
         "dgain_ra_seconds" => {
             settings.dgain_ra_seconds = parse_f64_in_range(trimmed, 0.1, 120.0)?;
+        }
+        "dgain_change_lazyness" => {
+            settings.dgain_change_lazyness = parse_f64_in_range(trimmed, 0.0, 100.0)?;
         }
         "xdgain_enabled" => {
             let enabled = parse_bool(trimmed)?;

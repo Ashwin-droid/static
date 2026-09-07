@@ -766,6 +766,7 @@ pub(in crate::cli_tui) fn help_shortcut_sections()
         ("d", "Dislike"),
         ("u", "Clear rating"),
         ("y", "Copy share URL"),
+        ("v", "Open visualiser window"),
         ("l", "Cycle loop / repeat"),
         ("↑ / ↓", "Volume (Player focus only)"),
         ("- / +", "Volume down / up"),

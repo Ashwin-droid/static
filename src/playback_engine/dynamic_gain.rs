@@ -20,6 +20,7 @@ pub(super) struct Config {
     pub enabled: bool,
     pub flatten_percent: f64,
     pub ra_seconds: f64,
+    pub change_lazyness_percent: f64,
     pub xdgain_enabled: bool,
 }
 
@@ -29,6 +30,7 @@ impl Default for Config {
             enabled: false,
             flatten_percent: 50.0,
             ra_seconds: 15.0,
+            change_lazyness_percent: 50.0,
             xdgain_enabled: false,
         }
     }
@@ -40,6 +42,15 @@ struct Observation {
     // Silence occupies time in the window, but is not a loudness reference.
     audible: bool,
     mean_square: f64,
+}
+
+/// Gain intent computed from original audio, before either gain stage.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GainTarget {
+    pub dynamic: f64,
+    pub offset_db: f64,
+    pub audible: bool,
+    pub peak: f64,
 }
 
 pub(super) struct DynamicGain {
@@ -56,6 +67,11 @@ pub(super) struct DynamicGain {
     reference_seconds: f64,
     reference_energy: f64,
     pub master_gain: f64,
+    revision: u64,
+    stream_revision: u64,
+    envelope_started: bool,
+    held_dynamic_db: f64,
+    held_offset_db: f64,
 }
 
 impl Default for DynamicGain {
@@ -74,6 +90,11 @@ impl Default for DynamicGain {
             reference_seconds: 0.0,
             reference_energy: 0.0,
             master_gain: 1.0,
+            revision: 0,
+            stream_revision: 0,
+            envelope_started: false,
+            held_dynamic_db: 0.0,
+            held_offset_db: 0.0,
         }
     }
 }
@@ -85,7 +106,7 @@ impl DynamicGain {
                 self.cross_song = CrossSongGain::default();
             }
             self.config = config;
-            self.reset();
+            self.reset_history();
         }
     }
 
@@ -98,6 +119,13 @@ impl DynamicGain {
     }
 
     pub fn reset(&mut self) {
+        self.stream_revision = self.stream_revision.wrapping_add(1);
+        self.reset_history();
+    }
+
+    fn reset_history(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.envelope_started = false;
         self.history.clear();
         self.history_frames = 0;
         self.audible_frames = 0;
@@ -180,90 +208,162 @@ impl DynamicGain {
         }
     }
 
-    /// Process native-endian, interleaved f32 audio without requiring aligned buffers.
-    /// A short block's peak is known before any samples are amplified, preventing a
-    /// sudden loud entry from escaping the limiter. No playback lookahead is added.
-    pub fn process(&mut self, bytes: &mut [u8]) {
-        let frame_bytes = self.channels * 4;
-        let block_bytes = (self.sample_rate / 100).max(1) * frame_bytes;
-        let recovery = 1.0 - (-1.0 / (self.sample_rate as f64 * 0.250)).exp();
-        let limiter_recovery = 1.0 - (-1.0 / (self.sample_rate as f64 * 0.100)).exp();
-        let cross_song_recovery = 1.0 - (-1.0 / self.sample_rate as f64).exp();
-        for block in bytes.chunks_mut(block_bytes) {
-            let frames = block.len() / frame_bytes;
-            if frames == 0 {
-                continue;
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn stream_revision(&self) -> u64 {
+        self.stream_revision
+    }
+
+    pub fn format(&self) -> (usize, usize) {
+        (self.sample_rate, self.channels)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Analyze each original audio block exactly once, as it enters lookahead.
+    /// The rolling reference advances in audio time independently of master gain.
+    pub fn analyze(&mut self, bytes: &[u8]) -> GainTarget {
+        let frames = bytes.len() / (self.channels * 4);
+        let mut square_sum = 0.0;
+        let mut peak = 0.0_f64;
+        for sample in bytes.chunks_exact(4) {
+            let value = f32::from_ne_bytes(sample.try_into().unwrap()) as f64;
+            let value = if value.is_finite() { value } else { 0.0 };
+            square_sum += value * value;
+            peak = peak.max(value.abs());
+        }
+        let rms = if frames == 0 {
+            0.0
+        } else {
+            (square_sum / (frames * self.channels) as f64).sqrt()
+        };
+        let average = if self.config.enabled && frames > 0 {
+            self.observe(frames, rms * rms)
+        } else {
+            0.0
+        };
+        let audible = rms >= SILENCE_RMS && average >= SILENCE_RMS;
+        let dynamic = if self.config.enabled && audible {
+            let tolerance = 1.0 + self.config.flatten_percent / 100.0;
+            (rms.clamp(average / tolerance, average * tolerance) / rms)
+                .clamp(0.000001, MAX_DYNAMIC_GAIN)
+        } else {
+            1.0
+        };
+        let offset_db = if self.config.enabled && self.config.xdgain_enabled {
+            self.desired_cross_song_offset(rms, average, frames)
+        } else {
+            self.cross_song.offset_db
+        };
+        GainTarget {
+            dynamic,
+            offset_db,
+            audible,
+            peak,
+        }
+    }
+
+    /// Apply the most conservative upcoming target to the current buffered audio.
+    /// Attack and release run per sample in dB, preserving linked stereo channels.
+    /// Only peak protection may attenuate immediately; normal dynamics never step
+    /// at block boundaries. A 250ms preview gives the 35ms attack time to settle
+    /// before a loud entry rather than clamping on the entry itself.
+    pub fn render(&mut self, bytes: &mut [u8], current: GainTarget, upcoming: GainTarget) {
+        let attack = 1.0 - (-1.0 / (self.sample_rate as f64 * 0.035)).exp();
+        let lazyness = (self.config.change_lazyness_percent / 100.0).clamp(0.0, 1.0);
+        let deadband_db = lazyness * 3.0;
+        let release_seconds = 0.250 + lazyness * 1.750;
+        let release = 1.0 - (-1.0 / (self.sample_rate as f64 * release_seconds)).exp();
+        let limiter_release = 1.0 - (-1.0 / (self.sample_rate as f64 * 0.100)).exp();
+        let cross_active = self.config.enabled && self.config.xdgain_enabled;
+        let desired_db = if self.config.enabled {
+            20.0 * upcoming.dynamic.max(0.000001).log10()
+        } else {
+            0.0
+        };
+        if !self.envelope_started {
+            // At a new stream there is no preceding audio on which to ramp.
+            self.dynamic_gain = 10.0_f64.powf(desired_db / 20.0);
+            if cross_active && current.audible {
+                self.cross_song.offset_db = self.cross_song.offset_db.min(upcoming.offset_db);
             }
-            let mut square_sum = 0.0;
-            let mut peak = 0.0_f64;
-            for sample in block[..frames * frame_bytes].chunks_exact(4) {
-                let value = f32::from_ne_bytes(sample.try_into().unwrap()) as f64;
-                let value = if value.is_finite() { value } else { 0.0 };
-                square_sum += value * value;
-                peak = peak.max(value.abs());
-            }
-            let rms = (square_sum / (frames * self.channels) as f64).sqrt();
-            let average = if self.config.enabled {
-                self.observe(frames, rms * rms)
+            self.held_dynamic_db = desired_db;
+            self.held_offset_db = upcoming.offset_db;
+            self.envelope_started = true;
+        }
+        // Hysteresis rejects repeated small corrections instead of chasing every
+        // 10ms RMS fluctuation. Large changes still start the fast attack ahead.
+        if (desired_db - self.held_dynamic_db).abs() > deadband_db {
+            self.held_dynamic_db = desired_db;
+        }
+        if (upcoming.offset_db - self.held_offset_db).abs() > deadband_db {
+            self.held_offset_db = upcoming.offset_db;
+        }
+        let desired_db = self.held_dynamic_db;
+        let desired_offset_db = self.held_offset_db;
+        let mut dynamic_db = 20.0 * self.dynamic_gain.max(0.000001).log10();
+        for frame in bytes.chunks_exact_mut(self.channels * 4) {
+            let coefficient = if desired_db < dynamic_db {
+                attack
             } else {
-                0.0
+                release
             };
-            let desired = if self.config.enabled {
-                if rms < SILENCE_RMS || average < SILENCE_RMS {
-                    1.0
+            dynamic_db += (desired_db - dynamic_db) * coefficient;
+            self.dynamic_gain = 10.0_f64.powf(dynamic_db / 20.0);
+            let cross_gain = if cross_active && current.audible {
+                let coefficient = if desired_offset_db < self.cross_song.offset_db {
+                    attack
                 } else {
-                    let tolerance = 1.0 + self.config.flatten_percent / 100.0;
-                    let target = rms.clamp(average / tolerance, average * tolerance);
-                    (target / rms).clamp(0.0, MAX_DYNAMIC_GAIN)
-                }
-            } else {
-                1.0
-            };
-            // Attenuate before the first sample of a loud block; gain recovers
-            // gradually to avoid pumping and zipper noise in quiet passages.
-            self.dynamic_gain = self.dynamic_gain.min(desired);
-            let cross_song_active = self.config.enabled && self.config.xdgain_enabled;
-            let cross_song_audible = cross_song_active && rms >= SILENCE_RMS;
-            let desired_offset = if cross_song_active {
-                self.desired_cross_song_offset(rms, average, frames)
-            } else {
-                self.cross_song.offset_db
-            };
-            if cross_song_audible {
-                // Do not carry a quiet song's boost into a loud entry unchecked.
-                self.cross_song.offset_db = self.cross_song.offset_db.min(desired_offset);
-            }
-            let largest_cross_song_gain = if cross_song_audible {
-                10.0_f64.powf(desired_offset.max(self.cross_song.offset_db) / 20.0)
-            } else {
-                1.0
-            };
-            let largest_gain =
-                self.dynamic_gain.max(desired) * largest_cross_song_gain * self.master_gain;
-            let safe = if peak * largest_gain > OUTPUT_CEILING {
-                OUTPUT_CEILING / (peak * largest_gain)
-            } else {
-                1.0
-            };
-            self.limiter_gain = self.limiter_gain.min(safe);
-            for frame in block[..frames * frame_bytes].chunks_exact_mut(frame_bytes) {
-                self.dynamic_gain += (desired - self.dynamic_gain) * recovery;
-                self.limiter_gain += (safe - self.limiter_gain) * limiter_recovery;
-                let cross_song_gain = if cross_song_audible {
-                    self.cross_song.offset_db +=
-                        (desired_offset - self.cross_song.offset_db) * cross_song_recovery;
-                    10.0_f64.powf(self.cross_song.offset_db / 20.0)
-                } else {
-                    1.0
+                    release
                 };
-                let gain =
-                    self.dynamic_gain * cross_song_gain * self.master_gain * self.limiter_gain;
-                for sample in frame.chunks_exact_mut(4) {
-                    let value = f32::from_ne_bytes(sample.try_into().unwrap()) as f64;
-                    let output = if value.is_finite() { value * gain } else { 0.0 };
-                    sample.copy_from_slice(&(output.clamp(-1.0, 1.0) as f32).to_ne_bytes());
-                }
+                self.cross_song.offset_db +=
+                    (desired_offset_db - self.cross_song.offset_db) * coefficient;
+                10.0_f64.powf(self.cross_song.offset_db / 20.0)
+            } else {
+                1.0
+            };
+            // Do not boost silence or inaudible noise, and keep volume independent.
+            let gain = if self.config.enabled && current.audible {
+                self.dynamic_gain * cross_gain * self.master_gain
+            } else {
+                self.master_gain
+            };
+            let safe = if current.peak * gain > OUTPUT_CEILING {
+                OUTPUT_CEILING / (current.peak * gain)
+            } else {
+                1.0
+            };
+            self.limiter_gain = if safe < self.limiter_gain {
+                safe
+            } else {
+                self.limiter_gain + (safe - self.limiter_gain) * limiter_release
+            };
+            for sample in frame.chunks_exact_mut(4) {
+                let value = f32::from_ne_bytes(sample.try_into().unwrap()) as f64;
+                let output = if value.is_finite() {
+                    value * gain * self.limiter_gain
+                } else {
+                    0.0
+                };
+                sample.copy_from_slice(
+                    &(output.clamp(-OUTPUT_CEILING, OUTPUT_CEILING) as f32).to_ne_bytes(),
+                );
             }
+        }
+    }
+
+    /// Convenience for offline unit tests. Streaming playback uses the buffered
+    /// element, which provides upcoming targets before rendering each block.
+    #[cfg(test)]
+    pub fn process(&mut self, bytes: &mut [u8]) {
+        let block_bytes = (self.sample_rate / 100).max(1) * self.channels * 4;
+        for block in bytes.chunks_mut(block_bytes) {
+            let target = self.analyze(block);
+            self.render(block, target, target);
         }
     }
 }
@@ -279,6 +379,7 @@ mod tests {
             enabled: true,
             flatten_percent,
             ra_seconds,
+            change_lazyness_percent: 0.0,
             ..Config::default()
         });
         gain
@@ -294,6 +395,39 @@ mod tests {
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
             .collect()
+    }
+
+    fn run_stream(gain: &mut DynamicGain, segments: &[(f32, usize)]) -> Vec<f32> {
+        let block_frames = (gain.sample_rate / 100).max(1);
+        let mut blocks = Vec::new();
+        for &(amplitude, frames) in segments {
+            for start in (0..frames).step_by(block_frames) {
+                let bytes: Vec<u8> = (0..block_frames.min(frames - start))
+                    .flat_map(|_| [amplitude, -amplitude / 2.0])
+                    .flat_map(f32::to_ne_bytes)
+                    .collect();
+                let target = gain.analyze(&bytes);
+                blocks.push((bytes, target));
+            }
+        }
+        let mut output = Vec::new();
+        for i in 0..blocks.len() {
+            let mut upcoming = blocks[i].1;
+            for (_, target) in &blocks[i..(i + 26).min(blocks.len())] {
+                upcoming.dynamic = upcoming.dynamic.min(target.dynamic);
+                if target.audible {
+                    upcoming.offset_db = upcoming.offset_db.min(target.offset_db);
+                }
+            }
+            let (bytes, target) = &mut blocks[i];
+            gain.render(bytes, *target, upcoming);
+            output.extend(
+                bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_ne_bytes(b.try_into().unwrap())),
+            );
+        }
+        output
     }
 
     #[test]
@@ -314,8 +448,15 @@ mod tests {
         run(&mut gain, 0.2, 5000);
         let quiet = run(&mut gain, 0.04, 2000);
         assert!(quiet[quiet.len() - 2] > 0.15);
-        let loud = run(&mut gain, 0.8, 10);
-        assert!(loud[0] < 0.25, "loud first sample escaped: {}", loud[0]);
+        // Streaming supplies 250ms of upcoming audio, allowing a smooth ramp
+        // during the preceding quiet passage instead of a step on the entry.
+        let transition = run_stream(&mut gain, &[(0.04, 500), (0.8, 100)]);
+        assert!(
+            transition[500 * 2] < 0.25,
+            "loud entry escaped: {}",
+            transition[500 * 2]
+        );
+        assert!(transition[490 * 2] < transition[100 * 2] / 4.0);
     }
 
     #[test]
@@ -324,7 +465,8 @@ mod tests {
         let mut flexible = processor(100.0, 15.0);
         run(&mut flat, 0.2, 5000);
         run(&mut flexible, 0.2, 5000);
-        assert!(run(&mut flat, 0.3, 10)[0] < 0.21);
+        let flat_transition = run_stream(&mut flat, &[(0.2, 300), (0.3, 10)]);
+        assert!(flat_transition[300 * 2] < 0.21);
         assert_eq!(run(&mut flexible, 0.3, 10)[0], 0.3);
         // 100% also permits a drop to half the reference, without boosting it.
         assert!((run(&mut flexible, 0.1, 10)[0] - 0.1).abs() < 0.00001);
@@ -524,6 +666,71 @@ mod tests {
                 .iter()
                 .chain(loud.iter())
                 .all(|sample| sample.is_finite() && sample.abs() <= 0.99901)
+        );
+    }
+    #[test]
+    fn lookahead_smooths_before_loud_entry_and_preserves_all_audio_frames() {
+        let mut gain = processor(0.0, 20.0);
+        let output = run_stream(&mut gain, &[(0.1, 1000), (0.6, 100), (0.1, 777)]);
+        assert_eq!(output.len(), 1877 * 2);
+        assert!(output[990 * 2] < output[700 * 2] / 3.0);
+        assert!(output[1000 * 2] < 0.15);
+        // No instantaneous 10ms gain step in the preceding constant passage.
+        for frame in (751..1000).map(|i| i * 2) {
+            assert!((output[frame] - output[frame - 2]).abs() < 0.005);
+        }
+    }
+
+    #[test]
+    fn lazyness_rejects_small_repeated_gain_changes_and_endpoints_are_finite() {
+        fn modulation(lazyness: f64) -> f64 {
+            let mut gain = processor(0.0, 20.0);
+            gain.configure(Config {
+                change_lazyness_percent: lazyness,
+                ..gain.config
+            });
+            let baseline = GainTarget {
+                dynamic: 1.0,
+                offset_db: 0.0,
+                audible: true,
+                peak: 0.1,
+            };
+            let mut bytes = vec![0u8; 80];
+            gain.render(&mut bytes, baseline, baseline);
+            let mut total = 0.0;
+            let mut previous = gain.dynamic_gain;
+            for i in 0..1000 {
+                let target = GainTarget {
+                    dynamic: if (i / 30) % 2 == 0 { 0.9 } else { 1.1 },
+                    ..baseline
+                };
+                gain.render(&mut bytes, baseline, target);
+                assert!(gain.dynamic_gain.is_finite());
+                total += (gain.dynamic_gain - previous).abs();
+                previous = gain.dynamic_gain;
+            }
+            total
+        }
+        let reactive = modulation(0.0);
+        let lazy = modulation(100.0);
+        assert!(reactive > 1.0, "zero lazyness should respond: {reactive}");
+        assert!(lazy < reactive * 0.1, "lazy {lazy}, reactive {reactive}");
+    }
+
+    #[test]
+    fn maximum_lazyness_still_anticipates_large_entries_and_protects_clipping() {
+        let mut gain = processor(0.0, 20.0);
+        gain.configure(Config {
+            change_lazyness_percent: 100.0,
+            ..gain.config
+        });
+        let output = run_stream(&mut gain, &[(0.05, 1000), (0.9, 500)]);
+        assert!(output[1000 * 2] < 0.12);
+        gain.master_gain = 5.0;
+        assert!(
+            run(&mut gain, 0.9, 200)
+                .iter()
+                .all(|s| s.is_finite() && s.abs() <= 0.99901)
         );
     }
 }

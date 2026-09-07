@@ -236,6 +236,7 @@ enum MprisHaltAutoPeerTransition {
 }
 
 struct DaemonState {
+    cartridges: crate::cartridges::CartridgeStore,
     player: PlaybackEngine,
     cache: MusicCache,
     settings: AppSettings,
@@ -1046,6 +1047,7 @@ pub fn run() -> Result<()> {
     let (command_tx, command_rx) = mpsc::channel::<CommandEnvelope>();
     let (background_tx, background_rx) = mpsc::channel::<BackgroundEvent>();
     let state = Rc::new(RefCell::new(DaemonState {
+        cartridges: crate::cartridges::CartridgeStore::default(),
         player,
         cache,
         settings,
@@ -1750,10 +1752,135 @@ fn dismiss_queue_after_current(state: &mut DaemonState) -> bool {
     changed
 }
 
+fn visualization_staticfs_mountpoint(settings: &AppSettings) -> Option<std::path::PathBuf> {
+    #[cfg(feature = "staticfs")]
+    {
+        settings
+            .staticfs_enabled
+            .then(|| crate::staticfs::host::resolve_mountpoint(&settings.staticfs_mountpoint))
+    }
+    #[cfg(not(feature = "staticfs"))]
+    {
+        let _ = settings;
+        None
+    }
+}
+
+fn handle_cartridge_request(
+    store: &mut crate::cartridges::CartridgeStore,
+    staticfs_enabled: bool,
+    request: DaemonRequest,
+) -> DaemonResponse {
+    use crate::cartridges::{CHUNK_BASE64_MAX, CHUNK_BYTES};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    match request {
+        DaemonRequest::BeginCartridgeUpload { name } => {
+            if !staticfs_enabled {
+                return DaemonResponse::Error(
+                    "Staticfs is disabled. Retry cartridge export to save to the filesystem."
+                        .into(),
+                );
+            }
+            match store.begin(name) {
+                Ok(id) => DaemonResponse::CartridgeUpload(id),
+                Err(error) => DaemonResponse::Error(error.to_string()),
+            }
+        }
+        DaemonRequest::AppendCartridgeUpload { id, data_base64 } => {
+            if data_base64.len() > CHUNK_BASE64_MAX {
+                store.abort(&id);
+                return DaemonResponse::Error("Cartridge chunk is too large".into());
+            }
+            match STANDARD.decode(data_base64) {
+                Ok(bytes) if bytes.len() <= CHUNK_BYTES => match store.append(&id, bytes) {
+                    Ok(()) => DaemonResponse::Ok,
+                    Err(error) => DaemonResponse::Error(error.to_string()),
+                },
+                _ => {
+                    store.abort(&id);
+                    DaemonResponse::Error("Invalid cartridge chunk".into())
+                }
+            }
+        }
+        DaemonRequest::CommitCartridgeUpload { id } => match store.commit(&id) {
+            Ok(info) => DaemonResponse::CartridgeCommitted(info),
+            Err(error) => DaemonResponse::Error(error.to_string()),
+        },
+        DaemonRequest::AbortCartridgeUpload { id } => {
+            store.abort(&id);
+            DaemonResponse::Ok
+        }
+        DaemonRequest::ListMemoryCartridges => DaemonResponse::MemoryCartridges(store.list()),
+        DaemonRequest::MemoryCartridgeInfo { name } => {
+            DaemonResponse::MemoryCartridgeInfo(store.info(&name))
+        }
+        DaemonRequest::ReadMemoryCartridge { name, offset, size } => {
+            DaemonResponse::CartridgeChunk(
+                store
+                    .read(&name, offset, size)
+                    .map(|bytes| STANDARD.encode(bytes)),
+            )
+        }
+        DaemonRequest::RemoveMemoryCartridge { name } => {
+            DaemonResponse::CartridgeRemoved(store.remove(&name))
+        }
+        _ => DaemonResponse::Error("Unsupported cartridge request".into()),
+    }
+}
+
 fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResponse {
     match request {
+        request @ (DaemonRequest::BeginCartridgeUpload { .. }
+        | DaemonRequest::AppendCartridgeUpload { .. }
+        | DaemonRequest::CommitCartridgeUpload { .. }
+        | DaemonRequest::AbortCartridgeUpload { .. }
+        | DaemonRequest::ListMemoryCartridges
+        | DaemonRequest::MemoryCartridgeInfo { .. }
+        | DaemonRequest::ReadMemoryCartridge { .. }
+        | DaemonRequest::RemoveMemoryCartridge { .. }) => handle_cartridge_request(
+            &mut state.cartridges,
+            state.settings.staticfs_enabled,
+            request,
+        ),
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::GetState => DaemonResponse::State(state_snapshot(state)),
+        DaemonRequest::GetVisualizationFrame { bands } => {
+            if !(8..=128).contains(&bands) {
+                return DaemonResponse::Error(
+                    "Visualization bands must be between 8 and 128".into(),
+                );
+            }
+            DaemonResponse::VisualizationFrame(state.player.visualization_frame(bands as usize))
+        }
+        DaemonRequest::GetVisualizationSource {
+            video_id,
+            supports_memory,
+        } => {
+            if state.settings.staticfs_enabled && !supports_memory {
+                return DaemonResponse::Error(
+                    "Reopen the visualiser to use in-memory cartridges.".into(),
+                );
+            }
+            match (
+                state.active_track.as_ref(),
+                state.player.visualization_uri(),
+            ) {
+                (Some(track), Some(uri)) if track.video_id == video_id => {
+                    DaemonResponse::VisualizationSource(crate::ipc::VisualizationSource {
+                        video_id: track.video_id.clone(),
+                        title: track.title.clone(),
+                        artist: track.artist.clone(),
+                        uri,
+                        storage_root: state.cache.base_dir().to_path_buf(),
+                        staticfs_enabled: state.settings.staticfs_enabled,
+                        staticfs_mountpoint: visualization_staticfs_mountpoint(&state.settings),
+                    })
+                }
+                _ => DaemonResponse::Error(
+                    "The playing song changed. Capture the cartridge again.".into(),
+                ),
+            }
+        }
         DaemonRequest::RateCurrentTrack { rating } => {
             let Some(video_id) = state
                 .active_track

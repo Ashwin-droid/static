@@ -159,6 +159,11 @@ impl StaticFs {
     /// length (cheap: one D-Bus GetState / one SQL query per read). Errors
     /// while rendering surface as the mapped errno.
     fn content_len(&self, node: &Node) -> Result<u64, Errno> {
+        if let Node::Cartridge(name) = node {
+            return super::cartridge_files::metadata(&self.ctx, name)
+                .map(|metadata| metadata.size)
+                .map_err(|error| errno_of(&error));
+        }
         if node.is_dir() || !node.readable() {
             return Ok(0);
         }
@@ -175,7 +180,15 @@ impl StaticFs {
         };
         // Timestamps: mount time for static directories, "now" for dynamic
         // content nodes (files regenerate on every read).
-        let timestamp = if node.is_dir() {
+        let timestamp = if let Node::Cartridge(name) = node {
+            super::cartridge_files::metadata(&self.ctx, name)
+                .ok()
+                .and_then(|metadata| {
+                    SystemTime::UNIX_EPOCH
+                        .checked_add(Duration::from_millis(metadata.created_unix_millis))
+                })
+                .unwrap_or(self.mount_time)
+        } else if node.is_dir() {
             self.mount_time
         } else {
             SystemTime::now()
@@ -197,6 +210,13 @@ impl StaticFs {
             blksize: BLKSIZE,
             flags: 0,
         }
+    }
+
+    fn unlink_child(&self, parent: &Node, name: &str) -> Result<(), Errno> {
+        if *parent != Node::CartridgesDir {
+            return Err(Errno::EACCES);
+        }
+        super::cartridge_files::remove(&self.ctx, name).map_err(|error| errno_of(&error))
     }
 
     /// Processes every complete newline-terminated line currently buffered
@@ -302,6 +322,21 @@ impl Filesystem for StaticFs {
                 }
             }
             Err(err) => reply.error(errno_of(&err)),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(parent_node) = self.node_of(parent) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self.unlink_child(&parent_node, name) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -418,16 +453,9 @@ impl Filesystem for StaticFs {
             reply.error(Errno::EACCES);
             return;
         }
-        match node.read(&self.ctx) {
+        match node.read_range(&self.ctx, offset, size) {
             Ok(bytes) => {
-                let len = bytes.len() as u64;
-                if offset >= len {
-                    reply.data(&[]);
-                    return;
-                }
-                let start = offset as usize;
-                let end = usize::min(bytes.len(), start.saturating_add(size as usize));
-                reply.data(&bytes[start..end]);
+                reply.data(&bytes);
             }
             Err(err) => reply.error(errno_of(&err)),
         }

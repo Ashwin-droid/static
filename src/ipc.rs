@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::cartridges::{CHUNK_BASE64_MAX, CHUNK_BYTES, CartridgeInfo};
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use rusqlite::{Connection as SqliteConnection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use zbus::blocking::{Connection, Proxy};
@@ -217,10 +219,67 @@ impl Default for PlaybackSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizationFrame {
+    pub generation: u64,
+    pub sequence: u64,
+    pub sample_rate: u32,
+    pub bands: Vec<f32>,
+    pub rms: f32,
+    pub peak: f32,
+}
+
+/// Audio source for a native cartridge worker; never sent to the web page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizationSource {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub uri: String,
+    pub storage_root: PathBuf,
+    pub staticfs_enabled: bool,
+    #[serde(default)]
+    pub staticfs_mountpoint: Option<PathBuf>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DaemonRequest {
+    BeginCartridgeUpload {
+        name: String,
+    },
+    AppendCartridgeUpload {
+        id: String,
+        data_base64: String,
+    },
+    CommitCartridgeUpload {
+        id: String,
+    },
+    AbortCartridgeUpload {
+        id: String,
+    },
+    ListMemoryCartridges,
+    MemoryCartridgeInfo {
+        name: String,
+    },
+    ReadMemoryCartridge {
+        name: String,
+        offset: u64,
+        size: u32,
+    },
+    RemoveMemoryCartridge {
+        name: String,
+    },
     Ping,
     GetState,
+    GetVisualizationFrame {
+        bands: u32,
+    },
+    GetVisualizationSource {
+        video_id: String,
+        /// Older visualizer processes must reopen before exporting in memory mode.
+        #[serde(default)]
+        supports_memory: bool,
+    },
     RateCurrentTrack {
         rating: SongRating,
     },
@@ -346,9 +405,17 @@ pub enum DaemonRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DaemonResponse {
+    CartridgeUpload(String),
+    MemoryCartridges(Vec<CartridgeInfo>),
+    MemoryCartridgeInfo(Option<CartridgeInfo>),
+    CartridgeCommitted(CartridgeInfo),
+    CartridgeChunk(Option<String>),
+    CartridgeRemoved(bool),
     Ok,
     Pong,
     State(PlaybackSnapshot),
+    VisualizationFrame(VisualizationFrame),
+    VisualizationSource(VisualizationSource),
     CoordinationTargets(CoordinationTargetsSnapshot),
     SleepStatus(SleepStatusSnapshot),
     ShareUrl(String),
@@ -650,6 +717,140 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    pub fn begin_cartridge_upload(&self, name: &str) -> Result<String> {
+        match self.request(&DaemonRequest::BeginCartridgeUpload {
+            name: name.to_owned(),
+        })? {
+            DaemonResponse::CartridgeUpload(id) => Ok(id),
+            DaemonResponse::Error(error) => bail!(error),
+            other => bail!("Unexpected cartridge upload response: {other:?}"),
+        }
+    }
+
+    pub fn append_cartridge_upload(&self, id: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > CHUNK_BYTES {
+            bail!("Cartridge chunk is too large");
+        }
+        match self.request(&DaemonRequest::AppendCartridgeUpload {
+            id: id.to_owned(),
+            data_base64: STANDARD.encode(bytes),
+        })? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error(error) => bail!(error),
+            other => bail!("Unexpected cartridge upload response: {other:?}"),
+        }
+    }
+
+    pub fn commit_cartridge_upload(&self, id: &str) -> Result<CartridgeInfo> {
+        match self.request(&DaemonRequest::CommitCartridgeUpload { id: id.to_owned() })? {
+            DaemonResponse::CartridgeCommitted(info) => Ok(info),
+            DaemonResponse::Error(error) => bail!(error),
+            other => bail!("Unexpected cartridge commit response: {other:?}"),
+        }
+    }
+
+    pub fn abort_cartridge_upload(&self, id: &str) -> Result<()> {
+        match self.request(&DaemonRequest::AbortCartridgeUpload { id: id.to_owned() })? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::Error(error) => bail!(error),
+            other => bail!("Unexpected cartridge abort response: {other:?}"),
+        }
+    }
+
+    #[cfg_attr(not(feature = "staticfs"), allow(dead_code))]
+    pub fn try_list_memory_cartridges(
+        &self,
+    ) -> std::result::Result<Vec<CartridgeInfo>, DaemonCallError> {
+        match self.try_request(&DaemonRequest::ListMemoryCartridges)? {
+            DaemonResponse::MemoryCartridges(entries) => Ok(entries),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected cartridge list response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn try_memory_cartridge_info(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<CartridgeInfo>, DaemonCallError> {
+        match self.try_request(&DaemonRequest::MemoryCartridgeInfo {
+            name: name.to_owned(),
+        })? {
+            DaemonResponse::MemoryCartridgeInfo(info) => Ok(info),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected cartridge info response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn try_read_memory_cartridge(
+        &self,
+        name: &str,
+        offset: u64,
+        size: u32,
+    ) -> std::result::Result<Option<Vec<u8>>, DaemonCallError> {
+        match self.try_request(&DaemonRequest::ReadMemoryCartridge {
+            name: name.to_owned(),
+            offset,
+            size: size.min(CHUNK_BYTES as u32),
+        })? {
+            DaemonResponse::CartridgeChunk(Some(encoded)) => {
+                if encoded.len() > CHUNK_BASE64_MAX {
+                    return Err(DaemonCallError::Transport(anyhow::anyhow!(
+                        "Cartridge reply exceeds chunk limit"
+                    )));
+                }
+                let bytes = STANDARD
+                    .decode(encoded)
+                    .map_err(|error| DaemonCallError::Transport(error.into()))?;
+                if bytes.len() > (size as usize).min(CHUNK_BYTES) {
+                    return Err(DaemonCallError::Transport(anyhow::anyhow!(
+                        "Cartridge reply exceeds requested length"
+                    )));
+                }
+                Ok(Some(bytes))
+            }
+            DaemonResponse::CartridgeChunk(None) => Ok(None),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected cartridge read response: {other:?}"
+            ))),
+        }
+    }
+
+    #[cfg_attr(not(feature = "staticfs"), allow(dead_code))]
+    pub fn try_remove_memory_cartridge(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bool, DaemonCallError> {
+        match self.try_request(&DaemonRequest::RemoveMemoryCartridge {
+            name: name.to_owned(),
+        })? {
+            DaemonResponse::CartridgeRemoved(removed) => Ok(removed),
+            other => Err(DaemonCallError::Transport(anyhow::anyhow!(
+                "Unexpected cartridge remove response: {other:?}"
+            ))),
+        }
+    }
+
+    pub fn visualization_frame(&self, bands: u32) -> Result<VisualizationFrame> {
+        match self.request(&DaemonRequest::GetVisualizationFrame { bands })? {
+            DaemonResponse::VisualizationFrame(frame) => Ok(frame),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected visualization response: {other:?}"),
+        }
+    }
+
+    pub fn visualization_source(&self, video_id: &str) -> Result<VisualizationSource> {
+        match self.request(&DaemonRequest::GetVisualizationSource {
+            video_id: video_id.to_owned(),
+            supports_memory: true,
+        })? {
+            DaemonResponse::VisualizationSource(source) => Ok(source),
+            DaemonResponse::Error(err) => bail!(err),
+            other => bail!("Unexpected visualization source response: {other:?}"),
+        }
+    }
+
     pub fn new() -> Result<Self> {
         ensure_daemon_running()?;
         Ok(Self {

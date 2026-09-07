@@ -51,6 +51,10 @@ fn internet_and_keyring_stay_inside_network() {
 
         let allow_url_literals = relative == "src/ui/content_loading.rs"
             || relative == "src/ipc.rs"
+            // These two modules host and display the loopback-only visualizer.
+            // Remote audio downloads still go through src/network.
+            || relative == "src/visualizer/server.rs"
+            || relative == "src/visualizer/window.rs"
             || relative == "src/network_parser/shared_parser.rs";
 
         if !allow_url_literals && (contents.contains("https://") || contents.contains("http://")) {

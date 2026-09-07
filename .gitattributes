@@ -1,0 +1,2 @@
+# Preserve whitespace inside generated shader strings and mark bundled assets.
+visualizer/dist/** -whitespace linguist-generated=true

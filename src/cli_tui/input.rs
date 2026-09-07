@@ -155,6 +155,12 @@ impl InteractiveTui {
             KeyCode::Tab => self.cycle_focus(),
             KeyCode::Char(' ') => self.run_action(TuiAction::TogglePause)?,
             KeyCode::Char('r') => self.refresh_current_view(),
+            KeyCode::Char('v') => {
+                self.status_line = match crate::visualizer::launch() {
+                    Ok(()) => "Opened the visualiser window.".to_owned(),
+                    Err(err) => format!("Could not open visualiser: {err}"),
+                };
+            }
             KeyCode::Char('1') => self.detail_tab = DetailTab::Queue,
             KeyCode::Char('2') => self.detail_tab = DetailTab::Lyrics,
             KeyCode::Char('t') => self.toggle_detail_tab(),

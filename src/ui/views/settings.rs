@@ -72,6 +72,7 @@ pub enum SettingToggle {
 pub enum SettingNumber {
     DgainFlattenPercent,
     DgainRaSeconds,
+    DgainChangeLazyness,
     PrefetchAhead,
     OfflineCacheTarget,
     OfflineRewatchThreshold,
@@ -633,6 +634,15 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
                 stepper(
                     SettingNumber::DgainFlattenPercent,
                     draft.dgain_flatten_percent,
+                    true,
+                ),
+            ),
+            settings_row(
+                "dGain change lazyness",
+                "Higher values resist small, frequent gain changes. Lower values follow loudness more closely.",
+                stepper(
+                    SettingNumber::DgainChangeLazyness,
+                    draft.dgain_change_lazyness,
                     true,
                 ),
             ),
@@ -1328,6 +1338,7 @@ fn number_meta(number: SettingNumber) -> (f64, f64, f64, usize) {
     match number {
         SettingNumber::DgainFlattenPercent => (0.0, 100.0, 1.0, 1),
         SettingNumber::DgainRaSeconds => (0.1, 120.0, 0.1, 1),
+        SettingNumber::DgainChangeLazyness => (0.0, 100.0, 1.0, 0),
         SettingNumber::PrefetchAhead => (0.0, 12.0, 1.0, 0),
         SettingNumber::OfflineCacheTarget => (0.0, 500.0, 5.0, 0),
         SettingNumber::OfflineRewatchThreshold => (0.0, 50.0, 1.0, 0),
@@ -2020,6 +2031,7 @@ fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
     match number {
         SettingNumber::DgainFlattenPercent => settings.dgain_flatten_percent,
         SettingNumber::DgainRaSeconds => settings.dgain_ra_seconds,
+        SettingNumber::DgainChangeLazyness => settings.dgain_change_lazyness,
         SettingNumber::PrefetchAhead => settings.prefetch_ahead as f64,
         SettingNumber::OfflineCacheTarget => settings.offline_cache_target as f64,
         SettingNumber::OfflineRewatchThreshold => settings.offline_rewatch_threshold as f64,
@@ -2044,6 +2056,7 @@ fn set_number(settings: &mut AppSettings, number: SettingNumber, value: f64) {
     match number {
         SettingNumber::DgainFlattenPercent => settings.dgain_flatten_percent = value,
         SettingNumber::DgainRaSeconds => settings.dgain_ra_seconds = value,
+        SettingNumber::DgainChangeLazyness => settings.dgain_change_lazyness = value,
         SettingNumber::PrefetchAhead => settings.prefetch_ahead = value.round() as u32,
         SettingNumber::OfflineCacheTarget => settings.offline_cache_target = value.round() as u32,
         SettingNumber::OfflineRewatchThreshold => {

@@ -310,6 +310,7 @@ fn gain_config_supports_fractional_settings_and_boost_toggle() {
         ("dgain_enabled", "yes", "yes"),
         ("dgain_flatten_percent", "37.5", "37.5"),
         ("dgain_ra_seconds", "0.5", "0.5"),
+        ("dgain_change_lazyness", "72.5", "72.5"),
     ] {
         assert!(super::CONFIG_SPECS.iter().any(|spec| spec.name == key));
         apply_config_value(&mut settings, key, value).unwrap();
@@ -334,6 +335,11 @@ fn dgain_config_rejects_invalid_values_without_changing_settings() {
             vec!["NaN", "inf", "-inf", "0", "0.09", "121", "oops"],
             "15",
         ),
+        (
+            "dgain_change_lazyness",
+            vec!["NaN", "inf", "-inf", "-1", "101", "oops"],
+            "50",
+        ),
     ] {
         for value in invalid {
             assert!(
@@ -346,6 +352,7 @@ fn dgain_config_rejects_invalid_values_without_changing_settings() {
     for (key, endpoints) in [
         ("dgain_flatten_percent", ["0", "100"]),
         ("dgain_ra_seconds", ["0.1", "120"]),
+        ("dgain_change_lazyness", ["0", "100"]),
     ] {
         for value in endpoints {
             apply_config_value(&mut settings, key, value).unwrap();

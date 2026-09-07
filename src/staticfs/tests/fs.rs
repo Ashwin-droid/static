@@ -26,9 +26,9 @@ fn handle_for(node: Node) -> HandleState {
 fn inode_table_preallocates_static_tree_with_root_at_one() {
     let table = InodeTable::new();
     assert_eq!(table.node(1), Some(Node::Root));
-    // 37 fixed nodes (see tree tests) preallocated at mount.
-    assert_eq!(table.by_ino.len(), 37);
-    assert_eq!(table.by_node.len(), 37);
+    // 38 fixed nodes (see tree tests) preallocated at mount.
+    assert_eq!(table.by_ino.len(), 38);
+    assert_eq!(table.by_node.len(), 38);
     for (ino, node) in &table.by_ino {
         assert_eq!(table.by_node.get(node), Some(ino));
     }
@@ -195,4 +195,102 @@ fn content_len_matches_render_and_write_only_files_are_zero() {
     assert_eq!(fs.content_len(&Node::SettingsFsmod).expect("render"), 4);
     assert_eq!(fs.content_len(&Node::QueueClear).expect("write-only"), 0);
     assert_eq!(fs.content_len(&Node::PlaybackDir).expect("dir"), 0);
+}
+
+#[test]
+#[ignore = "requires /dev/fuse; mounts only a temporary test filesystem"]
+fn cartridges_are_readable_through_an_isolated_fuse_mount() {
+    let root =
+        std::env::temp_dir().join(format!("staticfs-cartridge-mount-{}", uuid::Uuid::new_v4()));
+    let storage = root.join("store");
+    let mountpoint = root.join("mount");
+    let backend = super::super::cartridge_files::test_backend::TestCartridges::default();
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let bytes: Vec<u8> = (0..262_149).map(|i| (i % 251) as u8).collect();
+    backend.insert("song.png", &bytes);
+    let session = fuser::spawn_mount2(
+        StaticFs::new(Ctx::with_test_cartridges(storage.clone(), backend.clone())),
+        &mountpoint,
+        &crate::staticfs::mount_config(false),
+    )
+    .unwrap();
+    let visible = mountpoint.join("cartridges/song.png");
+    assert_eq!(
+        std::fs::metadata(&visible).unwrap().len(),
+        bytes.len() as u64
+    );
+    assert_eq!(std::fs::read(&visible).unwrap(), bytes);
+    assert!(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&visible)
+            .is_err()
+    );
+    backend.insert("new.png", b"new cartridge");
+    assert_eq!(
+        std::fs::read(mountpoint.join("cartridges/new.png")).unwrap(),
+        b"new cartridge"
+    );
+    assert!(std::fs::write(mountpoint.join("cartridges/created.png"), b"overwrite").is_err());
+    std::fs::remove_file(&visible).unwrap();
+    assert!(backend.info("song.png").is_none());
+    assert_eq!(
+        std::fs::read(&visible).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    // Deleting one cartridge keeps the mount and the remaining entries alive.
+    assert_eq!(
+        std::fs::read(mountpoint.join("cartridges/new.png")).unwrap(),
+        b"new cartridge"
+    );
+    assert!(
+        !storage.exists(),
+        "memory cartridge access must not create storage files"
+    );
+    assert!(crate::staticfs::is_live_staticfs_mount(&mountpoint));
+    drop(session);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unlink_only_removes_memory_cartridges_and_attributes_use_daemon_metadata() {
+    let backend = super::super::cartridge_files::test_backend::TestCartridges::default();
+    backend.insert("song.png", b"audio");
+    let fs = StaticFs::new(Ctx::with_test_cartridges(
+        "/nonexistent/static-root".into(),
+        backend.clone(),
+    ));
+    let node = Node::Cartridge("song.png".into());
+    assert_eq!(fs.content_len(&node).unwrap(), 5);
+    let attr = fs.attr_for(fs.assign_ino(&node), &node, 5);
+    assert_eq!(
+        attr.mtime,
+        std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(1234567)
+    );
+    assert_eq!(attr.perm, 0o444);
+    assert_eq!(
+        fs.unlink_child(&Node::PlaybackDir, "song.png")
+            .map_err(i32::from),
+        Err(i32::from(Errno::EACCES))
+    );
+    assert_eq!(
+        fs.unlink_child(&Node::Root, "shutdown").map_err(i32::from),
+        Err(i32::from(Errno::EACCES))
+    );
+    assert!(backend.info("song.png").is_some());
+    fs.unlink_child(&Node::CartridgesDir, "song.png").unwrap();
+    assert_eq!(
+        fs.content_len(&node).map_err(i32::from),
+        Err(i32::from(Errno::ENOENT))
+    );
+    assert_eq!(
+        fs.unlink_child(&Node::CartridgesDir, "song.png")
+            .map_err(i32::from),
+        Err(i32::from(Errno::ENOENT))
+    );
+    assert_eq!(
+        fs.unlink_child(&Node::CartridgesDir, "../private.png")
+            .map_err(i32::from),
+        Err(i32::from(Errno::ENOENT))
+    );
 }

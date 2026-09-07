@@ -391,19 +391,18 @@ impl Host {
     /// The raw mountpoint setting resolved to a path: empty = the default
     /// (~/Music/staticfs), leading `~/` expands to $HOME.
     fn resolved_mountpoint(&self) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        match self
-            .mountpoint_setting
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            None => PathBuf::from(home).join("Music").join("staticfs"),
-            Some(value) => match value.strip_prefix("~/") {
-                Some(rest) => PathBuf::from(home).join(rest),
-                None => PathBuf::from(value),
-            },
-        }
+        resolve_mountpoint(self.mountpoint_setting.as_deref().unwrap_or_default())
+    }
+}
+
+pub(crate) fn resolve_mountpoint(setting: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    match setting.trim() {
+        "" => PathBuf::from(home).join("Music/staticfs"),
+        value => match value.strip_prefix("~/") {
+            Some(rest) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(value),
+        },
     }
 }
 

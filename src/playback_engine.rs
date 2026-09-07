@@ -13,6 +13,7 @@ use gstreamer_play as gst_play;
 
 mod audio_filter;
 mod dynamic_gain;
+mod spectrum;
 
 use dynamic_gain::{Config as GainConfig, DynamicGain};
 
@@ -25,6 +26,8 @@ macro_rules! eprintln {
 pub struct PlaybackEngine {
     inner: gst_play::Play,
     gain: Arc<Mutex<DynamicGain>>,
+    spectrum: Arc<spectrum::Spectrum>,
+    visualization_uri: RefCell<Option<String>>,
     master_volume: Cell<f64>,
     paused: Cell<bool>,
     buf_percent: Rc<Cell<u32>>,
@@ -41,8 +44,9 @@ impl PlaybackEngine {
         let pipeline = inner.pipeline();
         pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
         let gain = Arc::new(Mutex::new(DynamicGain::default()));
-        let filter =
-            audio_filter::build(gain.clone()).expect("Failed to build playback gain filter");
+        let spectrum = Arc::new(spectrum::Spectrum::default());
+        let filter = audio_filter::build(gain.clone(), spectrum.clone())
+            .expect("Failed to build playback gain filter");
         pipeline.set_property("audio-filter", &filter);
         inner.set_volume(1.0);
 
@@ -127,6 +131,8 @@ impl PlaybackEngine {
         Self {
             inner,
             gain,
+            spectrum,
+            visualization_uri: RefCell::new(None),
             master_volume: Cell::new(1.0),
             paused: Cell::new(false),
             buf_percent,
@@ -139,6 +145,8 @@ impl PlaybackEngine {
     }
 
     pub fn play_uri(&self, uri: &str) {
+        self.spectrum.reset();
+        *self.visualization_uri.borrow_mut() = Some(uri.to_owned());
         // Capture a short first song before GStreamer's flush can clear its history.
         self.gain.lock().unwrap().finish_reference();
         self.inner.stop();
@@ -155,11 +163,13 @@ impl PlaybackEngine {
     }
 
     pub fn pause(&self) {
+        self.spectrum.reset();
         self.inner.pause();
         self.paused.set(true);
     }
 
     pub fn resume(&self) {
+        self.spectrum.reset();
         self.inner.play();
         self.paused.set(false);
     }
@@ -169,6 +179,8 @@ impl PlaybackEngine {
     }
 
     pub fn stop(&self) {
+        self.spectrum.reset();
+        self.visualization_uri.borrow_mut().take();
         // Capture a short first song before GStreamer's flush can clear its history.
         self.gain.lock().unwrap().finish_reference();
         self.inner.stop();
@@ -183,6 +195,7 @@ impl PlaybackEngine {
     }
 
     pub fn seek(&self, position: ClockTime) {
+        self.spectrum.reset();
         self.gain.lock().unwrap().reset();
         self.cached_position_nanos
             .store(position.nseconds(), Ordering::Relaxed);
@@ -206,6 +219,7 @@ impl PlaybackEngine {
             enabled: settings.dgain_enabled,
             flatten_percent: settings.dgain_flatten_percent,
             ra_seconds: settings.dgain_ra_seconds,
+            change_lazyness_percent: settings.dgain_change_lazyness,
             xdgain_enabled: settings.xdgain_enabled,
         });
     }
@@ -222,6 +236,17 @@ impl PlaybackEngine {
             .unwrap()
             .restore_cross_song_state(cross_song);
         replacement
+    }
+
+    pub fn visualization_frame(&self, bands: usize) -> crate::ipc::VisualizationFrame {
+        self.spectrum.frame(
+            bands,
+            !self.is_paused() && self.pipeline_state() == gst::State::Playing,
+        )
+    }
+
+    pub fn visualization_uri(&self) -> Option<String> {
+        self.visualization_uri.borrow().clone()
     }
 
     pub fn position(&self) -> Option<ClockTime> {

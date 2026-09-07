@@ -285,3 +285,27 @@ fn play_queue_at_requests_can_start_paused_without_peer_mpris_pause() {
         other => panic!("unexpected request variant: {other:?}"),
     }
 }
+
+#[test]
+fn older_visualizer_source_requests_do_not_advertise_memory_export_support() {
+    let request: DaemonRequest =
+        serde_json::from_value(json!({"GetVisualizationSource":{"video_id":"song"}})).unwrap();
+    assert!(matches!(
+        request,
+        DaemonRequest::GetVisualizationSource {
+            supports_memory: false,
+            ..
+        }
+    ));
+    let request: DaemonRequest = serde_json::from_value(
+        json!({"GetVisualizationSource":{"video_id":"song","supports_memory":true}}),
+    )
+    .unwrap();
+    assert!(matches!(
+        request,
+        DaemonRequest::GetVisualizationSource {
+            supports_memory: true,
+            ..
+        }
+    ));
+}

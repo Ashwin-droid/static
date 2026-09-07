@@ -1,5 +1,5 @@
 //! staticfs: a FUSE filesystem exposing the Static playback daemon and the
-//! local stats database as plaintext files (contract Part B).
+//! local stats database as plaintext files, plus ephemeral cartridge PNGs.
 //!
 //! Module layout mirrors the repo's `foo.rs` + `foo/` convention:
 //! - `staticfs.rs` (this file): mount options, stale-mount recovery, plus
@@ -21,6 +21,7 @@ use fuser::{Config, MountOption, SessionACL};
 
 use crate::ipc::{DaemonCallError, DaemonClient};
 
+pub(crate) mod cartridge_files;
 pub(crate) mod format;
 mod fs;
 pub mod host;
@@ -103,6 +104,9 @@ impl DaemonHandle {
 /// Shared context handed to every slice function (contract B6).
 pub(crate) struct Ctx {
     daemon: DaemonHandle,
+    /// Test-only fake daemon. Production cartridge access always uses D-Bus.
+    #[cfg(test)]
+    test_cartridges: Option<cartridge_files::test_backend::TestCartridges>,
     /// Read-only stats DB seam; internals owned by the stats slice
     /// (`stats_files.rs`). Constructed at mount with `static_root` resolved
     /// exactly once.
@@ -116,9 +120,21 @@ impl Ctx {
     pub(crate) fn new(static_root: PathBuf) -> Self {
         Self {
             daemon: DaemonHandle::new(),
+            #[cfg(test)]
+            test_cartridges: None,
             stats: stats_files::StatsDb::new(static_root),
             fsmod: Mutex::new(FsMode::default()),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_cartridges(
+        static_root: PathBuf,
+        backend: cartridge_files::test_backend::TestCartridges,
+    ) -> Self {
+        let mut ctx = Self::new(static_root);
+        ctx.test_cartridges = Some(backend);
+        ctx
     }
 
     fn daemon_client(&self) -> FsResult<DaemonClient> {
@@ -198,7 +214,7 @@ fn recover_stale_mount(mountpoint: &Path) {
 
 /// Refuse to mount over a directory ONLY if it is already a live staticfs
 /// mount (any other non-empty directory is accepted).
-fn is_live_staticfs_mount(mountpoint: &Path) -> bool {
+pub(crate) fn is_live_staticfs_mount(mountpoint: &Path) -> bool {
     let canonical = match mountpoint.canonicalize() {
         Ok(path) => path,
         Err(_) => return false,

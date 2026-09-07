@@ -76,6 +76,8 @@ pub enum RecentList {
 
 #[derive(Clone)]
 pub enum Msg {
+    OpenVisualizer,
+    VisualizerOpened(Result<(), String>),
     SearchInput(String),
     SearchSubmitted,
     SuggestDebounceFired {
@@ -149,9 +151,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .height(Length::Fill);
 
-    let bottom = container(nav_button("Settings", NavItem::Settings, app.active_nav))
-        .width(Length::Fill)
-        .padding(theme::SPACE_MD);
+    let bottom = container(column![
+        button(text("Visualiser").size(theme::SIZE_BODY))
+            .width(Length::Fill)
+            .padding(theme::SPACE_MD)
+            .style(theme::nav_item(false))
+            .on_press(Message::Sidebar(Msg::OpenVisualizer)),
+        nav_button("Settings", NavItem::Settings, app.active_nav),
+    ])
+    .width(Length::Fill)
+    .padding(theme::SPACE_MD);
 
     let body = column![
         search_shell,
@@ -172,6 +181,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
 pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
     match msg {
+        Msg::OpenVisualizer => Task::perform(
+            async { crate::visualizer::launch().map_err(|err| err.to_string()) },
+            |result| Message::Sidebar(Msg::VisualizerOpened(result)),
+        ),
+        Msg::VisualizerOpened(result) => match result {
+            Ok(()) => Task::none(),
+            Err(err) => app.show_toast(err),
+        },
         Msg::SearchInput(value) => {
             app.sidebar.search_text = value;
             if app.sidebar.suppress_suggestions {

@@ -68,10 +68,11 @@ fn parse_position_millis(line: &str) -> Option<u64> {
     Some((secs * 1000.0).round() as u64)
 }
 
-/// playback/volume write grammar: f64 in 0.0..=1.0.
+/// playback/volume write grammar: f64 in 0.0..=5.0. The daemon enforces
+/// the active limit, rejecting values over 1.0 unless boost is enabled.
 fn parse_volume_value(line: &str) -> Option<f64> {
     let volume: f64 = line.parse().ok()?;
-    if !volume.is_finite() || !(0.0..=1.0).contains(&volume) {
+    if !volume.is_finite() || !(0.0..=5.0).contains(&volume) {
         return None;
     }
     Some(volume)
@@ -236,18 +237,18 @@ pub(crate) fn read_duration(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
     Ok(format::scalar(&value))
 }
 
-/// playback/volume (rw), read side. B5: "scalar float 0.0-1.0 (2 decimals
+/// playback/volume (rw), read side. Scalar float 0.0-5.0 (2 decimals
 /// ok, print like 0.75)."
 pub(crate) fn read_volume(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
     let snap = snapshot(ctx)?;
     Ok(format::scalar(&format!("{:.2}", snap.volume)))
 }
 
-/// playback/volume (rw), write side. B5: "w: f64 in 0.0..=1.0 → SetVolume,
+/// playback/volume (rw), write side. "w: f64 in 0.0..=5.0 → SetVolume,
 /// else EINVAL."
 pub(crate) fn write_volume(ctx: &Ctx, line: &str) -> FsResult<()> {
     let volume = parse_volume_value(line)
-        .ok_or_else(|| FsError::invalid(format!("invalid volume (0.0..=1.0): {line:?}")))?;
+        .ok_or_else(|| FsError::invalid(format!("invalid volume (0.0..=5.0): {line:?}")))?;
     send(ctx, &DaemonRequest::SetVolume { volume })
 }
 

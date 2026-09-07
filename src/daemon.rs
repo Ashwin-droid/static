@@ -1041,6 +1041,7 @@ pub fn run() -> Result<()> {
     cache.clear_temp();
     let settings = cache.load_settings().unwrap_or_default();
     let player = PlaybackEngine::new();
+    player.configure_gain(&settings);
     let initial_volume = player.volume();
     let (command_tx, command_rx) = mpsc::channel::<CommandEnvelope>();
     let (background_tx, background_rx) = mpsc::channel::<BackgroundEvent>();
@@ -1993,6 +1994,12 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             DaemonResponse::State(state_snapshot(state))
         }
         DaemonRequest::SetVolume { volume } => {
+            if !valid_requested_volume(volume, &state.settings) {
+                return DaemonResponse::Error(format!(
+                    "volume must be finite and between 0 and {}",
+                    state.settings.max_volume()
+                ));
+            }
             set_logical_volume(state, volume);
             sync_mpris(state);
             maybe_persist_playback_state(state, true);
@@ -2678,6 +2685,7 @@ fn suspend_playback_for_probe(state: &mut DaemonState) {
     state.player.stop();
     state.volume_ramp = None;
     state.player = PlaybackEngine::new();
+    state.player.configure_gain(&state.settings);
     state.active_track.take();
     state.track_repeat_loops_left = None;
     state.sponsor_segments.clear();
@@ -4025,6 +4033,7 @@ fn stage_play_index_after_desync(
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
     stop_playback_without_mpris_sync(state, false);
     state.player = PlaybackEngine::new();
+    state.player.configure_gain(&state.settings);
     state.probe_context = None;
     state.queue_index = index;
     mark_radio_touched_through(state, index);
@@ -4117,6 +4126,7 @@ fn start_pending_playback(state: &mut DaemonState) -> Result<()> {
         .ok_or_else(|| anyhow!("Queue index {index} is out of bounds"))?;
     let prepared = prepare_playback(state, &track.video_id)?;
     state.player = PlaybackEngine::new();
+    state.player.configure_gain(&state.settings);
     state.probe_context = None;
     start_prepared_playback(
         state,
@@ -4152,6 +4162,7 @@ fn play_index_with_startup_retries(
 
     stop_playback_without_mpris_sync(state, false);
     state.player = PlaybackEngine::new();
+    state.player.configure_gain(&state.settings);
     state.probe_context = None;
 
     start_prepared_playback(
@@ -4517,7 +4528,13 @@ fn ensure_client_loaded(state: &mut DaemonState) -> Result<Arc<NetworkState>> {
 fn reload_settings(state: &mut DaemonState) {
     match state.cache.load_settings() {
         Ok(settings) => {
+            let volume_limit_lowered = settings.max_volume() < state.settings.max_volume();
             state.settings = settings;
+            state.player.configure_gain(&state.settings);
+            if volume_limit_lowered {
+                apply_volume_limit_after_settings_reload(state);
+            }
+            sync_mpris(state);
             reset_track_repeat_budget_for_current_track(state);
             if !state.settings.other_mpris_mode.coordinates_peers() {
                 state.peer_mpris.deactivate();
@@ -5639,6 +5656,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         paused: state.probe_context.is_some()
             || (has_current_track(state) && is_logically_paused(state)),
         volume: logical_volume(state),
+        max_volume: state.settings.max_volume(),
         position_millis,
         duration_millis: (state.probe_context.is_none() && !hide_timing)
             .then(|| visible_duration_millis(state))
@@ -5701,6 +5719,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             }),
         paused: is_logically_paused(state),
         volume: logical_volume(state),
+        max_volume: state.settings.max_volume(),
         position_millis: (!hide_timing)
             .then(|| visible_position_millis(state))
             .flatten(),
@@ -6082,6 +6101,25 @@ fn logical_volume(state: &DaemonState) -> f64 {
     state.pre_duck_volume
 }
 
+fn valid_requested_volume(volume: f64, settings: &AppSettings) -> bool {
+    volume.is_finite() && (0.0..=settings.max_volume()).contains(&volume)
+}
+
+fn apply_volume_limit_after_settings_reload(state: &mut DaemonState) {
+    state.pre_duck_volume = state.pre_duck_volume.min(state.settings.max_volume());
+    let output = steady_output_volume(state);
+    state.player.set_volume(state.player.volume().min(output));
+    if let Some(ramp) = state.volume_ramp {
+        // Keep pause-fade completion and its deadline when boost is disabled.
+        start_volume_ramp_with_completion(
+            state,
+            ramp.target_volume.min(output),
+            ramp.duration.saturating_sub(ramp.started_at.elapsed()),
+            ramp.completion,
+        );
+    }
+}
+
 fn steady_output_volume(state: &DaemonState) -> f64 {
     if state.ducked {
         pipewire_duck_output_volume(state)
@@ -6096,11 +6134,14 @@ fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
             .settings
             .pipewire_ducking_volume
             .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX))
-    .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX)
+    .clamp(0.0, 5.0)
 }
 
 fn set_logical_volume(state: &mut DaemonState, volume: f64) {
-    let volume = volume.clamp(0.0, 1.0);
+    if !volume.is_finite() {
+        return;
+    }
+    let volume = volume.clamp(0.0, state.settings.max_volume());
     state.pre_duck_volume = volume;
 
     if state.ducked {
@@ -6144,7 +6185,7 @@ fn start_volume_ramp_with_completion(
     duration: Duration,
     completion: VolumeRampCompletion,
 ) {
-    let target_volume = target_volume.clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX);
+    let target_volume = target_volume.clamp(0.0, 5.0);
     let current_volume = state.player.volume();
     state.player.set_volume(current_volume);
     if volumes_match(current_volume, target_volume) {
@@ -6179,9 +6220,7 @@ fn finish_volume_ramp(
     final_volume: f64,
     completion: VolumeRampCompletion,
 ) {
-    state
-        .player
-        .set_volume(final_volume.clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX));
+    state.player.set_volume(final_volume.clamp(0.0, 5.0));
     state.volume_ramp = None;
 
     match completion {
@@ -6200,10 +6239,12 @@ fn finish_volume_ramp(
 }
 
 fn volume_ramp_value(ramp: VolumeRamp) -> f64 {
+    if ramp.duration.is_zero() {
+        return ramp.target_volume.clamp(0.0, 5.0);
+    }
     let progress =
         (ramp.started_at.elapsed().as_secs_f64() / ramp.duration.as_secs_f64()).clamp(0.0, 1.0);
-    (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress)
-        .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX)
+    (ramp.start_volume + (ramp.target_volume - ramp.start_volume) * progress).clamp(0.0, 5.0)
 }
 
 fn volumes_match(left: f64, right: f64) -> bool {

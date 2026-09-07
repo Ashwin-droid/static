@@ -48,6 +48,7 @@ fn persisted_playback_state_round_trips_through_database() {
         up_next: None,
         paused: true,
         volume: 0.75,
+        max_volume: 5.0,
         position_millis: Some(12_345),
         duration_millis: Some(67_890),
         buffered_fraction: 0.5,
@@ -92,6 +93,7 @@ fn persisted_playback_state_round_trips_through_database() {
     );
     assert_eq!(loaded.snapshot.paused, persisted.snapshot.paused);
     assert_eq!(loaded.snapshot.volume, persisted.snapshot.volume);
+    assert_eq!(loaded.snapshot.max_volume, 5.0);
     assert_eq!(
         loaded.snapshot.position_millis,
         persisted.snapshot.position_millis
@@ -246,6 +248,7 @@ fn old_snapshots_without_ducking_fields_still_deserialize() {
     }))
     .expect("old snapshot without ducked fields should deserialize");
 
+    assert_eq!(snapshot.max_volume, 1.0);
     assert!(!snapshot.ducked);
     assert!(!snapshot.pipewire_pause_active);
     assert!(snapshot.up_next.is_none());

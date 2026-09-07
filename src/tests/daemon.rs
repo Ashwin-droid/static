@@ -21,7 +21,7 @@ use super::{
     should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
     should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
     should_wait_for_radio_extension_at_natural_end, title_similarity, tracking_retry_delay,
-    volume_ramp_is_complete, weighted_index,
+    valid_requested_volume, volume_ramp_is_complete, volume_ramp_value, weighted_index,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
@@ -762,6 +762,40 @@ fn volume_ramp_completion_is_deadline_based() {
     };
 
     assert!(volume_ramp_is_complete(ramp, 0.25));
+}
+
+#[test]
+fn volume_requests_respect_boost_setting_and_reject_nonfinite_values() {
+    let mut settings = AppSettings::default();
+    assert!(valid_requested_volume(0.0, &settings));
+    assert!(valid_requested_volume(1.0, &settings));
+    assert!(!valid_requested_volume(1.01, &settings));
+    settings.volume_boost_enabled = true;
+    assert!(valid_requested_volume(5.0, &settings));
+    for invalid in [-0.1, 5.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(!valid_requested_volume(invalid, &settings));
+    }
+    settings.volume_boost_enabled = false;
+    assert!(!valid_requested_volume(5.0, &settings));
+}
+
+#[test]
+fn volume_ramps_reach_boosted_targets_and_handle_expired_reload_deadlines() {
+    let ramp = VolumeRamp {
+        started_at: Instant::now() - Duration::from_secs(1),
+        start_volume: 0.0,
+        target_volume: 5.0,
+        duration: Duration::from_millis(200),
+        completion: VolumeRampCompletion::None,
+    };
+    assert_eq!(volume_ramp_value(ramp), 5.0);
+    let finished_pause = VolumeRamp {
+        start_volume: 5.0,
+        target_volume: 0.0,
+        duration: Duration::ZERO,
+        ..ramp
+    };
+    assert_eq!(volume_ramp_value(finished_pause), 0.0);
 }
 
 #[test]

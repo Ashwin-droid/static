@@ -964,6 +964,8 @@ pub(in crate::cli_tui) fn text_setting_field(
 
 pub(in crate::cli_tui) fn current_boolean_setting(settings: &AppSettings, key: &str) -> bool {
     match key {
+        "volume_boost_enabled" => settings.volume_boost_enabled,
+        "dgain_enabled" => settings.dgain_enabled,
         "auto_sync_chromium_cookies" => settings.auto_sync_chromium_cookies,
         "auto_release_track_loops" => settings.auto_release_track_loops,
         "auto_manage_offline_cache" => settings.auto_manage_offline_cache,
@@ -1001,6 +1003,8 @@ pub(in crate::cli_tui) fn current_coordination_filter_setting(
 
 pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, key: &str) -> f64 {
     match key {
+        "dgain_flatten_percent" => settings.dgain_flatten_percent,
+        "dgain_ra_seconds" => settings.dgain_ra_seconds,
         "auto_release_track_loops_after" => settings.auto_release_track_loops_after as f64,
         "listen_again_cache_days" => settings.listen_again_cache_days as f64,
         "offline_cache_target" => settings.offline_cache_target as f64,
@@ -1020,6 +1024,18 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
 
 pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSettingMeta> {
     match key {
+        "dgain_flatten_percent" => Some(NumericSettingMeta {
+            min: 0.0,
+            max: 100.0,
+            step: 1.0,
+            integer: false,
+        }),
+        "dgain_ra_seconds" => Some(NumericSettingMeta {
+            min: 0.1,
+            max: 120.0,
+            step: 0.1,
+            integer: false,
+        }),
         "auto_release_track_loops_after" => Some(NumericSettingMeta {
             min: 1.0,
             max: 100.0,
@@ -1224,8 +1240,32 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
     Ok(vec![
         TuiSettingsSection {
             title: "Playback & Cache".to_string(),
-            subtitle: "How local cache, loops, and prefetch behave.".to_string(),
+            subtitle: "Loudness, local playback, track loops, and prefetching.".to_string(),
             fields: vec![
+                toggle_setting_field(
+                    settings,
+                    "volume_boost_enabled",
+                    "Gain above 100%",
+                    "Extend the volume controls to 500% for quiet songs.",
+                ),
+                toggle_setting_field(
+                    settings,
+                    "dgain_enabled",
+                    "dGain on",
+                    "Even out quiet and loud passages using a rolling loudness average. Independent of gain above 100%.",
+                ),
+                stepper_setting_field(
+                    settings,
+                    "dgain_flatten_percent",
+                    "dGain flatten %",
+                    "Allowed variation: 0% follows the average; 50% allows 2/3–1.5×; 100% allows 0.5–2×.",
+                )?,
+                stepper_setting_field(
+                    settings,
+                    "dgain_ra_seconds",
+                    "dGain RA time (seconds)",
+                    "Rolling average window. Longer windows smooth loudness across longer passages.",
+                )?,
                 toggle_setting_field(
                     settings,
                     "prefer_local_cache_on_playback",

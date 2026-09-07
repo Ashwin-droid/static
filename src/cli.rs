@@ -867,7 +867,7 @@ fn run_info() -> Result<()> {
     );
     println!(
         "volume_percent: {:.0}",
-        (snapshot.volume * 100.0).clamp(0.0, 100.0)
+        (snapshot.volume * 100.0).clamp(0.0, 500.0)
     );
 
     if let Some(track) = snapshot.current_track.as_ref() {
@@ -1248,6 +1248,14 @@ fn join_required_input(args: &[String], label: &str) -> Result<String> {
     Ok(args.join(" "))
 }
 
+fn restored_volume(saved_volume: f64, current_max_volume: f64) -> f64 {
+    if saved_volume.is_finite() {
+        saved_volume.clamp(0.0, current_max_volume)
+    } else {
+        1.0_f64.min(current_max_volume)
+    }
+}
+
 pub(crate) fn restore_playback_snapshot_via_daemon(
     snapshot: PlaybackSnapshot,
     resume_playback: bool,
@@ -1257,7 +1265,8 @@ pub(crate) fn restore_playback_snapshot_via_daemon(
         .queue_index
         .min(snapshot.queue.len().saturating_sub(1));
 
-    let mut restored = client.set_volume(snapshot.volume)?;
+    let current = client.state()?;
+    let mut restored = client.set_volume(restored_volume(snapshot.volume, current.max_volume))?;
     if snapshot.queue.is_empty() {
         return Ok(restored);
     }
@@ -1302,7 +1311,8 @@ pub(crate) fn restore_paused_playback_snapshot_via_daemon(
         .queue_index
         .min(snapshot.queue.len().saturating_sub(1));
 
-    let mut restored = client.set_volume(snapshot.volume)?;
+    let current = client.state()?;
+    let mut restored = client.set_volume(restored_volume(snapshot.volume, current.max_volume))?;
     if snapshot.queue.is_empty() {
         return Ok(restored);
     }
@@ -1712,6 +1722,22 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::Bool,
     },
     ConfigSpec {
+        name: "volume_boost_enabled",
+        kind: ConfigKind::Bool,
+    },
+    ConfigSpec {
+        name: "dgain_enabled",
+        kind: ConfigKind::Bool,
+    },
+    ConfigSpec {
+        name: "dgain_flatten_percent",
+        kind: ConfigKind::F64,
+    },
+    ConfigSpec {
+        name: "dgain_ra_seconds",
+        kind: ConfigKind::F64,
+    },
+    ConfigSpec {
         name: "other_mpris_mode",
         kind: ConfigKind::String,
     },
@@ -1813,6 +1839,18 @@ fn sponsorblock_category_list() -> String {
 
 fn config_description(name: &str) -> String {
     match name {
+        "volume_boost_enabled" => format!(
+            "Extends the normal volume control from 100% to 500% for quiet tracks.\nDefault: off.\n{}",
+            bool_values_note("allow volume up to 500%", "limit volume to 100%")
+        ),
+        "dgain_enabled" => format!(
+            "Enables dGain, which smooths quiet and loud passages against a rolling loudness average.\nDefault: off.\n{}",
+            bool_values_note("apply dynamic gain during playback", "leave track dynamics unchanged")
+        ),
+        "dgain_flatten_percent" => "Allowed loudness deviation around the rolling average before dGain corrects it.\n0% follows the average closely; 100% allows loudness from half to twice the average.\nAccepted range: 0-100. Default: 50."
+            .to_string(),
+        "dgain_ra_seconds" => "Rolling loudness average window for dGain, in seconds.\nAccepted range: 0.1-120. Default: 15."
+            .to_string(),
         "auto_sync_chromium_cookies" => format!(
             "Controls whether Static tries to refresh a saved YouTube Music session from a \
 Chromium-family browser profile when the current saved cookie is missing or rejected.\n{}",
@@ -2061,6 +2099,10 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "prefetch_enabled" => yes_no_bool(settings.prefetch_enabled),
         "prefetch_ahead" => settings.prefetch_ahead.to_string(),
         "prefer_local_cache_on_playback" => yes_no_bool(settings.prefer_local_cache_on_playback),
+        "volume_boost_enabled" => yes_no_bool(settings.volume_boost_enabled),
+        "dgain_enabled" => yes_no_bool(settings.dgain_enabled),
+        "dgain_flatten_percent" => settings.dgain_flatten_percent.to_string(),
+        "dgain_ra_seconds" => settings.dgain_ra_seconds.to_string(),
         "other_mpris_mode" => settings.other_mpris_mode.as_str().to_string(),
         "other_mpris_halt_auto_resume_secs" => {
             settings.other_mpris_halt_auto_resume_secs.to_string()
@@ -2116,6 +2158,14 @@ pub(crate) fn apply_config_value(
         "prefetch_ahead" => settings.prefetch_ahead = parse_u32(trimmed)?.clamp(0, 12),
         "prefer_local_cache_on_playback" => {
             settings.prefer_local_cache_on_playback = parse_bool(trimmed)?
+        }
+        "volume_boost_enabled" => settings.volume_boost_enabled = parse_bool(trimmed)?,
+        "dgain_enabled" => settings.dgain_enabled = parse_bool(trimmed)?,
+        "dgain_flatten_percent" => {
+            settings.dgain_flatten_percent = parse_f64_in_range(trimmed, 0.0, 100.0)?;
+        }
+        "dgain_ra_seconds" => {
+            settings.dgain_ra_seconds = parse_f64_in_range(trimmed, 0.1, 120.0)?;
         }
         "other_mpris_mode" => settings.other_mpris_mode = parse_coordination_mode(trimmed)?,
         "other_mpris_halt_auto_resume_secs" => {
@@ -2209,6 +2259,14 @@ fn parse_f64(value: &str) -> Result<f64> {
         .with_context(|| format!("Expected a number, got `{value}`"))?;
     if !parsed.is_finite() {
         bail!("Expected a finite number, got `{value}`");
+    }
+    Ok(parsed)
+}
+
+fn parse_f64_in_range(value: &str, minimum: f64, maximum: f64) -> Result<f64> {
+    let parsed = parse_f64(value)?;
+    if !(minimum..=maximum).contains(&parsed) {
+        bail!("Expected a number from {minimum} to {maximum}, got `{value}`");
     }
     Ok(parsed)
 }

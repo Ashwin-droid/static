@@ -286,7 +286,7 @@ impl InteractiveTui {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(Span::styled(
-                    format!("{:.0}%", (self.snapshot.volume * 100.0).clamp(0.0, 100.0)),
+                    format!("{:.0}%", self.snapshot.volume * 100.0),
                     Style::default().fg(theme.text),
                 )),
                 Line::from(Span::styled("vol", Style::default().fg(theme.muted))),
@@ -579,11 +579,13 @@ impl InteractiveTui {
                 self.client.set_repeat_mode(next_mode)
             }
             TuiAction::VolumeDown => {
-                let next = (self.snapshot.volume - VOLUME_STEP).clamp(0.0, 1.0);
+                let next =
+                    (self.snapshot.volume - VOLUME_STEP).clamp(0.0, self.snapshot.max_volume);
                 self.client.set_volume(next)
             }
             TuiAction::VolumeUp => {
-                let next = (self.snapshot.volume + VOLUME_STEP).clamp(0.0, 1.0);
+                let next =
+                    (self.snapshot.volume + VOLUME_STEP).clamp(0.0, self.snapshot.max_volume);
                 self.client.set_volume(next)
             }
             TuiAction::DismissQueue => {

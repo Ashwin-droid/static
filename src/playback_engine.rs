@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -11,6 +11,11 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_play as gst_play;
 
+mod audio_filter;
+mod dynamic_gain;
+
+use dynamic_gain::{Config as GainConfig, DynamicGain};
+
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         crate::app_log!($($arg)*);
@@ -19,6 +24,8 @@ macro_rules! eprintln {
 
 pub struct PlaybackEngine {
     inner: gst_play::Play,
+    gain: Arc<Mutex<DynamicGain>>,
+    master_volume: Cell<f64>,
     paused: Cell<bool>,
     buf_percent: Rc<Cell<u32>>,
     last_error: Rc<RefCell<Option<String>>>,
@@ -33,6 +40,11 @@ impl PlaybackEngine {
         let inner = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
         let pipeline = inner.pipeline();
         pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
+        let gain = Arc::new(Mutex::new(DynamicGain::default()));
+        let filter =
+            audio_filter::build(gain.clone()).expect("Failed to build playback gain filter");
+        pipeline.set_property("audio-filter", &filter);
+        inner.set_volume(1.0);
 
         let buf_percent = Rc::new(Cell::new(0u32));
         let bp = buf_percent.clone();
@@ -114,6 +126,8 @@ impl PlaybackEngine {
 
         Self {
             inner,
+            gain,
+            master_volume: Cell::new(1.0),
             paused: Cell::new(false),
             buf_percent,
             last_error,
@@ -126,6 +140,7 @@ impl PlaybackEngine {
 
     pub fn play_uri(&self, uri: &str) {
         self.inner.stop();
+        self.gain.lock().unwrap().reset();
         self.buf_percent.set(0);
         self.last_error.borrow_mut().take();
         self.cached_position_nanos
@@ -153,6 +168,7 @@ impl PlaybackEngine {
 
     pub fn stop(&self) {
         self.inner.stop();
+        self.gain.lock().unwrap().reset();
         self.paused.set(false);
         self.buf_percent.set(0);
         self.last_error.borrow_mut().take();
@@ -163,17 +179,30 @@ impl PlaybackEngine {
     }
 
     pub fn seek(&self, position: ClockTime) {
+        self.gain.lock().unwrap().reset();
         self.cached_position_nanos
             .store(position.nseconds(), Ordering::Relaxed);
         self.inner.seek(position);
     }
 
     pub fn set_volume(&self, volume: f64) {
-        self.inner.set_volume(volume);
+        if volume.is_finite() {
+            let volume = volume.clamp(0.0, 5.0);
+            self.master_volume.set(volume);
+            self.gain.lock().unwrap().master_gain = volume;
+        }
     }
 
     pub fn volume(&self) -> f64 {
-        self.inner.volume()
+        self.master_volume.get()
+    }
+
+    pub fn configure_gain(&self, settings: &crate::offline::AppSettings) {
+        self.gain.lock().unwrap().configure(GainConfig {
+            enabled: settings.dgain_enabled,
+            flatten_percent: settings.dgain_flatten_percent,
+            ra_seconds: settings.dgain_ra_seconds,
+        });
     }
 
     pub fn position(&self) -> Option<ClockTime> {
@@ -200,4 +229,82 @@ impl PlaybackEngine {
 fn atomic_nanos_to_clock_time(nanos: &AtomicU64) -> Option<ClockTime> {
     let nanos = nanos.load(Ordering::Relaxed);
     (nanos != u64::MAX).then(|| ClockTime::from_nseconds(nanos))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_engine_routes_boost_through_filter_with_internal_volume_at_unity() {
+        gst::init().unwrap();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let engine = PlaybackEngine::new();
+                let pipeline = engine.inner.pipeline();
+                let sink = gst::ElementFactory::make("fakesink")
+                    .property("sync", false)
+                    .build()
+                    .unwrap();
+                pipeline.set_property("audio-sink", &sink);
+                let filter: gst::Bin = pipeline.property("audio-filter");
+                let (send, receive) = std::sync::mpsc::channel();
+                filter
+                    .by_name("static_gain")
+                    .unwrap()
+                    .static_pad("src")
+                    .unwrap()
+                    .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                        if let Some(buffer) = info.buffer() {
+                            let map = buffer.map_readable().unwrap();
+                            let peak = map
+                                .as_slice()
+                                .chunks_exact(4)
+                                .map(|b| f32::from_ne_bytes(b.try_into().unwrap()).abs())
+                                .fold(0.0_f32, f32::max);
+                            let _ = send.send(peak);
+                        }
+                        gst::PadProbeReturn::Ok
+                    });
+                // A local 100ms stereo WAV, intentionally quiet and with no device I/O.
+                let data: Vec<u8> = (0..4800)
+                    .flat_map(|frame| {
+                        let sample = if frame % 2 == 0 { 3276i16 } else { -3276i16 };
+                        [sample, sample].into_iter().flat_map(i16::to_le_bytes)
+                    })
+                    .collect();
+                let mut wav = b"RIFF".to_vec();
+                wav.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(b"WAVEfmt ");
+                wav.extend_from_slice(&16u32.to_le_bytes());
+                wav.extend_from_slice(&1u16.to_le_bytes());
+                wav.extend_from_slice(&2u16.to_le_bytes());
+                wav.extend_from_slice(&48_000u32.to_le_bytes());
+                wav.extend_from_slice(&192_000u32.to_le_bytes());
+                wav.extend_from_slice(&4u16.to_le_bytes());
+                wav.extend_from_slice(&16u16.to_le_bytes());
+                wav.extend_from_slice(b"data");
+                wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                wav.extend_from_slice(&data);
+                let path =
+                    std::env::temp_dir().join(format!("static-gain-{}.wav", uuid::Uuid::new_v4()));
+                std::fs::write(&path, wav).unwrap();
+                engine.set_volume(5.0);
+                assert_eq!(engine.volume(), 5.0);
+                assert_eq!(engine.inner.volume(), 1.0);
+                let uri = glib::filename_to_uri(&path, None).unwrap();
+                engine.play_uri(&uri);
+                let peak = receive.recv_timeout(std::time::Duration::from_secs(10));
+                engine.stop();
+                pipeline.set_state(gst::State::Null).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let peak = peak.expect("Play did not produce audio through its gain filter");
+                assert!(
+                    (0.49..0.51).contains(&peak),
+                    "gain lost in Play pipeline: {peak}"
+                );
+            })
+            .unwrap();
+    }
 }

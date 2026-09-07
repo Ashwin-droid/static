@@ -385,12 +385,17 @@ fn controls_row(app: &App) -> Element<'_, Message> {
             .style(|_t: &Theme, _s| svg::Style {
                 color: Some(theme::white(0.5)),
             }),
-        slider(0.0..=1.0, app.player.volume.clamp(0.0, 1.0), |value| {
-            pmsg(Msg::VolumeChanged(value))
-        })
+        slider(
+            0.0..=app.player.snapshot.max_volume,
+            app.player.volume.clamp(0.0, app.player.snapshot.max_volume),
+            |value| pmsg(Msg::VolumeChanged(value)),
+        )
         .step(0.05)
         .width(Length::Fixed(VOLUME_SLIDER_WIDTH))
         .style(volume_slider_style),
+        text(format!("{:.0}%", app.player.volume * 100.0))
+            .size(theme::SIZE_SUB)
+            .color(theme::TEXT_DIM),
     ]
     .spacing(theme::SPACE_XS)
     .align_y(Alignment::Center);
@@ -858,7 +863,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::VolumeChanged(value) => {
-            let value = value.clamp(0.0, 1.0);
+            let value = value.clamp(0.0, app.player.snapshot.max_volume);
             app.player.volume = value;
             if app.player_bar.volume_send_in_flight {
                 app.player_bar.pending_volume = Some(value);

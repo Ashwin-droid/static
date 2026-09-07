@@ -301,3 +301,64 @@ fn playlist_delete_and_listen_again_help_describe_server_actions() {
     assert!(help.contains("static pin [ytm/yt url | video id | search term]"));
     assert!(help.contains("Pin/unpin update YouTube Music Listen again"));
 }
+
+#[test]
+fn gain_config_supports_fractional_settings_and_boost_toggle() {
+    let mut settings = AppSettings::default();
+    for (key, value, expected) in [
+        ("volume_boost_enabled", "on", "yes"),
+        ("dgain_enabled", "yes", "yes"),
+        ("dgain_flatten_percent", "37.5", "37.5"),
+        ("dgain_ra_seconds", "0.5", "0.5"),
+    ] {
+        assert!(super::CONFIG_SPECS.iter().any(|spec| spec.name == key));
+        apply_config_value(&mut settings, key, value).unwrap();
+        assert_eq!(format_config_value(&settings, key).unwrap(), expected);
+    }
+    assert_eq!(settings.max_volume(), 5.0);
+    apply_config_value(&mut settings, "volume_boost_enabled", "off").unwrap();
+    assert_eq!(settings.max_volume(), 1.0);
+}
+
+#[test]
+fn dgain_config_rejects_invalid_values_without_changing_settings() {
+    let mut settings = AppSettings::default();
+    for (key, invalid, expected) in [
+        (
+            "dgain_flatten_percent",
+            vec!["NaN", "inf", "-inf", "-1", "101", "oops"],
+            "50",
+        ),
+        (
+            "dgain_ra_seconds",
+            vec!["NaN", "inf", "-inf", "0", "0.09", "121", "oops"],
+            "15",
+        ),
+    ] {
+        for value in invalid {
+            assert!(
+                apply_config_value(&mut settings, key, value).is_err(),
+                "{key} accepted {value}"
+            );
+            assert_eq!(format_config_value(&settings, key).unwrap(), expected);
+        }
+    }
+    for (key, endpoints) in [
+        ("dgain_flatten_percent", ["0", "100"]),
+        ("dgain_ra_seconds", ["0.1", "120"]),
+    ] {
+        for value in endpoints {
+            apply_config_value(&mut settings, key, value).unwrap();
+            assert_eq!(format_config_value(&settings, key).unwrap(), value);
+        }
+    }
+}
+
+#[test]
+fn restoring_volume_uses_current_limit_after_boost_was_disabled() {
+    assert_eq!(super::restored_volume(3.0, 1.0), 1.0);
+    assert_eq!(super::restored_volume(3.0, 5.0), 3.0);
+    assert_eq!(super::restored_volume(0.0, 1.0), 0.0);
+    assert_eq!(super::restored_volume(0.75, 5.0), 0.75);
+    assert_eq!(super::restored_volume(f64::NAN, 5.0), 1.0);
+}

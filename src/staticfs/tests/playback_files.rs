@@ -100,12 +100,14 @@ fn position_rejects_nan_negative_and_junk() {
 }
 
 #[test]
-fn volume_accepts_unit_interval_only() {
+fn volume_accepts_boost_range_for_daemon_validation() {
     assert_eq!(parse_volume_value("0"), Some(0.0));
     assert_eq!(parse_volume_value("0.75"), Some(0.75));
     assert_eq!(parse_volume_value("1"), Some(1.0));
     assert_eq!(parse_volume_value("1.0"), Some(1.0));
-    for junk in ["1.01", "-0.1", "NaN", "inf", "loud", "", "75%"] {
+    assert_eq!(parse_volume_value("1.01"), Some(1.01));
+    assert_eq!(parse_volume_value("5"), Some(5.0));
+    for junk in ["5.01", "-0.1", "NaN", "inf", "loud", "", "75%"] {
         assert_eq!(parse_volume_value(junk), None, "{junk:?}");
     }
 }

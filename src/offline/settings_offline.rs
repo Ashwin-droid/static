@@ -110,6 +110,10 @@ pub struct AppSettings {
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
+    pub volume_boost_enabled: bool,
+    pub dgain_enabled: bool,
+    pub dgain_flatten_percent: f64,
+    pub dgain_ra_seconds: f64,
     pub other_mpris_mode: CoordinationMode,
     pub other_mpris_halt_auto_resume_secs: u32,
     pub other_mpris_filter_mode: CoordinationFilterMode,
@@ -148,6 +152,10 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
+            volume_boost_enabled: false,
+            dgain_enabled: false,
+            dgain_flatten_percent: 50.0,
+            dgain_ra_seconds: 15.0,
             other_mpris_mode: CoordinationMode::HaltAuto,
             other_mpris_halt_auto_resume_secs: 0,
             other_mpris_filter_mode: CoordinationFilterMode::Blacklist,
@@ -164,6 +172,12 @@ impl Default for AppSettings {
             staticfs_enabled: false,
             staticfs_mountpoint: String::new(),
         }
+    }
+}
+
+impl AppSettings {
+    pub fn max_volume(&self) -> f64 {
+        if self.volume_boost_enabled { 5.0 } else { 1.0 }
     }
 }
 
@@ -263,6 +277,25 @@ impl MusicCache {
                 "prefer_local_cache_on_playback" => {
                     settings.prefer_local_cache_on_playback =
                         parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
+                }
+                "volume_boost_enabled" => {
+                    settings.volume_boost_enabled =
+                        parse_bool_setting(&row.1, settings.volume_boost_enabled);
+                }
+                "dgain_enabled" => {
+                    settings.dgain_enabled = parse_bool_setting(&row.1, settings.dgain_enabled);
+                }
+                "dgain_flatten_percent" => {
+                    settings.dgain_flatten_percent = parse_f64_setting_in_range(
+                        &row.1,
+                        settings.dgain_flatten_percent,
+                        0.0,
+                        100.0,
+                    );
+                }
+                "dgain_ra_seconds" => {
+                    settings.dgain_ra_seconds =
+                        parse_f64_setting_in_range(&row.1, settings.dgain_ra_seconds, 0.1, 120.0);
                 }
                 "other_mpris_mode" => {
                     loaded_other_mpris_mode = CoordinationMode::from_str(&row.1);
@@ -411,6 +444,16 @@ impl MusicCache {
                 "prefer_local_cache_on_playback",
                 bool_setting(settings.prefer_local_cache_on_playback),
             ),
+            (
+                "volume_boost_enabled",
+                bool_setting(settings.volume_boost_enabled),
+            ),
+            ("dgain_enabled", bool_setting(settings.dgain_enabled)),
+            (
+                "dgain_flatten_percent",
+                settings.dgain_flatten_percent.to_string(),
+            ),
+            ("dgain_ra_seconds", settings.dgain_ra_seconds.to_string()),
             (
                 "other_mpris_mode",
                 settings.other_mpris_mode.as_str().to_string(),

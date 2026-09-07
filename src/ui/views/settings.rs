@@ -52,6 +52,8 @@ const COORDINATION_POPUP_REFRESH: Duration = Duration::from_secs(1);
 /// Identifies a boolean setting row (one per switch in the cards).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingToggle {
+    VolumeBoostEnabled,
+    DgainEnabled,
     PreferLocalCacheOnPlayback,
     PrefetchEnabled,
     AutoManageOfflineCache,
@@ -67,6 +69,8 @@ pub enum SettingToggle {
 /// Identifies a numeric setting row (spin/scale controls).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingNumber {
+    DgainFlattenPercent,
+    DgainRaSeconds,
     PrefetchAhead,
     OfflineCacheTarget,
     OfflineRewatchThreshold,
@@ -595,8 +599,37 @@ fn settings_row_with_note<'a>(
 fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
     settings_card(
         "Playback & Cache",
-        "Decide when local cache wins and how aggressively Static stages upcoming songs.",
+        "Adjust loudness, local playback, track loops, and prefetching.",
         vec![
+            settings_row(
+                "Gain above 100%",
+                "Extend the volume slider to 500% for quiet songs.",
+                setting_toggle(
+                    draft.volume_boost_enabled,
+                    true,
+                    SettingToggle::VolumeBoostEnabled,
+                ),
+            ),
+            settings_row(
+                "dGain on",
+                "Even out quiet and loud passages using a rolling loudness average. Independent of gain above 100%.",
+                setting_toggle(draft.dgain_enabled, true, SettingToggle::DgainEnabled),
+            ),
+            settings_row(
+                "dGain flatten %",
+                "Allowed variation: 0% follows the rolling average; 50% allows 2/3–1.5×; \
+                 100% allows 0.5–2×.",
+                stepper(
+                    SettingNumber::DgainFlattenPercent,
+                    draft.dgain_flatten_percent,
+                    true,
+                ),
+            ),
+            settings_row(
+                "dGain RA time (seconds)",
+                "Rolling average window. Longer windows smooth loudness across longer passages.",
+                stepper(SettingNumber::DgainRaSeconds, draft.dgain_ra_seconds, true),
+            ),
             settings_row(
                 "Prefer local cache on playback",
                 "Play offline or prefetched audio first when it exists, then fall back to \
@@ -1282,6 +1315,8 @@ fn stepper<'a>(number: SettingNumber, value: f64, enabled: bool) -> Element<'a, 
 /// as the GTK `SpinButton::with_range` calls.
 fn number_meta(number: SettingNumber) -> (f64, f64, f64, usize) {
     match number {
+        SettingNumber::DgainFlattenPercent => (0.0, 100.0, 1.0, 1),
+        SettingNumber::DgainRaSeconds => (0.1, 120.0, 0.1, 1),
         SettingNumber::PrefetchAhead => (0.0, 12.0, 1.0, 0),
         SettingNumber::OfflineCacheTarget => (0.0, 500.0, 5.0, 0),
         SettingNumber::OfflineRewatchThreshold => (0.0, 50.0, 1.0, 0),
@@ -1930,6 +1965,8 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
 
 fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
     match toggle {
+        SettingToggle::VolumeBoostEnabled => settings.volume_boost_enabled,
+        SettingToggle::DgainEnabled => settings.dgain_enabled,
         SettingToggle::PreferLocalCacheOnPlayback => settings.prefer_local_cache_on_playback,
         SettingToggle::PrefetchEnabled => settings.prefetch_enabled,
         SettingToggle::AutoManageOfflineCache => settings.auto_manage_offline_cache,
@@ -1945,6 +1982,8 @@ fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
 
 fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
     match toggle {
+        SettingToggle::VolumeBoostEnabled => settings.volume_boost_enabled = value,
+        SettingToggle::DgainEnabled => settings.dgain_enabled = value,
         SettingToggle::PreferLocalCacheOnPlayback => {
             settings.prefer_local_cache_on_playback = value
         }
@@ -1962,6 +2001,8 @@ fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
 
 fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
     match number {
+        SettingNumber::DgainFlattenPercent => settings.dgain_flatten_percent,
+        SettingNumber::DgainRaSeconds => settings.dgain_ra_seconds,
         SettingNumber::PrefetchAhead => settings.prefetch_ahead as f64,
         SettingNumber::OfflineCacheTarget => settings.offline_cache_target as f64,
         SettingNumber::OfflineRewatchThreshold => settings.offline_rewatch_threshold as f64,
@@ -1984,6 +2025,8 @@ fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
 
 fn set_number(settings: &mut AppSettings, number: SettingNumber, value: f64) {
     match number {
+        SettingNumber::DgainFlattenPercent => settings.dgain_flatten_percent = value,
+        SettingNumber::DgainRaSeconds => settings.dgain_ra_seconds = value,
         SettingNumber::PrefetchAhead => settings.prefetch_ahead = value.round() as u32,
         SettingNumber::OfflineCacheTarget => settings.offline_cache_target = value.round() as u32,
         SettingNumber::OfflineRewatchThreshold => {

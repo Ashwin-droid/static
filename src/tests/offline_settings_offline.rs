@@ -94,3 +94,67 @@ fn coordination_filters_support_blacklist_and_whitelist_semantics() {
         &unrelated
     ));
 }
+
+#[test]
+fn gain_settings_default_to_unmodified_playback() {
+    let settings = super::AppSettings::default();
+    assert!(!settings.volume_boost_enabled);
+    assert!(!settings.dgain_enabled);
+    assert_eq!(settings.max_volume(), 1.0);
+    assert_eq!(settings.dgain_flatten_percent, 50.0);
+    assert_eq!(settings.dgain_ra_seconds, 15.0);
+}
+
+#[test]
+fn gain_settings_survive_reopening_the_store_and_sanitize_corrupt_numbers() {
+    let root = std::env::temp_dir().join(format!("static-gain-settings-{}", uuid::Uuid::new_v4()));
+    // An existing destination DB prevents the constructor's production storage migration.
+    std::fs::create_dir_all(&root).unwrap();
+    drop(rusqlite::Connection::open(root.join("data.db")).unwrap());
+    let raw_root = root.to_string_lossy();
+    let cache = super::MusicCache::new_with_storage_root(Some(&raw_root)).unwrap();
+    // Existing databases without these keys retain the new defaults.
+    let initial = cache.load_settings().unwrap();
+    assert_eq!(initial.max_volume(), 1.0);
+    assert!(!initial.dgain_enabled);
+    let settings = super::AppSettings {
+        volume_boost_enabled: true,
+        dgain_enabled: true,
+        dgain_flatten_percent: 37.5,
+        dgain_ra_seconds: 0.5,
+        ..initial
+    };
+    cache.save_settings(&settings).unwrap();
+    drop(cache);
+
+    let cache = super::MusicCache::new_with_storage_root(Some(&raw_root)).unwrap();
+    let loaded = cache.load_settings().unwrap();
+    assert_eq!(loaded.max_volume(), 5.0);
+    assert!(loaded.dgain_enabled);
+    assert_eq!(loaded.dgain_flatten_percent, 37.5);
+    assert_eq!(loaded.dgain_ra_seconds, 0.5);
+
+    for (flatten, seconds, expected_flatten, expected_seconds) in [
+        ("NaN", "inf", 50.0, 15.0),
+        ("-1", "0", 0.0, 0.1),
+        ("101", "121", 100.0, 120.0),
+    ] {
+        for (key, value) in [
+            ("dgain_flatten_percent", flatten),
+            ("dgain_ra_seconds", seconds),
+        ] {
+            cache
+                .db
+                .execute(
+                    "UPDATE app_settings SET value = ?1 WHERE key = ?2",
+                    rusqlite::params![value, key],
+                )
+                .unwrap();
+        }
+        let loaded = cache.load_settings().unwrap();
+        assert_eq!(loaded.dgain_flatten_percent, expected_flatten);
+        assert_eq!(loaded.dgain_ra_seconds, expected_seconds);
+    }
+    drop(cache);
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -75,6 +75,9 @@ pub struct PlaybackSnapshot {
     pub up_next: Option<Track>,
     pub paused: bool,
     pub volume: f64,
+    /// Current user volume limit, owned by the daemon's playback settings.
+    #[serde(default = "default_max_volume")]
+    pub max_volume: f64,
     pub position_millis: Option<u64>,
     pub duration_millis: Option<u64>,
     pub buffered_fraction: f64,
@@ -118,6 +121,10 @@ pub struct CoordinationTargetSnapshot {
 
 fn default_coordination_target_filterable() -> bool {
     true
+}
+
+fn default_max_volume() -> f64 {
+    1.0
 }
 
 fn default_true() -> bool {
@@ -194,6 +201,7 @@ impl Default for PlaybackSnapshot {
             up_next: None,
             paused: false,
             volume: 1.0,
+            max_volume: 1.0,
             position_millis: None,
             duration_millis: None,
             buffered_fraction: 0.0,

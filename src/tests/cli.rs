@@ -362,3 +362,27 @@ fn restoring_volume_uses_current_limit_after_boost_was_disabled() {
     assert_eq!(super::restored_volume(0.75, 5.0), 0.75);
     assert_eq!(super::restored_volume(f64::NAN, 5.0), 1.0);
 }
+
+#[test]
+fn xdgain_requires_dgain_and_preserves_preference_while_suspended() {
+    let mut settings = AppSettings::default();
+    assert!(apply_config_value(&mut settings, "xdgain_enabled", "yes").is_err());
+    assert!(!settings.xdgain_enabled);
+    apply_config_value(&mut settings, "dgain_enabled", "yes").unwrap();
+    apply_config_value(&mut settings, "xdgain_enabled", "yes").unwrap();
+    assert_eq!(
+        format_config_value(&settings, "xdgain_enabled").unwrap(),
+        "yes"
+    );
+    assert!(
+        super::CONFIG_SPECS
+            .iter()
+            .any(|spec| spec.name == "xdgain_enabled")
+    );
+    apply_config_value(&mut settings, "dgain_enabled", "no").unwrap();
+    assert!(settings.xdgain_enabled);
+    apply_config_value(&mut settings, "xdgain_enabled", "no").unwrap();
+    assert!(!settings.xdgain_enabled);
+    assert!(apply_config_value(&mut settings, "xdgain_enabled", "maybe").is_err());
+    assert!(!settings.xdgain_enabled);
+}

@@ -966,6 +966,7 @@ pub(in crate::cli_tui) fn current_boolean_setting(settings: &AppSettings, key: &
     match key {
         "volume_boost_enabled" => settings.volume_boost_enabled,
         "dgain_enabled" => settings.dgain_enabled,
+        "xdgain_enabled" => settings.xdgain_enabled,
         "auto_sync_chromium_cookies" => settings.auto_sync_chromium_cookies,
         "auto_release_track_loops" => settings.auto_release_track_loops,
         "auto_manage_offline_cache" => settings.auto_manage_offline_cache,
@@ -1253,6 +1254,16 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     "dgain_enabled",
                     "dGain on",
                     "Even out quiet and loud passages using a rolling loudness average. Independent of gain above 100%.",
+                ),
+                toggle_setting_field(
+                    settings,
+                    "xdgain_enabled",
+                    "xdGain on",
+                    if settings.dgain_enabled {
+                        "Match later songs to the first song actually played; carry the virtual gain offset across tracks."
+                    } else {
+                        "Inactive while dGain is off. Enable dGain before turning xdGain on."
+                    },
                 ),
                 stepper_setting_field(
                     settings,

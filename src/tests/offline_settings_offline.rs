@@ -100,6 +100,7 @@ fn gain_settings_default_to_unmodified_playback() {
     let settings = super::AppSettings::default();
     assert!(!settings.volume_boost_enabled);
     assert!(!settings.dgain_enabled);
+    assert!(!settings.xdgain_enabled);
     assert_eq!(settings.max_volume(), 1.0);
     assert_eq!(settings.dgain_flatten_percent, 50.0);
     assert_eq!(settings.dgain_ra_seconds, 15.0);
@@ -120,6 +121,7 @@ fn gain_settings_survive_reopening_the_store_and_sanitize_corrupt_numbers() {
     let settings = super::AppSettings {
         volume_boost_enabled: true,
         dgain_enabled: true,
+        xdgain_enabled: true,
         dgain_flatten_percent: 37.5,
         dgain_ra_seconds: 0.5,
         ..initial
@@ -131,6 +133,7 @@ fn gain_settings_survive_reopening_the_store_and_sanitize_corrupt_numbers() {
     let loaded = cache.load_settings().unwrap();
     assert_eq!(loaded.max_volume(), 5.0);
     assert!(loaded.dgain_enabled);
+    assert!(loaded.xdgain_enabled);
     assert_eq!(loaded.dgain_flatten_percent, 37.5);
     assert_eq!(loaded.dgain_ra_seconds, 0.5);
 

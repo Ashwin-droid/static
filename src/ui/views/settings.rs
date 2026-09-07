@@ -54,6 +54,7 @@ const COORDINATION_POPUP_REFRESH: Duration = Duration::from_secs(1);
 pub enum SettingToggle {
     VolumeBoostEnabled,
     DgainEnabled,
+    XdgainEnabled,
     PreferLocalCacheOnPlayback,
     PrefetchEnabled,
     AutoManageOfflineCache,
@@ -614,6 +615,16 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
                 "dGain on",
                 "Even out quiet and loud passages using a rolling loudness average. Independent of gain above 100%.",
                 setting_toggle(draft.dgain_enabled, true, SettingToggle::DgainEnabled),
+            ),
+            settings_row(
+                "xdGain on",
+                "Match later songs to the first song you actually play. The virtual gain offset \
+                 carries across tracks. Requires dGain; independent of the volume slider.",
+                setting_toggle(
+                    draft.xdgain_enabled,
+                    draft.dgain_enabled,
+                    SettingToggle::XdgainEnabled,
+                ),
             ),
             settings_row(
                 "dGain flatten %",
@@ -1967,6 +1978,7 @@ fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
     match toggle {
         SettingToggle::VolumeBoostEnabled => settings.volume_boost_enabled,
         SettingToggle::DgainEnabled => settings.dgain_enabled,
+        SettingToggle::XdgainEnabled => settings.xdgain_enabled,
         SettingToggle::PreferLocalCacheOnPlayback => settings.prefer_local_cache_on_playback,
         SettingToggle::PrefetchEnabled => settings.prefetch_enabled,
         SettingToggle::AutoManageOfflineCache => settings.auto_manage_offline_cache,
@@ -1984,6 +1996,11 @@ fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
     match toggle {
         SettingToggle::VolumeBoostEnabled => settings.volume_boost_enabled = value,
         SettingToggle::DgainEnabled => settings.dgain_enabled = value,
+        SettingToggle::XdgainEnabled => {
+            if !value || settings.dgain_enabled {
+                settings.xdgain_enabled = value;
+            }
+        }
         SettingToggle::PreferLocalCacheOnPlayback => {
             settings.prefer_local_cache_on_playback = value
         }

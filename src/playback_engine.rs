@@ -139,6 +139,8 @@ impl PlaybackEngine {
     }
 
     pub fn play_uri(&self, uri: &str) {
+        // Capture a short first song before GStreamer's flush can clear its history.
+        self.gain.lock().unwrap().finish_reference();
         self.inner.stop();
         self.gain.lock().unwrap().reset();
         self.buf_percent.set(0);
@@ -167,6 +169,8 @@ impl PlaybackEngine {
     }
 
     pub fn stop(&self) {
+        // Capture a short first song before GStreamer's flush can clear its history.
+        self.gain.lock().unwrap().finish_reference();
         self.inner.stop();
         self.gain.lock().unwrap().reset();
         self.paused.set(false);
@@ -202,7 +206,22 @@ impl PlaybackEngine {
             enabled: settings.dgain_enabled,
             flatten_percent: settings.dgain_flatten_percent,
             ra_seconds: settings.dgain_ra_seconds,
+            xdgain_enabled: settings.xdgain_enabled,
         });
+    }
+
+    /// A new decoder gets fresh per-song analysis, but keeps the session's
+    /// xdGain reference and virtual volume offset through queue transitions.
+    pub fn replacement(&self, settings: &crate::offline::AppSettings) -> Self {
+        let cross_song = self.gain.lock().unwrap().cross_song_state();
+        let replacement = Self::new();
+        replacement.configure_gain(settings);
+        replacement
+            .gain
+            .lock()
+            .unwrap()
+            .restore_cross_song_state(cross_song);
+        replacement
     }
 
     pub fn position(&self) -> Option<ClockTime> {
@@ -304,6 +323,48 @@ mod tests {
                     (0.49..0.51).contains(&peak),
                     "gain lost in Play pipeline: {peak}"
                 );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn engine_replacement_preserves_xdgain_from_a_short_first_song() {
+        gst::init().unwrap();
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                let settings = crate::offline::AppSettings {
+                    dgain_enabled: true,
+                    xdgain_enabled: true,
+                    ..Default::default()
+                };
+                let first = PlaybackEngine::new();
+                first.configure_gain(&settings);
+                {
+                    let mut gain = first.gain.lock().unwrap();
+                    gain.set_format(1000, 1);
+                    let mut samples: Vec<u8> =
+                        (0..500).flat_map(|_| 0.2_f32.to_ne_bytes()).collect();
+                    gain.process(&mut samples);
+                }
+                // A skip before the calibration period ends must still preserve its reference.
+                first.stop();
+                let next = first.replacement(&settings);
+                next.seek(ClockTime::from_seconds(60));
+                {
+                    let mut gain = next.gain.lock().unwrap();
+                    gain.set_format(1000, 1);
+                    let mut samples: Vec<u8> =
+                        (0..8000).flat_map(|_| 0.02_f32.to_ne_bytes()).collect();
+                    gain.process(&mut samples);
+                    let last = f32::from_ne_bytes(samples[samples.len() - 4..].try_into().unwrap());
+                    assert!(
+                        (last - 0.2).abs() < 0.001,
+                        "reference lost during decoder replacement: {last}"
+                    );
+                }
+                assert_eq!(next.volume(), 1.0);
+                next.stop();
             })
             .unwrap();
     }

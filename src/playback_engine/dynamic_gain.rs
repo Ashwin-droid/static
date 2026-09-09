@@ -15,26 +15,10 @@ pub(super) struct CrossSongGain {
     offset_db: f64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Config {
-    pub enabled: bool,
-    pub flatten_percent: f64,
-    pub ra_seconds: f64,
-    pub change_lazyness_percent: f64,
-    pub xdgain_enabled: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            flatten_percent: 50.0,
-            ra_seconds: 15.0,
-            change_lazyness_percent: 50.0,
-            xdgain_enabled: false,
-        }
-    }
-}
+pub(super) use crate::ipc::GainCalibrationSettings as Config;
+use crate::ipc::GainDiagnostics;
+use std::sync::atomic::{AtomicU64, Ordering};
+static DIAGNOSTIC_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 struct Observation {
@@ -51,10 +35,15 @@ pub(super) struct GainTarget {
     pub offset_db: f64,
     pub audible: bool,
     pub peak: f64,
+    pub rms: f64,
+    pub average: f64,
+    pub window_seconds: f64,
+    pub audible_seconds: f64,
 }
 
 pub(super) struct DynamicGain {
     config: Config,
+    diagnostics: GainDiagnostics,
     sample_rate: usize,
     channels: usize,
     history: VecDeque<Observation>,
@@ -78,6 +67,10 @@ impl Default for DynamicGain {
     fn default() -> Self {
         Self {
             config: Config::default(),
+            diagnostics: GainDiagnostics {
+                generation: DIAGNOSTIC_GENERATION.fetch_add(1, Ordering::Relaxed),
+                ..Default::default()
+            },
             sample_rate: 48_000,
             channels: 2,
             history: VecDeque::new(),
@@ -124,6 +117,10 @@ impl DynamicGain {
     }
 
     fn reset_history(&mut self) {
+        self.diagnostics = GainDiagnostics {
+            generation: DIAGNOSTIC_GENERATION.fetch_add(1, Ordering::Relaxed),
+            ..Default::default()
+        };
         self.revision = self.revision.wrapping_add(1);
         self.envelope_started = false;
         self.history.clear();
@@ -264,7 +261,24 @@ impl DynamicGain {
             offset_db,
             audible,
             peak,
+            rms,
+            average,
+            window_seconds: self.history_frames as f64 / self.sample_rate as f64,
+            audible_seconds: self.audible_frames as f64 / self.sample_rate as f64,
         }
+    }
+
+    pub fn diagnostics(&self) -> GainDiagnostics {
+        GainDiagnostics {
+            settings: self.config,
+            master_gain: self.master_gain,
+            reference_rms: self.cross_song.target_rms,
+            ..self.diagnostics.clone()
+        }
+    }
+
+    pub fn set_diagnostic_position(&mut self, millis: Option<u64>) {
+        self.diagnostics.position_millis = millis;
     }
 
     /// Apply the most conservative upcoming target to the current buffered audio.
@@ -306,6 +320,9 @@ impl DynamicGain {
         let desired_db = self.held_dynamic_db;
         let desired_offset_db = self.held_offset_db;
         let mut dynamic_db = 20.0 * self.dynamic_gain.max(0.000001).log10();
+        let mut output_energy = 0.0;
+        let mut output_peak = 0.0_f64;
+        let mut output_samples = 0;
         for frame in bytes.chunks_exact_mut(self.channels * 4) {
             let coefficient = if desired_db < dynamic_db {
                 attack
@@ -349,10 +366,35 @@ impl DynamicGain {
                 } else {
                     0.0
                 };
-                sample.copy_from_slice(
-                    &(output.clamp(-OUTPUT_CEILING, OUTPUT_CEILING) as f32).to_ne_bytes(),
-                );
+                let output = output.clamp(-OUTPUT_CEILING, OUTPUT_CEILING) as f32;
+                output_energy += (output as f64).powi(2);
+                output_peak = output_peak.max((output as f64).abs());
+                output_samples += 1;
+                sample.copy_from_slice(&output.to_ne_bytes());
             }
+        }
+        if output_samples > 0 {
+            self.diagnostics.sequence = self.diagnostics.sequence.wrapping_add(1);
+            self.diagnostics.input_rms = current.rms;
+            self.diagnostics.input_peak = current.peak;
+            self.diagnostics.output_rms = (output_energy / output_samples as f64).sqrt();
+            self.diagnostics.output_peak = output_peak;
+            self.diagnostics.rolling_rms = current.average;
+            self.diagnostics.window_seconds = current.window_seconds;
+            self.diagnostics.audible_seconds = current.audible_seconds;
+            self.diagnostics.requested_gain = current.dynamic;
+            self.diagnostics.preview_gain = upcoming.dynamic;
+            self.diagnostics.applied_gain = if self.config.enabled && current.audible {
+                self.dynamic_gain
+            } else {
+                1.0
+            };
+            self.diagnostics.xdgain_db = if cross_active && current.audible {
+                self.cross_song.offset_db
+            } else {
+                0.0
+            };
+            self.diagnostics.limiter_gain = self.limiter_gain;
         }
     }
 
@@ -690,6 +732,10 @@ mod tests {
                 ..gain.config
             });
             let baseline = GainTarget {
+                rms: 0.1,
+                average: 0.1,
+                window_seconds: 1.0,
+                audible_seconds: 1.0,
                 dynamic: 1.0,
                 offset_db: 0.0,
                 audible: true,
@@ -732,5 +778,70 @@ mod tests {
                 .iter()
                 .all(|s| s.is_finite() && s.abs() <= 0.99901)
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    fn pcm(level: f32, samples: usize) -> Vec<u8> {
+        (0..samples).flat_map(|_| level.to_ne_bytes()).collect()
+    }
+    #[test]
+    fn diagnostics_match_original_block_not_future_analysis_and_measured_output() {
+        let mut gain = DynamicGain::default();
+        gain.configure(Config {
+            enabled: true,
+            flatten_percent: 0.0,
+            ..Config::default()
+        });
+        let mut quiet = pcm(0.1, 960);
+        let current = gain.analyze(&quiet);
+        let loud = gain.analyze(&pcm(0.9, 960));
+        gain.render(&mut quiet, current, loud);
+        gain.set_diagnostic_position(Some(4200));
+        let frame = gain.diagnostics();
+        assert!((frame.input_rms - 0.1).abs() < 1e-6);
+        assert!((frame.rolling_rms - 0.1).abs() < 1e-6);
+        assert!((frame.window_seconds - 0.01).abs() < 1e-9);
+        assert_eq!(frame.requested_gain, current.dynamic);
+        assert_eq!(frame.preview_gain, loud.dynamic);
+        assert_eq!(frame.position_millis, Some(4200));
+        let values: Vec<f64> = quiet
+            .chunks_exact(4)
+            .map(|v| f32::from_ne_bytes(v.try_into().unwrap()) as f64)
+            .collect();
+        let rms = (values.iter().map(|v| v * v).sum::<f64>() / values.len() as f64).sqrt();
+        assert!((frame.output_rms - rms).abs() < 1e-10);
+        assert!((frame.output_peak - values.iter().copied().fold(0.0, f64::max)).abs() < 1e-10);
+        assert_eq!(frame.sequence, 1);
+        assert!(serde_json::to_string(&frame).is_ok());
+    }
+    #[test]
+    fn disabled_dgain_still_reports_master_and_limiter_and_resets_cleanly() {
+        let mut gain = DynamicGain::default();
+        gain.master_gain = 5.0;
+        let mut bytes = pcm(0.8, 960);
+        let target = gain.analyze(&bytes);
+        gain.render(&mut bytes, target, target);
+        let frame = gain.diagnostics();
+        assert_eq!(frame.applied_gain, 1.0);
+        assert_eq!(frame.master_gain, 5.0);
+        assert!(frame.limiter_gain < 0.3);
+        assert!(frame.output_peak <= 1.0);
+        assert_eq!(frame.rolling_rms, 0.0);
+        let generation = frame.generation;
+        gain.configure(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        assert!(gain.diagnostics().generation > generation);
+        assert_eq!(gain.diagnostics().sequence, 0);
+        assert_eq!(gain.diagnostics().output_rms, 0.0);
+        assert!(gain.diagnostics().settings.enabled);
+        assert_eq!(gain.diagnostics().master_gain, 5.0);
+        let next = gain.diagnostics().generation;
+        gain.reset();
+        assert!(gain.diagnostics().generation > next);
     }
 }

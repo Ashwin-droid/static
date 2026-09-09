@@ -1,5 +1,8 @@
 //! Ephemeral, loopback-only HTTPS host for the bundled visualiser.
 //! D-Bus calls run on a bounded worker; the socket only retains its latest frame.
+#[path = "calibration_server.rs"]
+mod calibration_server;
+
 use std::{
     collections::HashMap,
     net::TcpListener,
@@ -152,6 +155,7 @@ fn start_inner(sampling_enabled: bool) -> Result<Server> {
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/ws", get(upgrade))
+        .route("/gain/ws", get(calibration_server::upgrade))
         .route("/cartridges/{id}", get(download))
         .route(
             "/cartridge/decode",
@@ -255,7 +259,7 @@ async fn upgrade(
 
 fn asset_path(path: &str) -> Option<&str> {
     let path = path.strip_prefix('/')?;
-    if path.is_empty() {
+    if path.is_empty() || path == "calibrate" {
         return Some("index.html");
     }
     if path.contains(['%', '\\'])

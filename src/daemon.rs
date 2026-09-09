@@ -1844,6 +1844,32 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
         ),
         DaemonRequest::Ping => DaemonResponse::Pong,
         DaemonRequest::GetState => DaemonResponse::State(state_snapshot(state)),
+        DaemonRequest::GetGainDiagnostics => {
+            let mut diagnostics = state.player.gain_diagnostics();
+            diagnostics.playback_paused = is_logically_paused(state);
+            diagnostics.track = current_track_snapshot(state);
+            DaemonResponse::GainDiagnostics(diagnostics)
+        }
+        DaemonRequest::SetGainCalibration {
+            settings: calibration,
+        } => {
+            let mut settings = match state.cache.load_settings() {
+                Ok(settings) => settings,
+                Err(error) => {
+                    return DaemonResponse::Error(format!("Failed to load settings: {error}"));
+                }
+            };
+            if let Err(error) = calibration.apply_to(&mut settings) {
+                return DaemonResponse::Error(error.to_string());
+            }
+            if let Err(error) = state.cache.save_settings(&settings) {
+                return DaemonResponse::Error(format!("Failed to save settings: {error}"));
+            }
+            reload_settings(state);
+            sync_mpris(state);
+            maybe_persist_playback_state(state, true);
+            DaemonResponse::State(state_snapshot(state))
+        }
         DaemonRequest::GetVisualizationFrame { bands } => {
             if !(8..=128).contains(&bands) {
                 return DaemonResponse::Error(

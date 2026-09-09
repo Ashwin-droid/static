@@ -67,6 +67,7 @@ Usage:
   static visualizer
   static visualizer decode <cartridge.png|jpg|webp>
   static coordination list
+  static settings dGain calibrate
   static config list
   static config desc [config_name]
   static config get [config_name]
@@ -121,6 +122,14 @@ pub fn run(args: &[String]) -> Result<()> {
         "info" => run_info(),
         "coordination" => run_coordination(&args[1..]),
         "config" => run_config(&args[1..]),
+        "settings"
+            if args.len() == 3
+                && args[1].eq_ignore_ascii_case("dgain")
+                && args[2].eq_ignore_ascii_case("calibrate") =>
+        {
+            crate::visualizer::calibrate()
+        }
+        "settings" => bail!("Usage: static settings dGain calibrate"),
         "i" => run_interactive_tui(),
         other => bail!("Unknown CLI command `{other}`.\n\n{}", help_text()),
     }

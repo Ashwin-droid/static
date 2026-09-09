@@ -118,6 +118,7 @@ mod imp {
                     }
                     let mut block = pending.blocks.pop_front().unwrap();
                     pending.frames -= block.frames;
+                    let position = block.buffer.pts().map(|pts| pts.mseconds());
                     {
                         let mut map = block
                             .buffer
@@ -125,6 +126,7 @@ mod imp {
                             .map_writable()
                             .map_err(|_| gst::FlowError::Error)?;
                         processor.render(map.as_mut_slice(), block.target, upcoming);
+                        processor.set_diagnostic_position(position);
                         self.spectrum
                             .get()
                             .unwrap()
@@ -768,6 +770,38 @@ mod tests {
             expected_pts += buffer.duration().unwrap();
         }
         assert_eq!(expected_pts, gst::ClockTime::from_seconds(1));
+    }
+
+    #[test]
+    fn gain_telemetry_follows_emitted_pts_and_resets_on_seek() {
+        let harness = Harness::new();
+        harness.push(0.1, 250, 0);
+        assert_eq!(harness.processor.lock().unwrap().diagnostics().sequence, 0);
+        harness.push(0.8, 10, 250);
+        let frame = harness.processor.lock().unwrap().diagnostics();
+        assert_eq!(frame.position_millis, Some(0));
+        assert!((frame.input_peak - 0.1).abs() < 1e-6);
+        assert!(frame.preview_gain < frame.requested_gain);
+        let output = harness.output.lock().unwrap();
+        let bytes = output.last().unwrap().map_readable().unwrap();
+        let samples: Vec<f64> = bytes
+            .as_slice()
+            .chunks_exact(4)
+            .map(|v| f32::from_ne_bytes(v.try_into().unwrap()) as f64)
+            .collect();
+        assert!(
+            (frame.output_rms
+                - (samples.iter().map(|v| v * v).sum::<f64>() / samples.len() as f64).sqrt())
+            .abs()
+                < 1e-9
+        );
+        drop(bytes);
+        drop(output);
+        harness.segment();
+        let reset = harness.processor.lock().unwrap().diagnostics();
+        assert_eq!(reset.sequence, 0);
+        assert_eq!(reset.position_millis, None);
+        assert!(reset.generation > frame.generation);
     }
 
     #[test]

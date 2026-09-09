@@ -228,8 +228,20 @@ pub fn run(page_url: &str, certificate_pem: &str) -> Result<()> {
         gobject_ffi::g_object_unref(certificate.cast());
         let view = webkit_web_view_new_with_context(context);
         let window = gtk_window_new(0);
-        gtk_window_set_title(window, c"Static Visualiser".as_ptr());
-        gtk_window_set_default_size(window, 1200, 850);
+        let calibration = url.path() == "/calibrate";
+        gtk_window_set_title(
+            window,
+            if calibration {
+                c"Static · dGain calibration".as_ptr()
+            } else {
+                c"Static Visualiser".as_ptr()
+            },
+        );
+        gtk_window_set_default_size(
+            window,
+            if calibration { 900 } else { 1200 },
+            if calibration { 760 } else { 850 },
+        );
         let settings = webkit_web_view_get_settings(view);
         webkit_settings_set_enable_webgl(settings, 1);
         webkit_settings_set_enable_fullscreen(settings, 1);

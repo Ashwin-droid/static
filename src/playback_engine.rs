@@ -214,6 +214,10 @@ impl PlaybackEngine {
         self.master_volume.get()
     }
 
+    pub fn gain_diagnostics(&self) -> crate::ipc::GainDiagnostics {
+        self.gain.lock().unwrap().diagnostics()
+    }
+
     pub fn configure_gain(&self, settings: &crate::offline::AppSettings) {
         self.gain.lock().unwrap().configure(GainConfig {
             enabled: settings.dgain_enabled,

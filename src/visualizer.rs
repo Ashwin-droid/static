@@ -46,3 +46,18 @@ pub fn inspect_cartridge(path: &str) -> Result<()> {
     );
     Ok(())
 }
+
+/// Dedicated compact window; observes and tunes the daemon's existing processor.
+pub fn calibrate() -> Result<()> {
+    let client = crate::ipc::DaemonClient::new()?;
+    client.gain_diagnostics().context("The running daemon does not support dGain calibration. Install the current build and restart Static first")?;
+    let id = format!("gain-calibration-{}", uuid::Uuid::new_v4());
+    client.register_ui_client(&id)?;
+    let result = (|| {
+        let mut server = server::start()?;
+        server.url = server.url.replacen("/#", "/calibrate#", 1);
+        window::run(&server.url, &server.certificate_pem)
+    })();
+    let _ = client.unregister_ui_client(&id);
+    result
+}

@@ -30,6 +30,75 @@ pub fn youtube_music_watch_url(video_id: &str) -> String {
     format!("https://music.youtube.com/watch?v={video_id}")
 }
 
+/// Settings edited together by the dGain calibration window.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GainCalibrationSettings {
+    pub enabled: bool,
+    pub flatten_percent: f64,
+    pub ra_seconds: f64,
+    pub change_lazyness_percent: f64,
+    pub xdgain_enabled: bool,
+}
+impl Default for GainCalibrationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            flatten_percent: 50.0,
+            ra_seconds: 15.0,
+            change_lazyness_percent: 50.0,
+            xdgain_enabled: false,
+        }
+    }
+}
+impl GainCalibrationSettings {
+    pub fn apply_to(&self, settings: &mut crate::offline::AppSettings) -> Result<()> {
+        // Validate on a clone so a refused edit cannot partially mutate settings.
+        let mut next = settings.clone();
+        for (key, value) in [
+            ("xdgain_enabled", "false".to_owned()),
+            ("dgain_enabled", self.enabled.to_string()),
+            ("dgain_flatten_percent", self.flatten_percent.to_string()),
+            ("dgain_ra_seconds", self.ra_seconds.to_string()),
+            (
+                "dgain_change_lazyness",
+                self.change_lazyness_percent.to_string(),
+            ),
+            ("xdgain_enabled", self.xdgain_enabled.to_string()),
+        ] {
+            crate::cli::apply_config_value(&mut next, key, &value)?;
+        }
+        *settings = next;
+        Ok(())
+    }
+}
+
+/// Measurements of one rendered PCM block, before the device/mixer volume.
+/// RMS values are linear amplitudes; gain ratios use 1.0 for unity.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GainDiagnostics {
+    pub playback_paused: bool,
+    pub track: Option<ActiveTrackSnapshot>,
+    pub generation: u64,
+    pub sequence: u64,
+    pub position_millis: Option<u64>,
+    pub settings: GainCalibrationSettings,
+    pub input_rms: f64,
+    pub input_peak: f64,
+    pub output_rms: f64,
+    pub output_peak: f64,
+    pub rolling_rms: f64,
+    pub window_seconds: f64,
+    pub audible_seconds: f64,
+    pub requested_gain: f64,
+    pub preview_gain: f64,
+    pub applied_gain: f64,
+    pub xdgain_db: f64,
+    pub reference_rms: Option<f64>,
+    pub limiter_gain: f64,
+    pub master_gain: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RepeatMode {
     Off,
@@ -271,6 +340,10 @@ pub enum DaemonRequest {
     },
     Ping,
     GetState,
+    GetGainDiagnostics,
+    SetGainCalibration {
+        settings: GainCalibrationSettings,
+    },
     GetVisualizationFrame {
         bands: u32,
     },
@@ -414,6 +487,7 @@ pub enum DaemonResponse {
     Ok,
     Pong,
     State(PlaybackSnapshot),
+    GainDiagnostics(GainDiagnostics),
     VisualizationFrame(VisualizationFrame),
     VisualizationSource(VisualizationSource),
     CoordinationTargets(CoordinationTargetsSnapshot),
@@ -830,6 +904,21 @@ impl DaemonClient {
                 "Unexpected cartridge remove response: {other:?}"
             ))),
         }
+    }
+
+    pub fn gain_diagnostics(&self) -> Result<GainDiagnostics> {
+        match self.request(&DaemonRequest::GetGainDiagnostics)? {
+            DaemonResponse::GainDiagnostics(frame) => Ok(frame),
+            DaemonResponse::Error(error) => bail!(error),
+            other => bail!("Unexpected dGain diagnostics response: {other:?}"),
+        }
+    }
+
+    pub fn set_gain_calibration(
+        &self,
+        settings: GainCalibrationSettings,
+    ) -> Result<PlaybackSnapshot> {
+        Ok(self.try_state_request(&DaemonRequest::SetGainCalibration { settings })?)
     }
 
     pub fn visualization_frame(&self, bands: u32) -> Result<VisualizationFrame> {
@@ -1300,3 +1389,7 @@ impl DaemonClient {
 #[cfg(test)]
 #[path = "tests/ipc.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/gain_calibration.rs"]
+mod gain_calibration_tests;

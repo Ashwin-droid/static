@@ -32,7 +32,14 @@ fn main() {
 
     if args.get(1).is_some_and(|arg| arg == "visualizer") {
         init_tracing();
-        if let Err(err) = visualizer::run() {
+        let result = match args.get(2).map(String::as_str) {
+            None => visualizer::run(),
+            Some("decode") if args.len() == 4 => visualizer::inspect_cartridge(&args[3]),
+            _ => Err(anyhow::anyhow!(
+                "Usage: static visualizer [decode <cartridge.png|jpg|webp>]"
+            )),
+        };
+        if let Err(err) = result {
             eprintln!("Visualizer: {err:#}");
             std::process::exit(1);
         }

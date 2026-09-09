@@ -357,3 +357,61 @@ fn memory_download_reads_bounded_ranges_and_stops_on_disconnect_or_missing_data(
     );
     assert_eq!(errors, 1);
 }
+
+#[tokio::test]
+async fn cartridge_import_requires_local_auth_and_rejects_bad_images() {
+    let state = test_state();
+    let uri: Uri = format!("{}/cartridge/decode", state.origin)
+        .parse()
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, state.host.parse().unwrap());
+    headers.insert(header::ORIGIN, state.origin.parse().unwrap());
+    let response = decode_cartridge(
+        State(state.clone()),
+        Query(Auth { token: None }),
+        headers.clone(),
+        uri.clone(),
+        Bytes::from_static(b"not an image"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = decode_cartridge(
+        State(state.clone()),
+        Query(Auth {
+            token: Some(state.token.clone()),
+        }),
+        headers.clone(),
+        uri.clone(),
+        Bytes::from_static(b"not an image"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let permit = state.export_slot.clone().acquire_owned().await.unwrap();
+    let response = decode_cartridge(
+        State(state.clone()),
+        Query(Auth {
+            token: Some(state.token.clone()),
+        }),
+        headers,
+        uri,
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(permit);
+    for id in ["../file.png", "https://evil", "short", "abcdefghij!"] {
+        assert!(
+            validate_command(&Command::PlayCartridge {
+                video_id: id.into()
+            })
+            .is_err()
+        );
+    }
+    assert!(
+        validate_command(&Command::PlayCartridge {
+            video_id: "dQw4w9WgXcQ".into()
+        })
+        .is_ok()
+    );
+}

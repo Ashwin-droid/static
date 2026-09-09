@@ -1,5 +1,6 @@
 //! Local visualizer client. The daemon remains the sole playback owner.
 mod cartridge;
+mod cartridge_codec;
 mod server;
 mod theme;
 mod window;
@@ -30,4 +31,18 @@ pub fn run() -> Result<()> {
     })();
     let _ = client.unregister_ui_client(&id);
     result
+}
+
+/// Decode without starting the daemon, accessing audio, or changing playback.
+pub fn inspect_cartridge(path: &str) -> Result<()> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(cartridge_codec::MAX_IMAGE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&cartridge_codec::decode_bytes(&bytes)?)?
+    );
+    Ok(())
 }

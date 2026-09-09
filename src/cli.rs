@@ -65,6 +65,7 @@ Usage:
   static offline play [ytm/yt url | video id]
   static info
   static visualizer
+  static visualizer decode <cartridge.png|jpg|webp>
   static coordination list
   static config list
   static config desc [config_name]

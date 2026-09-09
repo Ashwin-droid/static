@@ -83,3 +83,6 @@ input[type=number], select { border: 1px solid color-mix(in srgb, var(--primary)
   .config-controls { gap: 18px; grid-template-columns: 1fr; }
   .colors { grid-template-columns: repeat(3, 1fr); }
 }
+
+.cartridge-import { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+.cartridge-import input { max-width: 100%; font: inherit; }

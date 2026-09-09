@@ -1861,16 +1861,14 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
                     "Reopen the visualiser to use in-memory cartridges.".into(),
                 );
             }
-            match (
-                state.active_track.as_ref(),
-                state.player.visualization_uri(),
-            ) {
-                (Some(track), Some(uri)) if track.video_id == video_id => {
+            match state.active_track.as_ref() {
+                Some(track) if track.video_id == video_id => {
                     DaemonResponse::VisualizationSource(crate::ipc::VisualizationSource {
                         video_id: track.video_id.clone(),
                         title: track.title.clone(),
                         artist: track.artist.clone(),
-                        uri,
+                        // Link cartridges do not need an audio stream or local file.
+                        uri: state.player.visualization_uri().unwrap_or_default(),
                         storage_root: state.cache.base_dir().to_path_buf(),
                         staticfs_enabled: state.settings.staticfs_enabled,
                         staticfs_mountpoint: visualization_staticfs_mountpoint(&state.settings),

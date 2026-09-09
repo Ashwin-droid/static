@@ -117,6 +117,13 @@ export function attachViewControls(camera: PerspectiveCamera, canvas: HTMLElemen
       return changed || moving;
     },
     reset,
+    restore: (view: CameraControls) => {
+      reset();
+      controls.target.set(view.position.x, view.position.y, view.position.z);
+      camera.position.setFromSphericalCoords(view.distance, view.rotation.roll, view.rotation.yaw).add(controls.target);
+      controls.update();
+      sync();
+    },
     dispose: () => {
       disposed = true;
       stopMoving();

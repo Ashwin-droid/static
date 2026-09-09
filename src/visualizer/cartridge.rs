@@ -1,7 +1,7 @@
 //! Native cartridge export. Only the bounded screenshot and view settings come
-//! from the browser; encoded song bytes stream to daemon memory or disk.
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Cursor, Read, Write};
+//! from the browser; the pixels carry a compact song link and view payload.
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
@@ -12,11 +12,6 @@ use serde_json::{Value, json};
 
 const MAX_SCREENSHOT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
-const AUDIO_START: &[u8] = b"---AUDIO-START---";
-const AUDIO_END: &[u8] = b"---AUDIO-END---";
-const METADATA_START: &[u8] = b"---METADATA-START---";
-const METADATA_END: &[u8] = b"---METADATA-END---";
-
 pub const STREAM_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
@@ -71,25 +66,18 @@ fn create_with_upload<T: UploadTarget>(
 ) -> Result<CartridgeFile> {
     let screenshot = decode_screenshot(screenshot)?;
     let metadata = prepare_metadata(source, metadata)?;
-    let card = render_card(&screenshot, source, &metadata)?;
-    // Only the fixed-size card needs a seekable buffer. Audio is never collected.
+    let payload = super::cartridge_codec::pack(&metadata)?;
+    let mut card = render_card(&screenshot, source, &metadata)?;
+    super::cartridge_codec::embed(&mut card, &payload)?;
     let mut png = Cursor::new(Vec::new());
     DynamicImage::ImageRgb8(card).write_to(&mut png, ImageFormat::Png)?;
-    let metadata_bytes = serde_json::to_string(&metadata)?.replace("---", "\\u002d\\u002d\\u002d");
-    if metadata_bytes.len() > MAX_METADATA_BYTES {
-        bail!("cartridge metadata exceeds 64 KiB");
-    }
-    let uri = url::Url::parse(&source.uri).context("invalid song URI")?;
-    if !matches!(uri.scheme(), "file" | "https" | "http") {
-        bail!("unsupported song URI scheme");
-    }
     let identifier = uuid::Uuid::new_v4();
     let filename = format!("{}-{identifier}.png", safe_filename(&source.title));
     if source.staticfs_enabled {
         // The setting, not mount availability, chooses storage. A missing mount
         // or a failed upload must never silently persist this cartridge on disk.
         let mut output = UploadWriter::new(begin_upload(&filename)?);
-        write_cartridge(&mut output, png.get_ref(), &uri, metadata_bytes.as_bytes())?;
+        output.write_all(png.get_ref())?;
         let info = output.finish()?;
         let display_path = source
             .staticfs_mountpoint
@@ -125,7 +113,7 @@ fn create_with_upload<T: UploadTarget>(
         .context("cannot create cartridge file")?;
     let cleanup = TemporaryFile(temporary.clone());
     let mut output = BufWriter::with_capacity(STREAM_CHUNK_BYTES, file);
-    write_cartridge(&mut output, png.get_ref(), &uri, metadata_bytes.as_bytes())?;
+    output.write_all(png.get_ref())?;
     output.flush()?;
     output.get_ref().sync_all()?;
     drop(output);
@@ -136,52 +124,6 @@ fn create_with_upload<T: UploadTarget>(
         filename,
         display_path: Some(destination),
     })
-}
-
-fn write_cartridge(
-    output: &mut dyn Write,
-    png: &[u8],
-    uri: &url::Url,
-    metadata: &[u8],
-) -> Result<()> {
-    output.write_all(png)?;
-    output.write_all(AUDIO_START)?;
-    let count = match uri.scheme() {
-        "file" => {
-            let path = uri
-                .to_file_path()
-                .map_err(|_| anyhow::anyhow!("song URI is not a local file"))?;
-            let mut input = File::open(&path).context("cannot open song audio")?;
-            let info = input.metadata()?;
-            if !info.is_file() {
-                bail!("song audio must be a regular file");
-            }
-            let mut buffer = vec![0u8; STREAM_CHUNK_BYTES];
-            let mut count = 0;
-            loop {
-                let read = input.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                output.write_all(&buffer[..read])?;
-                count += read as u64;
-            }
-            if count != info.len() {
-                bail!("song audio changed size during cartridge creation");
-            }
-            count
-        }
-        _ => crate::network::stream_media_to_writer(uri.as_str(), output)?,
-    };
-    if count == 0 {
-        bail!("song audio is empty");
-    }
-    output.write_all(AUDIO_END)?;
-    output.write_all(METADATA_START)?;
-    output.write_all(metadata)?;
-    output.write_all(METADATA_END)?;
-    output.flush()?;
-    Ok(())
 }
 
 trait UploadTarget {
@@ -323,7 +265,7 @@ fn prepare_metadata(source: &crate::ipc::VisualizationSource, metadata: Value) -
     if serde_json::to_vec(object)?.len() > MAX_METADATA_BYTES {
         bail!("cartridge metadata exceeds 64 KiB");
     }
-    // Preserve the original cartridge schema, taking only known, bounded values.
+    // JSON is only the local UI transport, never the on-image representation.
     let color = |section: &str, name: &str, default: &str| -> String {
         object
             .get(section)
@@ -339,28 +281,27 @@ fn prepare_metadata(source: &crate::ipc::VisualizationSource, metadata: Value) -
             .and_then(|value| value.get(section))
             .and_then(|value| value.get(axis))
             .and_then(Value::as_f64)
-            .filter(|value| value.is_finite() && value.abs() <= 1_000_000.0)
+            .filter(|value| value.is_finite())
             .unwrap_or(default)
     };
     let fft = object
         .get("fftSize")
         .and_then(Value::as_u64)
-        .filter(|value| (256..=32768).contains(value) && value.is_power_of_two())
-        .unwrap_or(2048);
+        .filter(|value| (8..=128).contains(value))
+        .unwrap_or(30);
     let spacing = object
         .get("lineSpacing")
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1000.0)
-        .unwrap_or(0.5);
+        .unwrap_or(2.0);
     let distance = object
         .get("cameraControls")
         .and_then(|camera| camera.get("distance"))
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (5.0..=600.0).contains(value))
+        .filter(|value| value.is_finite())
         .unwrap_or(60.0);
     let timestamp = chrono::Utc::now().timestamp_millis();
     Ok(json!({
-        "fileName": format!("{}.{}", safe_filename(&source.title), audio_extension(&source.uri)),
         "videoId": source.video_id,
         "title": source.title.chars().take(512).collect::<String>(),
         "artist": source.artist.chars().take(512).collect::<String>(),
@@ -371,43 +312,15 @@ fn prepare_metadata(source: &crate::ipc::VisualizationSource, metadata: Value) -
         },
         "graphTheme": { "line1": color("graphTheme", "line1", "#9b87f5"), "line2": color("graphTheme", "line2", "#D946EF") },
         "cameraControls": {
-            "position": { "x": camera_number("position", "x", 0.0), "y": camera_number("position", "y", 5.0), "z": camera_number("position", "z", 10.0) },
-            "rotation": { "yaw": camera_number("rotation", "yaw", 0.0), "pitch": camera_number("rotation", "pitch", 0.0), "roll": camera_number("rotation", "roll", 0.0) },
+            "position": { "x": camera_number("position", "x", 0.0), "y": camera_number("position", "y", 0.0), "z": camera_number("position", "z", 0.0) },
+            "rotation": { "yaw": camera_number("rotation", "yaw", 0.0), "pitch": camera_number("rotation", "pitch", 0.0), "roll": camera_number("rotation", "roll", 80.0f64.to_radians()) },
             "distance": distance
         },
         "lineSpacing": spacing, "fftSize": fft, "timestamp": timestamp
     }))
 }
 
-fn audio_extension(uri: &str) -> &'static str {
-    let Ok(uri) = url::Url::parse(uri) else {
-        return "audio";
-    };
-    let mime = uri
-        .query_pairs()
-        .find_map(|(key, value)| (key == "mime").then(|| value.into_owned()));
-    match mime.as_deref() {
-        Some("audio/webm") => return "webm",
-        Some("audio/mp4") => return "m4a",
-        Some("audio/mpeg") => return "mp3",
-        _ => {}
-    }
-    match Path::new(uri.path())
-        .extension()
-        .and_then(|value| value.to_str())
-    {
-        Some("mp3") => "mp3",
-        Some("m4a") => "m4a",
-        Some("webm") => "webm",
-        Some("ogg") => "ogg",
-        Some("opus") => "opus",
-        Some("wav") => "wav",
-        Some("flac") => "flac",
-        _ => "audio",
-    }
-}
-
-fn parse_color(value: &str) -> Option<[u8; 3]> {
+pub(super) fn parse_color(value: &str) -> Option<[u8; 3]> {
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 || !hex.is_ascii() {
         return None;
@@ -634,7 +547,7 @@ mod tests {
 
     fn source(uri: String) -> crate::ipc::VisualizationSource {
         crate::ipc::VisualizationSource {
-            video_id: "test-video".into(),
+            video_id: "dQw4w9WgXcQ".into(),
             storage_root: std::env::temp_dir(),
             staticfs_enabled: false,
             staticfs_mountpoint: None,
@@ -645,50 +558,35 @@ mod tests {
     }
 
     #[test]
-    fn cartridge_streams_local_audio_and_preserves_legacy_format() {
+    fn cartridge_encodes_link_and_view_without_accessing_audio() {
         let root =
-            std::env::temp_dir().join(format!("static-cartridge-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let audio = root.join("song with spaces #1.wav");
-        let length = 8 * 1024 * 1024 + 17;
-        let mut input = File::create(&audio).unwrap();
-        std::io::copy(
-            &mut std::io::Read::take(std::io::repeat(0x5a), length),
-            &mut input,
-        )
-        .unwrap();
-        drop(input);
-        let mut source = source(url::Url::from_file_path(&audio).unwrap().to_string());
+            std::env::temp_dir().join(format!("static-link-cartridge-{}", uuid::Uuid::new_v4()));
+        let mut source = source("file:///does-not-exist/song.wav".into());
         source.storage_root = root.clone();
-        let result = create(&source, &screenshot(), json!({"fftSize": 4096})).unwrap();
+        let result = create(&source, &screenshot(), json!({"fftSize": 64})).unwrap();
         let CartridgeStorage::Disk(path) = &result.storage else {
             panic!("expected disk export")
         };
         assert_eq!(path.parent(), Some(root.join("cartridges").as_path()));
         assert!(!result.filename.contains('/'));
         let bytes = std::fs::read(path).unwrap();
-        let start = bytes
-            .windows(AUDIO_START.len())
-            .position(|value| value == AUDIO_START)
-            .unwrap();
-        let png = image::load_from_memory(&bytes[..start]).unwrap();
-        assert_eq!((png.width(), png.height()), (800, 1120));
-        let audio_start = start + AUDIO_START.len();
-        assert!(
-            bytes[audio_start..audio_start + length as usize]
-                .iter()
-                .all(|value| *value == 0x5a)
-        );
-        let audio_end = audio_start + length as usize;
-        assert_eq!(&bytes[audio_end..audio_end + AUDIO_END.len()], AUDIO_END);
-        let metadata_start = audio_end + AUDIO_END.len() + METADATA_START.len();
-        let metadata: Value =
-            serde_json::from_slice(&bytes[metadata_start..bytes.len() - METADATA_END.len()])
+        assert!(bytes.len() < 2 * 1024 * 1024);
+        // PNG ends at IEND. There are no audio bytes or metadata trailers.
+        assert_eq!(&bytes[bytes.len() - 8..], b"IEND\xaeB`\x82");
+        let decoded = super::super::cartridge_codec::decode_bytes(&bytes).unwrap();
+        assert_eq!(decoded["videoId"], source.video_id);
+        assert_eq!(decoded["fftSize"], 64);
+        let original = image::load_from_memory(&bytes).unwrap();
+        for quality in [70, 30] {
+            let mut compressed = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut compressed, quality)
+                .encode_image(&original)
                 .unwrap();
-        assert_eq!(metadata["videoId"], "test-video");
-        assert_eq!(metadata["title"], source.title);
-        assert_eq!(metadata["fftSize"], 4096);
-        assert!(!metadata.to_string().contains("file://"));
+            assert_eq!(
+                super::super::cartridge_codec::decode_bytes(&compressed).unwrap(),
+                decoded
+            );
+        }
         assert_eq!(
             std::fs::read_dir(root.join("cartridges")).unwrap().count(),
             1
@@ -697,21 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn cartridge_rejects_invalid_screenshots_and_remote_file_hosts() {
+    fn cartridge_rejects_invalid_screenshots() {
         assert!(decode_screenshot("data:image/jpeg;base64,aGVsbG8=").is_err());
         assert!(decode_screenshot("data:image/png;base64,not base64").is_err());
         assert!(decode_screenshot(&"x".repeat(MAX_SCREENSHOT_BYTES + 1)).is_err());
-        let root =
-            std::env::temp_dir().join(format!("static-cartridge-invalid-{}", uuid::Uuid::new_v4()));
-        let result = create_in(
-            &root,
-            &source("file://remotehost/tmp/audio.wav".into()),
-            &screenshot(),
-            json!({}),
-        );
-        assert!(result.is_err());
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -730,15 +617,15 @@ mod tests {
     #[test]
     fn metadata_keeps_view_settings_and_rejects_unbounded_payloads() {
         let input = source("file:///tmp/audio?mime=audio%2Fwebm".into());
-        let metadata = prepare_metadata(&input, json!({"uiTheme": {"primary":"#112233"}, "cameraControls":{"position":{"x":3.5},"rotation":{"yaw":0.4,"roll":1.2},"distance":125.5}, "lineSpacing":0.25,"fftSize":1024})).unwrap();
+        let metadata = prepare_metadata(&input, json!({"uiTheme": {"primary":"#112233"}, "cameraControls":{"position":{"x":3.5},"rotation":{"yaw":0.4,"roll":1.2},"distance":125.5}, "lineSpacing":0.25,"fftSize":64})).unwrap();
         assert_eq!(metadata["uiTheme"]["primary"], "#112233");
         assert_eq!(metadata["cameraControls"]["position"]["x"], 3.5);
         assert_eq!(metadata["cameraControls"]["rotation"]["yaw"], 0.4);
         assert_eq!(metadata["cameraControls"]["distance"], 125.5);
         let fallback = prepare_metadata(&input, json!({"cameraControls":{"distance":0}})).unwrap();
-        assert_eq!(fallback["cameraControls"]["distance"], 60.0);
+        assert!(super::super::cartridge_codec::pack(&fallback).is_err());
         assert_eq!(metadata["lineSpacing"], 0.25);
-        assert!(metadata["fileName"].as_str().unwrap().ends_with(".webm"));
+        assert_eq!(metadata["fftSize"], 64);
         assert!(prepare_metadata(&input, json!({"junk":"x".repeat(MAX_METADATA_BYTES)})).is_err());
         assert!(prepare_metadata(&input, json!([])).is_err());
         assert!(safe_filename(&"界".repeat(100)).len() <= 160);
@@ -785,11 +672,7 @@ mod tests {
     fn enabled_staticfs_exports_only_to_memory_even_without_a_mount() {
         let root =
             std::env::temp_dir().join(format!("static-memory-cartridge-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let audio = root.join("song.wav");
-        let audio_bytes = vec![0x5a; 3 * STREAM_CHUNK_BYTES + 17];
-        std::fs::write(&audio, &audio_bytes).unwrap();
-        let mut source = source(url::Url::from_file_path(&audio).unwrap().to_string());
+        let mut source = source("unused-audio-uri".into());
         source.storage_root = root.clone();
         source.staticfs_enabled = true;
         let state = std::sync::Arc::new(std::sync::Mutex::new(UploadState::default()));
@@ -797,7 +680,7 @@ mod tests {
             &root.join("cartridges"),
             &source,
             &screenshot(),
-            json!({"fftSize":4096}),
+            json!({"fftSize":64}),
             |name| {
                 state.lock().unwrap().name = name.into();
                 Ok(FakeUpload(state.clone()))
@@ -806,36 +689,14 @@ mod tests {
         .unwrap();
         assert!(matches!(result.storage, CartridgeStorage::Memory { .. }));
         assert!(result.display_path.is_none());
-        assert!(!root.join("cartridges").exists());
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert!(!root.exists());
         let stored = state.lock().unwrap();
         assert_eq!(stored.commits, 1);
         assert_eq!(stored.aborts, 0);
         assert!(stored.max_chunk <= STREAM_CHUNK_BYTES);
-        let bytes = &stored.bytes;
-        let png_end = bytes
-            .windows(AUDIO_START.len())
-            .position(|part| part == AUDIO_START)
-            .unwrap();
-        let png = image::load_from_memory(&bytes[..png_end]).unwrap();
-        assert_eq!((png.width(), png.height()), (800, 1120));
-        let start = png_end + AUDIO_START.len();
-        assert_eq!(&bytes[start..start + audio_bytes.len()], audio_bytes);
-        let end = start + audio_bytes.len();
-        assert_eq!(&bytes[end..end + AUDIO_END.len()], AUDIO_END);
-        assert_eq!(
-            &bytes[end + AUDIO_END.len()..end + AUDIO_END.len() + METADATA_START.len()],
-            METADATA_START
-        );
-        let metadata: Value = serde_json::from_slice(
-            &bytes[end + AUDIO_END.len() + METADATA_START.len()..bytes.len() - METADATA_END.len()],
-        )
-        .unwrap();
-        assert_eq!(metadata["title"], source.title);
-        assert_eq!(metadata["fftSize"], 4096);
-        assert!(bytes.ends_with(METADATA_END));
-        drop(stored);
-        std::fs::remove_dir_all(root).unwrap();
+        let metadata = super::super::cartridge_codec::decode_bytes(&stored.bytes).unwrap();
+        assert_eq!(metadata["videoId"], source.video_id);
+        assert_eq!(metadata["fftSize"], 64);
     }
 
     #[test]
@@ -857,6 +718,7 @@ mod tests {
         for fail_append in [false, true] {
             let state = std::sync::Arc::new(std::sync::Mutex::new(UploadState {
                 fail_append,
+                fail_commit: !fail_append,
                 ..Default::default()
             }));
             assert!(

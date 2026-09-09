@@ -182,3 +182,18 @@ test('blur, hidden windows, reset and disposal stop movement; shortcuts do not m
   near(new Vector3(s.view().position.x, s.view().position.y, s.view().position.z).length(), 3);
   s.controls.dispose();
 });
+
+test('restoring a cartridge replaces the view and drains movement inertia', () => {
+  const s = setup();
+  input(s.canvas, 'keydown', { key: 'w' });
+  s.advance(50);
+  input(s.canvas, 'pointerdown');
+  input(s.canvas, 'pointermove', { clientX: 230, clientY: 120 });
+  input(s.canvas, 'pointerup');
+  const imported = { position: { x: -12, y: 20, z: 34 }, rotation: { yaw: 0.5, roll: 1.2, pitch: 0 }, distance: 75 };
+  s.controls.restore(imported);
+  s.advance(100);
+  near(s.view().position.x, -12); near(s.view().position.y, 20); near(s.view().position.z, 34);
+  near(s.view().rotation.yaw, 0.5); near(s.view().rotation.roll, 1.2); near(s.view().distance, 75);
+  s.controls.dispose();
+});

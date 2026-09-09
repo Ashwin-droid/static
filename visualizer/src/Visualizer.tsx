@@ -8,6 +8,7 @@ interface Props {
   historyRef: MutableRefObject<FrequencyHistory>;
   captureRef: MutableRefObject<(() => string) | null>;
   viewRef: MutableRefObject<CameraControls>;
+  restoreViewRef: MutableRefObject<((view: CameraControls) => void) | null>;
   theme: ThemePreset;
   displayedThemeRef: MutableRefObject<ThemePreset>;
   onThemeFrame: (theme: ThemePreset) => void;
@@ -37,6 +38,7 @@ export function Visualizer(props: Props) {
     host.appendChild(renderer.domElement);
     renderer.domElement.setAttribute('aria-label', 'Live frequency traces. Drag to rotate. With the canvas focused, W/S move forward/back, A/D move left/right, Q/E move down/up. Scroll to zoom. Double-click or press Home to reset.');
     const controls = attachViewControls(camera, renderer.domElement, view => { current.current.viewRef.current = view; });
+    props.restoreViewRef.current = controls.restore;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x000000, 0);
     let lines: THREE.Line<THREE.BufferGeometry, THREE.LineBasicMaterial>[] = [];
@@ -180,6 +182,7 @@ export function Visualizer(props: Props) {
       cancelAnimationFrame(frameId);
       observer.disconnect();
       controls.dispose();
+      current.current.restoreViewRef.current = null;
       renderer.domElement.removeEventListener('webglcontextlost', lost);
       if (current.current.captureRef.current === capture) current.current.captureRef.current = null;
       disposeLines();

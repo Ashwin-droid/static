@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { HardDrive, Music, Pause, Play, RotateCcw, SkipBack, SkipForward, Sliders, Volume2, Maximize, Minimize } from 'lucide-react';
 import { Visualizer } from './Visualizer';
-import { initialCamera } from './view-controls';
+import { initialCamera, type CameraControls } from './view-controls';
+import { readCartridge, type Cartridge } from './cartridge';
 import { FullscreenView, type FullscreenState } from './fullscreen';
 import { connectStatic, type ConnectionStatus } from './connection';
 import { downloadUrl, FrequencyHistory, socketUrl, type PlaybackSnapshot, type ServerMessage } from './protocol';
@@ -31,6 +32,10 @@ export function App() {
   const bandsRef = useRef(bands);
   const [spacing, setSpacing] = useState(2);
   const view = useRef(initialCamera());
+  const restoreView = useRef<((view: CameraControls) => void) | null>(null);
+  const [imported, setImported] = useState<Cartridge | null>(null);
+  const [reading, setReading] = useState(false);
+  const importRequest = useRef<AbortController | null>(null);
   const [themeSelection, setThemeSelection] = useState(initialThemeSelection);
   const themeSelectionRef = useRef(themeSelection);
   const theme = activeTheme(themeSelection);
@@ -108,6 +113,7 @@ export function App() {
       },
     });
     return () => {
+      importRequest.current?.abort();
       connection.current?.dispose();
       connection.current = null;
       if (requestTimeout.current !== undefined) clearTimeout(requestTimeout.current);
@@ -130,6 +136,30 @@ export function App() {
     const safe = Math.max(0, Math.min(state.max_volume, value));
     if (safe > 0) lastVolume.current = safe;
     send({ type: 'volume', value: safe });
+  };
+  const importCartridge = async (file: File) => {
+    importRequest.current?.abort();
+    const controller = new AbortController();
+    importRequest.current = controller;
+    setReading(true); setImported(null); setNotice(null);
+    const timer = setTimeout(() => controller.abort(), 60_000);
+    try {
+      const recovered = await readCartridge(file, location.origin, location.hash, controller.signal);
+      if (!controller.signal.aborted) setImported(recovered);
+    } catch (error) {
+      if (importRequest.current === controller) setNotice(controller.signal.aborted ? 'Reading the cartridge timed out.' : error instanceof Error ? error.message : 'Could not read the cartridge.');
+    } finally {
+      clearTimeout(timer);
+      if (importRequest.current === controller) { setReading(false); importRequest.current = null; }
+    }
+  };
+  const loadCartridge = () => {
+    if (!imported || !send({ type: 'play_cartridge', video_id: imported.videoId })) return;
+    changeTheme({ type: 'manual', theme: imported.theme });
+    changeBands(imported.bands);
+    setSpacing(imported.spacing);
+    restoreView.current?.(imported.camera);
+    setNotice('Cartridge view restored. Static is opening the song.');
   };
   const createCartridge = () => {
     if (!state.current_track || !capture.current || busy) return;
@@ -167,7 +197,7 @@ export function App() {
       {status === 'connecting' ? 'Connecting to Static…' : status === 'disconnected' ? 'Connection lost. Reconnecting…' : 'Open the visualiser from Static to connect.'}
       {status === 'unavailable' && <button onClick={() => location.reload()}>Retry</button>}
     </div>}
-    <Visualizer historyRef={history} captureRef={capture} viewRef={view} theme={theme}
+    <Visualizer historyRef={history} captureRef={capture} viewRef={view} restoreViewRef={restoreView} theme={theme}
       displayedThemeRef={displayedTheme} onThemeFrame={paintTheme} lineSpacing={spacing} numBands={bands} />
     <section id="visualizer-controls" className="controls" aria-label="Visualiser controls" hidden={!showControls}>
       <div className="panel">
@@ -218,8 +248,15 @@ export function App() {
             </div>
           </div>}
           {tab === 'cartridge' && <div className="cartridge-controls">
-            <div><h2>Audio cartridge</h2><p>Capture this view, its settings and the current song together.</p></div>
-            <button className="create" disabled={!connected || !state.current_track || busy} onClick={createCartridge}><HardDrive size={16} />{busy ? 'Creating cartridge…' : 'Create cartridge'}</button>
+            <div><h2>Song cartridge</h2><p>Share this view with its song link and settings embedded in the image.</p></div>
+            <button className="create" disabled={!connected || !state.current_track || busy || reading} onClick={createCartridge}><HardDrive size={16} />{busy ? 'Creating cartridge…' : 'Create cartridge'}</button>
+            <label className="cartridge-import">{reading ? 'Reading cartridge…' : 'Open cartridge image'}
+              <input type="file" accept="image/png,image/jpeg,image/webp" disabled={reading || busy} onChange={event => {
+                const file = event.currentTarget.files?.[0]; event.currentTarget.value = ''; if (file) void importCartridge(file);
+              }} />
+            </label>
+            {imported && <div className="cartridge-result"><p>Song: {imported.videoId} · {imported.bands} bands</p>
+              <button disabled={!connected || busy || reading} onClick={loadCartridge}><Play size={16} />Play and restore view</button></div>}
             {cartridge && <div className="cartridge-result" role="status">
               <a href={downloadUrl(cartridge.url, location.origin)!} download={cartridge.filename}>Save cartridge · {cartridge.filename}</a>
               {cartridge.storage === 'memory'

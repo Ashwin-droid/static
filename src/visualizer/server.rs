@@ -15,14 +15,14 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    body::Body,
+    body::{Body, Bytes},
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use include_dir::{Dir, include_dir};
@@ -153,8 +153,45 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/ws", get(upgrade))
         .route("/cartridges/{id}", get(download))
+        .route(
+            "/cartridge/decode",
+            post(decode_cartridge).layer(DefaultBodyLimit::max(
+                super::cartridge_codec::MAX_IMAGE_BYTES,
+            )),
+        )
         .fallback(asset)
         .with_state(state)
+}
+
+async fn decode_cartridge(
+    State(state): State<AppState>,
+    Query(auth): Query<Auth>,
+    headers: HeaderMap,
+    uri: Uri,
+    bytes: Bytes,
+) -> Response {
+    if !authenticated(&headers, &uri, &auth, &state, true) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(permit) = state.export_slot.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Another cartridge operation is running",
+        )
+            .into_response();
+    };
+    // Keep the permit on the worker even if the HTTP client disconnects.
+    match export_thread(move || {
+        let _permit = permit;
+        super::cartridge_codec::decode_bytes(&bytes)
+    })
+    .await
+    {
+        Ok(metadata) => {
+            ([(header::CACHE_CONTROL, "no-store")], axum::Json(metadata)).into_response()
+        }
+        Err(err) => (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response(),
+    }
 }
 
 fn valid_host(headers: &HeaderMap, uri: &Uri, state: &AppState) -> bool {
@@ -406,6 +443,9 @@ fn stream_memory_chunks(
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
+    PlayCartridge {
+        video_id: String,
+    },
     Configure {
         bands: u32,
     },
@@ -432,6 +472,13 @@ enum Transport {
 
 fn validate_command(command: &Command) -> Result<()> {
     match command {
+        Command::PlayCartridge { video_id } => anyhow::ensure!(
+            video_id.len() == 11
+                && video_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)),
+            "Invalid cartridge video ID"
+        ),
         Command::Configure { bands } => anyhow::ensure!(
             (8..=128).contains(bands),
             "Frequency bands must be between 8 and 128"
@@ -548,6 +595,9 @@ fn worker(
                     action: Transport::Previous,
                 } => daemon.previous(),
                 Command::Volume { value } => daemon.set_volume(value),
+                Command::PlayCartridge { video_id } => {
+                    daemon.resolve_and_play_radio(&crate::ipc::youtube_music_watch_url(&video_id))
+                }
                 _ => continue,
             };
             match result {
@@ -676,7 +726,7 @@ async fn connection(socket: WebSocket, app: AppState) {
                                                     daemon.visualization_source(&video_id)?
                                                 };
                                                 anyhow::ensure!(!cancelled.load(Ordering::Acquire), "Cartridge export cancelled");
-                                                tracing::debug!("Rendering native cartridge and copying audio");
+                                                tracing::debug!("Rendering native cartridge and embedding song link");
                                                 let file = super::cartridge::create(&source, &screenshot, metadata)?;
                                                 tracing::debug!("Native cartridge completed");
                                                 Ok(file)

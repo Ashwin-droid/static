@@ -8,7 +8,17 @@ The daemon owns playback and analysis. The page receives bounded frequency value
 
 The default Cover art theme follows the current song. Rust extracts its palette and sends five RGB colours; the page never downloads or decodes cover images. The last valid cover palette stays visible while a new palette is pending or unavailable. Purple Dream is used only before the first valid cover palette. Selecting any of the twelve presets or editing a colour keeps that manual choice across songs. Select Cover art again to follow the current artwork. Cartridges include the colours currently displayed.
 
-Cartridge creation captures a PNG of the view, at most 1280 by 720, and sends that screenshot plus visual preferences and the selected video ID. Rust prepares the artwork and embeds the audio. The returned download is an ordinary browser download streamed from Rust, without fetching the cartridge into a JavaScript blob. Its storage status and, when available, its filesystem path are shown alongside it. Original browser cartridge import code is intentionally absent.
+Cartridge creation captures a PNG of the view, at most 1280 by 720, and sends that screenshot plus visual preferences and the selected video ID. Rust embeds a compact binary song link and view payload into the card's image pixels with the `blind_watermark` DWT–DCT–SVD library and Reed–Solomon error correction. No audio is downloaded, decoded or included. Titles and capture time are visible text on the card; they are not part of the binary payload.
+
+In the Cartridge tab, choose **Open cartridge image**, then **Play and restore view**. Rust reads the image and recovers its settings. Playback goes through the daemon's normal YouTube Music resolver and requires the song to be available to that account or cache. Opening a file alone does not change playback. The restored view is quantized; the image itself preserves the original traces.
+
+For inspection without starting the daemon or changing playback, run:
+
+```sh
+static visualizer decode /path/to/cartridge.jpg
+```
+
+The decoder prints the reconstructed YouTube Music link and view settings as JSON. PNG, JPEG and WebP input is supported, with a 16 MiB input limit and bounded decoded dimensions. The old audio-appended cartridge format is no longer exported or imported.
 
 ## Moving the view
 
@@ -32,7 +42,7 @@ Use the Visualiser button above Settings in the GUI, press `v` in the TUI, or ru
 
 The Rust host requires the WebKitGTK 4.1 and GTK 3 development libraries when compiling. Its installed runtime dependencies are collected by `cargo deb`. Compiled frontend files are embedded in the executable, so running or installing it does not require Node or a web server.
 
-When staticfs is enabled, new cartridges live only in the playback daemon's memory. Rust streams the card, full encoded audio, and metadata into a bounded upload without creating an output file or temporary file. Completed cartridges appear at `<staticfs mount>/cartridges/<filename>.png`; if the mount is temporarily unavailable they remain in memory, with no disk fallback. Closing the visualiser leaves them available until the daemon stops. Removing a memory cartridge from staticfs releases it. Use **Save cartridge** or copy the file out of staticfs to keep a permanent copy. The explicit save link streams into `~/Downloads/Static/` in the native window; nothing is downloaded automatically.
+When staticfs is enabled, new cartridges live only in the playback daemon's memory. Rust streams the finished watermarked PNG into a bounded upload without creating an output file or temporary file. Completed cartridges appear at `<staticfs mount>/cartridges/<filename>.png`; if the mount is temporarily unavailable they remain in memory, with no disk fallback. Closing the visualiser leaves them available until the daemon stops. Removing a memory cartridge from staticfs releases it. Use **Save cartridge** or copy the file out of staticfs to keep a permanent copy. The explicit save link streams into `~/Downloads/Static/` in the native window; nothing is downloaded automatically.
 
 With staticfs disabled, new cartridges are saved atomically in the daemon's current storage root under `cartridges/`. Existing disk cartridges are preserved. Staticfs serves both existing files and memory cartridges using bounded byte ranges; cartridge content is read-only. Daemon memory has a shared 512 MiB limit for pending and completed cartridges, and a full store rejects the export without writing to disk.
 
@@ -58,6 +68,7 @@ Client messages:
 - `{ "type": "configure", "bands": 30 }`, with 8 to 128 bands.
 - `{ "type": "transport", "action": "toggle" }`, or `previous` or `next`.
 - `{ "type": "volume", "value": 0.8 }`, using the daemon's `max_volume` limit.
+- `{ "type": "play_cartridge", "video_id": "dQw4w9WgXcQ" }`, resolving and playing a decoded song through the daemon.
 - `{ "type": "cartridge", "id": "uuid", "video_id": "…", "screenshot": "data:image/png;base64,…", "metadata": { "uiTheme": {}, "graphTheme": {}, "cameraControls": { "position": {}, "rotation": {} }, "lineSpacing": 2, "fftSize": 30, "timestamp": 0 } }`.
 
 Server messages:
@@ -81,3 +92,29 @@ The unit tests exercise protocol validation, fixed memory history, stale/duplica
 Every valid palette change blends the colour used for newly arriving FFT points, UI colours and the background over three seconds. Existing trace points keep their recorded colours, so the transition becomes a visible gradient segment along each trace. Red, green and blue each interpolate independently from their old 0–255 value to their new value on every animation frame, with no intermediate stages. Yellow fading to blue therefore passes smoothly through grey. An interrupted fade starts its next transition from the current on-screen blend. The existing animation loop drives the fade without rendering the React controls on every frame.
 
 Missing or delayed artwork keeps the previous cover palette indefinitely; only a valid new palette starts another transition. Cartridge images preserve the multi-colour trace history and the currently displayed background blend.
+
+## Binary cartridge format, version 1
+
+The positional payload is 39 bytes, with no separators, JSON, hex text, filenames or full URL. All multibyte integers use big-endian order.
+
+| Byte offsets | Meaning | Encoding |
+| --- | --- | --- |
+| 0–1 | Format marker | ASCII `SC` |
+| 2 | Version | `1` |
+| 3–11 | YouTube video ID | Eleven URL-safe base64 alphabet indices packed into 66 bits; top six bits zero |
+| 12–26 | Five colours | Three RGB bytes each: UI primary, secondary, background, graph start, graph end |
+| 27–29 | Camera target X, Y, Z | Signed bytes, two scene units per step; −256 through 254 |
+| 30 | Camera yaw | One turn divided into 256 steps |
+| 31 | Camera polar angle | Zero through π, divided into 255 steps |
+| 32 | View distance | Unsigned byte, 5–255 |
+| 33 | Line spacing | Unsigned byte, 0.05 units per step |
+| 34 | Frequency bands | Unsigned byte, 8–128 |
+| 35–38 | CRC-32 | Checksum of bytes 0–34 |
+
+The orbit camera's unused third rotation value is zero and is omitted. Position precision is within one scene unit, distance within half a unit, yaw within about 0.71°, and polar angle within about 0.36°. Out-of-range views are rejected with an instruction to move closer or reduce distance; values never wrap. Colours and the ID are lossless.
+
+`reed-solomon` adds 128 parity bytes to the 39-byte payload, producing 167 bytes and correcting up to 64 corrupted byte symbols. The watermark library embeds this codeword with its own repeated-bit placement and three-channel voting. We use `blind_watermark` **0.1.3**, primary singular-value strength 72, secondary embedding disabled, strategy seed `0x5354415449430001`, and LSB-first bit order. The public seed is a format parameter, not an encryption key. No watermark algorithm, transform, placement strategy or ECC implementation is maintained in Static.
+
+Exports are 800×1120 pixels. A received image with the same aspect ratio is normalized to that size for recovery. Tests cover JPEG quality 90/70/50/30, resizing to 600×840 and 400×560 followed by JPEG quality 70, and repeated JPEG encoding. These are local recompression tests, not proof of every WhatsApp pipeline. Keep the full image: cropping, added borders, rotation or severe editing can prevent recovery. The stronger watermark can slightly alter flat regions. The version marker, field validation and checksum must all pass before recovered data is offered to the user.
+
+`POST /cartridge/decode?token=…` accepts the raw image with the same loopback Host, Origin and token checks as the WebSocket. It runs on the bounded native cartridge worker and returns only recovered link/view metadata. It does not write the uploaded image to disk.

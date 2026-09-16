@@ -209,12 +209,12 @@ pub enum QueueDragPayload {
 }
 
 /// An artist name rendered as a link inside a track row/card: clicking it
-/// opens the artist's browse page (the parser only keeps ids whose browse
-/// endpoint is an artist page).
+/// opens the artist page or, for uploader channels, the user channel page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistLink {
     pub browse_id: String,
     pub name: String,
+    pub page_type: crate::models::HomeBrowsePageType,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -802,7 +802,7 @@ impl App {
                 link.browse_id,
                 link.name,
                 None,
-                crate::models::HomeBrowsePageType::Artist,
+                link.page_type,
                 false,
             ),
 

@@ -586,16 +586,7 @@ fn extract_browse_id_and_page_type(renderer: &Value) -> Option<(String, HomeBrow
         let page_type = browse
             .pointer("/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
             .and_then(|value| value.as_str())
-            .and_then(|page_type| match page_type {
-                "MUSIC_PAGE_TYPE_PLAYLIST" => Some(HomeBrowsePageType::Playlist),
-                "MUSIC_PAGE_TYPE_ALBUM" => Some(HomeBrowsePageType::Album),
-                "MUSIC_PAGE_TYPE_ARTIST" => Some(HomeBrowsePageType::Artist),
-                "MUSIC_PAGE_TYPE_USER_CHANNEL" => Some(HomeBrowsePageType::UserChannel),
-                "MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE" => {
-                    Some(HomeBrowsePageType::PodcastShow)
-                }
-                _ => None,
-            })?;
+            .and_then(music_page_type)?;
         let browse_id = browse.get("browseId")?.as_str()?.to_string();
         Some((browse_id, page_type))
     })
@@ -652,21 +643,44 @@ fn extract_artists_from_subtitle(renderer: &Value) -> Vec<Artist> {
     extract_artists_from_runs(runs)
 }
 
+/// `browseEndpointContextMusicConfig.pageType` → the browse page it opens.
+fn music_page_type(page_type: &str) -> Option<HomeBrowsePageType> {
+    match page_type {
+        "MUSIC_PAGE_TYPE_PLAYLIST" => Some(HomeBrowsePageType::Playlist),
+        "MUSIC_PAGE_TYPE_ALBUM" => Some(HomeBrowsePageType::Album),
+        "MUSIC_PAGE_TYPE_ARTIST" => Some(HomeBrowsePageType::Artist),
+        "MUSIC_PAGE_TYPE_USER_CHANNEL" => Some(HomeBrowsePageType::UserChannel),
+        "MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE" => Some(HomeBrowsePageType::PodcastShow),
+        _ => None,
+    }
+}
+
+/// Page type of a subtitle run's browse endpoint, if it is one an artist line
+/// can link to: an official artist page or an uploader's user channel.
+fn run_artist_page_type(run: &Value) -> Option<HomeBrowsePageType> {
+    run.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+        .and_then(|p| p.as_str())
+        .and_then(music_page_type)
+        .filter(|page_type| {
+            matches!(
+                page_type,
+                HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel
+            )
+        })
+}
+
 fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
     let artists: Vec<Artist> = runs
         .iter()
-        .filter(|run| {
-            run.pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
-                .and_then(|p| p.as_str())
-                .is_some_and(|p| p == "MUSIC_PAGE_TYPE_ARTIST")
-        })
         .filter_map(|run| {
+            let page_type = run_artist_page_type(run)?;
             Some(Artist {
                 name: run.get("text")?.as_str()?.trim().to_string(),
                 id: run
                     .pointer("/navigationEndpoint/browseEndpoint/browseId")
                     .and_then(|b| b.as_str())
                     .map(String::from),
+                page_type: Some(page_type),
             })
         })
         .filter(|artist| !artist.name.is_empty())
@@ -707,6 +721,7 @@ fn extract_artists_from_runs(runs: &[Value]) -> Vec<Artist> {
         vec![Artist {
             name: artist_name,
             id: None,
+            page_type: None,
         }]
     }
 }
@@ -739,6 +754,7 @@ fn extract_multi_row_artists(renderer: &Value) -> Vec<Artist> {
         vec![Artist {
             name: artist_name.to_string(),
             id: None,
+            page_type: None,
         }]
     }
 }
@@ -994,6 +1010,7 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                                         .pointer("/navigationEndpoint/browseEndpoint/browseId")
                                         .and_then(|b| b.as_str())
                                         .map(String::from),
+                                    page_type: run_artist_page_type(run),
                                 })
                                 .collect()
                         })

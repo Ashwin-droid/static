@@ -21,7 +21,12 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artist {
     pub name: String,
+    /// Browse id of the artist's page, when the row linked one.
     pub id: Option<String>,
+    /// Page type behind `id`: an official artist page or an uploader's user
+    /// channel. Absent for older persisted rows; treated as an artist page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_type: Option<HomeBrowsePageType>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

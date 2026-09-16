@@ -819,6 +819,7 @@ fn offline_track_from_parts(
             vec![Artist {
                 name: artist,
                 id: None,
+                page_type: None,
             }]
         },
         album: None,
@@ -1398,6 +1399,7 @@ pub(crate) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track
                 artists: vec![Artist {
                     name: track.artist.clone(),
                     id: None,
+                    page_type: None,
                 }],
                 album: None,
                 duration: None,

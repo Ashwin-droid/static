@@ -9,6 +9,7 @@ fn sample_track(title: &str) -> Track {
         artists: vec![Artist {
             name: "Sample Artist".to_string(),
             id: None,
+            page_type: None,
         }],
         album: Some("Sample Album".to_string()),
         duration: Some("3:45".to_string()),

@@ -13,6 +13,7 @@ fn test_track(video_id: &str) -> Track {
         artists: vec![Artist {
             name: "Artist".to_string(),
             id: None,
+            page_type: None,
         }],
         album: None,
         duration: None,

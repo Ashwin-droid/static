@@ -1985,6 +1985,7 @@ pub fn play_track_task(
         artists: vec![Artist {
             name: artist.clone(),
             id: None,
+            page_type: None,
         }],
         album: None,
         duration: None,
@@ -2578,6 +2579,7 @@ fn load_offline_collection_tracks(
                 vec![Artist {
                     name: artist,
                     id: None,
+                    page_type: None,
                 }]
             };
             Track {

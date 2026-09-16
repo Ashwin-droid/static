@@ -638,6 +638,7 @@ pub(in crate::cli_tui) fn load_offline_page_data_tui()
                 vec![crate::models::Artist {
                     name: artist,
                     id: None,
+                    page_type: None,
                 }]
             },
             album: None,
@@ -699,6 +700,7 @@ pub(in crate::cli_tui) fn load_offline_playlist_tracks_tui(
                     vec![crate::models::Artist {
                         name: artist,
                         id: None,
+                        page_type: None,
                     }]
                 },
                 album: None,

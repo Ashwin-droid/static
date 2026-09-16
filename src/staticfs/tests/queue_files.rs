@@ -11,6 +11,7 @@ fn track(video_id: &str, title: &str, artists: &[&str]) -> Track {
             .map(|name| Artist {
                 name: name.to_string(),
                 id: None,
+                page_type: None,
             })
             .collect(),
         album: None,

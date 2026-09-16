@@ -35,6 +35,7 @@ fn queue_track(video_id: &str, title: &str) -> Track {
         artists: vec![Artist {
             name: "Artist".to_string(),
             id: None,
+            page_type: None,
         }],
         album: None,
         duration: None,

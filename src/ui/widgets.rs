@@ -76,7 +76,7 @@ pub fn icon(handle: svg::Handle, size: f32) -> Element<'static, Message> {
 }
 
 /// One-line artist caption. Every artist with a browse id is an underlined
-/// link that opens the artist page; the rest is plain text. Links are
+/// link that opens its artist or channel page; the rest is plain text. Links are
 /// padding-less buttons so the enclosing row/card (a `mouse_area` drag
 /// source) sees neither the press nor the release of a link click.
 pub fn artist_line(track: &Track, size: f32, color: Color) -> Element<'static, Message> {
@@ -109,6 +109,9 @@ pub fn artist_line(track: &Track, size: f32, color: Color) -> Element<'static, M
                         .on_press(Message::ArtistLinkClicked(ArtistLink {
                             browse_id: browse_id.clone(),
                             name: artist.name.clone(),
+                            page_type: artist
+                                .page_type
+                                .unwrap_or(crate::models::HomeBrowsePageType::Artist),
                         })),
                 );
             }

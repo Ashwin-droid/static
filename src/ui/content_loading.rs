@@ -533,6 +533,7 @@ fn resolve_direct_video_track(
         artists: vec![Artist {
             name: "Unknown artist".to_owned(),
             id: None,
+            page_type: None,
         }],
         album: None,
         duration: None,
@@ -1060,6 +1061,7 @@ fn offline_track(
         vec![Artist {
             name: artist,
             id: None,
+            page_type: None,
         }]
     };
 

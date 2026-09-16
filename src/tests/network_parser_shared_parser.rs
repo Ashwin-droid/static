@@ -8,7 +8,7 @@ use super::{
 };
 
 #[test]
-fn responsive_history_items_fall_back_to_user_channel_name() {
+fn responsive_history_items_link_user_channel_runs() {
     let renderer = json!({
         "flexColumns": [
             {
@@ -56,7 +56,14 @@ fn responsive_history_items_fall_back_to_user_channel_name() {
     let track = parse_track_from_renderer(&renderer).expect("history track should parse");
     assert_eq!(track.artists.len(), 1);
     assert_eq!(track.artists[0].name, "Evercore");
-    assert_eq!(track.artists[0].id, None);
+    assert_eq!(
+        track.artists[0].id.as_deref(),
+        Some("UCdOr-hoBc8cJsBvgUjNQlMw")
+    );
+    assert_eq!(
+        track.artists[0].page_type,
+        Some(HomeBrowsePageType::UserChannel)
+    );
 }
 
 #[test]

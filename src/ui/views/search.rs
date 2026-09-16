@@ -44,6 +44,9 @@ pub struct State {
     /// hover tint (rows are `mouse_area`s, not buttons, so they can be queue
     /// drag sources; hover feedback is tracked explicitly).
     pub hovered_item: Option<(usize, usize)>,
+    /// Hovered Play All / Shuffle control `(section, shuffle)` — also a
+    /// `mouse_area` drag source.
+    pub hovered_control: Option<(usize, bool)>,
 }
 
 impl Default for State {
@@ -53,6 +56,7 @@ impl Default for State {
             loading_query: None,
             error: None,
             hovered_item: None,
+            hovered_control: None,
         }
     }
 }
@@ -88,6 +92,20 @@ pub enum Msg {
     },
     /// Lean Play All / Shuffle emitted by the view (same resolution).
     SectionPlayAll {
+        section: usize,
+        shuffle: bool,
+    },
+    /// Play All / Shuffle pressed: resolve the section's tracks and register
+    /// them as a queue drag; the release delivers `SectionPlayAll`.
+    SectionControlPressed {
+        section: usize,
+        shuffle: bool,
+    },
+    ControlHovered {
+        section: usize,
+        shuffle: bool,
+    },
+    ControlUnhovered {
         section: usize,
         shuffle: bool,
     },
@@ -191,11 +209,38 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
             queue_panel::play_all_task(app, tracks, shuffle, None)
         }
         Msg::SectionPlayAll { section, shuffle } => {
+            if release_pending_press(app).was_drag_or_foreign() {
+                return Task::none();
+            }
             let tracks = cached_section_tracks(app, section);
             if tracks.is_empty() {
                 return Task::none();
             }
             queue_panel::play_all_task(app, tracks, shuffle, None)
+        }
+        Msg::SectionControlPressed { section, shuffle } => {
+            let title = app
+                .search
+                .cache
+                .as_ref()
+                .and_then(|cache| cache.results.sections.get(section))
+                .map(|section| section.title.clone())
+                .unwrap_or_default();
+            let tracks = cached_section_tracks(app, section);
+            match queue_panel::track_list_payload(tracks, title, shuffle) {
+                Some(payload) => queue_panel::start_drag_task(app, payload),
+                None => Task::none(),
+            }
+        }
+        Msg::ControlHovered { section, shuffle } => {
+            app.search.hovered_control = Some((section, shuffle));
+            Task::none()
+        }
+        Msg::ControlUnhovered { section, shuffle } => {
+            if app.search.hovered_control == Some((section, shuffle)) {
+                app.search.hovered_control = None;
+            }
+            Task::none()
         }
 
         Msg::ItemHovered { section, item } => {
@@ -205,6 +250,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         Msg::ItemUnhovered { section, item } => {
             if app.search.hovered_item == Some((section, item)) {
                 app.search.hovered_item = None;
+                app.search.hovered_control = None;
             }
             Task::none()
         }
@@ -270,6 +316,18 @@ fn start_radio_from_track(app: &mut App, tracks: Vec<Track>, index: usize) -> Ta
 struct ReleasedPress {
     payload: Option<QueueDragPayload>,
     was_active: bool,
+}
+
+impl ReleasedPress {
+    /// A Play All / Shuffle release is a click only when the press did not
+    /// become a drag and did not slide in from a row or card.
+    fn was_drag_or_foreign(&self) -> bool {
+        self.was_active
+            || !matches!(
+                self.payload,
+                None | Some(QueueDragPayload::TrackList { .. })
+            )
+    }
 }
 
 /// Rows deliver their click on `mouse_area::on_release` (the press registered
@@ -404,7 +462,7 @@ fn section_body<'a>(
 
     let mut body = column![].spacing(theme::SPACE_LG).width(Length::Fill);
     if track_count > 1 {
-        body = body.push(play_controls(section_index));
+        body = body.push(play_controls(app, section_index));
     }
 
     let mut cells: Vec<Element<'a, Message>> = Vec::with_capacity(section.contents.len());
@@ -431,42 +489,37 @@ fn section_body<'a>(
     body.push(two_col_grid(cells)).into()
 }
 
-fn play_controls(section_index: usize) -> Element<'static, Message> {
+/// Play All / Shuffle are queue drag sources: dropping one into the queue
+/// inserts the section's (shuffled) tracks at the drop slot.
+fn play_controls(app: &App, section_index: usize) -> Element<'static, Message> {
     row![
-        control_button(
-            icons::play(),
-            "Play All",
-            Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: false,
-            },
-        ),
-        control_button(
-            icons::shuffle(),
-            "Shuffle",
-            Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: true,
-            },
-        ),
+        control_button(app, icons::play(), "Play All", section_index, false),
+        control_button(app, icons::shuffle(), "Shuffle", section_index, true),
     ]
     .spacing(theme::SPACE_MD)
     .into()
 }
 
-fn control_button(icon: svg::Handle, label: &'static str, msg: Msg) -> Element<'static, Message> {
-    button(
-        row![
-            widgets::icon(icon, CONTROL_ICON_SIZE),
-            text(label).size(theme::SIZE_BODY),
-        ]
-        .spacing(theme::SPACE_SM)
-        .align_y(iced::Alignment::Center),
+fn control_button(
+    app: &App,
+    icon: svg::Handle,
+    label: &'static str,
+    section: usize,
+    shuffle: bool,
+) -> Element<'static, Message> {
+    let hovered = app.search.hovered_control == Some((section, shuffle));
+    widgets::drag_control(
+        icon,
+        CONTROL_ICON_SIZE,
+        label,
+        hovered,
+        widgets::DragControlEvents {
+            press: Message::Search(Msg::SectionControlPressed { section, shuffle }),
+            release: Message::Search(Msg::SectionPlayAll { section, shuffle }),
+            enter: Message::Search(Msg::ControlHovered { section, shuffle }),
+            exit: Message::Search(Msg::ControlUnhovered { section, shuffle }),
+        },
     )
-    .style(theme::secondary_button)
-    .padding([theme::SPACE_SM, theme::SPACE_LG])
-    .on_press(Message::Search(msg))
-    .into()
 }
 
 /// Track row: 44 px art (letter fallback), truncated title with full-text
@@ -488,7 +541,7 @@ fn track_row<'a>(
     );
     let info = column![
         clipped_title(&track.title),
-        clipped_caption(artist_string(track))
+        widgets::artist_line(track, theme::SIZE_CAPTION, theme::TEXT_DIM)
     ]
     .spacing(theme::SPACE_XXS)
     .width(Length::Fill);
@@ -742,19 +795,6 @@ fn drag_payload_for_browse_card(card: &HomeBrowseCard) -> Option<QueueDragPayloa
             page_type: card.page_type,
         }),
         HomeBrowsePageType::Artist | HomeBrowsePageType::UserChannel => None,
-    }
-}
-
-fn artist_string(track: &Track) -> String {
-    if track.artists.is_empty() {
-        "Unknown artist".to_owned()
-    } else {
-        track
-            .artists
-            .iter()
-            .map(|artist| artist.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
     }
 }
 

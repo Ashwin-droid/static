@@ -1,9 +1,10 @@
 use super::{
     DIVIDER_HEIGHT, LIST_TOP_MARGIN, QUEUE_ROW_HEIGHT, dismiss_queue_after_current_state,
     normalized_preview_slot, preview_slot_for_queue_y, queue_drag_autoscroll_velocity,
-    slot_for_content_y_with,
+    slot_for_content_y_with, track_list_payload, track_list_subtitle,
 };
 use crate::models::{Artist, RadioVirtualPlaylist, Track};
+use crate::ui::app::QueueDragPayload;
 
 fn test_track(video_id: &str) -> Track {
     Track {
@@ -174,4 +175,53 @@ fn autoscroll_scales_within_the_band() {
 #[test]
 fn autoscroll_is_disabled_without_viewport() {
     assert_eq!(queue_drag_autoscroll_velocity(100.0, 0.0), 0.0);
+}
+
+#[test]
+fn track_list_payload_is_empty_for_a_control_with_nothing_to_play() {
+    assert!(track_list_payload(Vec::new(), "Videos", false).is_none());
+    assert!(track_list_payload(Vec::new(), "Videos", true).is_none());
+}
+
+#[test]
+fn track_list_payload_keeps_play_all_order_and_title() {
+    let tracks = vec![test_track("a"), test_track("b"), test_track("c")];
+    let payload = track_list_payload(tracks.clone(), "Videos", false).expect("payload");
+    assert_eq!(
+        payload,
+        QueueDragPayload::TrackList {
+            tracks,
+            title: "Videos".to_owned(),
+            shuffled: false,
+        }
+    );
+}
+
+#[test]
+fn track_list_payload_shuffles_at_press_time_without_losing_tracks() {
+    let tracks: Vec<Track> = (0..40).map(|i| test_track(&format!("t{i}"))).collect();
+    let Some(QueueDragPayload::TrackList {
+        tracks: shuffled,
+        shuffled: flag,
+        ..
+    }) = track_list_payload(tracks.clone(), "Videos", true)
+    else {
+        panic!("expected a track list payload");
+    };
+    assert!(flag);
+    let mut sorted = shuffled.clone();
+    sorted.sort_by(|a, b| a.video_id.cmp(&b.video_id));
+    let mut expected = tracks.clone();
+    expected.sort_by(|a, b| a.video_id.cmp(&b.video_id));
+    assert_eq!(sorted, expected);
+    // 40 tracks landing in their original order after a shuffle is
+    // astronomically unlikely; the drop must insert the shuffled order.
+    assert_ne!(shuffled, tracks);
+}
+
+#[test]
+fn track_list_subtitle_reports_count_and_shuffle() {
+    assert_eq!(track_list_subtitle(1, false), "1 song");
+    assert_eq!(track_list_subtitle(12, false), "12 songs");
+    assert_eq!(track_list_subtitle(12, true), "Shuffled · 12 songs");
 }

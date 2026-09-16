@@ -198,6 +198,23 @@ pub enum QueueDragPayload {
         subtitle: Option<String>,
         page_type: crate::models::HomeBrowsePageType,
     },
+    /// A Play All / Shuffle control dragged into the queue: the control's
+    /// tracks, resolved (and shuffled when `shuffled`) at press time, so the
+    /// drop follows the same insert path as a resolved playlist drop.
+    TrackList {
+        tracks: Vec<Track>,
+        title: String,
+        shuffled: bool,
+    },
+}
+
+/// An artist name rendered as a link inside a track row/card: clicking it
+/// opens the artist's browse page (the parser only keeps ids whose browse
+/// endpoint is an artist page).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistLink {
+    pub browse_id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -431,6 +448,9 @@ pub enum Message {
     ToastExpired {
         serial: u64,
     },
+    /// Artist link in a track row/card: open the artist page. The link is a
+    /// button, so the enclosing row never sees the press or release.
+    ArtistLinkClicked(ArtistLink),
     Noop,
 
     Playlists(super::playlists::Msg),
@@ -776,6 +796,15 @@ impl App {
                     ])
                 })
             }
+
+            Message::ArtistLinkClicked(link) => content_loading::load_browse_detail_task(
+                self,
+                link.browse_id,
+                link.name,
+                None,
+                crate::models::HomeBrowsePageType::Artist,
+                false,
+            ),
 
             Message::FocusSearch => {
                 // Ctrl+F (main page only): focus the search entry, select all.

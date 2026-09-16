@@ -5,10 +5,12 @@
 //! area-specific (track rows, cover cards, queue rows, settings cards) is
 //! built privately inside the owning area file using these primitives.
 
-use iced::widget::{Space, button, container, svg, text};
-use iced::{Element, Length};
+use iced::widget::{Space, button, container, mouse_area, rich_text, row, span, svg, text};
+use iced::{Color, Element, Length};
 
-use super::app::Message;
+use crate::models::Track;
+
+use super::app::{ArtistLink, Message};
 use super::theme;
 
 /// 1px horizontal hairline (replaces GTK `Separator`).
@@ -71,6 +73,83 @@ pub fn icon(handle: svg::Handle, size: f32) -> Element<'static, Message> {
         .width(Length::Fixed(size))
         .height(Length::Fixed(size))
         .into()
+}
+
+/// One-line artist caption. Every artist with a browse id is an underlined
+/// link that opens the artist page; the rest is plain text. Links are
+/// padding-less buttons so the enclosing row/card (a `mouse_area` drag
+/// source) sees neither the press nor the release of a link click.
+pub fn artist_line(track: &Track, size: f32, color: Color) -> Element<'static, Message> {
+    let plain = |label: String| {
+        text(label)
+            .size(size)
+            .color(color)
+            .wrapping(text::Wrapping::None)
+    };
+    let mut line = row![].align_y(iced::Alignment::Center);
+    if track.artists.is_empty() {
+        line = line.push(plain("Unknown artist".to_owned()));
+    }
+    for (index, artist) in track.artists.iter().enumerate() {
+        if index > 0 {
+            line = line.push(plain(", ".to_owned()));
+        }
+        match &artist.id {
+            Some(browse_id) => {
+                let name = rich_text::<(), Message, iced::Theme, iced::Renderer>([span(
+                    artist.name.clone(),
+                )
+                .underline(true)])
+                .size(size)
+                .wrapping(text::Wrapping::None);
+                line = line.push(
+                    button(name)
+                        .style(theme::link_text(color))
+                        .padding(0)
+                        .on_press(Message::ArtistLinkClicked(ArtistLink {
+                            browse_id: browse_id.clone(),
+                            name: artist.name.clone(),
+                        })),
+                );
+            }
+            None => line = line.push(plain(artist.name.clone())),
+        }
+    }
+    container(line).width(Length::Fill).clip(true).into()
+}
+
+/// Messages a `drag_control` emits (its press registers a queue drag, so the
+/// click lands on release and hover is tracked by the owning view).
+pub struct DragControlEvents {
+    pub press: Message,
+    pub release: Message,
+    pub enter: Message,
+    pub exit: Message,
+}
+
+/// Icon + label control styled like `secondary_button` but built on a
+/// `mouse_area` so it doubles as a queue drag source (Play All / Shuffle).
+pub fn drag_control(
+    handle: svg::Handle,
+    icon_size: f32,
+    label: &'static str,
+    hovered: bool,
+    events: DragControlEvents,
+) -> Element<'static, Message> {
+    let content = row![icon(handle, icon_size), text(label).size(theme::SIZE_BODY)]
+        .spacing(theme::SPACE_SM)
+        .align_y(iced::Alignment::Center);
+    mouse_area(
+        container(content)
+            .padding([theme::SPACE_SM, theme::SPACE_LG])
+            .style(theme::secondary_surface(hovered)),
+    )
+    .interaction(iced::mouse::Interaction::Pointer)
+    .on_press(events.press)
+    .on_release(events.release)
+    .on_enter(events.enter)
+    .on_exit(events.exit)
+    .into()
 }
 
 /// Circular transparent icon button. `on_press: None` renders it disabled —

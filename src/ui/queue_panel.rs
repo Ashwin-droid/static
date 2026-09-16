@@ -1375,6 +1375,7 @@ fn payload_thumbnail_url<'a>(app: &'a App, payload: &'a QueueDragPayload) -> Opt
         QueueDragPayload::Track { track } => track.thumbnail_url.as_deref(),
         QueueDragPayload::Playlist { thumbnail_url, .. }
         | QueueDragPayload::BrowseCollection { thumbnail_url, .. } => thumbnail_url.as_deref(),
+        QueueDragPayload::TrackList { tracks, .. } => tracks.first()?.thumbnail_url.as_deref(),
     }
 }
 
@@ -1437,7 +1438,66 @@ fn queue_preview_data_for_payload(
             thumbnail_url: thumbnail_url.clone(),
             duration: None,
         }),
+        QueueDragPayload::TrackList {
+            tracks,
+            title,
+            shuffled,
+        } => Some(QueuePreviewData {
+            title: title.clone(),
+            subtitle: track_list_subtitle(tracks.len(), *shuffled),
+            thumbnail_url: tracks.first().and_then(|track| track.thumbnail_url.clone()),
+            duration: None,
+        }),
     }
+}
+
+/// Drop-preview subtitle for a dragged Play All / Shuffle control.
+fn track_list_subtitle(count: usize, shuffled: bool) -> String {
+    let songs = if count == 1 {
+        "1 song".to_owned()
+    } else {
+        format!("{count} songs")
+    };
+    if shuffled {
+        format!("Shuffled · {songs}")
+    } else {
+        songs
+    }
+}
+
+/// Payload for a pressed Play All / Shuffle control. The tracks are captured
+/// now (shuffled when asked) so a later drop inserts exactly what the preview
+/// showed; `None` when the control has nothing to play.
+pub fn track_list_payload(
+    tracks: Vec<Track>,
+    title: impl Into<String>,
+    shuffle: bool,
+) -> Option<QueueDragPayload> {
+    if tracks.is_empty() {
+        return None;
+    }
+    let mut tracks = tracks;
+    if shuffle {
+        use rand::seq::SliceRandom;
+        tracks.shuffle(&mut rand::rng());
+    }
+    Some(QueueDragPayload::TrackList {
+        tracks,
+        title: title.into(),
+        shuffled: shuffle,
+    })
+}
+
+/// Register a pending queue drag from view `update` code (the control's
+/// press resolved its payload from state rather than at view time).
+pub fn start_drag_task(app: &mut App, payload: QueueDragPayload) -> Task<Message> {
+    update(
+        app,
+        Msg::DragStarted {
+            payload,
+            position: Point::ORIGIN,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2049,6 +2109,9 @@ pub fn handle_drop_payload_task(
             queue_op(app, move |daemon| daemon.move_queue_item(from, raw_slot))
         }
         QueueDragPayload::Track { track } => insert_tracks_task(app, vec![track], raw_slot),
+        // Already resolved (and shuffled) at press time: same insert as a
+        // resolved collection drop.
+        QueueDragPayload::TrackList { tracks, .. } => insert_tracks_task(app, tracks, raw_slot),
         payload @ (QueueDragPayload::Playlist { .. }
         | QueueDragPayload::BrowseCollection { .. }) => {
             let client = app.app_client();
@@ -2473,7 +2536,9 @@ fn resolve_dragged_collection_tracks(
             .ok_or_else(|| "Not connected.".to_owned())?
             .get_browse_tracks(browse_id)
             .map_err(|err| err.to_string()),
-        QueueDragPayload::QueueRow { .. } | QueueDragPayload::Track { .. } => Ok(Vec::new()),
+        QueueDragPayload::QueueRow { .. }
+        | QueueDragPayload::Track { .. }
+        | QueueDragPayload::TrackList { .. } => Ok(Vec::new()),
     }
 }
 

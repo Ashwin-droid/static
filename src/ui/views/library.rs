@@ -95,6 +95,11 @@ pub enum Hover {
     OfflineCard(usize),
     OfflineRow(usize),
     OfflinePlaylistRow(usize),
+    /// Play All (`shuffle: false`) / Shuffle control of a page.
+    PlayControl {
+        page: Page,
+        shuffle: bool,
+    },
 }
 
 pub struct State {
@@ -184,6 +189,12 @@ pub enum Msg {
     },
     /// Lean Play All / Shuffle emitted by the view (same resolution).
     PagePlayAll {
+        page: Page,
+        shuffle: bool,
+    },
+    /// Play All / Shuffle pressed: resolve the page's tracks and register
+    /// them as a queue drag; the release delivers `PagePlayAll`.
+    PageControlPressed {
         page: Page,
         shuffle: bool,
     },
@@ -426,11 +437,24 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::PagePlayAll { page, shuffle } => {
+            if release_pending_press(app).was_drag_or_foreign() {
+                return Task::none();
+            }
             let (tracks, context) = page_play_data(app, page);
             if tracks.is_empty() {
                 return Task::none();
             }
             queue_panel::play_all_task(app, tracks, shuffle, context)
+        }
+        Msg::PageControlPressed { page, shuffle } => {
+            let (tracks, context) = page_play_data(app, page);
+            let title = context
+                .map(|context| context.title)
+                .unwrap_or_else(|| "Offline".to_owned());
+            match queue_panel::track_list_payload(tracks, title, shuffle) {
+                Some(payload) => queue_panel::start_drag_task(app, payload),
+                None => Task::none(),
+            }
         }
 
         Msg::DownloadAll { tracks, meta } => {
@@ -561,6 +585,18 @@ fn play_track_context(
 struct ReleasedPress {
     payload: Option<QueueDragPayload>,
     was_active: bool,
+}
+
+impl ReleasedPress {
+    /// A Play All / Shuffle release is a click only when the press did not
+    /// become a drag and did not slide in from a row or card.
+    fn was_drag_or_foreign(&self) -> bool {
+        self.was_active
+            || !matches!(
+                self.payload,
+                None | Some(QueueDragPayload::TrackList { .. })
+            )
+    }
 }
 
 /// Rows/cards deliver their click on `mouse_area::on_release` (the press
@@ -1096,22 +1132,10 @@ fn play_controls<'a>(
         }
     }
 
-    controls = controls.push(control_button(
-        icons::play(),
-        "Play All",
-        Msg::PagePlayAll {
-            page,
-            shuffle: false,
-        },
-    ));
-    controls = controls.push(control_button(
-        icons::shuffle(),
-        "Shuffle",
-        Msg::PagePlayAll {
-            page,
-            shuffle: true,
-        },
-    ));
+    // Play All / Shuffle are queue drag sources: dropping one into the queue
+    // inserts the page's (shuffled) tracks at the drop slot.
+    controls = controls.push(control_button(app, icons::play(), "Play All", page, false));
+    controls = controls.push(control_button(app, icons::shuffle(), "Shuffle", page, true));
 
     if let Some(playlist_id) = download_playlist_id {
         let downloaded = app.library.downloaded_playlists.contains(playlist_id);
@@ -1149,12 +1173,26 @@ fn control_content(icon: svg::Handle, label: &'static str) -> Element<'static, M
     .into()
 }
 
-fn control_button(icon: svg::Handle, label: &'static str, msg: Msg) -> Element<'static, Message> {
-    button(control_content(icon, label))
-        .style(theme::secondary_button)
-        .padding([theme::SPACE_SM, theme::SPACE_LG])
-        .on_press(Message::Library(msg))
-        .into()
+fn control_button(
+    app: &App,
+    icon: svg::Handle,
+    label: &'static str,
+    page: Page,
+    shuffle: bool,
+) -> Element<'static, Message> {
+    let hover = Hover::PlayControl { page, shuffle };
+    widgets::drag_control(
+        icon,
+        CONTROL_ICON_SIZE,
+        label,
+        app.library.hovered == Some(hover),
+        widgets::DragControlEvents {
+            press: Message::Library(Msg::PageControlPressed { page, shuffle }),
+            release: Message::Library(Msg::PagePlayAll { page, shuffle }),
+            enter: Message::Library(Msg::Hovered(hover)),
+            exit: Message::Library(Msg::Unhovered(hover)),
+        },
+    )
 }
 
 /// Homogeneous 2-column track grid: item `i` lands at column `i % 2`, row
@@ -1238,7 +1276,7 @@ fn track_row<'a>(
     );
     let info = column![
         clipped_title(&track.title),
-        clipped_caption(artist_string(track)),
+        widgets::artist_line(track, theme::SIZE_CAPTION, theme::TEXT_DIM),
     ]
     .spacing(theme::SPACE_XXS)
     .width(Length::Fill);
@@ -1406,19 +1444,6 @@ fn clipped_caption(label: String) -> Element<'static, Message> {
 // ---------------------------------------------------------------------------
 // Pure helpers (ported from GTK window.rs)
 // ---------------------------------------------------------------------------
-
-fn artist_string(track: &Track) -> String {
-    if track.artists.is_empty() {
-        "Unknown artist".to_owned()
-    } else {
-        track
-            .artists
-            .iter()
-            .map(|artist| artist.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
 
 fn count_label(label: String) -> Element<'static, Message> {
     text(label)

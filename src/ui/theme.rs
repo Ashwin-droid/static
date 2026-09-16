@@ -408,6 +408,39 @@ pub fn secondary_button(_t: &Theme, status: button::Status) -> button::Style {
     style
 }
 
+/// `secondary_button` look for a `mouse_area`-driven control (Play All /
+/// Shuffle are queue drag sources, so hover is tracked by the view).
+pub fn secondary_surface(hovered: bool) -> impl Fn(&Theme) -> container::Style {
+    move |_t| container::Style {
+        background: Some(Background::Color(if hovered {
+            white(0.10)
+        } else {
+            white(0.06)
+        })),
+        text_color: Some(TEXT),
+        border: Border {
+            color: BORDER_SUBTLE,
+            width: 1.0,
+            radius: RADIUS_LG.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Inline artist link (a padding-less button inside a caption line): the
+/// caption colour at rest, bright while hovered/pressed. The underline comes
+/// from the rich-text span it wraps.
+pub fn link_text(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_t, status| button::Style {
+        background: None,
+        text_color: match status {
+            button::Status::Hovered | button::Status::Pressed => TEXT_BRIGHT,
+            _ => color,
+        },
+        ..button::Style::default()
+    }
+}
+
 /// Destructive action ("Log out", "Clear cache").
 pub fn danger_button(_t: &Theme, status: button::Status) -> button::Style {
     let bg = match status {

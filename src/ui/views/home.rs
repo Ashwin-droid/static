@@ -73,6 +73,9 @@ pub struct State {
     /// `mouse_area`s (queue drag sources), so hover feedback is tracked
     /// explicitly like the search grids.
     pub hovered_item: Option<(usize, usize)>,
+    /// Hovered Play All / Shuffle control `(section, shuffle)` — also a
+    /// `mouse_area` drag source.
+    pub hovered_control: Option<(usize, bool)>,
 }
 
 impl Default for State {
@@ -88,6 +91,7 @@ impl Default for State {
             resume: None,
             resume_in_flight: false,
             hovered_item: None,
+            hovered_control: None,
         }
     }
 }
@@ -138,6 +142,20 @@ pub enum Msg {
     BrowseCardClicked(HomeBrowseCard),
     /// Play All / Shuffle on a section (tracks resolved from state).
     SectionPlayAll {
+        section: usize,
+        shuffle: bool,
+    },
+    /// Play All / Shuffle pressed: resolve the section's tracks and register
+    /// them as a queue drag; the release delivers `SectionPlayAll`.
+    SectionControlPressed {
+        section: usize,
+        shuffle: bool,
+    },
+    ControlHovered {
+        section: usize,
+        shuffle: bool,
+    },
+    ControlUnhovered {
         section: usize,
         shuffle: bool,
     },
@@ -202,7 +220,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
         let tracks = section_tracks(section);
         if should_show_home_play_controls(section, &tracks) {
-            content = content.push(play_controls(section_index));
+            content = content.push(play_controls(app, section_index));
         }
         content = content.push(section_body(app, section_index, section, tracks.len()));
     }
@@ -226,12 +244,39 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         Msg::TrackCardClicked(track) => handle_track_card_clicked(app, track),
         Msg::BrowseCardClicked(card) => handle_browse_card_clicked(app, card),
         Msg::SectionPlayAll { section, shuffle } => {
+            if release_pending_press(app).was_drag_or_foreign() {
+                return Task::none();
+            }
             let tracks = cached_section_tracks(app, section);
             if tracks.is_empty() {
                 return Task::none();
             }
             // Home play controls carry no playlist context (views spec §6.1).
             queue_panel::play_all_task(app, tracks, shuffle, None)
+        }
+        Msg::SectionControlPressed { section, shuffle } => {
+            let title = app
+                .home
+                .page
+                .as_ref()
+                .and_then(|page| page.sections.get(section))
+                .map(|section| section.title.clone())
+                .unwrap_or_default();
+            let tracks = cached_section_tracks(app, section);
+            match queue_panel::track_list_payload(tracks, title, shuffle) {
+                Some(payload) => queue_panel::start_drag_task(app, payload),
+                None => Task::none(),
+            }
+        }
+        Msg::ControlHovered { section, shuffle } => {
+            app.home.hovered_control = Some((section, shuffle));
+            Task::none()
+        }
+        Msg::ControlUnhovered { section, shuffle } => {
+            if app.home.hovered_control == Some((section, shuffle)) {
+                app.home.hovered_control = None;
+            }
+            Task::none()
         }
         Msg::ResumeClicked => handle_resume_clicked(app),
         Msg::ResumeFinished { result } => {
@@ -267,6 +312,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         Msg::ItemUnhovered { section, item } => {
             if app.home.hovered_item == Some((section, item)) {
                 app.home.hovered_item = None;
+                app.home.hovered_control = None;
             }
             Task::none()
         }
@@ -590,6 +636,18 @@ struct ReleasedPress {
     was_active: bool,
 }
 
+impl ReleasedPress {
+    /// A Play All / Shuffle release is a click only when the press did not
+    /// become a drag and did not slide in from a row or card.
+    fn was_drag_or_foreign(&self) -> bool {
+        self.was_active
+            || !matches!(
+                self.payload,
+                None | Some(QueueDragPayload::TrackList { .. })
+            )
+    }
+}
+
 /// Cards/rows deliver their click on `mouse_area::on_release` (the press
 /// registered a pending queue drag). A release before the drag activated is
 /// the normal click (CONTRACT.md §7.2); either way the pending drag state is
@@ -658,13 +716,7 @@ fn resume_row(app: &App) -> Option<Element<'_, Message>> {
             Some(theme::FONT_SEMIBOLD),
             None
         ),
-        clipped_line(
-            &artist_string(&data.track),
-            theme::SIZE_CAPTION,
-            theme::TEXT_DIM,
-            None,
-            None
-        ),
+        widgets::artist_line(&data.track, theme::SIZE_CAPTION, theme::TEXT_DIM),
         clipped_line(&data.meta, theme::SIZE_MICRO, theme::TEXT_FAINT, None, None),
     ]
     .spacing(theme::SPACE_XXS)
@@ -796,13 +848,7 @@ fn cover_card<'a>(app: &'a App, key: (usize, usize), track: &'a Track) -> Elemen
             Some(theme::FONT_SEMIBOLD),
             Some(&track.title)
         ),
-        clipped_line(
-            &artist_string(track),
-            theme::SIZE_CAPTION,
-            theme::TEXT_FAINT,
-            None,
-            None
-        ),
+        widgets::artist_line(track, theme::SIZE_CAPTION, theme::TEXT_FAINT),
     ]
     .spacing(theme::SPACE_SM)
     .width(Length::Fixed(COVER_ART_SIZE));
@@ -922,13 +968,7 @@ fn track_row<'a>(app: &'a App, key: (usize, usize), track: &'a Track) -> Element
             Some(theme::FONT_SEMIBOLD),
             Some(&track.title)
         ),
-        clipped_line(
-            &artist_string(track),
-            theme::SIZE_CAPTION,
-            theme::TEXT_DIM,
-            None,
-            None
-        ),
+        widgets::artist_line(track, theme::SIZE_CAPTION, theme::TEXT_DIM),
     ]
     .spacing(theme::SPACE_XXS)
     .width(Length::Fill);
@@ -1049,42 +1089,37 @@ fn browse_row<'a>(
 
 /// Play All + Shuffle (home sections never carry Download All or a playlist
 /// context — views spec §6.1).
-fn play_controls(section_index: usize) -> Element<'static, Message> {
+/// Both controls are queue drag sources: dropping one into the queue inserts
+/// the section's (shuffled) tracks at the drop slot.
+fn play_controls(app: &App, section_index: usize) -> Element<'static, Message> {
     row![
-        control_button(
-            icons::play(),
-            "Play All",
-            Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: false,
-            },
-        ),
-        control_button(
-            icons::shuffle(),
-            "Shuffle",
-            Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: true,
-            },
-        ),
+        control_button(app, icons::play(), "Play All", section_index, false),
+        control_button(app, icons::shuffle(), "Shuffle", section_index, true),
     ]
     .spacing(theme::SPACE_MD)
     .into()
 }
 
-fn control_button(icon: svg::Handle, label: &'static str, msg: Msg) -> Element<'static, Message> {
-    button(
-        row![
-            widgets::icon(icon, CONTROL_ICON_SIZE),
-            text(label).size(theme::SIZE_BODY),
-        ]
-        .spacing(theme::SPACE_SM)
-        .align_y(iced::Alignment::Center),
+fn control_button(
+    app: &App,
+    icon: svg::Handle,
+    label: &'static str,
+    section: usize,
+    shuffle: bool,
+) -> Element<'static, Message> {
+    let hovered = app.home.hovered_control == Some((section, shuffle));
+    widgets::drag_control(
+        icon,
+        CONTROL_ICON_SIZE,
+        label,
+        hovered,
+        widgets::DragControlEvents {
+            press: Message::Home(Msg::SectionControlPressed { section, shuffle }),
+            release: Message::Home(Msg::SectionPlayAll { section, shuffle }),
+            enter: Message::Home(Msg::ControlHovered { section, shuffle }),
+            exit: Message::Home(Msg::ControlUnhovered { section, shuffle }),
+        },
     )
-    .style(theme::secondary_button)
-    .padding([theme::SPACE_SM, theme::SPACE_LG])
-    .on_press(Message::Home(msg))
-    .into()
 }
 
 /// Homogeneous 2-column grid: item `i` lands at column `i % 2`, row `i / 2`

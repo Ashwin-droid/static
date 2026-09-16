@@ -65,6 +65,9 @@ pub struct State {
     /// Hovered cell `(section, item)` — rows/cards are `mouse_area`s (queue
     /// drag sources), so hover feedback is tracked explicitly.
     pub hovered_item: Option<(usize, usize)>,
+    /// Hovered Play All / Shuffle control `(section, shuffle)`; page-level
+    /// controls use `None` — also `mouse_area` drag sources.
+    pub hovered_control: Option<(Option<usize>, bool)>,
     /// Persisted per-playlist resume state exists (probed after every load).
     pub resume_available: bool,
     pub resume_in_flight: bool,
@@ -87,6 +90,7 @@ impl Default for State {
             autoplay_pending: false,
             request_serial: 0,
             hovered_item: None,
+            hovered_control: None,
             resume_available: false,
             resume_in_flight: false,
             playlist_downloaded: false,
@@ -130,6 +134,21 @@ pub enum Msg {
     /// Play controls of an all-track artist section (context-less queue).
     SectionPlayAll {
         section: usize,
+        shuffle: bool,
+    },
+    /// Play All / Shuffle pressed (page-level when `section` is `None`):
+    /// resolve the tracks and register them as a queue drag; the release
+    /// delivers `PlayAll` / `SectionPlayAll`.
+    ControlPressed {
+        section: Option<usize>,
+        shuffle: bool,
+    },
+    ControlHovered {
+        section: Option<usize>,
+        shuffle: bool,
+    },
+    ControlUnhovered {
+        section: Option<usize>,
         shuffle: bool,
     },
     /// Autoplay fallback fetch finished (first playable card's tracks).
@@ -212,6 +231,9 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::PlayAll { shuffle } => {
+            if release_pending_press(app).was_drag_or_foreign() {
+                return Task::none();
+            }
             let Some(BrowseDetailData::Tracks(tracks)) = &app.browse.data else {
                 return Task::none();
             };
@@ -317,6 +339,9 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::SectionPlayAll { section, shuffle } => {
+            if release_pending_press(app).was_drag_or_foreign() {
+                return Task::none();
+            }
             let Some(BrowseDetailData::Sections(page)) = &app.browse.data else {
                 return Task::none();
             };
@@ -329,6 +354,33 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
                 return Task::none();
             }
             queue_panel::play_all_task(app, tracks, shuffle, None)
+        }
+        Msg::ControlPressed { section, shuffle } => {
+            let (title, tracks) = match (section, &app.browse.data) {
+                (None, Some(BrowseDetailData::Tracks(tracks))) => {
+                    (app.browse.title.clone(), tracks.clone())
+                }
+                (Some(index), Some(BrowseDetailData::Sections(page))) => page
+                    .sections
+                    .get(index)
+                    .map(|section| (section.title.clone(), section_tracks(section)))
+                    .unwrap_or_default(),
+                _ => return Task::none(),
+            };
+            match queue_panel::track_list_payload(tracks, title, shuffle) {
+                Some(payload) => queue_panel::start_drag_task(app, payload),
+                None => Task::none(),
+            }
+        }
+        Msg::ControlHovered { section, shuffle } => {
+            app.browse.hovered_control = Some((section, shuffle));
+            Task::none()
+        }
+        Msg::ControlUnhovered { section, shuffle } => {
+            if app.browse.hovered_control == Some((section, shuffle)) {
+                app.browse.hovered_control = None;
+            }
+            Task::none()
         }
 
         Msg::AutoplayFallbackLoaded { card, tracks } => {
@@ -399,6 +451,7 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         Msg::ItemUnhovered { section, item } => {
             if app.browse.hovered_item == Some((section, item)) {
                 app.browse.hovered_item = None;
+                app.browse.hovered_control = None;
             }
             Task::none()
         }
@@ -727,6 +780,18 @@ struct ReleasedPress {
     was_active: bool,
 }
 
+impl ReleasedPress {
+    /// A Play All / Shuffle release is a click only when the press did not
+    /// become a drag and did not slide in from a row or card.
+    fn was_drag_or_foreign(&self) -> bool {
+        self.was_active
+            || !matches!(
+                self.payload,
+                None | Some(QueueDragPayload::TrackList { .. })
+            )
+    }
+}
+
 /// Rows/cards register a pending queue drag on press; a release before the
 /// drag activated is the normal click. The pending drag state is cleared
 /// either way because the queue panel never sees releases over the content
@@ -867,15 +932,21 @@ fn play_controls(app: &App) -> Element<'_, Message> {
             (!state.resume_in_flight).then_some(Msg::ResumePressed),
         ));
     }
-    controls = controls.push(control_button(
+    // Play All / Shuffle are queue drag sources: dropping one into the queue
+    // inserts the collection's (shuffled) tracks at the drop slot.
+    controls = controls.push(drag_control_button(
+        app,
         icons::play(),
         "Play All",
-        Some(Msg::PlayAll { shuffle: false }),
+        None,
+        false,
     ));
-    controls = controls.push(control_button(
+    controls = controls.push(drag_control_button(
+        app,
         icons::shuffle(),
         "Shuffle",
-        Some(Msg::PlayAll { shuffle: true }),
+        None,
+        true,
     ));
 
     if matches!(
@@ -901,27 +972,41 @@ fn play_controls(app: &App) -> Element<'_, Message> {
     controls.into()
 }
 
-fn artist_play_controls(section_index: usize) -> Element<'static, Message> {
+fn artist_play_controls(app: &App, section_index: usize) -> Element<'static, Message> {
     row![
-        control_button(
-            icons::play(),
-            "Play All",
-            Some(Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: false,
-            }),
-        ),
-        control_button(
-            icons::shuffle(),
-            "Shuffle",
-            Some(Msg::SectionPlayAll {
-                section: section_index,
-                shuffle: true,
-            }),
-        ),
+        drag_control_button(app, icons::play(), "Play All", Some(section_index), false),
+        drag_control_button(app, icons::shuffle(), "Shuffle", Some(section_index), true),
     ]
     .spacing(theme::SPACE_MD)
     .into()
+}
+
+/// Play All / Shuffle built on a `mouse_area` so the press registers a queue
+/// drag; a release that never became a drag is the click.
+fn drag_control_button(
+    app: &App,
+    icon: svg::Handle,
+    label: &'static str,
+    section: Option<usize>,
+    shuffle: bool,
+) -> Element<'static, Message> {
+    let hovered = app.browse.hovered_control == Some((section, shuffle));
+    let release = match section {
+        Some(section) => Msg::SectionPlayAll { section, shuffle },
+        None => Msg::PlayAll { shuffle },
+    };
+    widgets::drag_control(
+        icon,
+        CONTROL_ICON_SIZE,
+        label,
+        hovered,
+        widgets::DragControlEvents {
+            press: Message::Browse(Msg::ControlPressed { section, shuffle }),
+            release: Message::Browse(release),
+            enter: Message::Browse(Msg::ControlHovered { section, shuffle }),
+            exit: Message::Browse(Msg::ControlUnhovered { section, shuffle }),
+        },
+    )
 }
 
 /// `on_press: None` renders the button disabled (Resume in flight,
@@ -990,7 +1075,7 @@ fn sections_page<'a>(app: &'a App, page: &'a BrowseSectionsPage) -> Element<'a, 
         let card_count = section.contents.len() - track_count;
 
         if track_count == section.contents.len() && track_count > 0 {
-            body = body.push(artist_play_controls(*section_index));
+            body = body.push(artist_play_controls(app, *section_index));
             body = body.push(section_track_grid(app, *section_index, section));
         } else if card_count == section.contents.len() && card_count > 0 {
             body = body.push(section_browse_grid(app, *section_index, section));
@@ -1040,7 +1125,7 @@ fn hero<'a>(
 
     if let Some((section_index, top_songs)) = sections.top_songs {
         if !section_tracks(top_songs).is_empty() {
-            meta = meta.push(artist_play_controls(section_index));
+            meta = meta.push(artist_play_controls(app, section_index));
         }
     }
 
@@ -1169,7 +1254,7 @@ fn track_row<'a>(
     );
     let info = column![
         clipped_title(&track.title),
-        clipped_caption(artist_string(track)),
+        widgets::artist_line(track, theme::SIZE_CAPTION, theme::TEXT_DIM),
     ]
     .spacing(theme::SPACE_XXS)
     .width(Length::Fill);

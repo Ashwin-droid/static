@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { db, defaultGainSettings, GainHistory, parseDiagnostics, type Diagnostics } from '../src/calibration-data';
-const sample = (sequence=1, generation=1): Diagnostics => ({type:'diagnostics',paused:false,track:{video_id:'test',title:'Test',artist:'Artist'},frame:{generation,sequence,position_millis:100,settings:{...defaultGainSettings},input_rms:0.1,input_peak:0.2,output_rms:0.2,output_peak:0.4,rolling_rms:0.15,window_seconds:1,audible_seconds:1,requested_gain:2,preview_gain:1.5,applied_gain:1.9,xdgain_db:0,reference_rms:null,limiter_gain:1,master_gain:1}});
+const sample = (sequence=1, generation=1): Diagnostics => ({type:'diagnostics',paused:false,track:{video_id:'test',title:'Test',artist:'Artist'},frame:{generation,sequence,position_millis:100,settings:{...defaultGainSettings},input_rms:0.1,input_peak:0.2,gain_output_rms:0.2,gain_output_peak:0.4,output_rms:0.1,output_peak:0.2,rolling_rms:0.15,window_seconds:1,audible_seconds:1,requested_gain:2,preview_gain:1.5,applied_gain:1.9,xdgain_reference_dbfs:null,limiter_gain:1,master_gain:1}});
 test('diagnostics use amplitude dB and refuse malformed or nonfinite values',()=>{
   assert.equal(db(0.1),-20);assert.equal(db(0),-96);assert.ok(Math.abs(db(2)-6.0206)<0.001);
   assert.deepEqual(parseDiagnostics(sample()),sample());
-  for(const invalid of [{},null,{...sample(),paused:'false'}, {...sample(),frame:{...sample().frame,output_rms:NaN}}, {...sample(),frame:{...sample().frame,settings:{...defaultGainSettings,ra_seconds:0}}}])assert.equal(parseDiagnostics(invalid),null);
+  for(const invalid of [{},null,{...sample(),paused:'false'}, {...sample(),frame:{...sample().frame,gain_output_rms:undefined}}, {...sample(),frame:{...sample().frame,gain_output_rms:NaN}}, {...sample(),frame:{...sample().frame,output_rms:NaN}}, {...sample(),frame:{...sample().frame,settings:{...defaultGainSettings,ra_seconds:0}}}])assert.equal(parseDiagnostics(invalid),null);
 });
 test('history records fresh output only, remains bounded, and resets for new streams',()=>{
   const history=new GainHistory();
@@ -16,4 +16,11 @@ test('history records fresh output only, remains bounded, and resets for new str
   assert.ok(history.append(sample(1,2),100000));assert.equal(history.points.length,1);
   assert.ok(!history.append(sample(2000,1),100100));
   history.clear();assert.ok(history.append(sample(1,1),101000));
+});
+
+test('previous-song reference accepts negative dBFS and remains optional on the first song',()=>{
+  const chained={...sample(),frame:{...sample().frame,xdgain_reference_dbfs:-22.5}};
+  assert.equal(parseDiagnostics(chained)?.frame.xdgain_reference_dbfs,-22.5);
+  assert.equal(parseDiagnostics(sample())?.frame.xdgain_reference_dbfs,null);
+  assert.equal(parseDiagnostics({...chained,frame:{...chained.frame,xdgain_reference_dbfs:NaN}}),null);
 });

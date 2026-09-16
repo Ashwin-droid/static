@@ -112,9 +112,6 @@ mod imp {
                     let mut upcoming = front.target;
                     for block in &pending.blocks {
                         upcoming.dynamic = upcoming.dynamic.min(block.target.dynamic);
-                        if block.target.audible {
-                            upcoming.offset_db = upcoming.offset_db.min(block.target.offset_db);
-                        }
                     }
                     let mut block = pending.blocks.pop_front().unwrap();
                     pending.frames -= block.frames;
@@ -267,12 +264,7 @@ mod imp {
                     if self.emit(true).is_err() {
                         return false;
                     }
-                    self.processor
-                        .get()
-                        .unwrap()
-                        .lock()
-                        .unwrap()
-                        .finish_reference();
+                    self.processor.get().unwrap().lock().unwrap().finish_song();
                 }
                 _ => {}
             }
@@ -802,6 +794,49 @@ mod tests {
         assert_eq!(reset.sequence, 0);
         assert_eq!(reset.position_millis, None);
         assert!(reset.generation > frame.generation);
+    }
+
+    #[test]
+    fn eos_finalizes_the_emitted_tail_and_skip_excludes_buffered_future_audio() {
+        for natural_end in [false, true] {
+            let harness = Harness::new();
+            {
+                let mut processor = harness.processor.lock().unwrap();
+                processor.configure(super::super::dynamic_gain::Config {
+                    enabled: true,
+                    xdgain_enabled: true,
+                    flatten_percent: 0.0,
+                    ra_seconds: 1.0,
+                    ..Default::default()
+                });
+            }
+            harness.push(0.1, 260, 0);
+            if natural_end {
+                harness.push(0.8, 100, 260);
+                harness.eos();
+            } else {
+                harness.push(0.8, 100, 260);
+            }
+            let mut processor = harness.processor.lock().unwrap();
+            let last_db = 20.0 * processor.diagnostics().rolling_rms.log10();
+            assert_eq!(processor.diagnostics().xdgain_reference_dbfs, None);
+            let state = processor.cross_song_state();
+            processor.reset();
+            processor.finish_song();
+            drop(processor);
+            let next = Harness::new();
+            let mut new_processor = next.processor.lock().unwrap();
+            new_processor.configure(super::super::dynamic_gain::Config {
+                enabled: true,
+                xdgain_enabled: true,
+                ..Default::default()
+            });
+            new_processor.restore_cross_song_state(state);
+            assert!(
+                (new_processor.diagnostics().xdgain_reference_dbfs.unwrap() - last_db).abs()
+                    < 1e-10
+            );
+        }
     }
 
     #[test]

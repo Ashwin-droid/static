@@ -3,9 +3,9 @@ export interface GainSettings {
 }
 export interface GainFrame {
   generation: number; sequence: number; position_millis: number | null; settings: GainSettings;
-  input_rms: number; input_peak: number; output_rms: number; output_peak: number; rolling_rms: number;
+  input_rms: number; input_peak: number; gain_output_rms: number; gain_output_peak: number; output_rms: number; output_peak: number; rolling_rms: number;
   window_seconds: number; audible_seconds: number; requested_gain: number; preview_gain: number;
-  applied_gain: number; xdgain_db: number; reference_rms: number | null; limiter_gain: number; master_gain: number;
+  applied_gain: number; xdgain_reference_dbfs: number | null; limiter_gain: number; master_gain: number;
 }
 export interface Diagnostics { type: 'diagnostics'; frame: GainFrame; paused: boolean; track: {video_id:string; title:string; artist:string} | null }
 export const defaultGainSettings: GainSettings = { enabled:false, flatten_percent:50, ra_seconds:15, change_lazyness_percent:50, xdgain_enabled:false };
@@ -22,8 +22,8 @@ export function parseDiagnostics(raw: unknown): Diagnostics | null {
       !within(s.flatten_percent,0,100) || !within(s.ra_seconds,0.1,120) || !within(s.change_lazyness_percent,0,100)) return null;
   if (!Number.isSafeInteger(f.generation) || f.generation < 0 || !Number.isSafeInteger(f.sequence) || f.sequence < 0 ||
       !(f.position_millis === null || (Number.isSafeInteger(f.position_millis) && f.position_millis >= 0)) ||
-      !['input_rms','input_peak','output_rms','output_peak','rolling_rms','window_seconds','audible_seconds','requested_gain','preview_gain','applied_gain','limiter_gain','master_gain'].every(key => finite(f[key]) && f[key] >= 0) ||
-      !finite(f.xdgain_db) || !(f.reference_rms === null || (finite(f.reference_rms) && f.reference_rms >= 0))) return null;
+      !['input_rms','input_peak','gain_output_rms','gain_output_peak','output_rms','output_peak','rolling_rms','window_seconds','audible_seconds','requested_gain','preview_gain','applied_gain','limiter_gain','master_gain'].every(key => finite(f[key]) && f[key] >= 0) ||
+      !(f.xdgain_reference_dbfs === null || finite(f.xdgain_reference_dbfs))) return null;
   if (!(raw.track === null || (record(raw.track) && ['video_id','title','artist'].every(key => typeof raw.track[key] === 'string')))) return null;
   return raw as unknown as Diagnostics;
 }

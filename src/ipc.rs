@@ -36,6 +36,7 @@ pub fn youtube_music_watch_url(video_id: &str) -> String {
 pub struct GainCalibrationSettings {
     pub enabled: bool,
     pub flatten_percent: f64,
+    /// WRA interval: 70% new input and 30% retained reference over this time.
     pub ra_seconds: f64,
     pub change_lazyness_percent: f64,
     pub xdgain_enabled: bool,
@@ -85,16 +86,21 @@ pub struct GainDiagnostics {
     pub settings: GainCalibrationSettings,
     pub input_rms: f64,
     pub input_peak: f64,
+    /// Correction against WRA (including the xdGain reference), before master/limiter.
+    pub gain_output_rms: f64,
+    pub gain_output_peak: f64,
     pub output_rms: f64,
     pub output_peak: f64,
+    /// WRA blended in dBFS, converted to linear amplitude for level metering.
     pub rolling_rms: f64,
+    /// Audio observed since the WRA reset; there is no finite expiry window.
     pub window_seconds: f64,
     pub audible_seconds: f64,
     pub requested_gain: f64,
     pub preview_gain: f64,
     pub applied_gain: f64,
-    pub xdgain_db: f64,
-    pub reference_rms: Option<f64>,
+    /// Fixed last emitted WRA of the previous song; absent on the first song.
+    pub xdgain_reference_dbfs: Option<f64>,
     pub limiter_gain: f64,
     pub master_gain: f64,
 }

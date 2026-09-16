@@ -1267,7 +1267,7 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     "xdgain_enabled",
                     "xdGain on",
                     if settings.dgain_enabled {
-                        "Match later songs to the first song actually played; carry the virtual gain offset across tracks."
+                        "Seed each song from the previous song’s final WRA; blend it into the new WRA in dBFS."
                     } else {
                         "Inactive while dGain is off. Enable dGain before turning xdGain on."
                     },
@@ -1282,13 +1282,13 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     settings,
                     "dgain_change_lazyness",
                     "dGain change lazyness",
-                    "Higher values resist small, frequent gain changes. Lower values track loudness more closely.",
+                    "Linear correction in dB: 0% gives full response; 50% gives half; 100% gives no dGain/xdGain correction. Enable switches stay on.",
                 )?,
                 stepper_setting_field(
                     settings,
                     "dgain_ra_seconds",
                     "dGain RA time (seconds)",
-                    "Rolling average window. Longer windows smooth loudness across longer passages.",
+                    "WRA time: 70/30 input/history, or 50/20/30 input/previous-song reference/history with xdGain. Weights use dBFS.",
                 )?,
                 toggle_setting_field(
                     settings,

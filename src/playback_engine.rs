@@ -147,10 +147,10 @@ impl PlaybackEngine {
     pub fn play_uri(&self, uri: &str) {
         self.spectrum.reset();
         *self.visualization_uri.borrow_mut() = Some(uri.to_owned());
-        // Capture a short first song before GStreamer's flush can clear its history.
-        self.gain.lock().unwrap().finish_reference();
+        // Capture the last emitted WRA before GStreamer flushes the old song.
+        self.gain.lock().unwrap().finish_song();
         self.inner.stop();
-        self.gain.lock().unwrap().reset();
+        self.gain.lock().unwrap().begin_song();
         self.buf_percent.set(0);
         self.last_error.borrow_mut().take();
         self.cached_position_nanos
@@ -181,8 +181,8 @@ impl PlaybackEngine {
     pub fn stop(&self) {
         self.spectrum.reset();
         self.visualization_uri.borrow_mut().take();
-        // Capture a short first song before GStreamer's flush can clear its history.
-        self.gain.lock().unwrap().finish_reference();
+        // Capture the last emitted WRA before GStreamer flushes the old song.
+        self.gain.lock().unwrap().finish_song();
         self.inner.stop();
         self.gain.lock().unwrap().reset();
         self.paused.set(false);
@@ -229,7 +229,7 @@ impl PlaybackEngine {
     }
 
     /// A new decoder gets fresh per-song analysis, but keeps the session's
-    /// xdGain reference and virtual volume offset through queue transitions.
+    /// previous-song WRA reference through queue transitions.
     pub fn replacement(&self, settings: &crate::offline::AppSettings) -> Self {
         let cross_song = self.gain.lock().unwrap().cross_song_state();
         let replacement = Self::new();
@@ -357,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_replacement_preserves_xdgain_from_a_short_first_song() {
+    fn engine_replacement_preserves_previous_songs_last_emitted_wra() {
         gst::init().unwrap();
         let context = glib::MainContext::new();
         context
@@ -376,7 +376,9 @@ mod tests {
                         (0..500).flat_map(|_| 0.2_f32.to_ne_bytes()).collect();
                     gain.process(&mut samples);
                 }
-                // A skip before the calibration period ends must still preserve its reference.
+                let reference_db =
+                    20.0 * first.gain.lock().unwrap().diagnostics().rolling_rms.log10();
+                // Stop/flush/replacement/seek must retain the completed song's last WRA.
                 first.stop();
                 let next = first.replacement(&settings);
                 next.seek(ClockTime::from_seconds(60));
@@ -388,8 +390,12 @@ mod tests {
                     gain.process(&mut samples);
                     let last = f32::from_ne_bytes(samples[samples.len() - 4..].try_into().unwrap());
                     assert!(
-                        (last - 0.2).abs() < 0.001,
-                        "reference lost during decoder replacement: {last}"
+                        last > 0.02 && last < 0.2,
+                        "chained correction missing: {last}"
+                    );
+                    assert!(
+                        (gain.diagnostics().xdgain_reference_dbfs.unwrap() - reference_db).abs()
+                            < 1e-6
                     );
                 }
                 assert_eq!(next.volume(), 1.0);

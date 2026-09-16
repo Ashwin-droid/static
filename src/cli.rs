@@ -1868,11 +1868,11 @@ fn config_description(name: &str) -> String {
         ),
         "dgain_flatten_percent" => "Allowed loudness deviation around the rolling average before dGain corrects it.\n0% follows the average closely; 100% allows loudness from half to twice the average.\nAccepted range: 0-100. Default: 50."
             .to_string(),
-        "dgain_ra_seconds" => "Rolling loudness average window for dGain, in seconds.\nAccepted range: 0.1-120. Default: 15."
+        "dgain_ra_seconds" => "Weighted rolling-average response time for dGain, in seconds. Weights apply in dBFS over this much audible audio: 70% input + 30% WRA on the first song; with an xdGain reference, 50% input + 20% previous-song WRA + 30% WRA. Updates between intervals are smooth. Earlier history fades continuously rather than expiring at a window boundary.\nAccepted range: 0.1-120. Default: 15."
             .to_string(),
-        "dgain_change_lazyness" => "Penalty for changing dGain: higher values resist small, frequent gain changes; lower values follow the rolling loudness target more closely. Works with lookahead; clipping protection stays active.\nAccepted range: 0-100%. Default: 50%.".to_string(),
+        "dgain_change_lazyness" => "Linearly reduces the dGain correction against WRA, including xdGain's contribution, in dB, with the same attack/release smoothing at every setting. 0% gives the full, most responsive correction; 50% applies half the correction in dB; 100% applies 0 dB without changing either enable switch. Rolling analysis and the xdGain reference remain active. Master volume and clipping protection stay active.\nAccepted range: 0-100%. Default: 50%.".to_string(),
         "xdgain_enabled" => format!(
-            "Matches song loudness to the first song actually played while xdGain is enabled, using its first 3 audible seconds as the reference. Resuming a playlist uses the song you resume.\nThe virtual gain offset carries across songs in this daemon session, independently of master volume. Offsets are bounded to -36 through +24 dB.\nRequires dGain. Disabling dGain suspends xdGain; toggling xdGain off resets its reference.\nDefault: off.\n{}",
+            "Chains each song from the previous song's final emitted WRA in dBFS. The first played song uses 70% input + 30% WRA. Later songs seed WRA from the prior song, then use 50% input + 20% fixed previous-song WRA + 30% WRA over the configured RA time.\nThe reference stays fixed during each song and advances at its end or skip. Seeks do not advance it. There is no separate xdGain volume offset.\nRequires dGain. Toggling xdGain off clears the chain. Default: off.\n{}",
             bool_values_note("enable cross-song gain", "disable cross-song gain")
         ),
         "auto_sync_chromium_cookies" => format!(

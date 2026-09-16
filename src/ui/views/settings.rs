@@ -619,8 +619,7 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
             ),
             settings_row(
                 "xdGain on",
-                "Match later songs to the first song you actually play. The virtual gain offset \
-                 carries across tracks. Requires dGain; independent of the volume slider.",
+                "Seed each song from the previous song's final WRA, then keep that reference fixed while blending it into the new WRA. Requires dGain; independent of master volume.",
                 setting_toggle(
                     draft.xdgain_enabled,
                     draft.dgain_enabled,
@@ -639,7 +638,7 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
             ),
             settings_row(
                 "dGain change lazyness",
-                "Higher values resist small, frequent gain changes. Lower values follow loudness more closely.",
+                "Linear correction in dB: 0% gives full response; 50% gives half; 100% gives no dGain/xdGain correction. Enable switches stay on.",
                 stepper(
                     SettingNumber::DgainChangeLazyness,
                     draft.dgain_change_lazyness,
@@ -648,7 +647,7 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
             ),
             settings_row(
                 "dGain RA time (seconds)",
-                "Rolling average window. Longer windows smooth loudness across longer passages.",
+                "WRA time: 70/30 input/history, or 50/20/30 input/previous-song reference/history with xdGain. Weights use dBFS.",
                 stepper(SettingNumber::DgainRaSeconds, draft.dgain_ra_seconds, true),
             ),
             settings_row(

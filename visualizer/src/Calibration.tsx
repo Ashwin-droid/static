@@ -2,18 +2,18 @@ import { useEffect, useRef, useState } from 'react';
 import { GainHistory, db, defaultGainSettings, gainDb, level, parseDiagnostics, type Diagnostics, type GainSettings, type Point } from './calibration-data';
 import './calibration.css';
 
-const colors = { input: '#d7a971', output: '#73d2af', average: '#a79bec', requested: '#93a9c7', preview: '#dbb26c', applied: '#73d2af', xd: '#ac9cec', limiter: '#e98786' };
+const colors = { input: '#d7a971', output: '#73d2af', average: '#a79bec', requested: '#93a9c7', preview: '#dbb26c', applied: '#73d2af', xd: '#78bde8', limiter: '#e98786' };
 type Series = { name: string; color: string; value: (p: Point) => number; dashed?: boolean };
 const loudness: Series[] = [
   { name: 'Song input', color: colors.input, value: p => db(p.frame.input_rms) },
-  { name: 'Rolling average', color: colors.average, value: p => p.frame.settings.enabled && p.frame.rolling_rms > 0 ? db(p.frame.rolling_rms) : Number.NaN, dashed: true },
-  { name: 'Processed output', color: colors.output, value: p => db(p.frame.output_rms) },
+  { name: 'Weighted average', color: colors.average, value: p => p.frame.settings.enabled && p.frame.rolling_rms > 0 ? db(p.frame.rolling_rms) : Number.NaN, dashed: true },
+  { name: 'Previous song WRA', color: colors.xd, value: p => p.frame.xdgain_reference_dbfs ?? Number.NaN, dashed:true },
+  { name: 'Processed output', color: colors.output, value: p => db(p.frame.gain_output_rms) },
 ];
 const gains: Series[] = [
   { name: 'Requested', color: colors.requested, value: p => db(p.frame.requested_gain), dashed:true },
   { name: 'Lookahead', color: colors.preview, value: p => db(p.frame.preview_gain), dashed:true },
   { name: 'Applied dGain', color: colors.applied, value: p => db(p.frame.applied_gain) },
-  { name: 'xdGain', color: colors.xd, value: p => p.frame.xdgain_db },
   { name: 'Limiter', color: colors.limiter, value: p => db(p.frame.limiter_gain) },
 ];
 function Graph({ points, series, min, max, band = false, title }: { points: Point[]; series: Series[]; min:number; max:number; band?:boolean; title:string }) {
@@ -107,31 +107,31 @@ export function Calibration() {
     setSaving(true);setError(null);socket.current.send(JSON.stringify({settings:draft}));
     saveTimer.current=setTimeout(()=>{setSaving(false);setError('No settings confirmation yet. Check the connection before retrying.');},15_000);
   };
-  const state = !ready?status:!data?.track?'No song selected':data.paused?'Playback paused':!f?.sequence?'Waiting for audio':performance.now()-fresh.current.time>1500?'Waiting for fresh audio':!f.settings.enabled?'dGain is off':f.input_rms<0.0001?'Silence · gain held':f.window_seconds<f.settings.ra_seconds?'Rolling average warming up':'Live';
+  const state = !ready?status:!data?.track?'No song selected':data.paused?'Playback paused':!f?.sequence?'Waiting for audio':performance.now()-fresh.current.time>1500?'Waiting for fresh audio':!f.settings.enabled?'dGain is off':f.settings.change_lazyness_percent===100?'0% correction · switches unchanged':f.input_rms<0.0001?'Silence · gain held':f.audible_seconds<f.settings.ra_seconds?'WRA settling':'Live';
   return <main className="gain-app">
     <header className="gain-header"><div><p className="gain-eyebrow">STATIC / PLAYBACK</p><h1>dGain calibration</h1></div><span className={`gain-state ${ready?'is-live':''}`}>{state}</span></header>
     <div className="gain-track"><strong>{data?.track?.title??'Play a song in Static to start measuring'}</strong><span>{data?.track?.artist}</span></div>
     <section className="gain-meters" aria-label="Current measurements">
       <div><span>Song input</span><strong>{f?.sequence?level(f.input_rms):'—'} <small>dBFS</small></strong></div>
-      <div><span>Rolling average</span><strong>{f?.settings.enabled&&f.sequence?level(f.rolling_rms):'—'} <small>dBFS</small></strong></div>
+      <div><span>Weighted average</span><strong>{f?.settings.enabled&&f.sequence?level(f.rolling_rms):'—'} <small>dBFS</small></strong></div>
       <div><span>dGain response</span><strong>{f?.sequence?gainDb(f.applied_gain):'—'} <small>dB</small></strong></div>
-      <div><span>Processed output</span><strong>{f?.sequence?level(f.output_rms):'—'} <small>dBFS</small></strong></div>
+      <div title="After dGain using the WRA reference; before master volume and limiter"><span>Processed output</span><strong>{f?.sequence?level(f.gain_output_rms):'—'} <small>dBFS</small></strong></div>
     </section>
     <Graph points={points} series={loudness} min={-72} max={12} band title="Loudness" />
     <Graph points={points} series={gains} min={-48} max={24} title="Gain response" />
     <div className="gain-details">
-      <span>Output peak <b>{f?.sequence?level(f.output_peak):'—'} dBFS</b></span>
+      <span title="Includes master volume and limiter">Final output <b>{f?.sequence?level(f.output_rms):'—'} dBFS</b></span>
+      <span title="Includes master volume and limiter">Final peak <b>{f?.sequence?level(f.output_peak):'—'} dBFS</b></span>
       <span className={f&&f.limiter_gain<0.99?'gain-limiting':''}>Limiter <b>{f?.sequence?gainDb(f.limiter_gain):'—'} dB</b></span>
       <span>Master <b>{f?Math.round(f.master_gain*100):'—'}%</b></span>
-      <span>xdGain <b>{f?.sequence?`${f.xdgain_db>=0?'+':''}${f.xdgain_db.toFixed(1)}`:'—'} dB</b></span>
-      <span>xdGain reference <b>{level(f?.reference_rms)} dBFS</b></span>
-      <span>Window <b>{f?.window_seconds.toFixed(1)??'0'} / {f?.settings.ra_seconds??15}s</b></span>
+      <span title="Fixed WRA from the previous song’s last emitted audio block">Previous song WRA <b>{f?.xdgain_reference_dbfs == null ? '—' : `${f.xdgain_reference_dbfs.toFixed(1)} dBFS`}</b></span>
+      <span>RA time <b>{f?.settings.ra_seconds??15}s</b></span>
       <span>Audible audio <b>{f?.audible_seconds.toFixed(1)??'0'}s</b></span>
       <span>Lookahead <b>{f?.settings.enabled?'250':'0'} ms</b></span>
-      <span>Attack / release <b>35 ms / {Math.round(250+(f?.settings.change_lazyness_percent??50)*17.5)} ms</b></span>
-      <span>Change deadband <b>{((f?.settings.change_lazyness_percent??50)*0.03).toFixed(1)} dB</b></span>
+      <span>Attack / release <b>35 ms / 250 ms</b></span>
+      <span>Correction strength <b>{100-(f?.settings.change_lazyness_percent??50)}%</b></span>
     </div>
-    <div className="gain-history-controls"><span>Last 60 seconds · hover graphs to inspect · levels are before the device mixer</span>
+    <div className="gain-history-controls"><span>Processed output excludes volume / limiter · final readouts include them</span>
       <button onClick={()=>{paused.current=!frozen;setFrozen(!frozen);}}>{frozen?'Resume graph':'Freeze graph'}</button>
       <button onClick={()=>{history.current.clear();setPoints([]);}}>Clear graph</button>
     </div>
@@ -139,10 +139,10 @@ export function Calibration() {
       <div className="gain-toggles"><label><input type="checkbox" checked={draft.enabled} onChange={event=>editing('enabled',event.target.checked)} />dGain</label><label><input type="checkbox" checked={draft.xdgain_enabled} disabled={!draft.enabled} onChange={event=>editing('xdgain_enabled',event.target.checked)} />xdGain across songs</label></div>
       <div className="gain-sliders">
         <label>Flatten tolerance <output>{draft.flatten_percent}%</output><input aria-label="Flatten tolerance" type="range" min="0" max="100" step="1" value={draft.flatten_percent} onChange={event=>editing('flatten_percent',Number(event.target.value))} /></label>
-        <label>Rolling average <div><input aria-label="Rolling average seconds" type="number" min="0.1" max="120" step="0.1" value={Number.isFinite(draft.ra_seconds)?draft.ra_seconds:''} onChange={event=>editing('ra_seconds',event.target.valueAsNumber)} /><span> seconds</span></div></label>
-        <label>Change lazyness <output>{draft.change_lazyness_percent}%</output><input aria-label="Change lazyness" type="range" min="0" max="100" step="1" value={draft.change_lazyness_percent} onChange={event=>editing('change_lazyness_percent',Number(event.target.value))} /></label>
+        <label title="WRA response time in dBFS: 70/30 input/history on the first song; 50/20/30 input/previous-song reference/history when chained.">Rolling average <div><input aria-label="Rolling average seconds" type="number" min="0.1" max="120" step="0.1" value={Number.isFinite(draft.ra_seconds)?draft.ra_seconds:''} onChange={event=>editing('ra_seconds',event.target.valueAsNumber)} /><span> seconds</span></div></label>
+        <label title="Correction in dB scales linearly: 0% gives full correction; 100% gives no dGain or xdGain correction, with both switches unchanged.">Change lazyness <output>{draft.change_lazyness_percent}%</output><input aria-label="Change lazyness" type="range" min="0" max="100" step="1" value={draft.change_lazyness_percent} onChange={event=>editing('change_lazyness_percent',Number(event.target.value))} /></label>
       </div>
-      <footer><p>Apply saves these playback settings. The rolling average refills after a change.</p><button type="submit" disabled={!ready||saving||!Number.isFinite(draft.ra_seconds)}>{saving?'Applying…':'Apply settings'}</button></footer>
+      <footer><p>Apply saves these playback settings. The weighted average restarts after a change.</p><button type="submit" disabled={!ready||saving||!Number.isFinite(draft.ra_seconds)}>{saving?'Applying…':'Apply settings'}</button></footer>
     </form>
     {error&&<p className="gain-error" role="alert">{error}</p>}
   </main>;

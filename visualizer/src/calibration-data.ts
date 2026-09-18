@@ -48,7 +48,7 @@ export class GainHistory {
 
 /** Fractions at one RA interval; the previous-song term reserves exactly 20%. */
 export function wraWeights(settings: GainSettings, hasReference: boolean) {
-  const history = 0.1 + 0.8 * settings.change_lazyness_percent / 100;
+  const history = 0.9 - 0.8 * settings.change_lazyness_percent / 100;
   const reference = settings.xdgain_enabled && hasReference ? 0.2 : 0;
   return { input: (1-reference)*(1-history), reference, history: (1-reference)*history };
 }

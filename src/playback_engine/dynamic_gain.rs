@@ -205,9 +205,9 @@ impl DynamicGain {
             .filter(|_| self.config.xdgain_enabled);
         let previous = self.weighted_db.unwrap_or(anchor.unwrap_or(input_db));
         let lazyness = (self.config.change_lazyness_percent / 100.0).clamp(0.0, 1.0);
-        // History's share moves linearly from 10% to 90%. A chained reference
+        // History's share moves linearly from 90% to 10% as correction gets lazier. A chained reference
         // always reserves 20%; input/history split the remaining 80%.
-        let recursive_share = 0.1 + 0.8 * lazyness;
+        let recursive_share = 0.9 - 0.8 * lazyness;
         let (input_weight, reference_weight, history_weight) = if anchor.is_some() {
             (0.8 * (1.0 - recursive_share), 0.2, 0.8 * recursive_share)
         } else {
@@ -546,8 +546,8 @@ mod tests {
         let mut gain = processor(0.0, 15.0);
         run(&mut gain, 0.2, 5000);
         let quiet = run(&mut gain, 0.04, 2000);
-        // At 0% laziness, WRA retains 10% per interval (2/15 of one interval here).
-        let expected = 0.04 * 5.0_f64.powf(0.1_f64.powf(2.0 / 15.0));
+        // At 0% laziness, WRA retains 90% per interval (2/15 of one interval here).
+        let expected = 0.04 * 5.0_f64.powf(0.9_f64.powf(2.0 / 15.0));
         assert!((quiet[quiet.len() - 2] as f64 - expected).abs() < 0.01);
         // Streaming supplies 250ms of upcoming audio, allowing a smooth ramp
         // during the preceding quiet passage instead of a step on the entry.
@@ -577,7 +577,7 @@ mod tests {
     fn weighted_reference_retains_history_beyond_the_old_window() {
         let mut gain = processor(0.0, 1.0);
         gain.configure(Config {
-            change_lazyness_percent: 25.0,
+            change_lazyness_percent: 75.0,
             ..gain.config
         });
         gain.observe(1000, 0.4);
@@ -606,7 +606,7 @@ mod tests {
             for chunk in [1, rate / 100, rate / 4] {
                 let mut gain = processor(0.0, 2.0);
                 gain.configure(Config {
-                    change_lazyness_percent: 25.0,
+                    change_lazyness_percent: 75.0,
                     ..gain.config
                 });
                 gain.set_format(rate, 2);
@@ -728,7 +728,7 @@ mod tests {
         let mut gain = cross_song_processor();
         gain.configure(Config {
             ra_seconds: 1.0,
-            change_lazyness_percent: 34.375,
+            change_lazyness_percent: 65.625,
             ..gain.config
         });
         emit_db(&mut gain, -30.0, 5000);
@@ -763,7 +763,9 @@ mod tests {
         let heard = emit_db(&mut gain, -30.0, 1000);
         let future: Vec<u8> = (0..2000).flat_map(|_| 1.0_f32.to_ne_bytes()).collect();
         gain.analyze(&future);
-        assert!(gain.weighted_db.unwrap() > heard + 10.0);
+        // At minimum laziness, the reference retains 90% of the -30 dB past.
+        // The unplayed 0 dB block moves it to -27 dB, but must not be finalized.
+        assert!((gain.weighted_db.unwrap() - -27.0).abs() < 1e-5);
         let state = gain.cross_song_state();
         assert!((state.last_wra_db.unwrap() - heard).abs() < 1e-10);
         gain.reset();
@@ -830,7 +832,7 @@ mod tests {
         assert_eq!(gain.song_reference_db, None);
         assert_eq!(gain.cross_song, CrossSongGain::default());
         let level = emit_db(&mut gain, -30.0, 1000);
-        let expected = -30.0 + (previous + 30.0) * 0.1_f64.powf(1.0 / 15.0);
+        let expected = -30.0 + (previous + 30.0) * 0.9_f64.powf(1.0 / 15.0);
         assert!((level - expected).abs() < 1e-5);
     }
 
@@ -841,7 +843,7 @@ mod tests {
                 let mut gain = cross_song_processor();
                 gain.configure(Config {
                     ra_seconds: 2.0,
-                    change_lazyness_percent: 34.375,
+                    change_lazyness_percent: 65.625,
                     ..gain.config
                 });
                 gain.set_format(rate, 2);
@@ -979,7 +981,7 @@ mod tests {
                 }
                 gain.weighted_db = Some(-30.0);
                 let output = 20.0 * gain.observe(1000, db_to_rms(-10.0)).log10();
-                let h = 0.1 + 0.8 * percent / 100.0;
+                let h = 0.9 - 0.8 * percent / 100.0;
                 let expected = if chained {
                     -10.0 * 0.8 * (1.0 - h) - 20.0 * 0.2 - 30.0 * 0.8 * h
                 } else {
@@ -987,10 +989,10 @@ mod tests {
                 };
                 assert!((output - expected).abs() < 1e-10);
                 if percent == 0.0 {
-                    assert!((output - if chained { -13.6 } else { -12.0 }).abs() < 1e-10);
+                    assert!((output - if chained { -26.4 } else { -28.0 }).abs() < 1e-10);
                 }
                 if percent == 100.0 {
-                    assert!((output - if chained { -26.4 } else { -28.0 }).abs() < 1e-10);
+                    assert!((output - if chained { -13.6 } else { -12.0 }).abs() < 1e-10);
                 }
             }
         }

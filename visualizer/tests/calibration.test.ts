@@ -27,12 +27,17 @@ test('previous-song reference accepts negative dBFS and remains optional on the 
 
 test('WRA weight display varies smoothly and keeps xdGain at exactly twenty percent',async()=>{
   const { wraWeights }=await import('../src/calibration-data');
+  let previousInput=-1, previousHistory=2;
   for(const lazy of [0,12.5,25,50,75,99.9,100]){
     const settings={...defaultGainSettings,change_lazyness_percent:lazy,xdgain_enabled:true};
     const off=wraWeights(settings,false),on=wraWeights(settings,true);
     assert.ok(Math.abs(off.input+off.history-1)<1e-12);
     assert.equal(on.reference,.2);assert.ok(Math.abs(on.input+on.reference+on.history-1)<1e-12);
     assert.ok(Math.abs(on.input-.8*off.input)<1e-12);
+    assert.ok(off.input>previousInput);assert.ok(off.history<previousHistory);
+    previousInput=off.input;previousHistory=off.history;
+    if(lazy===0){assert.ok(Math.abs(off.input-.1)<1e-12);assert.ok(Math.abs(on.history-.72)<1e-12);}
+    if(lazy===100){assert.ok(Math.abs(off.input-.9)<1e-12);assert.ok(Math.abs(on.history-.08)<1e-12);}
   }
 });
 test('graph retains earlier samples when playback position seeks within one song',()=>{

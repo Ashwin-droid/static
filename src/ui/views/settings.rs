@@ -638,7 +638,7 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
             ),
             settings_row(
                 "dGain change lazyness",
-                "Higher laziness reduces gain correction and slows WRA changes. Input/history weights range smoothly from 90/10 to 10/90; xdGain reserves 20% when present. At 100%, correction is zero; switches stay on.",
+                "Higher laziness reduces gain correction and speeds up WRA changes. Input/history weights range smoothly from 10/90 to 90/10; xdGain reserves 20% when present. At 100%, correction is zero; switches stay on.",
                 stepper(
                     SettingNumber::DgainChangeLazyness,
                     draft.dgain_change_lazyness,

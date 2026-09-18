@@ -13,6 +13,7 @@ use gstreamer_play as gst_play;
 
 mod audio_filter;
 mod dynamic_gain;
+mod gain_history;
 mod spectrum;
 
 use dynamic_gain::{Config as GainConfig, DynamicGain};
@@ -196,7 +197,7 @@ impl PlaybackEngine {
 
     pub fn seek(&self, position: ClockTime) {
         self.spectrum.reset();
-        self.gain.lock().unwrap().reset();
+        self.gain.lock().unwrap().seek(position.nseconds());
         self.cached_position_nanos
             .store(position.nseconds(), Ordering::Relaxed);
         self.inner.seek(position);

@@ -1,5 +1,8 @@
 //! Linked-channel gain processing. All timing is measured in decoded audio frames.
 
+use super::gain_history::GainHistory;
+
+pub(super) const OPENING_GUARD_NS: u64 = 15_000_000_000;
 const SILENCE_RMS: f64 = 0.0001;
 const MAX_DYNAMIC_GAIN: f64 = 5.0;
 const OUTPUT_CEILING: f64 = 0.999;
@@ -18,6 +21,7 @@ static DIAGNOSTIC_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Gain intent computed from original audio, before either gain stage.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct GainTarget {
+    pub opening_guard_millis: u64,
     pub dynamic: f64,
     pub audible: bool,
     pub peak: f64,
@@ -28,6 +32,9 @@ pub(super) struct GainTarget {
 }
 
 pub(super) struct DynamicGain {
+    history: GainHistory,
+    next_position_ns: u64,
+    needs_restore: bool,
     config: Config,
     diagnostics: GainDiagnostics,
     sample_rate: usize,
@@ -53,6 +60,9 @@ fn db_to_rms(db: f64) -> f64 {
 impl Default for DynamicGain {
     fn default() -> Self {
         Self {
+            history: GainHistory::default(),
+            next_position_ns: 0,
+            needs_restore: true,
             config: Config::default(),
             diagnostics: GainDiagnostics {
                 generation: DIAGNOSTIC_GENERATION.fetch_add(1, Ordering::Relaxed),
@@ -85,24 +95,52 @@ impl DynamicGain {
                 self.last_output_wra_db = None;
             }
             self.config = config;
-            self.reset_history();
+            // Edits change future evolution, not measurements already attached to
+            // this song's timeline. Reanalyze queued PCM without discarding it.
+            self.history.finish_span();
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
     pub fn set_format(&mut self, sample_rate: usize, channels: usize) {
         if self.sample_rate != sample_rate || self.channels != channels {
-            self.sample_rate = sample_rate.max(1);
+            let new_rate = sample_rate.max(1);
+            self.observed_frames = (self.observed_frames as u128 * new_rate as u128
+                / self.sample_rate as u128)
+                .min(usize::MAX as u128) as usize;
+            self.audible_frames = (self.audible_frames as u128 * new_rate as u128
+                / self.sample_rate as u128)
+                .min(usize::MAX as u128) as usize;
+            self.sample_rate = new_rate;
             self.channels = channels.max(1);
             self.reset();
         }
     }
 
+    /// Flush transport/envelopes while retaining this song's WRA timeline.
     pub fn reset(&mut self) {
+        self.history.finish_span();
         self.stream_revision = self.stream_revision.wrapping_add(1);
-        self.reset_history();
+        self.revision = self.revision.wrapping_add(1);
+        self.needs_restore = true;
+        self.envelope_started = false;
+        self.dynamic_gain = 1.0;
+        self.limiter_gain = 1.0;
+    }
+
+    pub fn seek(&mut self, position_ns: u64) {
+        self.reset();
+        self.next_position_ns = position_ns;
+        self.weighted_db = self
+            .history
+            .at(position_ns)
+            .or_else(|| self.history.before(position_ns))
+            .unwrap_or(self.song_reference_db);
     }
 
     fn reset_history(&mut self) {
+        self.history.clear();
+        self.needs_restore = true;
         self.diagnostics = GainDiagnostics {
             generation: DIAGNOSTIC_GENERATION.fetch_add(1, Ordering::Relaxed),
             ..Default::default()
@@ -137,6 +175,8 @@ impl DynamicGain {
             None
         };
         self.last_output_wra_db = None;
+        self.next_position_ns = 0;
+        self.reset_history();
         self.reset();
     }
 
@@ -150,9 +190,8 @@ impl DynamicGain {
         self.begin_song();
     }
 
-    /// All weighted terms are in dBFS. At one configured interval:
-    /// first song: 0.7 input + 0.3 previous WRA;
-    /// chained song: 0.5 input + 0.2 fixed prior-song reference + 0.3 previous WRA.
+    /// All weighted terms are in dBFS. Lazyness continuously sets input/history
+    /// weights. Chained songs reserve a fixed 20% for the previous-song reference.
     /// Fractional-time weights compose exactly across sample rates/block sizes.
     fn observe(&mut self, frames: usize, rms: f64) -> f64 {
         self.observed_frames = self.observed_frames.saturating_add(frames);
@@ -165,12 +204,19 @@ impl DynamicGain {
             .song_reference_db
             .filter(|_| self.config.xdgain_enabled);
         let previous = self.weighted_db.unwrap_or(anchor.unwrap_or(input_db));
-        // 0.7 * destination = 0.5 * input + 0.2 * anchor for chained songs.
-        let destination = anchor.map_or(input_db, |reference| {
-            (0.5 * input_db + 0.2 * reference) / 0.7
-        });
+        let lazyness = (self.config.change_lazyness_percent / 100.0).clamp(0.0, 1.0);
+        // History's share moves linearly from 10% to 90%. A chained reference
+        // always reserves 20%; input/history split the remaining 80%.
+        let recursive_share = 0.1 + 0.8 * lazyness;
+        let (input_weight, reference_weight, history_weight) = if anchor.is_some() {
+            (0.8 * (1.0 - recursive_share), 0.2, 0.8 * recursive_share)
+        } else {
+            (1.0 - recursive_share, 0.0, recursive_share)
+        };
+        let destination = (input_weight * input_db + reference_weight * anchor.unwrap_or(0.0))
+            / (1.0 - history_weight);
         let seconds = frames as f64 / self.sample_rate as f64;
-        let fresh_weight = -(0.3_f64.ln() * seconds / self.config.ra_seconds).exp_m1();
+        let fresh_weight = -(history_weight.ln() * seconds / self.config.ra_seconds).exp_m1();
         let average_db = previous + (destination - previous) * fresh_weight;
         self.weighted_db = Some(average_db);
         db_to_rms(average_db)
@@ -188,13 +234,25 @@ impl DynamicGain {
         (self.sample_rate, self.channels)
     }
 
+    pub fn analysis_position_ns(&self) -> u64 {
+        self.next_position_ns
+    }
+
     pub fn enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Analyze each original audio block exactly once, as it enters lookahead.
     /// The rolling reference advances in audio time independently of master gain.
+    // Algorithm tests start after the intro; transport/guard tests supply real PTS.
+    #[cfg(test)]
     pub fn analyze(&mut self, bytes: &[u8]) -> GainTarget {
+        let position = self.next_position_ns.max(OPENING_GUARD_NS);
+        self.analyze_at(bytes, Some(position))
+    }
+
+    pub fn analyze_at(&mut self, bytes: &[u8], position_ns: Option<u64>) -> GainTarget {
+        let start = position_ns.unwrap_or(self.next_position_ns);
         let frames = bytes.len() / (self.channels * 4);
         let mut square_sum = 0.0;
         let mut peak = 0.0_f64;
@@ -209,8 +267,56 @@ impl DynamicGain {
         } else {
             (square_sum / (frames * self.channels) as f64).sqrt()
         };
+        let duration = (frames as u128 * 1_000_000_000 / self.sample_rate as u128) as u64;
+        let end = start.saturating_add(duration);
+        if self.needs_restore || start.abs_diff(self.next_position_ns) > 1_000 {
+            self.history.finish_span();
+            self.weighted_db = self
+                .history
+                .at(start)
+                .or_else(|| self.history.before(start))
+                .unwrap_or(self.song_reference_db);
+            if start < OPENING_GUARD_NS {
+                self.weighted_db = self.song_reference_db;
+            }
+            self.history.start_span(start, self.weighted_db);
+            self.needs_restore = false;
+        }
+        self.next_position_ns = end;
         let average = if self.config.enabled && frames > 0 {
-            self.observe(frames, rms)
+            if end <= OPENING_GUARD_NS {
+                // The opening cannot establish or drag down a WRA reference.
+                self.weighted_db = self.song_reference_db;
+                self.observed_frames = self.observed_frames.saturating_add(frames);
+            } else if let Some(recorded) = self.history.at(end) {
+                self.weighted_db = recorded;
+                self.observed_frames = self.observed_frames.saturating_add(frames);
+            } else {
+                let eligible_start = start.max(OPENING_GUARD_NS);
+                let eligible_frames = if start >= OPENING_GUARD_NS {
+                    frames
+                } else {
+                    ((end - eligible_start) as u128 * self.sample_rate as u128 / 1_000_000_000)
+                        as usize
+                }
+                .min(frames);
+                let observed_rms = if eligible_frames < frames && eligible_frames > 0 {
+                    let tail = &bytes[(frames - eligible_frames) * self.channels * 4..];
+                    let energy: f64 = tail
+                        .chunks_exact(4)
+                        .map(|v| {
+                            let v = f32::from_ne_bytes(v.try_into().unwrap()) as f64;
+                            if v.is_finite() { v * v } else { 0.0 }
+                        })
+                        .sum();
+                    (energy / (eligible_frames * self.channels) as f64).sqrt()
+                } else {
+                    rms
+                };
+                self.observe(eligible_frames, observed_rms);
+            }
+            self.history.record(end, self.weighted_db);
+            self.weighted_db.map_or(0.0, db_to_rms)
         } else {
             0.0
         };
@@ -223,6 +329,7 @@ impl DynamicGain {
             1.0
         };
         GainTarget {
+            opening_guard_millis: OPENING_GUARD_NS.saturating_sub(start) / 1_000_000,
             dynamic,
             audible,
             peak,
@@ -327,6 +434,7 @@ impl DynamicGain {
         }
         if output_samples > 0 {
             self.diagnostics.sequence = self.diagnostics.sequence.wrapping_add(1);
+            self.diagnostics.opening_guard_millis = current.opening_guard_millis;
             self.diagnostics.input_rms = current.rms;
             self.diagnostics.input_peak = current.peak;
             self.diagnostics.gain_output_rms = (gain_output_energy / output_samples as f64).sqrt();
@@ -438,7 +546,9 @@ mod tests {
         let mut gain = processor(0.0, 15.0);
         run(&mut gain, 0.2, 5000);
         let quiet = run(&mut gain, 0.04, 2000);
-        assert!(quiet[quiet.len() - 2] > 0.15);
+        // At 0% laziness, WRA retains 10% per interval (2/15 of one interval here).
+        let expected = 0.04 * 5.0_f64.powf(0.1_f64.powf(2.0 / 15.0));
+        assert!((quiet[quiet.len() - 2] as f64 - expected).abs() < 0.01);
         // Streaming supplies 250ms of upcoming audio, allowing a smooth ramp
         // during the preceding quiet passage instead of a step on the entry.
         let transition = run_stream(&mut gain, &[(0.04, 500), (0.8, 100)]);
@@ -466,6 +576,10 @@ mod tests {
     #[test]
     fn weighted_reference_retains_history_beyond_the_old_window() {
         let mut gain = processor(0.0, 1.0);
+        gain.configure(Config {
+            change_lazyness_percent: 25.0,
+            ..gain.config
+        });
         gain.observe(1000, 0.4);
         let after_one = gain.observe(1000, 0.04);
         assert!(
@@ -491,6 +605,10 @@ mod tests {
         for rate in [1000, 44100, 48000] {
             for chunk in [1, rate / 100, rate / 4] {
                 let mut gain = processor(0.0, 2.0);
+                gain.configure(Config {
+                    change_lazyness_percent: 25.0,
+                    ..gain.config
+                });
                 gain.set_format(rate, 2);
                 gain.observe(rate, 0.1);
                 let mut frames = rate * 2;
@@ -509,7 +627,7 @@ mod tests {
 
     #[test]
     fn gradually_louder_input_is_corrected_against_its_weighted_history() {
-        let mut gain = processor(20.0, 15.0);
+        let mut gain = processor(20.0, 30.0);
         run(&mut gain, 0.05, 15000);
         for step in 0..6000 {
             let amplitude = 0.05 + 0.45 * (step + 1) as f32 / 6000.0;
@@ -556,7 +674,7 @@ mod tests {
         gain.master_gain = 0.5;
         run(&mut gain, 0.4, 1000);
         run(&mut gain, 0.04, 1000);
-        gain.reset();
+        gain.begin_song();
         assert_eq!(run(&mut gain, 0.04, 10)[0], 0.02);
         assert_eq!(gain.master_gain, 0.5);
     }
@@ -610,13 +728,14 @@ mod tests {
         let mut gain = cross_song_processor();
         gain.configure(Config {
             ra_seconds: 1.0,
+            change_lazyness_percent: 34.375,
             ..gain.config
         });
         emit_db(&mut gain, -30.0, 5000);
         assert_eq!(gain.diagnostics().xdgain_reference_dbfs, None);
         assert_eq!(gain.cross_song.last_wra_db, None);
         let first_end = emit_db(&mut gain, -10.0, 1000);
-        assert!((first_end - -16.0).abs() < 1e-5);
+        assert!((first_end - -17.5).abs() < 1e-5);
         assert_eq!(gain.diagnostics().xdgain_reference_dbfs, None);
         gain.finish_song();
         // Finalizing cannot change the current song's fixed anchor.
@@ -624,14 +743,14 @@ mod tests {
         gain.begin_song();
         assert!((gain.song_reference_db.unwrap() - first_end).abs() < 1e-10);
         let second_start = emit_db(&mut gain, -40.0, 1000);
-        assert!((second_start - -28.0).abs() < 1e-5);
+        assert!((second_start - -28.75).abs() < 1e-5);
         let second_end = emit_db(&mut gain, -5.0, 1000);
-        assert!((second_end - -14.1).abs() < 1e-5);
+        assert!((second_end - -14.625).abs() < 1e-5);
         assert!((gain.song_reference_db.unwrap() - first_end).abs() < 1e-10);
         gain.finish_song();
         gain.begin_song();
         assert!((gain.song_reference_db.unwrap() - second_end).abs() < 1e-10);
-        assert!((emit_db(&mut gain, -20.0, 1000) - -17.05).abs() < 1e-5);
+        assert!((emit_db(&mut gain, -20.0, 1000) - -17.3125).abs() < 1e-5);
     }
 
     #[test]
@@ -697,12 +816,13 @@ mod tests {
     }
 
     #[test]
-    fn disabling_xdgain_returns_to_unanchored_wra_without_an_offset() {
+    fn disabling_xdgain_clears_the_reference_but_keeps_the_recorded_wra() {
         let mut gain = cross_song_processor();
         emit_db(&mut gain, -10.0, 1000);
         gain.finish_song();
         gain.begin_song();
         emit_db(&mut gain, -30.0, 1000);
+        let previous = gain.weighted_db.unwrap();
         gain.configure(Config {
             xdgain_enabled: false,
             ..gain.config
@@ -710,8 +830,8 @@ mod tests {
         assert_eq!(gain.song_reference_db, None);
         assert_eq!(gain.cross_song, CrossSongGain::default());
         let level = emit_db(&mut gain, -30.0, 1000);
-        assert!((level - -30.0).abs() < 1e-5);
-        assert!((gain.diagnostics().applied_gain - 1.0).abs() < 1e-6);
+        let expected = -30.0 + (previous + 30.0) * 0.1_f64.powf(1.0 / 15.0);
+        assert!((level - expected).abs() < 1e-5);
     }
 
     #[test]
@@ -721,6 +841,7 @@ mod tests {
                 let mut gain = cross_song_processor();
                 gain.configure(Config {
                     ra_seconds: 2.0,
+                    change_lazyness_percent: 34.375,
                     ..gain.config
                 });
                 gain.set_format(rate, 2);
@@ -776,6 +897,7 @@ mod tests {
                 ..gain.config
             });
             let baseline = GainTarget {
+                opening_guard_millis: 0,
                 rms: 0.1,
                 average: 0.1,
                 window_seconds: 1.0,
@@ -841,27 +963,35 @@ mod tests {
     }
 
     #[test]
-    fn linear_strength_holds_during_changing_audio_and_smoothing() {
-        let segments = [(0.05, 600), (0.4, 400), (0.02, 600)];
-        let render = |lazyness| {
-            let mut gain = cross_song_processor();
-            gain.configure(Config {
-                change_lazyness_percent: lazyness,
-                ..gain.config
-            });
-            gain.restore_cross_song_state(CrossSongGain {
-                last_wra_db: Some(-20.0),
-            });
-            run_stream(&mut gain, &segments)
-        };
-        let full = render(0.0);
-        let unity = render(100.0);
-        for lazyness in [25.0, 50.0, 75.0, 99.9] {
-            let scaled = render(lazyness);
-            for ((&full, &input), &actual) in full.iter().zip(&unity).zip(&scaled) {
-                let full_db = 20.0 * (full as f64 / input as f64).log10();
-                let actual_db = 20.0 * (actual as f64 / input as f64).log10();
-                assert!((actual_db - full_db * (1.0 - lazyness / 100.0)).abs() < 0.0001);
+    fn lazyness_smoothly_weights_wra_with_a_fixed_xdgain_share() {
+        for percent in [0.0, 12.5, 25.0, 50.0, 75.0, 99.9, 100.0] {
+            for chained in [false, true] {
+                let mut gain = cross_song_processor();
+                gain.configure(Config {
+                    ra_seconds: 1.0,
+                    change_lazyness_percent: percent,
+                    ..gain.config
+                });
+                if chained {
+                    gain.restore_cross_song_state(CrossSongGain {
+                        last_wra_db: Some(-20.0),
+                    });
+                }
+                gain.weighted_db = Some(-30.0);
+                let output = 20.0 * gain.observe(1000, db_to_rms(-10.0)).log10();
+                let h = 0.1 + 0.8 * percent / 100.0;
+                let expected = if chained {
+                    -10.0 * 0.8 * (1.0 - h) - 20.0 * 0.2 - 30.0 * 0.8 * h
+                } else {
+                    -10.0 * (1.0 - h) - 30.0 * h
+                };
+                assert!((output - expected).abs() < 1e-10);
+                if percent == 0.0 {
+                    assert!((output - if chained { -13.6 } else { -12.0 }).abs() < 1e-10);
+                }
+                if percent == 100.0 {
+                    assert!((output - if chained { -26.4 } else { -28.0 }).abs() < 1e-10);
+                }
             }
         }
     }
@@ -1000,13 +1130,112 @@ mod diagnostics_tests {
             enabled: true,
             ..Config::default()
         });
-        assert!(gain.diagnostics().generation > generation);
-        assert_eq!(gain.diagnostics().sequence, 0);
-        assert_eq!(gain.diagnostics().output_rms, 0.0);
+        assert_eq!(gain.diagnostics().generation, generation);
+        assert_eq!(gain.diagnostics().sequence, frame.sequence);
+        assert_eq!(gain.diagnostics().output_rms, frame.output_rms);
         assert!(gain.diagnostics().settings.enabled);
         assert_eq!(gain.diagnostics().master_gain, 5.0);
         let next = gain.diagnostics().generation;
         gain.reset();
-        assert!(gain.diagnostics().generation > next);
+        assert_eq!(gain.diagnostics().generation, next);
+    }
+}
+
+#[cfg(test)]
+mod seek_guard_tests {
+    use super::*;
+    fn processor() -> DynamicGain {
+        let mut gain = DynamicGain::default();
+        gain.set_format(1000, 1);
+        gain.configure(Config {
+            enabled: true,
+            flatten_percent: 0.0,
+            change_lazyness_percent: 0.0,
+            ..Config::default()
+        });
+        gain
+    }
+    fn block(gain: &mut DynamicGain, ms: u64, amplitude: f32) -> GainDiagnostics {
+        let mut bytes: Vec<u8> = (0..10).flat_map(|_| amplitude.to_ne_bytes()).collect();
+        let target = gain.analyze_at(&bytes, Some(ms * 1_000_000));
+        gain.render(&mut bytes, target, target);
+        gain.set_diagnostic_position(Some(ms));
+        gain.diagnostics()
+    }
+    #[test]
+    fn opening_never_learns_quiet_input_and_no_reference_is_passthrough() {
+        let mut gain = processor();
+        for ms in (0..15000).step_by(10) {
+            let frame = block(&mut gain, ms, 0.0005);
+            assert_eq!(frame.rolling_rms, 0.0);
+            assert_eq!(frame.applied_gain, 1.0);
+            assert!((frame.gain_output_rms - frame.input_rms).abs() < 1e-12);
+        }
+        assert_eq!(gain.weighted_db, None);
+        let frame = block(&mut gain, 15000, 0.2);
+        assert!((frame.rolling_rms - 0.2).abs() < 1e-6);
+        assert_eq!(frame.opening_guard_millis, 0);
+    }
+    #[test]
+    fn chained_reference_is_held_for_opening_and_learning_begins_at_15_seconds() {
+        let mut gain = processor();
+        gain.configure(Config {
+            xdgain_enabled: true,
+            ..gain.config
+        });
+        gain.restore_cross_song_state(CrossSongGain {
+            last_wra_db: Some(-20.0),
+        });
+        for ms in (0..15000).step_by(10) {
+            assert!((block(&mut gain, ms, 0.001).rolling_rms - 0.1).abs() < 1e-9);
+        }
+        let before = gain.weighted_db.unwrap();
+        block(&mut gain, 15000, 0.001);
+        assert!(gain.weighted_db.unwrap() < before);
+        assert_eq!(gain.song_reference_db, Some(-20.0));
+    }
+    #[test]
+    fn seeking_reuses_the_song_timeline_without_restarting_average_or_graph() {
+        let mut gain = processor();
+        for ms in (15000..18000).step_by(10) {
+            block(&mut gain, ms, if ms < 16000 { 0.2 } else { 0.02 });
+        }
+        gain.history.finish_span();
+        let expected = gain.history.at(16_510_000_000).unwrap().unwrap();
+        let later = gain.history.at(17_510_000_000).unwrap().unwrap();
+        let generation = gain.diagnostics().generation;
+        let sequence = gain.diagnostics().sequence;
+        for _ in 0..3 {
+            gain.seek(16_500_000_000);
+            gain.reset();
+            gain.reset(); // GStreamer flush + segment
+            let frame = block(&mut gain, 16500, 0.02);
+            assert!((20.0 * frame.rolling_rms.log10() - expected).abs() < 1e-8);
+            assert_eq!(frame.generation, generation);
+            assert!(frame.sequence > sequence);
+            gain.seek(17_500_000_000);
+            let frame = block(&mut gain, 17500, 0.02);
+            assert!((20.0 * frame.rolling_rms.log10() - later).abs() < 1e-8);
+        }
+        gain.seek(5_000_000_000);
+        let intro = block(&mut gain, 5000, 0.0005);
+        assert_eq!(intro.applied_gain, 1.0);
+        assert_eq!(intro.rolling_rms, 0.0);
+        gain.seek(17_500_000_000);
+        assert!((20.0 * block(&mut gain, 17500, 0.02).rolling_rms.log10() - later).abs() < 1e-8);
+    }
+    #[test]
+    fn unvisited_seek_keeps_earlier_reference_and_does_not_start_a_new_guard() {
+        let mut gain = processor();
+        block(&mut gain, 15000, 0.2);
+        gain.seek(60_000_000_000);
+        gain.reset();
+        let frame = block(&mut gain, 60000, 0.02);
+        assert_eq!(frame.opening_guard_millis, 0);
+        assert!(frame.rolling_rms > 0.19);
+        let generation = frame.generation;
+        gain.begin_song();
+        assert!(gain.diagnostics().generation > generation);
+        assert_eq!(block(&mut gain, 0, 0.001).rolling_rms, 0.0);
     }
 }

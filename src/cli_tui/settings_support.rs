@@ -1282,13 +1282,13 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     settings,
                     "dgain_change_lazyness",
                     "dGain change lazyness",
-                    "Linear correction in dB: 0% gives full response; 50% gives half; 100% gives no dGain/xdGain correction. Enable switches stay on.",
+                    "Higher laziness reduces gain correction and slows WRA changes. Input/history weights range smoothly from 90/10 to 10/90; xdGain reserves 20% when present. At 100%, correction is zero; switches stay on.",
                 )?,
                 stepper_setting_field(
                     settings,
                     "dgain_ra_seconds",
                     "dGain RA time (seconds)",
-                    "WRA time: 70/30 input/history, or 50/20/30 input/previous-song reference/history with xdGain. Weights use dBFS.",
+                    "WRA response time in dBFS. Laziness sets the input/history split; xdGain keeps a fixed 20% reference share. Longer times retain older levels longer.",
                 )?,
                 toggle_setting_field(
                     settings,

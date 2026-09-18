@@ -15,6 +15,7 @@ const LOOKAHEAD_MS: u64 = 250;
 struct Pending {
     buffer: gst::Buffer,
     frames: usize,
+    position_ns: u64,
     target: GainTarget,
 }
 
@@ -45,12 +46,13 @@ impl BufferedAudio {
             // original queued audio into the freshly reset analysis, retaining
             // every frame and timestamp even while a settings control repeats.
             for block in &mut self.blocks {
-                block.target = processor.analyze(
+                block.target = processor.analyze_at(
                     block
                         .buffer
                         .map_readable()
                         .map_err(|_| gst::FlowError::Error)?
                         .as_slice(),
+                    Some(block.position_ns),
                 );
             }
             self.revision = processor.revision();
@@ -144,18 +146,36 @@ mod imp {
             if buffer.flags().contains(gst::BufferFlags::DISCONT) {
                 self.reset();
             }
-            let (rate, channels) = self.processor.get().unwrap().lock().unwrap().format();
+            let (rate, channels, fallback_position) = {
+                let processor = self.processor.get().unwrap().lock().unwrap();
+                let (rate, channels) = processor.format();
+                (rate, channels, processor.analysis_position_ns())
+            };
+            let buffer_position = buffer.pts().map_or(fallback_position, |pts| pts.nseconds());
             let frame_bytes = channels * 4;
             if !buffer.size().is_multiple_of(frame_bytes) {
                 return Err(gst::FlowError::Error);
             }
             let total_frames = buffer.size() / frame_bytes;
             let block_frames = (rate / 100).max(1);
-            for start in (0..total_frames).step_by(block_frames) {
+            let mut start = 0;
+            while start < total_frames {
                 if self.flushing.load(Ordering::Acquire) {
                     return Err(gst::FlowError::Flushing);
                 }
-                let frames = block_frames.min(total_frames - start);
+                let mut frames = block_frames.min(total_frames - start);
+                if let Some(pts) = buffer.pts() {
+                    let position = pts
+                        .nseconds()
+                        .saturating_add((start as u128 * 1_000_000_000 / rate as u128) as u64);
+                    let guard = super::super::dynamic_gain::OPENING_GUARD_NS;
+                    if position < guard {
+                        let until_guard = ((guard - position) as u128 * rate as u128)
+                            .div_ceil(1_000_000_000)
+                            as usize;
+                        frames = frames.min(until_guard.max(1));
+                    }
+                }
                 let mut block = buffer
                     .copy_region(
                         gst::BUFFER_COPY_ALL,
@@ -198,20 +218,23 @@ mod imp {
                             gst::message::Latency::builder().src(&*self.obj()).build(),
                         );
                     }
-                    let target = processor.analyze(
+                    let target = processor.analyze_at(
                         block
                             .map_readable()
                             .map_err(|_| gst::FlowError::Error)?
                             .as_slice(),
+                        Some(buffer_position.saturating_add(time_at(start).nseconds())),
                     );
                     pending.frames += frames;
                     pending.blocks.push_back(Pending {
                         buffer: block,
                         frames,
+                        position_ns: buffer_position.saturating_add(time_at(start).nseconds()),
                         target,
                     });
                 }
                 self.emit(false)?;
+                start += frames;
             }
             Ok(gst::FlowSuccess::Ok)
         }
@@ -676,8 +699,8 @@ mod tests {
     #[test]
     fn buffered_filter_attenuates_before_upcoming_loud_entry() {
         let harness = Harness::new();
-        harness.push(0.1, 1000, 0);
-        harness.push(0.6, 100, 1000);
+        harness.push(0.1, 1000, 15000);
+        harness.push(0.6, 100, 16000);
         harness.eos();
         let output = harness.output.lock().unwrap();
         let samples: Vec<f32> = output
@@ -765,13 +788,13 @@ mod tests {
     }
 
     #[test]
-    fn gain_telemetry_follows_emitted_pts_and_resets_on_seek() {
+    fn gain_telemetry_follows_emitted_pts_and_keeps_history_on_seek() {
         let harness = Harness::new();
-        harness.push(0.1, 250, 0);
+        harness.push(0.1, 250, 15000);
         assert_eq!(harness.processor.lock().unwrap().diagnostics().sequence, 0);
-        harness.push(0.8, 10, 250);
+        harness.push(0.8, 10, 15250);
         let frame = harness.processor.lock().unwrap().diagnostics();
-        assert_eq!(frame.position_millis, Some(0));
+        assert_eq!(frame.position_millis, Some(15000));
         assert!((frame.input_peak - 0.1).abs() < 1e-6);
         assert!(frame.preview_gain < frame.requested_gain);
         let output = harness.output.lock().unwrap();
@@ -791,9 +814,10 @@ mod tests {
         drop(output);
         harness.segment();
         let reset = harness.processor.lock().unwrap().diagnostics();
-        assert_eq!(reset.sequence, 0);
-        assert_eq!(reset.position_millis, None);
-        assert!(reset.generation > frame.generation);
+        assert_eq!(reset.sequence, frame.sequence);
+        assert_eq!(reset.position_millis, frame.position_millis);
+        assert_eq!(reset.rolling_rms, frame.rolling_rms);
+        assert_eq!(reset.generation, frame.generation);
     }
 
     #[test]
@@ -810,12 +834,12 @@ mod tests {
                     ..Default::default()
                 });
             }
-            harness.push(0.1, 260, 0);
+            harness.push(0.1, 260, 15000);
             if natural_end {
-                harness.push(0.8, 100, 260);
+                harness.push(0.8, 100, 15260);
                 harness.eos();
             } else {
-                harness.push(0.8, 100, 260);
+                harness.push(0.8, 100, 15260);
             }
             let mut processor = harness.processor.lock().unwrap();
             let last_db = 20.0 * processor.diagnostics().rolling_rms.log10();
@@ -837,6 +861,47 @@ mod tests {
                     < 1e-10
             );
         }
+    }
+
+    #[test]
+    fn startup_boundary_is_split_and_quiet_intro_cannot_seed_wra() {
+        let harness = Harness::new();
+        harness.push(0.0005, 13, 14990); // crosses the 15-second boundary mid-buffer
+        harness.push(0.2, 300, 15003);
+        harness.eos();
+        let output = harness.output.lock().unwrap();
+        assert_eq!(output[0].pts(), Some(gst::ClockTime::from_mseconds(14990)));
+        assert_eq!(
+            output[0].duration(),
+            Some(gst::ClockTime::from_mseconds(10))
+        );
+        assert_eq!(output[1].pts(), Some(gst::ClockTime::from_seconds(15)));
+        let map = output[0].map_readable().unwrap();
+        assert_eq!(
+            f32::from_ne_bytes(map.as_slice()[..4].try_into().unwrap()),
+            0.0005
+        );
+        assert_eq!(
+            output.iter().map(|buffer| buffer.size() / 8).sum::<usize>(),
+            313
+        );
+    }
+
+    #[test]
+    fn flush_seek_restores_recorded_wra_through_real_gstreamer_buffers() {
+        let harness = Harness::new();
+        harness.push(0.2, 1000, 15000);
+        harness.push(0.02, 1000, 16000);
+        harness.eos();
+        let generation = harness.processor.lock().unwrap().diagnostics().generation;
+        assert!(harness.source.push_event(gst::event::FlushStart::new()));
+        assert!(harness.source.push_event(gst::event::FlushStop::new(true)));
+        harness.segment();
+        harness.push(0.2, 100, 15000);
+        harness.eos();
+        let frame = harness.processor.lock().unwrap().diagnostics();
+        assert_eq!(frame.generation, generation);
+        assert!((frame.rolling_rms - 0.2 * 0.625_f64.sqrt()).abs() < 1e-6);
     }
 
     #[test]

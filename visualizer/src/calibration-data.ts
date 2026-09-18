@@ -2,7 +2,7 @@ export interface GainSettings {
   enabled: boolean; flatten_percent: number; ra_seconds: number; change_lazyness_percent: number; xdgain_enabled: boolean;
 }
 export interface GainFrame {
-  generation: number; sequence: number; position_millis: number | null; settings: GainSettings;
+  generation: number; sequence: number; position_millis: number | null; opening_guard_millis:number; settings: GainSettings;
   input_rms: number; input_peak: number; gain_output_rms: number; gain_output_peak: number; output_rms: number; output_peak: number; rolling_rms: number;
   window_seconds: number; audible_seconds: number; requested_gain: number; preview_gain: number;
   applied_gain: number; xdgain_reference_dbfs: number | null; limiter_gain: number; master_gain: number;
@@ -22,6 +22,7 @@ export function parseDiagnostics(raw: unknown): Diagnostics | null {
       !within(s.flatten_percent,0,100) || !within(s.ra_seconds,0.1,120) || !within(s.change_lazyness_percent,0,100)) return null;
   if (!Number.isSafeInteger(f.generation) || f.generation < 0 || !Number.isSafeInteger(f.sequence) || f.sequence < 0 ||
       !(f.position_millis === null || (Number.isSafeInteger(f.position_millis) && f.position_millis >= 0)) ||
+      !within(f.opening_guard_millis,0,15000) ||
       !['input_rms','input_peak','gain_output_rms','gain_output_peak','output_rms','output_peak','rolling_rms','window_seconds','audible_seconds','requested_gain','preview_gain','applied_gain','limiter_gain','master_gain'].every(key => finite(f[key]) && f[key] >= 0) ||
       !(f.xdgain_reference_dbfs === null || finite(f.xdgain_reference_dbfs))) return null;
   if (!(raw.track === null || (record(raw.track) && ['video_id','title','artist'].every(key => typeof raw.track[key] === 'string')))) return null;
@@ -43,4 +44,11 @@ export class GainHistory {
     while (this.points.length > 600 || this.points[0]?.time < now-60_000) this.points.shift();
     return true;
   }
+}
+
+/** Fractions at one RA interval; the previous-song term reserves exactly 20%. */
+export function wraWeights(settings: GainSettings, hasReference: boolean) {
+  const history = 0.1 + 0.8 * settings.change_lazyness_percent / 100;
+  const reference = settings.xdgain_enabled && hasReference ? 0.2 : 0;
+  return { input: (1-reference)*(1-history), reference, history: (1-reference)*history };
 }

@@ -36,7 +36,7 @@ pub fn youtube_music_watch_url(video_id: &str) -> String {
 pub struct GainCalibrationSettings {
     pub enabled: bool,
     pub flatten_percent: f64,
-    /// WRA interval: 70% new input and 30% retained reference over this time.
+    /// WRA interval over which lazyness-dependent input/history weights apply.
     pub ra_seconds: f64,
     pub change_lazyness_percent: f64,
     pub xdgain_enabled: bool,
@@ -83,6 +83,7 @@ pub struct GainDiagnostics {
     pub generation: u64,
     pub sequence: u64,
     pub position_millis: Option<u64>,
+    pub opening_guard_millis: u64,
     pub settings: GainCalibrationSettings,
     pub input_rms: f64,
     pub input_peak: f64,

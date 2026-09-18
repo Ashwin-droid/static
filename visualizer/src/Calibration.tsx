@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { GainHistory, db, defaultGainSettings, gainDb, level, parseDiagnostics, type Diagnostics, type GainSettings, type Point } from './calibration-data';
+import { GainHistory, wraWeights, db, defaultGainSettings, gainDb, level, parseDiagnostics, type Diagnostics, type GainSettings, type Point } from './calibration-data';
 import './calibration.css';
 
 const colors = { input: '#d7a971', output: '#73d2af', average: '#a79bec', requested: '#93a9c7', preview: '#dbb26c', applied: '#73d2af', xd: '#78bde8', limiter: '#e98786' };
@@ -50,7 +50,7 @@ function Graph({ points, series, min, max, band = false, title }: { points: Poin
     }
     for(const line of series){
       ctx.strokeStyle=line.color;ctx.lineWidth=1.6;ctx.setLineDash(line.dashed?[4,3]:[]);ctx.beginPath();
-      let drawing=false;points.forEach((point,i)=>{ const value=line.value(point);if(!Number.isFinite(value)){drawing=false;return;} const px=x(point.time),py=y(value); if(!drawing||i===0||point.time-points[i-1].time>1500)ctx.moveTo(px,py);else ctx.lineTo(px,py);drawing=true; });ctx.stroke();
+      let drawing=false;points.forEach((point,i)=>{ const value=line.value(point);if(!Number.isFinite(value)){drawing=false;return;} const px=x(point.time),py=y(value); if(!drawing||i===0||point.time-points[i-1].time>1500||(point.frame.position_millis!==null&&points[i-1].frame.position_millis!==null&&Math.abs(point.frame.position_millis!-points[i-1].frame.position_millis!)>1500))ctx.moveTo(px,py);else ctx.lineTo(px,py);drawing=true; });ctx.stroke();
     }
     ctx.setLineDash([]);
     if(hover!==null&&points[hover]){ctx.strokeStyle='#ffffff55';ctx.beginPath();ctx.moveTo(x(points[hover].time),top);ctx.lineTo(x(points[hover].time),bottom);ctx.stroke();}
@@ -101,13 +101,14 @@ export function Calibration() {
     return()=>{disposed=true;clearTimeout(retry);clearTimeout(saveTimer.current);if(socket.current){socket.current.onclose=null;socket.current.close();socket.current=null;}};
   },[]);
   const f=data?.frame, ready=status==='Connected';
+  const weights=wraWeights(f?.settings??defaultGainSettings,f?.xdgain_reference_dbfs!=null);
   const editing=<K extends keyof GainSettings>(key:K,value:GainSettings[K])=>{dirty.current=true;setDraft(old=>({...old,[key]:value,...(key==='enabled'&&!value?{xdgain_enabled:false}:{})}));};
   const apply=()=>{
     if(socket.current?.readyState!==WebSocket.OPEN||saving)return;
     setSaving(true);setError(null);socket.current.send(JSON.stringify({settings:draft}));
     saveTimer.current=setTimeout(()=>{setSaving(false);setError('No settings confirmation yet. Check the connection before retrying.');},15_000);
   };
-  const state = !ready?status:!data?.track?'No song selected':data.paused?'Playback paused':!f?.sequence?'Waiting for audio':performance.now()-fresh.current.time>1500?'Waiting for fresh audio':!f.settings.enabled?'dGain is off':f.settings.change_lazyness_percent===100?'0% correction · switches unchanged':f.input_rms<0.0001?'Silence · gain held':f.audible_seconds<f.settings.ra_seconds?'WRA settling':'Live';
+  const state = !ready?status:!data?.track?'No song selected':data.paused?'Playback paused':!f?.sequence?'Waiting for audio':performance.now()-fresh.current.time>1500?'Waiting for fresh audio':!f.settings.enabled?'dGain is off':f.opening_guard_millis>0?`Opening guard · ${Math.ceil(f.opening_guard_millis/1000)}s · ${f.rolling_rms>0?'WRA held':'passthrough'}`:f.settings.change_lazyness_percent===100?'0% correction · switches unchanged':f.input_rms<0.0001?'Silence · gain held':f.audible_seconds<f.settings.ra_seconds?'WRA settling':'Live';
   return <main className="gain-app">
     <header className="gain-header"><div><p className="gain-eyebrow">STATIC / PLAYBACK</p><h1>dGain calibration</h1></div><span className={`gain-state ${ready?'is-live':''}`}>{state}</span></header>
     <div className="gain-track"><strong>{data?.track?.title??'Play a song in Static to start measuring'}</strong><span>{data?.track?.artist}</span></div>
@@ -129,6 +130,7 @@ export function Calibration() {
       <span>Audible audio <b>{f?.audible_seconds.toFixed(1)??'0'}s</b></span>
       <span>Lookahead <b>{f?.settings.enabled?'250':'0'} ms</b></span>
       <span>Attack / release <b>35 ms / 250 ms</b></span>
+      <span title="Input / fixed previous-song reference / prior WRA at one RA interval">WRA weights <b>{(weights.input*100).toFixed(0)} / {(weights.reference*100).toFixed(0)} / {(weights.history*100).toFixed(0)}%</b></span>
       <span>Correction strength <b>{100-(f?.settings.change_lazyness_percent??50)}%</b></span>
     </div>
     <div className="gain-history-controls"><span>Processed output excludes volume / limiter · final readouts include them</span>
@@ -139,10 +141,10 @@ export function Calibration() {
       <div className="gain-toggles"><label><input type="checkbox" checked={draft.enabled} onChange={event=>editing('enabled',event.target.checked)} />dGain</label><label><input type="checkbox" checked={draft.xdgain_enabled} disabled={!draft.enabled} onChange={event=>editing('xdgain_enabled',event.target.checked)} />xdGain across songs</label></div>
       <div className="gain-sliders">
         <label>Flatten tolerance <output>{draft.flatten_percent}%</output><input aria-label="Flatten tolerance" type="range" min="0" max="100" step="1" value={draft.flatten_percent} onChange={event=>editing('flatten_percent',Number(event.target.value))} /></label>
-        <label title="WRA response time in dBFS: 70/30 input/history on the first song; 50/20/30 input/previous-song reference/history when chained.">Rolling average <div><input aria-label="Rolling average seconds" type="number" min="0.1" max="120" step="0.1" value={Number.isFinite(draft.ra_seconds)?draft.ra_seconds:''} onChange={event=>editing('ra_seconds',event.target.valueAsNumber)} /><span> seconds</span></div></label>
-        <label title="Correction in dB scales linearly: 0% gives full correction; 100% gives no dGain or xdGain correction, with both switches unchanged.">Change lazyness <output>{draft.change_lazyness_percent}%</output><input aria-label="Change lazyness" type="range" min="0" max="100" step="1" value={draft.change_lazyness_percent} onChange={event=>editing('change_lazyness_percent',Number(event.target.value))} /></label>
+        <label title="WRA response time. Laziness controls the input/history split; xdGain keeps a fixed 20% reference share.">Rolling average <div><input aria-label="Rolling average seconds" type="number" min="0.1" max="120" step="0.1" value={Number.isFinite(draft.ra_seconds)?draft.ra_seconds:''} onChange={event=>editing('ra_seconds',event.target.valueAsNumber)} /><span> seconds</span></div></label>
+        <label title="Higher laziness both reduces gain correction and resists WRA changes. WRA input/history moves smoothly from 90/10 to 10/90; xdGain reserves 20% when a reference exists.">Change lazyness <output>{draft.change_lazyness_percent}%</output><input aria-label="Change lazyness" type="range" min="0" max="100" step="1" value={draft.change_lazyness_percent} onChange={event=>editing('change_lazyness_percent',Number(event.target.value))} /></label>
       </div>
-      <footer><p>Apply saves these playback settings. The weighted average restarts after a change.</p><button type="submit" disabled={!ready||saving||!Number.isFinite(draft.ra_seconds)}>{saving?'Applying…':'Apply settings'}</button></footer>
+      <footer><p>Apply saves these playback settings. Changes apply to upcoming audio; WRA history is retained.</p><button type="submit" disabled={!ready||saving||!Number.isFinite(draft.ra_seconds)}>{saving?'Applying…':'Apply settings'}</button></footer>
     </form>
     {error&&<p className="gain-error" role="alert">{error}</p>}
   </main>;

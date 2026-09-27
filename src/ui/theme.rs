@@ -55,6 +55,12 @@ pub const ACCENT_BORDER: Color = ca(130, 160, 255, 0.40);
 pub const ACCENT_TEXT_DIM: Color = ca(160, 186, 255, 0.78);
 /// The lone deliberate non-accent color: YouTube-red playback progress.
 pub const PROGRESS_RED: Color = c(255, 0, 0);
+/// Queue rows seamless listening filled in from the offline library: a warm
+/// amber, deliberately off the accent hue so they read as "not what was
+/// queued".
+pub const OFFLINE_FILL: Color = c(255, 196, 120);
+pub const OFFLINE_FILL_DIM: Color = ca(255, 196, 120, 0.62);
+pub const OFFLINE_FILL_BG: Color = ca(255, 196, 120, 0.06);
 
 // Surfaces.
 pub const BG_CONTENT: Color = c(14, 14, 20);

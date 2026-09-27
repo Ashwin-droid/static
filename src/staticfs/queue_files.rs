@@ -9,7 +9,12 @@ use super::{Ctx, FsError, FsResult};
 /// Origin marker for a queue entry: entries at or past the radio
 /// `touched_len` boundary are radio-generated; with no radio session every
 /// entry is "touched" (same boundary logic as `print_queue` in cli.rs).
-fn origin_label(index: usize, touched_len: Option<usize>) -> &'static str {
+/// Entries seamless listening filled in from the offline library say so,
+/// whichever side of the boundary they sit on.
+fn origin_label(index: usize, touched_len: Option<usize>, offline_fill: bool) -> &'static str {
+    if offline_fill {
+        return "offline_fill";
+    }
     match touched_len {
         Some(len) if index >= len => "radio_generated",
         _ => "touched",
@@ -27,7 +32,7 @@ fn queue_rows(queue: &[Track], touched_len: Option<usize>) -> Vec<Vec<String>> {
                 track.title.clone(),
                 crate::cli::artist_string(track),
                 track.video_id.clone(),
-                origin_label(index, touched_len).to_string(),
+                origin_label(index, touched_len, track.offline_fill).to_string(),
             ]
         })
         .collect()

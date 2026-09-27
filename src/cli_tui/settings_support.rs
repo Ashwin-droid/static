@@ -972,6 +972,7 @@ pub(in crate::cli_tui) fn current_boolean_setting(settings: &AppSettings, key: &
         "auto_manage_offline_cache" => settings.auto_manage_offline_cache,
         "auto_cache_listen_again" => settings.auto_cache_listen_again,
         "prefetch_enabled" => settings.prefetch_enabled,
+        "seamless_listening" => settings.seamless_listening,
         "prefer_local_cache_on_playback" => settings.prefer_local_cache_on_playback,
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled,
         "sponsorblock_enabled" => settings.sponsorblock_enabled,
@@ -1320,6 +1321,12 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
                     "Prefetch ahead",
                     "How many tracks ahead Static stages locally.",
                 )?,
+                toggle_setting_field(
+                    settings,
+                    "seamless_listening",
+                    "Seamless listening",
+                    "When the next song can't be fetched and isn't staged, keep playing from the offline library. Filled songs show in amber.",
+                ),
             ],
         },
         TuiSettingsSection {

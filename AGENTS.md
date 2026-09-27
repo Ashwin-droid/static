@@ -47,6 +47,16 @@ Radio tail refreshes should dedupe against the prefix, preserve useful chip stat
 
 Repeat behavior also cares about the virtual-playlist boundary. Be careful when changing repeat-all, next/previous, natural-end behavior, or "jump to radio seed" flows: radio queues can be longer than the user-touched region, and those two concepts are intentionally separate.
 
+## Seamless Listening
+
+Seamless listening (`seamless_listening`, off by default) keeps music going from the offline library when a forward advance cannot fetch its next song. It is daemon behavior: frontends only render the result.
+
+It covers forward advances only — natural track end, Next, and skipping past a failed stream. A song the user picked explicitly is never substituted; that failure stays a failure. The lookahead comes first: a next song that is already cached or prefetched just plays. A fill happens when the next song is not locally available and the network is known to be down, when its fetch fails, or when a radio queue reaches its end because the tail could not be extended. A playlist that simply finished still ends.
+
+Fills are ordinary queue entries inserted next to the current track, so in radio mode they land inside the touched prefix. While offline, the unfetchable song stays ahead of the fill and is retried afterwards; when the network looks fine, the failed song itself is the suspect and the advance moves past it.
+
+The pick samples the combined offline store (automatic, manual, and playlist downloads) weighted by offline score and the radio pick's artist/title repulsion. `Track::offline_fill` marks a fill per row, and every queue surface shows it: amber rows in the GUI and TUI, a suffix in `static queue get`, and the `offline_fill` origin in staticfs.
+
 ## MPRIS And PipeWire Coordination
 
 Playback coordination is one of the most sensitive parts of the app.

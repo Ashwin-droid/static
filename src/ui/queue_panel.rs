@@ -533,6 +533,7 @@ fn queue_list(app: &App) -> Element<'_, Message> {
             RowVisual {
                 active: index == app.player.queue_index,
                 generated,
+                seamless: track.offline_fill,
                 hovered: state.hovered_row == Some(index) && !drag_active,
                 lifted: drag_source == Some(index),
                 dimmed: (drag_active && drag_source != Some(index))
@@ -568,6 +569,8 @@ fn queue_list(app: &App) -> Element<'_, Message> {
 struct RowVisual {
     active: bool,
     generated: bool,
+    /// Filled in from the offline library by seamless listening.
+    seamless: bool,
     hovered: bool,
     /// The internal drag source row ("lifted" look).
     lifted: bool,
@@ -585,6 +588,10 @@ fn queue_row<'a>(
 ) -> Element<'a, Message> {
     let (title_color, artist_color) = if visual.dimmed {
         (theme::TEXT_FAINT, theme::TEXT_GHOST)
+    } else if visual.seamless {
+        // Outranks the active look: the playing row keeps its highlight
+        // background, and the tint still says where the song came from.
+        (theme::OFFLINE_FILL, theme::OFFLINE_FILL_DIM)
     } else if visual.active {
         (theme::ACCENT_FG, theme::TEXT_DIM)
     } else if visual.generated {
@@ -667,6 +674,8 @@ fn queue_row_style(visual: &RowVisual) -> impl Fn(&Theme) -> container::Style + 
         (Some(theme::white(0.08)), Color::TRANSPARENT)
     } else if visual.hovered {
         (Some(theme::white(0.06)), Color::TRANSPARENT)
+    } else if visual.seamless {
+        (Some(theme::OFFLINE_FILL_BG), Color::TRANSPARENT)
     } else if visual.generated {
         (
             Some(Color {
@@ -1994,6 +2003,7 @@ pub fn play_track_task(
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     };
 
     play_track_radio_task(app, seed)
@@ -2593,6 +2603,7 @@ fn load_offline_collection_tracks(
                 playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
+                offline_fill: false,
             }
         })
         .collect()

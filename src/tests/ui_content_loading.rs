@@ -23,6 +23,7 @@ fn track(video_id: &str, title: &str, artists: &[&str]) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 

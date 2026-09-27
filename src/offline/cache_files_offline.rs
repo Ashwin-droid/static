@@ -14,6 +14,17 @@ macro_rules! eprintln {
     }};
 }
 
+/// One playable offline song with the offline score the seamless-listening
+/// pick weighs it by.
+#[derive(Debug, Clone)]
+pub struct ScoredOfflineTrack {
+    pub video_id: String,
+    pub title: String,
+    pub artist: String,
+    pub art_path: Option<String>,
+    pub score: f64,
+}
+
 impl MusicCache {
     /// Return the local path if this song has been downloaded.
     pub fn get_cached_audio(&self, video_id: &str) -> Option<PathBuf> {
@@ -98,6 +109,41 @@ impl MusicCache {
                 ))
             })?
             .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Every offline song whose audio file is actually on disk (automatic,
+    /// manual, and playlist downloads alike), with its offline score — the
+    /// same decayed play count [`offline_tracks_by_score`](Self::offline_tracks_by_score)
+    /// orders by. Tracks with no play history score 0.
+    pub fn scored_offline_tracks(&self, decay_window_days: u32) -> Result<Vec<ScoredOfflineTrack>> {
+        let decay = decay_window_days.max(1) as f64;
+        let mut stmt = self.db.prepare(
+            "SELECT o.video_id, COALESCE(p.title, o.video_id), COALESCE(p.artist, ''),
+                    CASE WHEN o.art_path != '' THEN o.art_path ELSE NULL END,
+                    o.audio_path,
+                    COALESCE(p.play_count, 0)
+                      / (1.0 + (MAX(strftime('%s', 'now') - COALESCE(p.last_played, 0), 0) / 86400.0) / ?1)
+             FROM offline o
+             LEFT JOIN plays p ON o.video_id = p.video_id",
+        )?;
+        let rows = stmt
+            .query_map([decay], |row| {
+                Ok((
+                    ScoredOfflineTrack {
+                        video_id: row.get(0)?,
+                        title: row.get(1)?,
+                        artist: row.get(2)?,
+                        art_path: row.get(3)?,
+                        score: row.get(5)?,
+                    },
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(_, audio_path)| std::path::Path::new(audio_path).exists())
+            .map(|(track, _)| track)
             .collect();
         Ok(rows)
     }

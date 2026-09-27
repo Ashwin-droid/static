@@ -122,6 +122,7 @@ fn test_track(video_id: &str) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 

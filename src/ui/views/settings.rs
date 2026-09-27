@@ -57,6 +57,7 @@ pub enum SettingToggle {
     XdgainEnabled,
     PreferLocalCacheOnPlayback,
     PrefetchEnabled,
+    SeamlessListening,
     AutoManageOfflineCache,
     AutoCacheListenAgain,
     AutoReleaseTrackLoops,
@@ -693,6 +694,17 @@ fn playback_card(draft: &AppSettings) -> Element<'_, Message> {
                     SettingNumber::PrefetchAhead,
                     draft.prefetch_ahead as f64,
                     true,
+                ),
+            ),
+            settings_row(
+                "Seamless listening",
+                "When the next song can't be fetched and isn't in the lookahead cache, keep \
+                 playing with a pick from your offline library. Filled songs are tinted amber \
+                 in the queue.",
+                setting_toggle(
+                    draft.seamless_listening,
+                    true,
+                    SettingToggle::SeamlessListening,
                 ),
             ),
         ],
@@ -1991,6 +2003,7 @@ fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
         SettingToggle::XdgainEnabled => settings.xdgain_enabled,
         SettingToggle::PreferLocalCacheOnPlayback => settings.prefer_local_cache_on_playback,
         SettingToggle::PrefetchEnabled => settings.prefetch_enabled,
+        SettingToggle::SeamlessListening => settings.seamless_listening,
         SettingToggle::AutoManageOfflineCache => settings.auto_manage_offline_cache,
         SettingToggle::AutoCacheListenAgain => settings.auto_cache_listen_again,
         SettingToggle::AutoReleaseTrackLoops => settings.auto_release_track_loops,
@@ -2015,6 +2028,7 @@ fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
             settings.prefer_local_cache_on_playback = value
         }
         SettingToggle::PrefetchEnabled => settings.prefetch_enabled = value,
+        SettingToggle::SeamlessListening => settings.seamless_listening = value,
         SettingToggle::AutoManageOfflineCache => settings.auto_manage_offline_cache = value,
         SettingToggle::AutoCacheListenAgain => settings.auto_cache_listen_again = value,
         SettingToggle::AutoReleaseTrackLoops => settings.auto_release_track_loops = value,

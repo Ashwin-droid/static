@@ -105,3 +105,57 @@ fn unpin_offline_returns_download_to_auto_managed_pool() {
 
     let _ = fs::remove_dir_all(base);
 }
+
+#[test]
+fn scored_offline_tracks_cover_the_whole_store_and_skip_missing_files() {
+    let base = std::env::temp_dir().join(format!("static-cache-test-{}", Uuid::new_v4()));
+    let raw_root = base.to_string_lossy().to_string();
+    let cache = MusicCache::new_with_storage_root(Some(&raw_root)).expect("cache init");
+
+    // Auto download with play history.
+    for _ in 0..3 {
+        cache
+            .record_play("auto", "Auto Song", "Auto Artist", None, 60)
+            .expect("record play");
+    }
+    cache
+        .store_audio("auto", b"audio", None)
+        .expect("store auto");
+    // Manual download, never played.
+    cache
+        .store_audio("manual", b"audio", None)
+        .expect("store manual");
+    cache.pin_offline("manual").expect("pin manual");
+    // Playlist download.
+    cache
+        .store_audio("playlist-song", b"audio", None)
+        .expect("store playlist song");
+    cache
+        .store_offline_playlist(
+            "playlist",
+            "Playlist",
+            None,
+            None,
+            &["playlist-song".to_string()],
+        )
+        .expect("store playlist");
+    // Indexed, but the audio file is gone.
+    cache
+        .store_audio("ghost", b"audio", None)
+        .expect("store ghost");
+    fs::remove_file(base.join("offline/ghost.audio")).expect("remove ghost audio");
+
+    let mut tracks = cache.scored_offline_tracks(30).expect("scored tracks");
+    tracks.sort_by(|left, right| left.video_id.cmp(&right.video_id));
+    let ids: Vec<&str> = tracks.iter().map(|track| track.video_id.as_str()).collect();
+    assert_eq!(ids, ["auto", "manual", "playlist-song"]);
+
+    assert_eq!(tracks[0].title, "Auto Song");
+    assert_eq!(tracks[0].artist, "Auto Artist");
+    assert!(tracks[0].score > 2.9 && tracks[0].score <= 3.0);
+    // No play history: titled by id, scored zero.
+    assert_eq!(tracks[1].title, "manual");
+    assert_eq!(tracks[1].score, 0.0);
+
+    let _ = fs::remove_dir_all(base);
+}

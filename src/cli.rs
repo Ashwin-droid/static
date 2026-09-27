@@ -831,6 +831,7 @@ fn offline_track_from_parts(
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     })
 }
 
@@ -1408,6 +1409,7 @@ pub(crate) fn resume_snapshot_track(snapshot: &PlaybackSnapshot) -> Option<Track
                 playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
+                offline_fill: false,
             })
         })
 }
@@ -1573,6 +1575,7 @@ fn fabricate_track(video_id: &str, fallback_title: &str) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 
@@ -1646,8 +1649,14 @@ fn print_queue(snapshot: &PlaybackSnapshot) {
             "  "
         };
 
+        let offline_fill = if track.offline_fill {
+            "  [offline fill]"
+        } else {
+            ""
+        };
+
         println!(
-            "{marker} {:>3}. {}",
+            "{marker} {:>3}. {}{offline_fill}",
             index.saturating_add(1),
             format_track_summary(track)
         );
@@ -1732,6 +1741,10 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
     },
     ConfigSpec {
         name: "prefer_local_cache_on_playback",
+        kind: ConfigKind::Bool,
+    },
+    ConfigSpec {
+        name: "seamless_listening",
         kind: ConfigKind::Bool,
     },
     ConfigSpec {
@@ -1965,6 +1978,18 @@ the same track exists locally.\n{}",
                 "prefer normal network playback even if a cached copy exists"
             )
         ),
+        "seamless_listening" => format!(
+            "Controls whether Static keeps music going from the offline library when the next \
+song cannot be fetched.\nApplies to forward advances only (track end, Next, skipping a failed \
+track): if the next song is not cached or prefetched and the network is down, or a radio queue \
+runs dry because it could not be extended, Static inserts a pick from your combined offline store \
+(automatic, manual, and playlist downloads) and plays that instead. Songs you pick explicitly are \
+never substituted.\n{}",
+            bool_values_note(
+                "fill from the offline library when the next song cannot be fetched",
+                "stop or fail as usual when the next song cannot be fetched"
+            )
+        ),
         "other_mpris_mode" => "Controls how Static reacts when another MPRIS player is active.\n\
 Values:\n  - `off`: ignore peer MPRIS players entirely.\n  - `halt`: pause for the other \
 player and stay halted until you resume manually.\n  - `halt_auto`: pause for the other player, \
@@ -2125,6 +2150,7 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "prefetch_enabled" => yes_no_bool(settings.prefetch_enabled),
         "prefetch_ahead" => settings.prefetch_ahead.to_string(),
         "prefer_local_cache_on_playback" => yes_no_bool(settings.prefer_local_cache_on_playback),
+        "seamless_listening" => yes_no_bool(settings.seamless_listening),
         "volume_boost_enabled" => yes_no_bool(settings.volume_boost_enabled),
         "dgain_enabled" => yes_no_bool(settings.dgain_enabled),
         "dgain_flatten_percent" => settings.dgain_flatten_percent.to_string(),
@@ -2187,6 +2213,7 @@ pub(crate) fn apply_config_value(
         "prefer_local_cache_on_playback" => {
             settings.prefer_local_cache_on_playback = parse_bool(trimmed)?
         }
+        "seamless_listening" => settings.seamless_listening = parse_bool(trimmed)?,
         "volume_boost_enabled" => settings.volume_boost_enabled = parse_bool(trimmed)?,
         "dgain_enabled" => settings.dgain_enabled = parse_bool(trimmed)?,
         "dgain_flatten_percent" => {

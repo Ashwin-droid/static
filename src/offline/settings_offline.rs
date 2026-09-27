@@ -110,6 +110,10 @@ pub struct AppSettings {
     pub prefetch_enabled: bool,
     pub prefetch_ahead: u32,
     pub prefer_local_cache_on_playback: bool,
+    /// When a forward advance cannot fetch its next song (network down, or a
+    /// radio tail that failed to extend), the daemon plays a pick from the
+    /// offline library instead of stopping.
+    pub seamless_listening: bool,
     pub volume_boost_enabled: bool,
     pub dgain_enabled: bool,
     pub dgain_flatten_percent: f64,
@@ -154,6 +158,7 @@ impl Default for AppSettings {
             prefetch_enabled: true,
             prefetch_ahead: 3,
             prefer_local_cache_on_playback: true,
+            seamless_listening: false,
             volume_boost_enabled: false,
             dgain_enabled: false,
             dgain_flatten_percent: 50.0,
@@ -281,6 +286,10 @@ impl MusicCache {
                 "prefer_local_cache_on_playback" => {
                     settings.prefer_local_cache_on_playback =
                         parse_bool_setting(&row.1, settings.prefer_local_cache_on_playback);
+                }
+                "seamless_listening" => {
+                    settings.seamless_listening =
+                        parse_bool_setting(&row.1, settings.seamless_listening);
                 }
                 "volume_boost_enabled" => {
                     settings.volume_boost_enabled =
@@ -458,6 +467,10 @@ impl MusicCache {
             (
                 "prefer_local_cache_on_playback",
                 bool_setting(settings.prefer_local_cache_on_playback),
+            ),
+            (
+                "seamless_listening",
+                bool_setting(settings.seamless_listening),
             ),
             (
                 "volume_boost_enabled",

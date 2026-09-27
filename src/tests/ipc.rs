@@ -175,6 +175,7 @@ fn playlist_state_rows_do_not_clobber_global_resume_row() {
                 playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
+                offline_fill: false,
             }],
             queue_index: 0,
             playlist_context: Some(playlist_context.clone()),
@@ -308,4 +309,26 @@ fn older_visualizer_source_requests_do_not_advertise_memory_export_support() {
             ..
         }
     ));
+}
+
+#[test]
+fn offline_fill_flag_is_absent_unless_set_and_defaults_to_false() {
+    let older_payload = json!({
+        "video_id": "abc",
+        "title": "Song",
+        "artists": [],
+        "album": null,
+        "duration": null,
+        "thumbnail_url": null
+    });
+    let mut track: Track = serde_json::from_value(older_payload).expect("older track payload");
+    assert!(!track.offline_fill);
+    let plain = serde_json::to_value(&track).expect("serialize plain track");
+    assert!(plain.get("offline_fill").is_none());
+
+    track.offline_fill = true;
+    let flagged = serde_json::to_value(&track).expect("serialize flagged track");
+    assert_eq!(flagged.get("offline_fill"), Some(&json!(true)));
+    let restored: Track = serde_json::from_value(flagged).expect("flagged track round trip");
+    assert!(restored.offline_fill);
 }

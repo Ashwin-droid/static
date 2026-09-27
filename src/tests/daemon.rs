@@ -12,16 +12,18 @@ use super::{
     pending_playback_start_is_ready, pipewire_unduck_can_replace_volume_ramp,
     playback_position_confirms_start, playback_start_stalled, prefetch_candidate_indices,
     previous_action, previous_action_position_millis_for_track, promote_untouched_pick,
-    radio_chips_with_replacement, radio_pick_weights, rearm_track_repeat_loops_for_snapshot,
-    refresh_shuffle_up_next_id, remove_cached_if_unwanted_after_playlist_sync,
-    resolve_pending_playback_index, resolve_pipewire_suppression_mode,
-    resolve_shuffle_advance_pick, restore_order, should_count_paused_idle_for_shutdown,
-    should_desync_playback_start, should_emit_live_mpris_seeked_hint,
-    should_evict_cache_after_startup_stall, should_expose_mpris_halt_auto_sidechannel,
-    should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
-    should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
-    should_wait_for_radio_extension_at_natural_end, title_similarity, tracking_retry_delay,
-    valid_requested_volume, volume_ramp_is_complete, volume_ramp_value, weighted_index,
+    radio_chips_with_replacement, radio_pick_weights, radio_ran_dry,
+    rearm_track_repeat_loops_for_snapshot, refresh_shuffle_up_next_id,
+    remove_cached_if_unwanted_after_playlist_sync, resolve_pending_playback_index,
+    resolve_pipewire_suppression_mode, resolve_shuffle_advance_pick, restore_order,
+    seamless_covers_advance, seamless_insert_slot_after_failed_target, seamless_pick,
+    seamless_pick_weights, should_count_paused_idle_for_shutdown, should_desync_playback_start,
+    should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
+    should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
+    should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
+    should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
+    title_similarity, tracking_retry_delay, valid_requested_volume, volume_ramp_is_complete,
+    volume_ramp_value, weighted_index,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
@@ -86,6 +88,7 @@ fn test_track(video_id: &str) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 
@@ -1753,4 +1756,117 @@ fn invalid_memory_cartridge_chunks_abort_without_publishing_partial_data() {
         assert!(store.commit(&id).is_err());
         assert!(store.list().is_empty());
     }
+}
+
+#[test]
+fn seamless_covers_only_unfetchable_forward_advances() {
+    // Disabled: never, whatever the network says.
+    assert!(!seamless_covers_advance(false, false, Some(false), true));
+    assert!(!seamless_covers_advance(false, false, None, true));
+
+    // Offline with an uncached next song: cover it.
+    assert!(seamless_covers_advance(true, false, Some(false), false));
+    // The lookahead cache already holds the next song: play that.
+    assert!(!seamless_covers_advance(true, false, Some(true), false));
+    // Online: the network is tried first; failures are covered afterwards.
+    assert!(!seamless_covers_advance(true, true, Some(false), false));
+
+    // No next song: only a radio queue that ran dry is covered — a finished
+    // playlist just ends.
+    assert!(seamless_covers_advance(true, true, None, true));
+    assert!(!seamless_covers_advance(true, false, None, false));
+}
+
+#[test]
+fn radio_runs_dry_only_when_the_tail_could_not_extend() {
+    assert!(radio_ran_dry(true, RepeatMode::Off, 4, false, true));
+    // Still fetching and the network is up: wait for the extension.
+    assert!(!radio_ran_dry(true, RepeatMode::Off, 4, true, true));
+    // Still "fetching" but known offline: waiting is pointless.
+    assert!(radio_ran_dry(true, RepeatMode::Off, 4, true, false));
+    assert!(!radio_ran_dry(false, RepeatMode::Off, 4, false, false));
+    assert!(!radio_ran_dry(true, RepeatMode::All, 4, false, false));
+    assert!(!radio_ran_dry(true, RepeatMode::Off, 0, false, false));
+}
+
+#[test]
+fn seamless_fill_slot_retries_offline_failures_and_skips_online_ones() {
+    // Offline: the failed song at 3 stays ahead of the fill.
+    assert_eq!(seamless_insert_slot_after_failed_target(false, 3, 3), 3);
+    // Online: the song itself is suspect; the fill lands behind it.
+    assert_eq!(seamless_insert_slot_after_failed_target(true, 3, 3), 4);
+}
+
+#[test]
+fn seamless_pick_skips_queued_songs_and_widens_when_exhausted() {
+    fn entry(id: &str, score: f64) -> (Track, f64) {
+        (
+            test_track_by(id, &format!("t-{id}"), &format!("artist-{id}")),
+            score,
+        )
+    }
+    let queue = vec![
+        test_track_by("q0", "t-q0", "artist-q0"),
+        test_track_by("q1", "t-q1", "artist-q1"),
+        test_track_by("q2", "t-q2", "artist-q2"),
+    ];
+
+    assert_eq!(seamless_pick(&[], &queue, 1, 0.5), None);
+
+    // Songs already in the queue (played or upcoming) are never picked while
+    // anything else is available.
+    let library = [entry("q0", 9.0), entry("q2", 9.0), entry("fresh", 0.0)];
+    for roll in [0.0, 0.5, 0.999] {
+        assert_eq!(
+            seamless_pick(&library, &queue, 1, roll).map(|track| track.video_id),
+            Some("fresh".to_string())
+        );
+    }
+
+    // Whole library queued: anything but the recent history (q0, q1) — here
+    // the upcoming q2.
+    let library = [entry("q0", 1.0), entry("q1", 1.0), entry("q2", 1.0)];
+    for roll in [0.0, 0.5, 0.999] {
+        assert_eq!(
+            seamless_pick(&library, &queue, 1, roll).map(|track| track.video_id),
+            Some("q2".to_string())
+        );
+    }
+
+    // Only recent history left: anything but the current song.
+    let library = [entry("q0", 1.0), entry("q1", 1.0)];
+    assert_eq!(
+        seamless_pick(&library, &queue, 1, 0.5).map(|track| track.video_id),
+        Some("q0".to_string())
+    );
+
+    // A one-song library still beats silence.
+    let library = [entry("q1", 1.0)];
+    assert_eq!(
+        seamless_pick(&library, &queue, 1, 0.5).map(|track| track.video_id),
+        Some("q1".to_string())
+    );
+}
+
+#[test]
+fn seamless_pick_weights_favour_played_songs_and_keep_repulsion() {
+    let history = [test_track_by("h", "Song H", "Same Artist")];
+    let candidates = [
+        test_track_by("a", "Alpha", "Other Artist"),
+        test_track_by("b", "Beta", "Another Artist"),
+        test_track_by("c", "Gamma", "Same Artist"),
+    ];
+
+    let weights = seamless_pick_weights(&candidates, &[0.0, 5.0, 5.0], &history);
+    // Same freshness, higher offline score: more likely.
+    assert!(weights[1] > weights[0]);
+    // Same score, but by the artist that just played: pushed down.
+    assert!(weights[2] < weights[1]);
+    // Never unpickable.
+    assert!(weights.iter().all(|weight| *weight > 0.0));
+
+    // A negative or missing score degrades to the unplayed baseline.
+    let baseline = seamless_pick_weights(&candidates[..1], &[0.0], &history);
+    let negative = seamless_pick_weights(&candidates[..1], &[-3.0], &history);
+    assert_eq!(baseline, negative);
 }

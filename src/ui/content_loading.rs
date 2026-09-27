@@ -542,6 +542,7 @@ fn resolve_direct_video_track(
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     };
 
     let Some(ytm) = client else {
@@ -1076,6 +1077,7 @@ fn offline_track(
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 

@@ -424,6 +424,7 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             playback_params: playback_params.clone(),
             not_interested_feedback_token,
             undo_feedback_token,
+            offline_fill: false,
         });
     }
 
@@ -453,6 +454,7 @@ fn parse_track_from_renderer(renderer: &Value) -> Option<Track> {
             playback_params,
             not_interested_feedback_token,
             undo_feedback_token,
+            offline_fill: false,
         });
     }
 
@@ -490,6 +492,7 @@ fn parse_multi_row_track_from_renderer(renderer: &Value) -> Option<Track> {
         playback_params,
         not_interested_feedback_token,
         undo_feedback_token,
+        offline_fill: false,
     })
 }
 
@@ -1037,6 +1040,7 @@ pub fn parse_radio(json: &Value) -> Result<RadioQueue> {
                         playback_params: None,
                         not_interested_feedback_token: None,
                         undo_feedback_token: None,
+                        offline_fill: false,
                     })
                 })
                 .collect()
@@ -1232,6 +1236,7 @@ fn parse_playlist_panel_track(
         playback_params,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     })
 }
 

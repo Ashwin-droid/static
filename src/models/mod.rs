@@ -16,6 +16,10 @@ pub struct Track {
     pub not_interested_feedback_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_feedback_token: Option<String>,
+    /// Inserted by seamless listening from the offline library because the
+    /// intended next song could not be fetched. Frontends tint these rows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offline_fill: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

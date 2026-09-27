@@ -30,7 +30,7 @@ use crate::ipc::{
     current_unix_millis, store_persisted_playback_state, store_persisted_playlist_state,
     youtube_music_watch_url,
 };
-use crate::models::{RadioChip, RadioVirtualPlaylist, SyncedLyrics, Track};
+use crate::models::{Artist, RadioChip, RadioVirtualPlaylist, SyncedLyrics, Track};
 use crate::network::{
     SongRating, SponsorBlockClient, SponsorSegment, TrackingInfo, default_skip_categories,
     download_media_bytes, fetch_thumbnail_bytes, filter_segments_for_categories,
@@ -189,6 +189,9 @@ struct PendingPlaybackStart {
     budget_mode: TrackRepeatBudgetMode,
     suppress_reporting: bool,
     preserved_track_repeat_loops_left: Option<u32>,
+    /// Staged by a forward advance (user Next), not an explicit song choice:
+    /// only these starts may be covered by seamless listening when they fail.
+    forward_advance: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2643,6 +2646,10 @@ fn maintain_playback(state: &mut DaemonState) {
         ) {
             Ok(target) => target,
             Err(err) => {
+                let insert_at = state.queue_index.saturating_add(1);
+                if seamless_cover(state, insert_at, "no upcoming radio song is cached") {
+                    return;
+                }
                 // Offline with nothing cached: stopping is the only honest
                 // outcome for an unattended track end (the daemon has no push
                 // error channel; user-initiated Next surfaces the message
@@ -2652,6 +2659,13 @@ fn maintain_playback(state: &mut DaemonState) {
                 return;
             }
         };
+        let cover_attempted = seamless_should_cover_target(state, target);
+        if cover_attempted {
+            let insert_at = state.queue_index.saturating_add(1);
+            if seamless_cover(state, insert_at, "the next song cannot be fetched") {
+                return;
+            }
+        }
         match target {
             Some(target) => {
                 let budget_mode = if repeat_mode == RepeatMode::One && target == state.queue_index {
@@ -2668,6 +2682,14 @@ fn maintain_playback(state: &mut DaemonState) {
                     false,
                 ) {
                     eprintln!("[DAEMON] failed to auto-advance: {err}");
+                    if !cover_attempted {
+                        let insert_at = seamless_insert_slot_after_failed_target(
+                            state.online,
+                            state.queue_index.saturating_add(1),
+                            target,
+                        );
+                        seamless_cover(state, insert_at, "the next song failed to load");
+                    }
                 }
             }
             None if should_wait_for_radio_extension_at_natural_end(
@@ -2944,7 +2966,21 @@ fn restore_after_probe(state: &mut DaemonState, resume_playback: bool) -> Result
 fn advance_queue_for_user_action(state: &mut DaemonState, forward: bool) -> Result<()> {
     let mut target = queue_target_index(state, forward);
     if forward {
-        target = promote_random_untouched_pick(state, target)?;
+        let insert_at = state.queue_index.saturating_add(1);
+        target = match promote_random_untouched_pick(state, target) {
+            Ok(target) => target,
+            Err(err) => Some(
+                seamless_fill_at(state, insert_at, "no upcoming radio song is cached")
+                    .ok_or(err)?,
+            ),
+        };
+        if seamless_should_cover_target(state, target) {
+            if let Some(index) =
+                seamless_fill_at(state, insert_at, "the next song cannot be fetched")
+            {
+                target = Some(index);
+            }
+        }
     }
     match target {
         Some(index) => {
@@ -2956,7 +2992,11 @@ fn advance_queue_for_user_action(state: &mut DaemonState, forward: bool) -> Resu
                 TrackRepeatBudgetMode::ResetForCurrentTrack,
                 false,
                 None,
-            )
+            )?;
+            if let Some(pending) = state.pending_playback_start.as_mut() {
+                pending.forward_advance = forward;
+            }
+            Ok(())
         }
         None => {
             stop_playback(state, false);
@@ -3489,6 +3529,245 @@ fn audio_is_cached(cache: &MusicCache, video_id: &str) -> bool {
     cache.is_cached(video_id) || cache.get_temp_audio(video_id).is_some()
 }
 
+// Seamless listening: when a forward advance cannot fetch its next song, the
+// daemon bridges the gap with a pick from the offline library instead of
+// stopping. Fills are ordinary queue entries inserted next to the current
+// track (so they land inside the radio touched prefix), flagged
+// `Track::offline_fill` so frontends can tint them. Explicit song choices are
+// never substituted — only forward advances are covered.
+
+/// Played-history window the seamless pick avoids repeating once every offline
+/// song is already somewhere in the queue.
+const SEAMLESS_RECENT_HISTORY: usize = 20;
+
+/// Whether a forward advance is covered from the offline library up front,
+/// without trying the network. `target_available` is whether the advance
+/// target can start locally (None = the queue has no next song). A reachable
+/// network is always tried first; its failures are covered afterwards by the
+/// callers' error paths.
+fn seamless_covers_advance(
+    enabled: bool,
+    online: bool,
+    target_available: Option<bool>,
+    radio_ran_dry: bool,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match target_available {
+        Some(available) => !online && !available,
+        None => radio_ran_dry,
+    }
+}
+
+/// A radio queue is endless by contract, so reaching its end means the tail
+/// could not be extended. While the extension is still in flight the advance
+/// waits for it, unless the network is known to be down.
+fn radio_ran_dry(
+    has_radio_queue: bool,
+    repeat_mode: RepeatMode,
+    queue_len: usize,
+    radio_append_in_flight: bool,
+    online: bool,
+) -> bool {
+    has_radio_queue
+        && repeat_mode == RepeatMode::Off
+        && queue_len > 0
+        && (!radio_append_in_flight || !online)
+}
+
+fn seamless_should_cover_target(state: &DaemonState, target: Option<usize>) -> bool {
+    // Replaying the current track (repeat-One) counts as available: it is not
+    // a "next song" to substitute.
+    let target_available = target.map(|index| {
+        index == state.queue_index
+            || state
+                .queue
+                .get(index)
+                .is_some_and(|track| audio_is_cached(&state.cache, &track.video_id))
+    });
+    seamless_covers_advance(
+        state.settings.seamless_listening,
+        state.online,
+        target_available,
+        radio_ran_dry(
+            state.radio_virtual_playlist.is_some(),
+            state.repeat_mode,
+            state.queue.len(),
+            state.radio_append_in_flight,
+            state.online,
+        ),
+    )
+}
+
+/// Where the fill goes once the advance target at `target` already failed to
+/// load. Offline, the failed song stays ahead of the fill (`before_target`) to
+/// be retried when the network is back. Online, the song itself is the
+/// suspect, so the fill lands behind it and the advance moves past — otherwise
+/// one unplayable song would be retried forever.
+fn seamless_insert_slot_after_failed_target(
+    online: bool,
+    before_target: usize,
+    target: usize,
+) -> usize {
+    if online {
+        target.saturating_add(1)
+    } else {
+        before_target
+    }
+}
+
+/// Per-candidate weights for the seamless pick: how much the user plays the
+/// song (its offline score, log-damped so favourites lead without drowning
+/// the rest) times the radio pick's freshness repulsion against `history`.
+fn seamless_pick_weights(candidates: &[Track], scores: &[f64], history: &[Track]) -> Vec<f64> {
+    radio_pick_weights(candidates, history)
+        .into_iter()
+        .zip(scores)
+        .map(|(freshness, score)| freshness * (1.0 + score.max(0.0).ln_1p()))
+        .collect()
+}
+
+/// "Which song would you like next" over the offline library (`library` pairs
+/// each playable offline track with its offline score): a weighted sample via
+/// [`seamless_pick_weights`]. Songs already in the queue are skipped; when the
+/// whole library is queued the pool widens step by step — outside the recent
+/// history, then anything but the current song, then anything at all.
+fn seamless_pick(
+    library: &[(Track, f64)],
+    queue: &[Track],
+    queue_index: usize,
+    roll: f64,
+) -> Option<Track> {
+    let history = &queue[..queue_index.saturating_add(1).min(queue.len())];
+    let queued: HashSet<&str> = queue.iter().map(|track| track.video_id.as_str()).collect();
+    let recent: HashSet<&str> = history[history.len().saturating_sub(SEAMLESS_RECENT_HISTORY)..]
+        .iter()
+        .map(|track| track.video_id.as_str())
+        .collect();
+    let current = history.last().map(|track| track.video_id.as_str());
+
+    let eligible = |allowed: &dyn Fn(&str) -> bool| -> Vec<&(Track, f64)> {
+        library
+            .iter()
+            .filter(|(track, _)| allowed(&track.video_id))
+            .collect()
+    };
+    let mut pool = eligible(&|id| !queued.contains(id));
+    if pool.is_empty() {
+        pool = eligible(&|id| !recent.contains(id));
+    }
+    if pool.is_empty() {
+        pool = eligible(&|id| Some(id) != current);
+    }
+    if pool.is_empty() {
+        pool = library.iter().collect();
+    }
+    if pool.is_empty() {
+        return None;
+    }
+
+    let candidates: Vec<Track> = pool.iter().map(|(track, _)| track.clone()).collect();
+    let scores: Vec<f64> = pool.iter().map(|(_, score)| *score).collect();
+    let weights = seamless_pick_weights(&candidates, &scores, history);
+    Some(candidates[weighted_index(&weights, roll)].clone())
+}
+
+/// The combined offline store (automatic, manual, and playlist downloads) as
+/// queueable tracks with their offline scores.
+fn seamless_library(state: &DaemonState) -> Vec<(Track, f64)> {
+    let tracks = match state
+        .cache
+        .scored_offline_tracks(state.settings.score_decay_window_days)
+    {
+        Ok(tracks) => tracks,
+        Err(err) => {
+            eprintln!("[SEAMLESS] failed to read the offline library: {err}");
+            return Vec::new();
+        }
+    };
+    tracks
+        .into_iter()
+        .map(|offline| {
+            let track = Track {
+                video_id: offline.video_id,
+                title: offline.title,
+                artists: if offline.artist.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    vec![Artist {
+                        name: offline.artist,
+                        id: None,
+                        page_type: None,
+                    }]
+                },
+                album: None,
+                duration: None,
+                thumbnail_url: offline
+                    .art_path
+                    .filter(|path| std::path::Path::new(path).exists())
+                    .map(|path| format!("file://{path}")),
+                playback_playlist_id: None,
+                playback_params: None,
+                not_interested_feedback_token: None,
+                undo_feedback_token: None,
+                offline_fill: true,
+            };
+            (track, offline.score)
+        })
+        .collect()
+}
+
+/// Inserts a seamless pick at `insert_at` and returns its queue index, or None
+/// when the feature is off or the offline library is empty. Does not start
+/// playback.
+fn seamless_fill_at(state: &mut DaemonState, insert_at: usize, reason: &str) -> Option<usize> {
+    if !state.settings.seamless_listening {
+        return None;
+    }
+    let roll = {
+        use rand::RngExt;
+        rand::rng().random::<f64>()
+    };
+    let library = seamless_library(state);
+    let Some(track) = seamless_pick(&library, &state.queue, state.queue_index, roll) else {
+        eprintln!("[SEAMLESS] {reason}, but the offline library is empty");
+        return None;
+    };
+    let index = insert_at.min(state.queue.len());
+    eprintln!(
+        "[SEAMLESS] {reason}; filling queue slot {} with offline song {} ({})",
+        index.saturating_add(1),
+        track.video_id,
+        track.title
+    );
+    insert_into_queue(state, vec![track], index);
+    Some(index)
+}
+
+/// [`seamless_fill_at`] plus starting the fill. Returns whether a fill is now
+/// playing.
+fn seamless_cover(state: &mut DaemonState, insert_at: usize, reason: &str) -> bool {
+    let Some(index) = seamless_fill_at(state, insert_at, reason) else {
+        return false;
+    };
+    match play_index(state, index) {
+        Ok(()) => {
+            maybe_persist_playback_state(state, true);
+            true
+        }
+        Err(err) => {
+            eprintln!("[SEAMLESS] failed to start the offline fill: {err}");
+            // Leave no trace of a fill that never played, so a caller that
+            // falls back to its own handling sees the queue it started with.
+            if let Err(err) = remove_from_queue(state, index) {
+                eprintln!("[SEAMLESS] failed to withdraw the unplayable fill: {err}");
+            }
+            false
+        }
+    }
+}
+
 /// Decides (or re-validates) the radio-shuffle pick for the NEXT advance. A
 /// still-valid pick is kept — its prefetch may already be underway — while an
 /// absent or invalidated one (consumed by an advance, removed from the queue,
@@ -3956,7 +4235,13 @@ fn maybe_recover_stalled_playback_start(state: &mut DaemonState) -> bool {
         return true;
     }
 
-    if startup_retries < PLAYBACK_START_RETRY_LIMIT {
+    // Known-offline remote starts cannot recover by retrying; hand over to the
+    // failure path right away so seamless listening can bridge the gap.
+    let retry_is_pointless = state.settings.seamless_listening
+        && !state.online
+        && playback_source == PlaybackSource::RemoteStream;
+
+    if startup_retries < PLAYBACK_START_RETRY_LIMIT && !retry_is_pointless {
         let next_retry = startup_retries.saturating_add(1);
         let next_attempt = next_retry.saturating_add(1);
         eprintln!(
@@ -4197,6 +4482,7 @@ fn stage_play_index_after_desync(
         budget_mode,
         suppress_reporting,
         preserved_track_repeat_loops_left,
+        forward_advance: false,
     });
     match budget_mode {
         TrackRepeatBudgetMode::ResetForCurrentTrack => {
@@ -4251,9 +4537,20 @@ fn maybe_start_pending_playback(state: &mut DaemonState, now: Instant) -> bool {
     if !pending_playback_start_is_ready(pending.due_at, pending.start_when_due, now) {
         return false;
     }
+    let forward_advance = pending.forward_advance;
 
     if let Err(err) = start_pending_playback(state) {
         eprintln!("[DAEMON] pending playback start failed: {err}");
+        if forward_advance {
+            let insert_at = seamless_insert_slot_after_failed_target(
+                state.online,
+                state.queue_index,
+                state.queue_index,
+            );
+            if seamless_cover(state, insert_at, "the next song failed to load") {
+                return true;
+            }
+        }
         stop_playback(state, false);
     }
     true
@@ -4498,7 +4795,15 @@ fn apply_prepared_video_id_to_track(
 }
 
 fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<PreparedPlayback> {
-    if state.settings.prefer_local_cache_on_playback {
+    // Seamless listening exists to avoid the network: its fills, and anything
+    // started while known-offline, play from local audio regardless of the
+    // prefer-local preference.
+    let seamless_local = (state.settings.seamless_listening && !state.online)
+        || state
+            .queue
+            .iter()
+            .any(|track| track.offline_fill && track.video_id == video_id);
+    if state.settings.prefer_local_cache_on_playback || seamless_local {
         if let Some(cached_path) = state.cache.get_cached_audio(video_id) {
             return url::Url::from_file_path(cached_path)
                 .map(|url| PreparedPlayback {
@@ -4508,7 +4813,7 @@ fn prepare_playback(state: &mut DaemonState, video_id: &str) -> Result<PreparedP
                 })
                 .map_err(|_| anyhow!("Failed to build file URL for cached audio"));
         }
-        if state.settings.prefetch_enabled {
+        if state.settings.prefetch_enabled || seamless_local {
             if let Some(temp_path) = state.cache.get_temp_audio(video_id) {
                 return url::Url::from_file_path(temp_path)
                     .map(|url| PreparedPlayback {
@@ -4617,9 +4922,35 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
         }
         if let Err(err) = play_index(state, queue_index) {
             eprintln!("[DAEMON] retry after offline-cache eviction failed for {video_id}: {err}");
+            if seamless_cover(state, queue_index, "the cached copy failed to play") {
+                return;
+            }
             stop_playback(state, false);
         }
         return;
+    }
+
+    // A failed stream is the first hint the network dropped; re-probe now
+    // instead of waiting out the interval.
+    state.last_connectivity_probe_at = None;
+    let next_target = queue_target_index(state, true).filter(|target| *target != queue_index);
+    if playback_source == PlaybackSource::RemoteStream
+        && seamless_should_cover_target(state, next_target)
+    {
+        // A song that never started is kept ahead of the fill to be retried
+        // once the network is back; one that died mid-play stays behind it.
+        let insert_at = if awaiting_fresh_position {
+            queue_index
+        } else {
+            queue_index.saturating_add(1)
+        };
+        if seamless_cover(
+            state,
+            insert_at,
+            "the stream failed and the next song cannot be fetched",
+        ) {
+            return;
+        }
     }
 
     if let Some(target) = queue_target_index(state, true) {
@@ -4637,6 +4968,14 @@ fn handle_playback_failure(state: &mut DaemonState, error: String) {
             }
             if let Err(err) = play_index(state, target) {
                 eprintln!("[DAEMON] failed to advance after playback failure on {video_id}: {err}");
+                let insert_at = seamless_insert_slot_after_failed_target(
+                    state.online,
+                    state.queue_index.saturating_add(1),
+                    target,
+                );
+                if seamless_cover(state, insert_at, "the next song failed to load") {
+                    return;
+                }
                 stop_playback(state, false);
             }
             return;
@@ -5559,8 +5898,9 @@ fn maybe_apply_sponsorblock_skip(state: &mut DaemonState) {
 /// track). The probe itself runs on a background thread; this hot-path hook
 /// only checks the throttle and reads/writes daemon state.
 fn maybe_probe_connectivity(state: &mut DaemonState) {
-    let relevant =
-        state.shuffle && state.radio_virtual_playlist.is_some() && has_current_track(state);
+    let relevant = has_current_track(state)
+        && ((state.settings.seamless_listening && !is_logically_paused(state))
+            || (state.shuffle && state.radio_virtual_playlist.is_some()));
     if !relevant
         || state.connectivity_probe_in_flight
         || state

@@ -648,6 +648,7 @@ pub(in crate::cli_tui) fn load_offline_page_data_tui()
             playback_params: None,
             not_interested_feedback_token: None,
             undo_feedback_token: None,
+            offline_fill: false,
         })
         .collect::<Vec<_>>();
 
@@ -710,6 +711,7 @@ pub(in crate::cli_tui) fn load_offline_playlist_tracks_tui(
                 playback_params: None,
                 not_interested_feedback_token: None,
                 undo_feedback_token: None,
+                offline_fill: false,
             }
         })
         .collect())

@@ -21,6 +21,7 @@ fn track(video_id: &str, title: &str, artists: &[&str]) -> Track {
         playback_params: None,
         not_interested_feedback_token: None,
         undo_feedback_token: None,
+        offline_fill: false,
     }
 }
 
@@ -35,22 +36,22 @@ fn chip(label: &str) -> RadioChip {
 #[test]
 fn origin_label_without_radio_is_always_touched() {
     for index in [0, 1, 5, 100] {
-        assert_eq!(origin_label(index, None), "touched");
+        assert_eq!(origin_label(index, None, false), "touched");
     }
 }
 
 #[test]
 fn origin_label_splits_at_touched_len_boundary() {
-    assert_eq!(origin_label(0, Some(2)), "touched");
-    assert_eq!(origin_label(1, Some(2)), "touched");
-    assert_eq!(origin_label(2, Some(2)), "radio_generated");
-    assert_eq!(origin_label(3, Some(2)), "radio_generated");
+    assert_eq!(origin_label(0, Some(2), false), "touched");
+    assert_eq!(origin_label(1, Some(2), false), "touched");
+    assert_eq!(origin_label(2, Some(2), false), "radio_generated");
+    assert_eq!(origin_label(3, Some(2), false), "radio_generated");
 }
 
 #[test]
 fn origin_label_touched_len_zero_marks_everything_radio_generated() {
-    assert_eq!(origin_label(0, Some(0)), "radio_generated");
-    assert_eq!(origin_label(9, Some(0)), "radio_generated");
+    assert_eq!(origin_label(0, Some(0), false), "radio_generated");
+    assert_eq!(origin_label(9, Some(0), false), "radio_generated");
 }
 
 #[test]
@@ -138,4 +139,26 @@ fn match_chip_label_is_trimmed_and_case_insensitive() {
 fn match_chip_label_first_match_wins() {
     let chips = vec![chip("Same"), chip("same")];
     assert_eq!(match_chip_label(&chips, "SAME"), Some(0));
+}
+
+#[test]
+fn origin_label_marks_offline_fills_on_either_side_of_the_boundary() {
+    assert_eq!(origin_label(0, None, true), "offline_fill");
+    assert_eq!(origin_label(1, Some(2), true), "offline_fill");
+    assert_eq!(origin_label(3, Some(2), true), "offline_fill");
+}
+
+#[test]
+fn queue_rows_mark_flagged_tracks_as_offline_fill() {
+    let mut queue = vec![
+        track("a", "A", &["X"]),
+        track("b", "B", &["X"]),
+        track("c", "C", &["X"]),
+    ];
+    queue[1].offline_fill = true;
+    let origins: Vec<String> = queue_rows(&queue, Some(2))
+        .into_iter()
+        .map(|row| row[3].clone())
+        .collect();
+    assert_eq!(origins, ["touched", "offline_fill", "radio_generated"]);
 }

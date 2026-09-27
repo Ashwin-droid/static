@@ -1,6 +1,10 @@
 use super::*;
 use super::{playback::*, widgets::*};
 
+/// Queue rows seamless listening filled in from the offline library (GUI
+/// parity: `theme::OFFLINE_FILL`).
+const OFFLINE_FILL_COLOR: Color = Color::Rgb(255, 196, 120);
+
 impl InteractiveTui {
     pub(in crate::cli_tui) fn render_detail_panel(
         &mut self,
@@ -296,6 +300,7 @@ impl InteractiveTui {
                             .radio_virtual_playlist
                             .as_ref()
                             .is_some_and(|radio| absolute_index >= radio.touched_len);
+                        let is_seamless = track.offline_fill;
                         frame.render_widget(
                             Block::default().style(Style::default().bg(if is_dragging_row {
                                 theme.accent_fill
@@ -338,13 +343,17 @@ impl InteractiveTui {
                                             &track.title,
                                             row_area.width.saturating_sub(6) as usize,
                                         ),
-                                        Style::default().fg(theme.text).add_modifier(
-                                            if is_selected {
+                                        Style::default()
+                                            .fg(if is_seamless {
+                                                OFFLINE_FILL_COLOR
+                                            } else {
+                                                theme.text
+                                            })
+                                            .add_modifier(if is_selected {
                                                 Modifier::BOLD
                                             } else {
                                                 Modifier::empty()
-                                            },
-                                        ),
+                                            }),
                                     ),
                                 ]),
                                 Line::from(Span::styled(
@@ -356,12 +365,16 @@ impl InteractiveTui {
                                 )),
                                 Line::from(vec![
                                     Span::styled(
-                                        if is_generated {
+                                        if is_seamless {
+                                            "Offline fill"
+                                        } else if is_generated {
                                             "Radio generated"
                                         } else {
                                             "Queue"
                                         },
-                                        Style::default().fg(if is_generated {
+                                        Style::default().fg(if is_seamless {
+                                            OFFLINE_FILL_COLOR
+                                        } else if is_generated {
                                             theme.accent
                                         } else {
                                             theme.border

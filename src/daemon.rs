@@ -324,6 +324,9 @@ struct ExternalMprisCoordinator {
     last_logged_playing_services: Vec<String>,
     waiting_for_services: Vec<String>,
     no_playing_services_since: Option<Instant>,
+    /// When the current run of playing peers started (desktop aware volume
+    /// uses it to pick the sink baseline from before the interruption).
+    playing_services_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +405,7 @@ impl ExternalMprisCoordinator {
             last_logged_playing_services: Vec::new(),
             waiting_for_services: Vec::new(),
             no_playing_services_since: None,
+            playing_services_since: None,
         }
     }
 
@@ -524,9 +528,19 @@ impl ExternalMprisCoordinator {
         if self.playing_services.is_empty() {
             self.no_playing_services_since
                 .get_or_insert_with(Instant::now);
+            self.playing_services_since = None;
         } else {
             self.no_playing_services_since = None;
+            self.playing_services_since.get_or_insert_with(Instant::now);
         }
+    }
+
+    fn has_playing_services(&self) -> bool {
+        !self.playing_services.is_empty()
+    }
+
+    fn playing_services_since(&self) -> Option<Instant> {
+        self.playing_services_since
     }
 
     fn no_playing_services_for(&self) -> Option<Duration> {
@@ -543,6 +557,7 @@ impl ExternalMprisCoordinator {
         self.last_logged_playing_services.clear();
         self.waiting_for_services.clear();
         self.no_playing_services_since = None;
+        self.playing_services_since = None;
     }
 
     fn is_waiting_for_peer_pause(&self) -> bool {
@@ -6640,19 +6655,34 @@ fn steady_output_volume(state: &DaemonState) -> f64 {
     (base * state.desktop_volume.comp_gain()).clamp(0.0, 5.0)
 }
 
+/// Desktop aware volume covers every coordination-driven interruption:
+/// PipeWire duck, PipeWire pause, and MPRIS peer pause (halt and
+/// halt-auto, including the pending auto-resume window).
 fn desktop_volume_inputs(state: &DaemonState, now: Instant) -> DesktopVolumeInputs {
-    let suppressed = state.ducked || state.pipewire_pause_active;
+    let mpris_suppressed =
+        state.peer_mpris.is_waiting_for_peer_pause() || mpris_halt_auto_resume_is_pending(state);
+    let suppressed = state.ducked || state.pipewire_pause_active || mpris_suppressed;
+    let mpris_foreign_active = state.peer_mpris.has_playing_services();
+    let foreign_active = state.pipewire_trigger_active || mpris_foreign_active;
+    let foreign_since = match (
+        state.pipewire_trigger_since,
+        state.peer_mpris.playing_services_since(),
+    ) {
+        (Some(pipewire), Some(mpris)) => Some(pipewire.min(mpris)),
+        (pipewire, mpris) => pipewire.or(mpris),
+    };
     DesktopVolumeInputs {
         now,
-        enabled: state.settings.desktop_aware_volume && state.settings.pipewire_ducking_enabled,
-        foreign_active: state.pipewire_trigger_active,
+        enabled: state.settings.desktop_aware_volume
+            && (state.settings.pipewire_ducking_enabled
+                || state.settings.other_mpris_mode.coordinates_peers()),
+        foreign_active,
         suppressed,
         playing_alone: state.active_track.is_some()
             && !suppressed
-            && !state.pipewire_trigger_active
-            && !is_logically_paused(state)
-            && !state.peer_mpris.is_waiting_for_peer_pause(),
-        foreign_since: state.pipewire_trigger_since,
+            && !foreign_active
+            && !is_logically_paused(state),
+        foreign_since,
         hold: Duration::from_secs(state.settings.desktop_aware_volume_hold_secs.into()),
         restore: Duration::from_secs(state.settings.desktop_aware_volume_restore_secs.into()),
     }

@@ -11,6 +11,7 @@ mod network_parser;
 mod network_state;
 mod offline;
 mod pipewire_monitor;
+mod pipewire_tap;
 mod playback_engine;
 mod player;
 #[cfg(feature = "staticfs")]

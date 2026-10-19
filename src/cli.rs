@@ -23,12 +23,13 @@ use crate::offline::{
     AppSettings, CoordinationFilterMode, CoordinationMode, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, MusicCache, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
-    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
-    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
-    coordination_filter_contains, sanitize_coordination_filter_entries,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_AMOUNT_MAX,
+    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
+    sanitize_coordination_filter_entries,
 };
+use crate::pipewire_tap::{LOUD_DBFS, QUIET_DBFS};
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
 const HELP_USAGE: &str = "\
@@ -1805,7 +1806,11 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::U32,
     },
     ConfigSpec {
-        name: "pipewire_ducking_volume",
+        name: "pipewire_ducking_min",
+        kind: ConfigKind::F64,
+    },
+    ConfigSpec {
+        name: "pipewire_ducking_max",
         kind: ConfigKind::F64,
     },
     ConfigSpec {
@@ -2046,7 +2051,7 @@ ducks volume or pauses depending on `pipewire_pause_mode`.\n{}",
         ),
         "pipewire_pause_mode" => "Chooses what Static does after PipeWire detects another audio \
 stream staying active long enough to matter.\nValues:\n  - `off`: keep playback running and use \
-ducking volume instead.\n  - `halt`: pause and stay halted until you resume manually.\n  - \
+dynamic ducking instead.\n  - `halt`: pause and stay halted until you resume manually.\n  - \
 `halt_auto`: pause, then auto-resume after `pipewire_pause_halt_auto_resume_secs` once the other \
 audio stays quiet. A delay of `0` resumes as soon as it goes quiet."
             .to_string(),
@@ -2109,21 +2114,20 @@ touches the sink. Requires `pipewire_ducking_enabled=true` and wpctl."
                 &format!("any integer >= {}", DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS)
             )
         ),
-        "pipewire_ducking_volume" => format!(
-            "Target multiplier applied to the saved pre-duck volume while PipeWire ducking is \
-active and `pipewire_pause_mode=off`.\n`0.3` means play at 30% of the original level, `1.0` \
-means do not lower the level at all, and values above `1.0` intentionally overdrive playback so \
-Static can punch through other audio when that is useful.\n{}",
-            advanced_cli_range_note(
-                &format!(
-                    "{:.1}-{:.1}",
-                    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_DUCKING_VOLUME_UI_MAX
-                ),
-                &format!(
-                    "{:.1}-{:.1}",
-                    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_DUCKING_VOLUME_CLI_MAX
-                )
-            )
+        "pipewire_ducking_min" => format!(
+            "Dynamic ducking, least duck. While PipeWire ducking is active and \
+`pipewire_pause_mode=off`, Static taps the foreign streams and ducks in proportion to how loud \
+they are: this amount applies while they are quiet (at or below {QUIET_DBFS:.0} dBFS short-term), \
+`pipewire_ducking_max` while they are loud (at or above {LOUD_DBFS:.0} dBFS), with a CSS-style \
+ease-in-out curve between. `0.3` means play at 70% of the original level, `0` means do not lower \
+it at all.\nRange: {:.1}-{:.1}.",
+            PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX
+        ),
+        "pipewire_ducking_max" => format!(
+            "Dynamic ducking, most duck: the amount applied while the foreign audio is loud (a \
+voice in a call). `0.85` means play at 15% of the original level, `1` means silence. See \
+`pipewire_ducking_min`.\nRange: {:.1}-{:.1}.",
+            PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX
         ),
         "pipewire_filter_mode" => "Switches how `pipewire_filter_list` is interpreted.\nValues:\n  - \
 `blacklist`: coordinate with every current foreign PipeWire stream except listed identifiers.\n  - \
@@ -2213,7 +2217,8 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
             settings.pipewire_pause_halt_auto_resume_secs.to_string()
         }
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
-        "pipewire_ducking_volume" => settings.pipewire_ducking_volume.to_string(),
+        "pipewire_ducking_min" => settings.pipewire_ducking_min.to_string(),
+        "pipewire_ducking_max" => settings.pipewire_ducking_max.to_string(),
         "desktop_aware_volume" => yes_no_bool(settings.desktop_aware_volume),
         "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs.to_string(),
         "desktop_aware_volume_restore_secs" => {
@@ -2302,11 +2307,13 @@ pub(crate) fn apply_config_value(
             settings.pipewire_ducking_threshold_secs =
                 parse_u32(trimmed)?.max(PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS)
         }
-        "pipewire_ducking_volume" => {
-            settings.pipewire_ducking_volume = parse_f64(trimmed)?.clamp(
-                PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-                PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-            )
+        "pipewire_ducking_min" => {
+            settings.pipewire_ducking_min =
+                parse_f64(trimmed)?.clamp(PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX)
+        }
+        "pipewire_ducking_max" => {
+            settings.pipewire_ducking_max =
+                parse_f64(trimmed)?.clamp(PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX)
         }
         "desktop_aware_volume" => settings.desktop_aware_volume = parse_bool(trimmed)?,
         "desktop_aware_volume_hold_secs" => {

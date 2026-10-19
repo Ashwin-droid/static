@@ -1,7 +1,6 @@
 use super::{
-    CoordinationFilterMode, CoordinationMode, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    coordination_filter_allows, parse_f64_setting_in_range, parse_u32_setting_at_least,
-    sanitize_coordination_filter_entries,
+    CoordinationFilterMode, CoordinationMode, coordination_filter_allows,
+    parse_f64_setting_in_range, parse_u32_setting_at_least, sanitize_coordination_filter_entries,
 };
 
 #[test]
@@ -29,14 +28,8 @@ fn advanced_u32_settings_preserve_cli_only_values() {
 
 #[test]
 fn advanced_f64_settings_allow_boosted_values_but_stay_bounded() {
-    assert_eq!(
-        parse_f64_setting_in_range("1.75", 0.3, 0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX),
-        1.75
-    );
-    assert_eq!(
-        parse_f64_setting_in_range("9.0", 0.3, 0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX),
-        PIPEWIRE_DUCKING_VOLUME_CLI_MAX
-    );
+    assert_eq!(parse_f64_setting_in_range("1.75", 0.3, 0.0, 2.0), 1.75);
+    assert_eq!(parse_f64_setting_in_range("9.0", 0.3, 0.0, 2.0), 2.0);
 }
 
 #[test]

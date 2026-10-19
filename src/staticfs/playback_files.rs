@@ -351,6 +351,19 @@ pub(crate) fn trigger_prev(ctx: &Ctx) -> FsResult<()> {
     send(ctx, &DaemonRequest::Previous)
 }
 
+/// playback/duck (r): one line, "off" or
+/// "amount=<0..1> level=<dBFS> tapped=<true|false>" while ducked.
+pub(crate) fn read_duck(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
+    let snap = snapshot(ctx)?;
+    let Some(duck) = snap.duck else {
+        return Ok(format::scalar("off"));
+    };
+    Ok(format::scalar(&format!(
+        "amount={:.2} level={:.1}dBFS tapped={}",
+        duck.amount, duck.level_dbfs, duck.tapped
+    )))
+}
+
 /// playback/desktop_aware_volume (r): one line, "idle" or
 /// "<phase> comp=<dB> sink=<dB> remaining=<secs>".
 pub(crate) fn read_desktop_aware_volume(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {

@@ -19,9 +19,9 @@ fn static_tree_contains_every_fixed_node() {
     let mut all = Vec::new();
     walk_static(&Node::Root, &mut all);
     // 9 fixed dirs (root, playback, queue, radio, settings, stats, top,
-    // tracks, cartridges) + shutdown + 16 playback files + 4 queue files + 3 radio files
-    // + fsmod + overview + 4 top files = 39 fixed nodes.
-    assert_eq!(all.len(), 39);
+    // tracks, cartridges) + shutdown + 17 playback files + 4 queue files + 3 radio files
+    // + fsmod + overview + 4 top files = 40 fixed nodes.
+    assert_eq!(all.len(), 40);
     for node in [
         Node::Shutdown,
         Node::CartridgesDir,

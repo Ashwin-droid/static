@@ -72,6 +72,8 @@ Static coordinates with two kinds of external audio activity:
 - MPRIS peer players, such as other media apps,
 - and PipeWire activity, such as non-MPRIS audio streams from games, calls, or browsers.
 
+PipeWire ducking is dynamic: the daemon taps each coordinated foreign stream with a `pw-record` child (`src/pipewire_tap.rs`), follows the combined level with a fast attack and slow release, and maps it through a fixed ease-in-out curve from `pipewire_ducking_min` (quiet foreign audio) to `pipewire_ducking_max` (loud foreign audio). The level window is fixed (about -50 to -20 dBFS short-term): there is deliberately no speech detection and no adaptive range. With no live tap the duck sits at the maximum. Desktop aware volume multiplies on top of the duck output.
+
 The app has coordination modes like off, halt, and halt-auto. The old `respect` mode is no longer a separate user-facing concept; its behavior has been folded into halt-auto semantics, with zero delay meaning immediate resume.
 
 MPRIS halt-auto has a deliberate side channel. During the pending auto-resume window, Static may advertise itself as playing to external media controls even though actual audio is still paused/frozen. That is an intent-capture trick: MPRIS Play/Next/Seek style commands during the pending window mean "resume Static now" without necessarily applying the transport command literally. Pause-like commands cancel the pending resume.

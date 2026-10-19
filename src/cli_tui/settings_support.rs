@@ -1021,7 +1021,8 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
             settings.pipewire_pause_halt_auto_resume_secs as f64
         }
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs as f64,
-        "pipewire_ducking_volume" => settings.pipewire_ducking_volume,
+        "pipewire_ducking_min" => settings.pipewire_ducking_min,
+        "pipewire_ducking_max" => settings.pipewire_ducking_max,
         "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs as f64,
         "desktop_aware_volume_restore_secs" => settings.desktop_aware_volume_restore_secs as f64,
         _ => 0.0,
@@ -1120,10 +1121,10 @@ pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSetti
             step: 5.0,
             integer: true,
         }),
-        "pipewire_ducking_volume" => Some(NumericSettingMeta {
+        "pipewire_ducking_min" | "pipewire_ducking_max" => Some(NumericSettingMeta {
             min: 0.0,
             max: 1.0,
-            step: 0.1,
+            step: 0.05,
             integer: false,
         }),
         _ => None,
@@ -1223,9 +1224,15 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
         )?,
         stepper_setting_field(
             settings,
-            "pipewire_ducking_volume",
-            "PipeWire duck volume",
-            "Temporary playback level while foreign audio is active.",
+            "pipewire_ducking_min",
+            "PipeWire duck (quiet)",
+            "How much to duck while the foreign audio is quiet. 0 = untouched, 1 = silent.",
+        )?,
+        stepper_setting_field(
+            settings,
+            "pipewire_ducking_max",
+            "PipeWire duck (loud)",
+            "How much to duck while the foreign audio is loud, e.g. a voice in a call.",
         )?,
         toggle_setting_field(
             settings,

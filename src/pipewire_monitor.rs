@@ -24,6 +24,8 @@ pub struct PipeWireMonitor {
 #[derive(Debug, Clone)]
 pub struct PipeWireStreamInfo {
     pub node_id: u32,
+    /// `object.serial`: what `pw-record --target` and pipewire-pulse index by.
+    pub object_serial: Option<u32>,
     pub first_seen: Instant,
     pub client_id: Option<String>,
     pub application_id: Option<String>,
@@ -99,6 +101,9 @@ impl PipeWireStreamInfo {
     }
 
     fn merge_missing_from(&mut self, other: &Self) {
+        if self.object_serial.is_none() {
+            self.object_serial = other.object_serial;
+        }
         fill_missing(&mut self.client_id, &other.client_id);
         fill_missing(&mut self.application_id, &other.application_id);
         fill_missing(&mut self.application_name, &other.application_name);
@@ -357,6 +362,7 @@ fn is_own_stream(props: &DictRef, self_identifiers: &HashSet<String>, self_pid: 
 fn stream_info_from_props(node_id: u32, props: &DictRef) -> PipeWireStreamInfo {
     PipeWireStreamInfo {
         node_id,
+        object_serial: dict_string(props, "object.serial").and_then(|serial| serial.parse().ok()),
         first_seen: Instant::now(),
         client_id: dict_string(props, "client.id"),
         application_id: dict_string(props, "application.id"),
@@ -506,6 +512,7 @@ mod tests {
     fn stream_with_keyless_node(node_id: u32, client_id: Option<&str>) -> PipeWireStreamInfo {
         PipeWireStreamInfo {
             node_id,
+            object_serial: None,
             first_seen: Instant::now(),
             client_id: client_id.map(str::to_string),
             application_id: None,

@@ -39,10 +39,11 @@ use crate::network::{
 };
 use crate::network_state::NetworkState;
 use crate::offline::{
-    AppSettings, CoordinationMode, MusicCache, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    coordination_filter_allows, normalize_coordination_identifier,
+    AppSettings, CoordinationMode, MusicCache, coordination_filter_allows,
+    normalize_coordination_identifier,
 };
 use crate::pipewire_monitor::PipeWireMonitor;
+use crate::pipewire_tap::{self, ForeignLevelTaps, LevelFollower};
 use crate::playback_engine::PlaybackEngine;
 
 macro_rules! eprintln {
@@ -294,6 +295,14 @@ struct DaemonState {
     pipewire_monitor: PipeWireMonitor,
     pipewire_trigger_active: bool,
     pipewire_trigger_since: Option<Instant>,
+    /// (node id, object serial) of streams past the trigger threshold that
+    /// can be tapped.
+    pipewire_trigger_nodes: Vec<(u32, u32)>,
+    duck_taps: ForeignLevelTaps,
+    duck_level: LevelFollower,
+    /// Current dynamic duck amount (0 = untouched, 1 = silent).
+    duck_amount: f64,
+    last_duck_slew_at: Option<Instant>,
     pipewire_quiet_since: Option<Instant>,
     last_pipewire_poll_at: Option<Instant>,
     desktop_volume: DesktopAwareVolume,
@@ -1114,6 +1123,11 @@ pub fn run() -> Result<()> {
         pipewire_monitor: PipeWireMonitor::new(),
         pipewire_trigger_active: false,
         pipewire_trigger_since: None,
+        pipewire_trigger_nodes: Vec::new(),
+        duck_taps: ForeignLevelTaps::default(),
+        duck_level: LevelFollower::default(),
+        duck_amount: 0.0,
+        last_duck_slew_at: None,
         pipewire_quiet_since: Some(Instant::now()),
         last_pipewire_poll_at: None,
         desktop_volume: DesktopAwareVolume::default(),
@@ -6205,6 +6219,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         sleep_after_current: false,
         ducked: false,
         pipewire_pause_active: false,
+        duck: None,
         desktop_aware_volume: None,
         staticfs_unmount_pending: None,
     };
@@ -6268,6 +6283,11 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         sleep_after_current: sleep_status.after_current,
         ducked: state.ducked,
         pipewire_pause_active: state.pipewire_pause_active,
+        duck: state.ducked.then(|| crate::ipc::DuckSnapshot {
+            amount: state.duck_amount,
+            level_dbfs: state.duck_level.level_dbfs(),
+            tapped: !state.duck_taps.is_empty(),
+        }),
         desktop_aware_volume: desktop_volume_snapshot(state),
         #[cfg(feature = "staticfs")]
         staticfs_unmount_pending: state
@@ -6761,12 +6781,35 @@ fn desktop_volume_snapshot(state: &DaemonState) -> Option<crate::ipc::DesktopAwa
 }
 
 fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
-    (state.pre_duck_volume
-        * state
-            .settings
-            .pipewire_ducking_volume
-            .clamp(0.0, PIPEWIRE_DUCKING_VOLUME_CLI_MAX))
-    .clamp(0.0, 5.0)
+    (state.pre_duck_volume * (1.0 - state.duck_amount.clamp(0.0, 1.0))).clamp(0.0, 5.0)
+}
+
+/// Follow the foreign streams' loudness and derive the current duck amount.
+/// With no live tap (pw-record missing, stream gone) the duck sits at the
+/// maximum: when we cannot hear the call, assume someone is talking.
+fn update_dynamic_duck(state: &mut DaemonState) {
+    state.duck_taps.sync(&state.pipewire_trigger_nodes);
+    let now = Instant::now();
+    let (min_duck, max_duck) = pipewire_tap::ordered_ducks(
+        state.settings.pipewire_ducking_min,
+        state.settings.pipewire_ducking_max,
+    );
+    state.duck_amount = match state.duck_taps.combined_level_dbfs(now) {
+        Some(instant_dbfs) => {
+            let level = state.duck_level.update(instant_dbfs, now);
+            pipewire_tap::duck_amount_for_level(level, min_duck, max_duck)
+        }
+        None => max_duck,
+    };
+}
+
+fn stop_dynamic_duck(state: &mut DaemonState) {
+    state.last_duck_slew_at = None;
+    if !state.duck_taps.is_empty() {
+        state.duck_taps.clear();
+    }
+    state.duck_level.reset();
+    state.duck_amount = 0.0;
 }
 
 fn set_logical_volume(state: &mut DaemonState, volume: f64) {
@@ -6782,6 +6825,28 @@ fn set_logical_volume(state: &mut DaemonState, volume: f64) {
         state.volume_ramp = None;
         state.player.set_volume(steady_output_volume(state));
     }
+}
+
+/// Time constant for the dynamic duck's volume slew.
+const DUCK_SLEW_TAU: Duration = Duration::from_millis(150);
+
+/// Move the player volume one tick toward `target` with an exponential slew.
+fn slew_player_volume(state: &mut DaemonState, target: f64) {
+    let now = Instant::now();
+    let dt = state.last_duck_slew_at.map_or(0.04, |last| {
+        now.saturating_duration_since(last).as_secs_f64()
+    });
+    state.last_duck_slew_at = Some(now);
+    let current = state.player.volume();
+    let target = target.clamp(0.0, 5.0);
+    if (target - current).abs() < 0.002 {
+        state.player.set_volume(target);
+        return;
+    }
+    let coefficient = 1.0 - (-dt / DUCK_SLEW_TAU.as_secs_f64()).exp();
+    state
+        .player
+        .set_volume(current + (target - current) * coefficient);
 }
 
 fn start_volume_ramp(state: &mut DaemonState, target_volume: f64) {
@@ -6954,7 +7019,7 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
         Duration::from_secs(state.settings.pipewire_ducking_threshold_secs.max(1).into());
     let active_streams = state.pipewire_monitor.active_streams();
 
-    let trigger_since = active_streams
+    let triggered: Vec<(u32, Option<u32>, Instant)> = active_streams
         .values()
         .filter(|stream| {
             coordination_filter_allows(
@@ -6964,10 +7029,17 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
             )
         })
         .filter(|stream| stream.first_seen.elapsed() >= threshold)
-        .map(|stream| stream.first_seen)
-        .min();
+        .map(|stream| (stream.node_id, stream.object_serial, stream.first_seen))
+        .collect();
+    let trigger_since = triggered.iter().map(|(_, _, since)| *since).min();
     state.pipewire_trigger_active = trigger_since.is_some();
     state.pipewire_trigger_since = trigger_since;
+    let mut nodes: Vec<(u32, u32)> = triggered
+        .into_iter()
+        .filter_map(|(node, serial, _)| serial.map(|serial| (node, serial)))
+        .collect();
+    nodes.sort_unstable();
+    state.pipewire_trigger_nodes = nodes;
     if state.pipewire_trigger_active {
         state.pipewire_quiet_since = None;
     } else {
@@ -7013,19 +7085,25 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
 }
 
 fn maybe_duck_for_pipewire(state: &mut DaemonState) {
-    match desired_pipewire_suppression_mode(state) {
+    let desired = desired_pipewire_suppression_mode(state);
+    if desired != PipeWireSuppressionMode::Duck {
+        stop_dynamic_duck(state);
+    }
+    match desired {
         PipeWireSuppressionMode::Duck => {
-            let target_volume = pipewire_duck_output_volume(state);
+            update_dynamic_duck(state);
             if !state.ducked {
                 state.pre_duck_volume = logical_volume(state);
                 state.ducked = true;
-                start_volume_ramp(state, target_volume);
-            } else if state.volume_ramp.map_or(true, |ramp| {
-                !volumes_match(ramp.target_volume, target_volume)
-            }) && !volumes_match(state.player.volume(), target_volume)
-            {
-                start_volume_ramp(state, target_volume);
             }
+            // Do not fight a pause fade that is already in flight.
+            if !pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
+                return;
+            }
+            // The target moves every tick while the foreign level moves, so a
+            // restarted ramp would never make progress. Slew directly instead.
+            state.volume_ramp = None;
+            slew_player_volume(state, steady_output_volume(state));
         }
         PipeWireSuppressionMode::Pause => {
             if !state.pipewire_pause_active {

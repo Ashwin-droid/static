@@ -33,11 +33,11 @@ use crate::offline::{
     AppSettings, CoordinationFilterMode, CoordinationMode, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
-    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
-    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
-    coordination_filter_contains, sanitize_coordination_filter_entries,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_AMOUNT_MAX,
+    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
+    sanitize_coordination_filter_entries,
 };
 
 use super::super::app::{self, App, ContentView, Message, NavItem, Screen};
@@ -86,7 +86,8 @@ pub enum SettingNumber {
     OtherMprisHaltAutoResumeSecs,
     PipewirePauseHaltAutoResumeSecs,
     PipewireDuckingThresholdSecs,
-    PipewireDuckingVolume,
+    PipewireDuckingMin,
+    PipewireDuckingMax,
     DesktopAwareVolumeHoldSecs,
     DesktopAwareVolumeRestoreSecs,
 }
@@ -743,10 +744,7 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
     );
     let threshold_enabled = draft.pipewire_ducking_enabled && threshold_cli_note.is_none();
 
-    let volume_cli_note = cli_only_volume_note(draft.pipewire_ducking_volume);
-    let volume_enabled = draft.pipewire_ducking_enabled
-        && !draft.pipewire_pause_mode.is_enabled()
-        && volume_cli_note.is_none();
+    let duck_enabled = draft.pipewire_ducking_enabled && !draft.pipewire_pause_mode.is_enabled();
 
     let desktop_hold_cli_note = cli_only_spin_note(
         draft.desktop_aware_volume_hold_secs,
@@ -843,11 +841,26 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
                     threshold_enabled,
                 ),
             ),
-            settings_row_with_note(
-                "PipeWire duck volume",
-                "Temporary playback level while foreign audio is active.",
-                volume_cli_note,
-                duck_volume_slider(draft.pipewire_ducking_volume, volume_enabled),
+            settings_row(
+                "PipeWire duck (quiet)",
+                "Ducking follows how loud the foreign audio is. This is how much to duck while \
+                 it is quiet, such as the gaps between sentences in a call. 0 leaves the music \
+                 untouched, 1 silences it.",
+                duck_amount_slider(
+                    draft.pipewire_ducking_min,
+                    duck_enabled,
+                    SettingNumber::PipewireDuckingMin,
+                ),
+            ),
+            settings_row(
+                "PipeWire duck (loud)",
+                "How much to duck while the foreign audio is loud, such as a voice speaking. \
+                 The curve between quiet and loud is a fixed ease-in-out.",
+                duck_amount_slider(
+                    draft.pipewire_ducking_max,
+                    duck_enabled,
+                    SettingNumber::PipewireDuckingMax,
+                ),
             ),
             settings_row(
                 "Desktop aware volume",
@@ -1427,9 +1440,9 @@ fn number_meta(number: SettingNumber) -> (f64, f64, f64, usize) {
             1.0,
             0,
         ),
-        SettingNumber::PipewireDuckingVolume => (
-            PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-            PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+        SettingNumber::PipewireDuckingMin | SettingNumber::PipewireDuckingMax => (
+            PIPEWIRE_DUCKING_AMOUNT_MIN,
+            PIPEWIRE_DUCKING_AMOUNT_MAX,
             0.05,
             2,
         ),
@@ -1453,7 +1466,11 @@ fn round_to(value: f64, decimals: usize) -> f64 {
     (value * factor).round() / factor
 }
 
-fn duck_volume_slider<'a>(value: f64, enabled: bool) -> Element<'a, Message> {
+fn duck_amount_slider<'a>(
+    value: f64,
+    enabled: bool,
+    number: SettingNumber,
+) -> Element<'a, Message> {
     if !enabled {
         return container(
             text(format!("{value:.2}"))
@@ -1466,17 +1483,12 @@ fn duck_volume_slider<'a>(value: f64, enabled: bool) -> Element<'a, Message> {
     }
     row![
         slider(
-            PIPEWIRE_DUCKING_VOLUME_UI_MIN..=PIPEWIRE_DUCKING_VOLUME_UI_MAX,
+            PIPEWIRE_DUCKING_AMOUNT_MIN..=PIPEWIRE_DUCKING_AMOUNT_MAX,
             value,
-            |next| Message::Settings(Msg::NumberChanged(
-                SettingNumber::PipewireDuckingVolume,
-                next,
-            )),
+            move |next| Message::Settings(Msg::NumberChanged(number, next)),
         )
         .step(0.05)
-        .on_release(Message::Settings(Msg::NumberCommitted(
-            SettingNumber::PipewireDuckingVolume,
-        )))
+        .on_release(Message::Settings(Msg::NumberCommitted(number)))
         .style(duck_slider_style)
         .width(Length::Fixed(160.0)),
         container(
@@ -1709,28 +1721,6 @@ fn cli_only_spin_note(current: u32, ui_min: u32, ui_max: u32, cli_key: &str) -> 
     ))
 }
 
-fn cli_only_volume_note(current: f64) -> Option<String> {
-    let clamped = current.clamp(
-        PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-        PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    );
-    let within_ui = clamped.is_finite()
-        && clamped >= PIPEWIRE_DUCKING_VOLUME_UI_MIN - 0.000_001
-        && clamped <= PIPEWIRE_DUCKING_VOLUME_UI_MAX + 0.000_001;
-    if within_ui {
-        return None;
-    }
-    Some(format!(
-        "CLI only right now: currently set to {current:.2}. The settings UI only edits \
-         {:.1}-{:.1} for this control. Use `static config set pipewire_ducking_volume <value>` \
-         to keep an advanced value, or move it back into the UI range to re-enable this card. \
-         The CLI supports up to {:.1} here on purpose.",
-        PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-        PIPEWIRE_DUCKING_VOLUME_UI_MAX,
-        PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    ))
-}
-
 // ---------------------------------------------------------------------------
 // Settings update
 // ---------------------------------------------------------------------------
@@ -1782,9 +1772,12 @@ pub fn update(app: &mut App, msg: Msg) -> Task<Message> {
         }
 
         Msg::NumberChanged(number, next) => {
-            if number == SettingNumber::PipewireDuckingVolume {
+            if matches!(
+                number,
+                SettingNumber::PipewireDuckingMin | SettingNumber::PipewireDuckingMax
+            ) {
                 // Live slider preview; persisted on release.
-                app.settings_page.draft.pipewire_ducking_volume = next;
+                set_number(&mut app.settings_page.draft, number, next);
                 return Task::none();
             }
             if app.settings_page.pending_warning.is_some() {
@@ -2127,7 +2120,8 @@ fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
         SettingNumber::PipewireDuckingThresholdSecs => {
             settings.pipewire_ducking_threshold_secs as f64
         }
-        SettingNumber::PipewireDuckingVolume => settings.pipewire_ducking_volume,
+        SettingNumber::PipewireDuckingMin => settings.pipewire_ducking_min,
+        SettingNumber::PipewireDuckingMax => settings.pipewire_ducking_max,
         SettingNumber::DesktopAwareVolumeHoldSecs => settings.desktop_aware_volume_hold_secs as f64,
         SettingNumber::DesktopAwareVolumeRestoreSecs => {
             settings.desktop_aware_volume_restore_secs as f64
@@ -2164,7 +2158,8 @@ fn set_number(settings: &mut AppSettings, number: SettingNumber, value: f64) {
         SettingNumber::PipewireDuckingThresholdSecs => {
             settings.pipewire_ducking_threshold_secs = value.round() as u32
         }
-        SettingNumber::PipewireDuckingVolume => settings.pipewire_ducking_volume = value,
+        SettingNumber::PipewireDuckingMin => settings.pipewire_ducking_min = value,
+        SettingNumber::PipewireDuckingMax => settings.pipewire_ducking_max = value,
         SettingNumber::DesktopAwareVolumeHoldSecs => {
             settings.desktop_aware_volume_hold_secs = value.round() as u32
         }

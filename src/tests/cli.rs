@@ -1,7 +1,7 @@
 use super::{
-    AppSettings, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
-    apply_config_value, config_description, cross_device_queue_is_singleton_seed,
-    format_config_value, settings_eviction_warning, should_use_local_resume_for_cross_device,
+    AppSettings, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, apply_config_value, config_description,
+    cross_device_queue_is_singleton_seed, format_config_value, settings_eviction_warning,
+    should_use_local_resume_for_cross_device,
 };
 use crate::ipc::{PersistedPlaybackState, PlaybackSnapshot};
 use crate::models::{CrossDeviceQueue, Track};
@@ -23,17 +23,14 @@ fn config_set_preserves_cli_only_delay_values() {
 }
 
 #[test]
-fn config_set_supports_boosted_pipewire_ducking_volume() {
+fn config_set_clamps_dynamic_duck_amounts() {
     let mut settings = AppSettings::default();
 
-    apply_config_value(&mut settings, "pipewire_ducking_volume", "1.75").unwrap();
-    assert!((settings.pipewire_ducking_volume - 1.75).abs() < 0.0001);
+    apply_config_value(&mut settings, "pipewire_ducking_min", "0.45").unwrap();
+    assert!((settings.pipewire_ducking_min - 0.45).abs() < 0.0001);
 
-    apply_config_value(&mut settings, "pipewire_ducking_volume", "9.0").unwrap();
-    assert_eq!(
-        settings.pipewire_ducking_volume,
-        PIPEWIRE_DUCKING_VOLUME_CLI_MAX
-    );
+    apply_config_value(&mut settings, "pipewire_ducking_max", "9.0").unwrap();
+    assert_eq!(settings.pipewire_ducking_max, 1.0);
 }
 
 #[test]
@@ -70,10 +67,10 @@ fn config_set_supports_coordination_filter_modes_and_lists() {
 
 #[test]
 fn config_descriptions_explain_cli_only_ranges() {
-    let description = config_description("pipewire_ducking_volume");
+    let description = config_description("pipewire_ducking_threshold_secs");
 
-    assert!(description.contains("GTK settings UI range: 0.0-1.0."));
-    assert!(description.contains("CLI range: 0.0-2.0."));
+    assert!(description.contains("GTK settings UI range: 1-30 seconds."));
+    assert!(description.contains("CLI range: any integer >= 1."));
     assert!(description.contains("CLI-only"));
 }
 

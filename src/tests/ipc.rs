@@ -59,6 +59,7 @@ fn persisted_playback_state_round_trips_through_database() {
         sleep_after_current: false,
         ducked: false,
         pipewire_pause_active: false,
+        duck: None,
         desktop_aware_volume: None,
         staticfs_unmount_pending: None,
     };

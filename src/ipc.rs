@@ -173,6 +173,9 @@ pub struct PlaybackSnapshot {
     pub ducked: bool,
     #[serde(default)]
     pub pipewire_pause_active: bool,
+    /// Dynamic PipeWire duck in effect (None when not ducked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duck: Option<DuckSnapshot>,
     /// Desktop aware volume job in flight (None when idle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop_aware_volume: Option<DesktopAwareVolumeSnapshot>,
@@ -181,6 +184,16 @@ pub struct PlaybackSnapshot {
     /// pattern: GUI/TUI render controls from this, CLI/fs show nothing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staticfs_unmount_pending: Option<StaticfsUnmountPending>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DuckSnapshot {
+    /// 0 = untouched, 1 = silent.
+    pub amount: f64,
+    /// Smoothed combined level of the tapped foreign streams, in dBFS.
+    pub level_dbfs: f64,
+    /// Whether at least one foreign stream is being tapped right now.
+    pub tapped: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -305,6 +318,7 @@ impl Default for PlaybackSnapshot {
             sleep_after_current: false,
             ducked: false,
             pipewire_pause_active: false,
+            duck: None,
             desktop_aware_volume: None,
             staticfs_unmount_pending: None,
         }

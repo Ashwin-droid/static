@@ -90,9 +90,9 @@ pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS: u32 = 0;
 pub const PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS: u32 = 60;
 pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS: u32 = 1;
 pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS: u32 = 30;
-pub const PIPEWIRE_DUCKING_VOLUME_UI_MIN: f64 = 0.0;
-pub const PIPEWIRE_DUCKING_VOLUME_UI_MAX: f64 = 1.0;
-pub const PIPEWIRE_DUCKING_VOLUME_CLI_MAX: f64 = 2.0;
+/// Duck amounts: 0.0 leaves the music untouched, 1.0 silences it.
+pub const PIPEWIRE_DUCKING_AMOUNT_MIN: f64 = 0.0;
+pub const PIPEWIRE_DUCKING_AMOUNT_MAX: f64 = 1.0;
 pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS: u32 = 0;
 pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS: u32 = 1800;
 pub const DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS: u32 = 1;
@@ -132,7 +132,10 @@ pub struct AppSettings {
     pub pipewire_pause_mode: CoordinationMode,
     pub pipewire_pause_halt_auto_resume_secs: u32,
     pub pipewire_ducking_threshold_secs: u32,
-    pub pipewire_ducking_volume: f64,
+    /// Duck amount while the foreign audio is quiet (least ducking).
+    pub pipewire_ducking_min: f64,
+    /// Duck amount while the foreign audio is loud (most ducking).
+    pub pipewire_ducking_max: f64,
     pub desktop_aware_volume: bool,
     pub desktop_aware_volume_hold_secs: u32,
     pub desktop_aware_volume_restore_secs: u32,
@@ -180,7 +183,8 @@ impl Default for AppSettings {
             pipewire_pause_mode: CoordinationMode::Off,
             pipewire_pause_halt_auto_resume_secs: 5,
             pipewire_ducking_threshold_secs: 5,
-            pipewire_ducking_volume: 0.3,
+            pipewire_ducking_min: 0.3,
+            pipewire_ducking_max: 0.85,
             desktop_aware_volume: false,
             desktop_aware_volume_hold_secs: 300,
             desktop_aware_volume_restore_secs: 60,
@@ -368,12 +372,20 @@ impl MusicCache {
                         PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
                     );
                 }
-                "pipewire_ducking_volume" => {
-                    settings.pipewire_ducking_volume = parse_f64_setting_in_range(
+                "pipewire_ducking_min" => {
+                    settings.pipewire_ducking_min = parse_f64_setting_in_range(
                         &row.1,
-                        settings.pipewire_ducking_volume,
-                        PIPEWIRE_DUCKING_VOLUME_UI_MIN,
-                        PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+                        settings.pipewire_ducking_min,
+                        PIPEWIRE_DUCKING_AMOUNT_MIN,
+                        PIPEWIRE_DUCKING_AMOUNT_MAX,
+                    );
+                }
+                "pipewire_ducking_max" => {
+                    settings.pipewire_ducking_max = parse_f64_setting_in_range(
+                        &row.1,
+                        settings.pipewire_ducking_max,
+                        PIPEWIRE_DUCKING_AMOUNT_MIN,
+                        PIPEWIRE_DUCKING_AMOUNT_MAX,
                     );
                 }
                 "desktop_aware_volume" => {
@@ -545,8 +557,12 @@ impl MusicCache {
                 settings.pipewire_ducking_threshold_secs.to_string(),
             ),
             (
-                "pipewire_ducking_volume",
-                settings.pipewire_ducking_volume.to_string(),
+                "pipewire_ducking_min",
+                settings.pipewire_ducking_min.to_string(),
+            ),
+            (
+                "pipewire_ducking_max",
+                settings.pipewire_ducking_max.to_string(),
             ),
             (
                 "desktop_aware_volume",

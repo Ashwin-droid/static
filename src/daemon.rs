@@ -2564,12 +2564,14 @@ fn maintain_playback(state: &mut DaemonState) {
     }
 
     poll_external_mpris(state);
+    poll_pipewire_streams(state);
+    // Before any resume/unduck below, so the compensated steady level is
+    // already what those paths ramp or jump to.
+    tick_desktop_aware_volume(state);
     maybe_resume_after_external_mpris(state);
     maybe_pause_for_external_mpris(state);
-    poll_pipewire_streams(state);
     maybe_unduck_for_pipewire(state);
     maybe_duck_for_pipewire(state);
-    tick_desktop_aware_volume(state);
     maybe_probe_connectivity(state);
     advance_volume_ramp(state);
     if state.shutting_down.get() {

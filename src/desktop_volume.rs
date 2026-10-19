@@ -316,30 +316,39 @@ impl DesktopAwareVolume {
                     job.phase = Phase::Interrupted {
                         samples: Vec::new(),
                     };
-                } else if inputs.playing_alone {
-                    let crank_db = *crank_db;
-                    let current = self
-                        .history
-                        .back()
-                        .filter(|sample| sample.node_id == job.sink_node)
-                        .map(|sample| sample.volume);
-                    let Some(current) = current else {
-                        self.abandon();
-                        return false;
-                    };
-                    let current_db = sink_db(current);
-                    if (current_db - job.baseline_db).abs() < MIN_DELTA_DB {
-                        // The user already put the sink back: nothing to do.
+                    return false;
+                }
+                // The compensation is applied EAGERLY, while Static is still
+                // suppressed, so every resume path (calm ramp, immediate
+                // resume, MPRIS side-channel resume, fresh track start)
+                // already sees the compensated steady level. Computing it
+                // on the tick after the resume let the first ~40 ms play at
+                // the cranked level.
+                let crank_db = *crank_db;
+                let current = self
+                    .history
+                    .back()
+                    .filter(|sample| sample.node_id == job.sink_node)
+                    .map(|sample| sample.volume);
+                let Some(current) = current else {
+                    self.abandon();
+                    return false;
+                };
+                let current_db = sink_db(current);
+                self.comp_db = if (current_db - job.baseline_db).abs() < MIN_DELTA_DB {
+                    // The user already put the sink back: nothing to do.
+                    0.0
+                } else if (crank_db - job.baseline_db).abs() < MIN_DELTA_DB {
+                    job.baseline_db - current_db
+                } else {
+                    job.baseline_db - crank_db
+                };
+                self.fade_out = None;
+                if inputs.playing_alone {
+                    if self.comp_db.abs() < 1e-9 {
                         self.abandon();
                         return false;
                     }
-                    let comp_db = if (crank_db - job.baseline_db).abs() < MIN_DELTA_DB {
-                        job.baseline_db - current_db
-                    } else {
-                        job.baseline_db - crank_db
-                    };
-                    self.comp_db = comp_db;
-                    self.fade_out = None;
                     job.expected_sink = Some(current);
                     job.watching = true;
                     job.paused_sink = None;
@@ -625,6 +634,10 @@ mod tests {
     /// t=180 during which the sink is cranked to 0.60, resume delay until
     /// t=240. Returns (machine, t0).
     fn run_canonical(machine: &mut DesktopAwareVolume, t0: Instant) {
+        run_canonical_checked(machine, t0, true);
+    }
+
+    fn run_canonical_checked(machine: &mut DesktopAwareVolume, t0: Instant, check: bool) {
         for t in 0..60 {
             let now = t0 + secs(t);
             machine.observe_sample(Some(sample(7, 0.30, now)));
@@ -642,6 +655,13 @@ mod tests {
             let volume = if t < 90 { 0.30 } else { 0.60 };
             machine.tick(&i);
             machine.observe_sample(Some(sample(7, volume, now)));
+            if check {
+                assert_eq!(
+                    machine.comp_db(),
+                    0.0,
+                    "nothing applied while foreign audio plays"
+                );
+            }
         }
         // Resume delay: foreign gone, Static still suppressed.
         for t in 180..240 {
@@ -659,11 +679,21 @@ mod tests {
         let t0 = Instant::now();
         let mut machine = DesktopAwareVolume::default();
         run_canonical(&mut machine, t0);
-        assert_eq!(machine.comp_db(), 0.0, "nothing applied while suppressed");
+        // Eager: the compensation is already in place during the resume
+        // delay, so whichever path resumes playback lands on it.
+        let expected = sink_db(0.30) - sink_db(0.60);
+        assert!(
+            (machine.comp_db() - expected).abs() < 1e-6,
+            "{}",
+            machine.comp_db()
+        );
+        assert_eq!(
+            machine.status().unwrap().phase,
+            DesktopVolumePhase::Resuming
+        );
 
         let now = t0 + secs(240);
         machine.tick(&inputs(now));
-        let expected = sink_db(0.30) - sink_db(0.60);
         assert!(
             (machine.comp_db() - expected).abs() < 1e-6,
             "{}",

@@ -20,13 +20,14 @@ use crate::network::{
 };
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{
-    AppSettings, CoordinationFilterMode, CoordinationMode, MusicCache,
-    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
-    PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
-    PIPEWIRE_DUCKING_VOLUME_CLI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MAX,
-    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
-    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
-    sanitize_coordination_filter_entries,
+    AppSettings, CoordinationFilterMode, CoordinationMode, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, MusicCache, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+    coordination_filter_contains, sanitize_coordination_filter_entries,
 };
 
 static HEADLESS_SESSION_BOOTSTRAP: Once = Once::new();
@@ -1808,6 +1809,18 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::F64,
     },
     ConfigSpec {
+        name: "desktop_aware_volume",
+        kind: ConfigKind::Bool,
+    },
+    ConfigSpec {
+        name: "desktop_aware_volume_hold_secs",
+        kind: ConfigKind::U32,
+    },
+    ConfigSpec {
+        name: "desktop_aware_volume_restore_secs",
+        kind: ConfigKind::U32,
+    },
+    ConfigSpec {
         name: "pipewire_filter_mode",
         kind: ConfigKind::String,
     },
@@ -2065,6 +2078,37 @@ brief audio blips.\n{}",
                 &format!("any integer >= {}", PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS)
             )
         ),
+        "desktop_aware_volume" => "Desktop aware volume. While PipeWire coordination has Static \
+ducked or paused for other audio, Static watches the system sink volume. If you cranked the sink \
+for that quieter content, Static comes back with its own output compensated so it is as loud as \
+before the interruption; after `desktop_aware_volume_hold_secs` of uninterrupted playback it \
+slides the sink back to its old level while fading the compensation out, so nothing audible \
+changes.\nGround rules: the job is tied to the sink node it started on (switching devices \
+abandons it); any sink change Static did not make itself abandons it; the hold clock only runs \
+while Static is actually playing alone. Abandoning only fades the compensation out and never \
+touches the sink. Requires `pipewire_ducking_enabled=true` and wpctl."
+            .to_string(),
+        "desktop_aware_volume_hold_secs" => format!(
+            "Uninterrupted playback Static waits for before it starts moving the sink back.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS
+                ),
+                &format!("any integer >= {}", DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS)
+            )
+        ),
+        "desktop_aware_volume_restore_secs" => format!(
+            "How long the sink restore and the compensation fade take.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS,
+                    DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS
+                ),
+                &format!("any integer >= {}", DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS)
+            )
+        ),
         "pipewire_ducking_volume" => format!(
             "Target multiplier applied to the saved pre-duck volume while PipeWire ducking is \
 active and `pipewire_pause_mode=off`.\n`0.3` means play at 30% of the original level, `1.0` \
@@ -2170,6 +2214,11 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         }
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
         "pipewire_ducking_volume" => settings.pipewire_ducking_volume.to_string(),
+        "desktop_aware_volume" => yes_no_bool(settings.desktop_aware_volume),
+        "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs.to_string(),
+        "desktop_aware_volume_restore_secs" => {
+            settings.desktop_aware_volume_restore_secs.to_string()
+        }
         "pipewire_filter_mode" => settings.pipewire_filter_mode.as_str().to_string(),
         "pipewire_filter_list" => settings.pipewire_filter_list.join(","),
         "sponsorblock_enabled" => yes_no_bool(settings.sponsorblock_enabled),
@@ -2258,6 +2307,15 @@ pub(crate) fn apply_config_value(
                 PIPEWIRE_DUCKING_VOLUME_UI_MIN,
                 PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
             )
+        }
+        "desktop_aware_volume" => settings.desktop_aware_volume = parse_bool(trimmed)?,
+        "desktop_aware_volume_hold_secs" => {
+            settings.desktop_aware_volume_hold_secs =
+                parse_u32(trimmed)?.max(DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS)
+        }
+        "desktop_aware_volume_restore_secs" => {
+            settings.desktop_aware_volume_restore_secs =
+                parse_u32(trimmed)?.max(DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS)
         }
         "pipewire_filter_mode" => {
             settings.pipewire_filter_mode = parse_coordination_filter_mode(trimmed)?

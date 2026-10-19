@@ -23,6 +23,7 @@ use signal_hook::flag;
 use zbus::blocking::{Connection, Proxy};
 use zbus::interface;
 
+use crate::desktop_volume::{self, DesktopAwareVolume, DesktopVolumeInputs, SinkSample};
 use crate::ipc::{
     ActiveTrackSnapshot, CoordinationTargetSnapshot, CoordinationTargetsSnapshot, DAEMON_BUS_NAME,
     DAEMON_OBJECT_PATH, DaemonRequest, DaemonResponse, PersistedPlaybackState, PlaybackSnapshot,
@@ -69,6 +70,7 @@ const MPRIS_PENDING_POSITION_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
+const DESKTOP_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Connectivity cache freshness for the offline radio-shuffle advance fallback.
 /// Desktop has no synchronous connectivity oracle (Android parity: the port asks
 /// ConnectivityManager at advance time), so a background TCP probe against the
@@ -291,8 +293,12 @@ struct DaemonState {
     mpris_halt_auto_resume: MprisHaltAutoResumeState,
     pipewire_monitor: PipeWireMonitor,
     pipewire_trigger_active: bool,
+    pipewire_trigger_since: Option<Instant>,
     pipewire_quiet_since: Option<Instant>,
     last_pipewire_poll_at: Option<Instant>,
+    desktop_volume: DesktopAwareVolume,
+    desktop_volume_io_in_flight: bool,
+    last_desktop_volume_sample_at: Option<Instant>,
     ducked: bool,
     pipewire_pause_active: bool,
     pre_duck_volume: f64,
@@ -674,6 +680,9 @@ enum BackgroundEvent {
         chips: Vec<crate::models::RadioChip>,
     },
     OfflineSyncFinished,
+    SinkSampleReady {
+        sample: Option<SinkSample>,
+    },
 }
 
 enum DeferredAction {
@@ -1089,8 +1098,12 @@ pub fn run() -> Result<()> {
         mpris_halt_auto_resume: MprisHaltAutoResumeState::Idle,
         pipewire_monitor: PipeWireMonitor::new(),
         pipewire_trigger_active: false,
+        pipewire_trigger_since: None,
         pipewire_quiet_since: Some(Instant::now()),
         last_pipewire_poll_at: None,
+        desktop_volume: DesktopAwareVolume::default(),
+        desktop_volume_io_in_flight: false,
+        last_desktop_volume_sample_at: None,
         ducked: false,
         pipewire_pause_active: false,
         pre_duck_volume: initial_volume,
@@ -2518,6 +2531,14 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
                 schedule_offline_cache_sync(state);
             }
         }
+        BackgroundEvent::SinkSampleReady { sample } => {
+            state.desktop_volume_io_in_flight = false;
+            let comp_before = state.desktop_volume.comp_gain();
+            state.desktop_volume.observe_sample(sample);
+            if !volumes_match(comp_before, state.desktop_volume.comp_gain()) {
+                apply_desktop_volume_comp(state);
+            }
+        }
     }
 }
 
@@ -2533,6 +2554,7 @@ fn maintain_playback(state: &mut DaemonState) {
     poll_pipewire_streams(state);
     maybe_unduck_for_pipewire(state);
     maybe_duck_for_pipewire(state);
+    tick_desktop_aware_volume(state);
     maybe_probe_connectivity(state);
     advance_volume_ramp(state);
     if state.shutting_down.get() {
@@ -6166,6 +6188,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         sleep_after_current: false,
         ducked: false,
         pipewire_pause_active: false,
+        desktop_aware_volume: None,
         staticfs_unmount_pending: None,
     };
     rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
@@ -6228,6 +6251,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
         sleep_after_current: sleep_status.after_current,
         ducked: state.ducked,
         pipewire_pause_active: state.pipewire_pause_active,
+        desktop_aware_volume: desktop_volume_snapshot(state),
         #[cfg(feature = "staticfs")]
         staticfs_unmount_pending: state
             .staticfs_host
@@ -6608,11 +6632,100 @@ fn apply_volume_limit_after_settings_reload(state: &mut DaemonState) {
 }
 
 fn steady_output_volume(state: &DaemonState) -> f64 {
-    if state.ducked {
+    let base = if state.ducked {
         pipewire_duck_output_volume(state)
     } else {
         logical_volume(state)
+    };
+    (base * state.desktop_volume.comp_gain()).clamp(0.0, 5.0)
+}
+
+fn desktop_volume_inputs(state: &DaemonState, now: Instant) -> DesktopVolumeInputs {
+    let suppressed = state.ducked || state.pipewire_pause_active;
+    DesktopVolumeInputs {
+        now,
+        enabled: state.settings.desktop_aware_volume && state.settings.pipewire_ducking_enabled,
+        foreign_active: state.pipewire_trigger_active,
+        suppressed,
+        playing_alone: state.active_track.is_some()
+            && !suppressed
+            && !state.pipewire_trigger_active
+            && !is_logically_paused(state)
+            && !state.peer_mpris.is_waiting_for_peer_pause(),
+        foreign_since: state.pipewire_trigger_since,
+        hold: Duration::from_secs(state.settings.desktop_aware_volume_hold_secs.into()),
+        restore: Duration::from_secs(state.settings.desktop_aware_volume_restore_secs.into()),
     }
+}
+
+fn tick_desktop_aware_volume(state: &mut DaemonState) {
+    let now = Instant::now();
+    let inputs = desktop_volume_inputs(state, now);
+    let comp_before = state.desktop_volume.comp_gain();
+    state.desktop_volume.tick(&inputs);
+    if !volumes_match(comp_before, state.desktop_volume.comp_gain()) {
+        apply_desktop_volume_comp(state);
+    }
+
+    if state.desktop_volume_io_in_flight {
+        return;
+    }
+    let pending_write = state.desktop_volume.take_pending_write();
+    let due = state
+        .last_desktop_volume_sample_at
+        .is_none_or(|last| last.elapsed() >= DESKTOP_VOLUME_SAMPLE_INTERVAL);
+    if pending_write.is_none() && !(due && state.desktop_volume.wants_samples(&inputs)) {
+        return;
+    }
+    state.desktop_volume_io_in_flight = true;
+    state.last_desktop_volume_sample_at = Some(now);
+    let background_tx = state.background_tx.clone();
+    std::thread::spawn(move || {
+        if let Some((node_id, volume)) = pending_write {
+            if !desktop_volume::write_sink_volume(node_id, volume) {
+                eprintln!("[DESKTOP-VOLUME] failed to set sink {node_id} volume to {volume:.2}");
+            }
+        }
+        let sample = desktop_volume::read_default_sink();
+        let _ = background_tx.send(BackgroundEvent::SinkSampleReady { sample });
+    });
+}
+
+/// Re-aim the output at the new compensated steady level without disturbing
+/// a pause fade or a transport that is not audible anyway.
+fn apply_desktop_volume_comp(state: &mut DaemonState) {
+    if state.active_track.is_none() || is_logically_paused(state) {
+        return;
+    }
+    let target = steady_output_volume(state);
+    match state.volume_ramp {
+        Some(ramp) if matches!(ramp.completion, VolumeRampCompletion::None) => {
+            if !volumes_match(ramp.target_volume, target) {
+                start_volume_ramp_with_completion(
+                    state,
+                    target,
+                    ramp.duration.saturating_sub(ramp.started_at.elapsed()),
+                    VolumeRampCompletion::None,
+                );
+            }
+        }
+        Some(_) => {}
+        None => state.player.set_volume(target),
+    }
+}
+
+fn desktop_volume_snapshot(state: &DaemonState) -> Option<crate::ipc::DesktopAwareVolumeSnapshot> {
+    let status = state.desktop_volume.status()?;
+    let inputs = desktop_volume_inputs(state, Instant::now());
+    Some(crate::ipc::DesktopAwareVolumeSnapshot {
+        phase: status.phase.as_str().to_string(),
+        comp_db: status.comp_db,
+        sink_delta_db: status.sink_delta_db,
+        remaining_secs: state
+            .desktop_volume
+            .remaining(&inputs)
+            .map(|remaining| remaining.as_secs()),
+    })
 }
 
 fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
@@ -6632,10 +6745,10 @@ fn set_logical_volume(state: &mut DaemonState, volume: f64) {
     state.pre_duck_volume = volume;
 
     if state.ducked {
-        start_volume_ramp(state, pipewire_duck_output_volume(state));
+        start_volume_ramp(state, steady_output_volume(state));
     } else {
         state.volume_ramp = None;
-        state.player.set_volume(volume);
+        state.player.set_volume(steady_output_volume(state));
     }
 }
 
@@ -6809,7 +6922,7 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
         Duration::from_secs(state.settings.pipewire_ducking_threshold_secs.max(1).into());
     let active_streams = state.pipewire_monitor.active_streams();
 
-    state.pipewire_trigger_active = active_streams
+    let trigger_since = active_streams
         .values()
         .filter(|stream| {
             coordination_filter_allows(
@@ -6818,7 +6931,11 @@ fn poll_pipewire_streams(state: &mut DaemonState) {
                 &stream.identifiers(),
             )
         })
-        .any(|stream| stream.first_seen.elapsed() >= threshold);
+        .filter(|stream| stream.first_seen.elapsed() >= threshold)
+        .map(|stream| stream.first_seen)
+        .min();
+    state.pipewire_trigger_active = trigger_since.is_some();
+    state.pipewire_trigger_since = trigger_since;
     if state.pipewire_trigger_active {
         state.pipewire_quiet_since = None;
     } else {
@@ -6832,7 +6949,7 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
     if state.ducked && desired != PipeWireSuppressionMode::Duck {
         state.ducked = false;
         if pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
-            start_volume_ramp(state, state.pre_duck_volume);
+            start_volume_ramp(state, steady_output_volume(state));
         }
     }
 

@@ -2,6 +2,7 @@ mod cartridges;
 mod cli;
 mod cli_tui;
 mod daemon;
+mod desktop_volume;
 mod ipc;
 mod logging;
 mod models;

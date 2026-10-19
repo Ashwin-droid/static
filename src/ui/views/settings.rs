@@ -30,13 +30,14 @@ use crate::ipc::{CoordinationTargetSnapshot, CoordinationTargetsSnapshot};
 use crate::network::{SPONSORBLOCK_CATEGORY_OPTIONS, sanitize_categories};
 use crate::network_state::{NetworkState, NetworkValidationOutcome};
 use crate::offline::{
-    AppSettings, CoordinationFilterMode, CoordinationMode,
-    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS,
-    PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS,
-    PIPEWIRE_DUCKING_VOLUME_CLI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MAX,
-    PIPEWIRE_DUCKING_VOLUME_UI_MIN, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
-    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
-    sanitize_coordination_filter_entries,
+    AppSettings, CoordinationFilterMode, CoordinationMode, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
+    OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
+    PIPEWIRE_DUCKING_VOLUME_UI_MAX, PIPEWIRE_DUCKING_VOLUME_UI_MIN,
+    PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS,
+    coordination_filter_contains, sanitize_coordination_filter_entries,
 };
 
 use super::super::app::{self, App, ContentView, Message, NavItem, Screen};
@@ -63,6 +64,7 @@ pub enum SettingToggle {
     AutoReleaseTrackLoops,
     SponsorblockEnabled,
     PipewireDuckingEnabled,
+    DesktopAwareVolume,
     AutoSyncChromiumCookies,
     #[cfg(feature = "staticfs")]
     StaticfsEnabled,
@@ -85,6 +87,8 @@ pub enum SettingNumber {
     PipewirePauseHaltAutoResumeSecs,
     PipewireDuckingThresholdSecs,
     PipewireDuckingVolume,
+    DesktopAwareVolumeHoldSecs,
+    DesktopAwareVolumeRestoreSecs,
 }
 
 /// Which coordination stack a control belongs to.
@@ -744,6 +748,22 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
         && !draft.pipewire_pause_mode.is_enabled()
         && volume_cli_note.is_none();
 
+    let desktop_hold_cli_note = cli_only_spin_note(
+        draft.desktop_aware_volume_hold_secs,
+        DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS,
+        DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
+        "desktop_aware_volume_hold_secs",
+    );
+    let desktop_restore_cli_note = cli_only_spin_note(
+        draft.desktop_aware_volume_restore_secs,
+        DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS,
+        DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
+        "desktop_aware_volume_restore_secs",
+    );
+    let desktop_aware_on = draft.pipewire_ducking_enabled && draft.desktop_aware_volume;
+    let desktop_hold_enabled = desktop_aware_on && desktop_hold_cli_note.is_none();
+    let desktop_restore_enabled = desktop_aware_on && desktop_restore_cli_note.is_none();
+
     settings_card(
         "Coordination settings",
         "Control how Static reacts when other audio apps or streams take over, including \
@@ -828,6 +848,38 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
                 "Temporary playback level while foreign audio is active.",
                 volume_cli_note,
                 duck_volume_slider(draft.pipewire_ducking_volume, volume_enabled),
+            ),
+            settings_row(
+                "Desktop aware volume",
+                "If you crank the system volume for quieter audio while Static is ducked or \
+                 paused, Static comes back at its old loudness and, after a quiet hold, slides \
+                 the sink back for you. It never touches a different output device and backs \
+                 off the moment you change the sink yourself.",
+                setting_toggle(
+                    draft.desktop_aware_volume,
+                    draft.pipewire_ducking_enabled,
+                    SettingToggle::DesktopAwareVolume,
+                ),
+            ),
+            settings_row_with_note(
+                "Desktop aware hold",
+                "Uninterrupted playback before Static starts moving the sink back.",
+                desktop_hold_cli_note,
+                stepper(
+                    SettingNumber::DesktopAwareVolumeHoldSecs,
+                    draft.desktop_aware_volume_hold_secs as f64,
+                    desktop_hold_enabled,
+                ),
+            ),
+            settings_row_with_note(
+                "Desktop aware restore",
+                "How long the sink restore and the compensation fade take.",
+                desktop_restore_cli_note,
+                stepper(
+                    SettingNumber::DesktopAwareVolumeRestoreSecs,
+                    draft.desktop_aware_volume_restore_secs as f64,
+                    desktop_restore_enabled,
+                ),
             ),
             settings_row(
                 "PipeWire filter mode",
@@ -1380,6 +1432,18 @@ fn number_meta(number: SettingNumber) -> (f64, f64, f64, usize) {
             PIPEWIRE_DUCKING_VOLUME_UI_MAX,
             0.05,
             2,
+        ),
+        SettingNumber::DesktopAwareVolumeHoldSecs => (
+            DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS as f64,
+            DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS as f64,
+            15.0,
+            0,
+        ),
+        SettingNumber::DesktopAwareVolumeRestoreSecs => (
+            DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS as f64,
+            DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS as f64,
+            5.0,
+            0,
         ),
     }
 }
@@ -2009,6 +2073,7 @@ fn toggle_value(settings: &AppSettings, toggle: SettingToggle) -> bool {
         SettingToggle::AutoReleaseTrackLoops => settings.auto_release_track_loops,
         SettingToggle::SponsorblockEnabled => settings.sponsorblock_enabled,
         SettingToggle::PipewireDuckingEnabled => settings.pipewire_ducking_enabled,
+        SettingToggle::DesktopAwareVolume => settings.desktop_aware_volume,
         SettingToggle::AutoSyncChromiumCookies => settings.auto_sync_chromium_cookies,
         #[cfg(feature = "staticfs")]
         SettingToggle::StaticfsEnabled => settings.staticfs_enabled,
@@ -2034,6 +2099,7 @@ fn set_toggle(settings: &mut AppSettings, toggle: SettingToggle, value: bool) {
         SettingToggle::AutoReleaseTrackLoops => settings.auto_release_track_loops = value,
         SettingToggle::SponsorblockEnabled => settings.sponsorblock_enabled = value,
         SettingToggle::PipewireDuckingEnabled => settings.pipewire_ducking_enabled = value,
+        SettingToggle::DesktopAwareVolume => settings.desktop_aware_volume = value,
         SettingToggle::AutoSyncChromiumCookies => settings.auto_sync_chromium_cookies = value,
         #[cfg(feature = "staticfs")]
         SettingToggle::StaticfsEnabled => settings.staticfs_enabled = value,
@@ -2062,6 +2128,10 @@ fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
             settings.pipewire_ducking_threshold_secs as f64
         }
         SettingNumber::PipewireDuckingVolume => settings.pipewire_ducking_volume,
+        SettingNumber::DesktopAwareVolumeHoldSecs => settings.desktop_aware_volume_hold_secs as f64,
+        SettingNumber::DesktopAwareVolumeRestoreSecs => {
+            settings.desktop_aware_volume_restore_secs as f64
+        }
     }
 }
 
@@ -2095,6 +2165,12 @@ fn set_number(settings: &mut AppSettings, number: SettingNumber, value: f64) {
             settings.pipewire_ducking_threshold_secs = value.round() as u32
         }
         SettingNumber::PipewireDuckingVolume => settings.pipewire_ducking_volume = value,
+        SettingNumber::DesktopAwareVolumeHoldSecs => {
+            settings.desktop_aware_volume_hold_secs = value.round() as u32
+        }
+        SettingNumber::DesktopAwareVolumeRestoreSecs => {
+            settings.desktop_aware_volume_restore_secs = value.round() as u32
+        }
     }
 }
 

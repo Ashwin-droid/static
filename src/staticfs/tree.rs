@@ -79,6 +79,7 @@ pub(crate) enum Node {
     PlaybackNext,
     PlaybackPrev,
     PlaybackDucked,
+    PlaybackDesktopAwareVolume,
     PlaybackActivePeers,
     PlaybackRating,
     PlaybackLyrics,
@@ -244,6 +245,7 @@ impl Node {
             | Node::PlaybackNext
             | Node::PlaybackPrev
             | Node::PlaybackDucked
+            | Node::PlaybackDesktopAwareVolume
             | Node::PlaybackActivePeers
             | Node::PlaybackRating
             | Node::PlaybackLyrics
@@ -290,6 +292,7 @@ impl Node {
                 ("next", Node::PlaybackNext),
                 ("prev", Node::PlaybackPrev),
                 ("ducked", Node::PlaybackDucked),
+                ("desktop_aware_volume", Node::PlaybackDesktopAwareVolume),
                 ("active_peers", Node::PlaybackActivePeers),
                 ("rating", Node::PlaybackRating),
                 ("lyrics", Node::PlaybackLyrics),
@@ -434,6 +437,9 @@ impl Node {
             Node::PlaybackNext => playback_files::read_next(ctx, mode),
             Node::PlaybackPrev => playback_files::read_prev(ctx, mode),
             Node::PlaybackDucked => playback_files::read_ducked(ctx, mode),
+            Node::PlaybackDesktopAwareVolume => {
+                playback_files::read_desktop_aware_volume(ctx, mode)
+            }
             Node::PlaybackActivePeers => playback_files::read_active_peers(ctx, mode),
             Node::PlaybackRating => playback_files::read_rating(ctx, mode),
             Node::PlaybackLyrics => playback_files::read_lyrics(ctx, mode),

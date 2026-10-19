@@ -53,7 +53,11 @@ use crate::network::{
     SPONSORBLOCK_CATEGORY_OPTIONS, SongRating, delete_storage_root, fetch_thumbnail_bytes,
     get_storage_root, store_storage_root,
 };
-use crate::offline::{AppSettings, CoordinationFilterMode, CoordinationMode, MusicCache};
+use crate::offline::{
+    AppSettings, CoordinationFilterMode, CoordinationMode, DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
+    DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, MusicCache,
+};
 
 const UI_TICK_INTERVAL: Duration = Duration::from_millis(250);
 const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(400);

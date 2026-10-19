@@ -93,6 +93,10 @@ pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS: u32 = 30;
 pub const PIPEWIRE_DUCKING_VOLUME_UI_MIN: f64 = 0.0;
 pub const PIPEWIRE_DUCKING_VOLUME_UI_MAX: f64 = 1.0;
 pub const PIPEWIRE_DUCKING_VOLUME_CLI_MAX: f64 = 2.0;
+pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS: u32 = 0;
+pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS: u32 = 1800;
+pub const DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS: u32 = 1;
+pub const DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS: u32 = 600;
 
 #[derive(Debug, Clone)]
 pub struct AppSettings {
@@ -129,6 +133,9 @@ pub struct AppSettings {
     pub pipewire_pause_halt_auto_resume_secs: u32,
     pub pipewire_ducking_threshold_secs: u32,
     pub pipewire_ducking_volume: f64,
+    pub desktop_aware_volume: bool,
+    pub desktop_aware_volume_hold_secs: u32,
+    pub desktop_aware_volume_restore_secs: u32,
     pub pipewire_filter_mode: CoordinationFilterMode,
     pub pipewire_filter_list: Vec<String>,
     pub sponsorblock_enabled: bool,
@@ -174,6 +181,9 @@ impl Default for AppSettings {
             pipewire_pause_halt_auto_resume_secs: 5,
             pipewire_ducking_threshold_secs: 5,
             pipewire_ducking_volume: 0.3,
+            desktop_aware_volume: false,
+            desktop_aware_volume_hold_secs: 300,
+            desktop_aware_volume_restore_secs: 60,
             pipewire_filter_mode: CoordinationFilterMode::Blacklist,
             pipewire_filter_list: Vec::new(),
             sponsorblock_enabled: true,
@@ -366,6 +376,24 @@ impl MusicCache {
                         PIPEWIRE_DUCKING_VOLUME_CLI_MAX,
                     );
                 }
+                "desktop_aware_volume" => {
+                    settings.desktop_aware_volume =
+                        parse_bool_setting(&row.1, settings.desktop_aware_volume);
+                }
+                "desktop_aware_volume_hold_secs" => {
+                    settings.desktop_aware_volume_hold_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.desktop_aware_volume_hold_secs,
+                        DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS,
+                    );
+                }
+                "desktop_aware_volume_restore_secs" => {
+                    settings.desktop_aware_volume_restore_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.desktop_aware_volume_restore_secs,
+                        DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS,
+                    );
+                }
                 "pipewire_filter_mode" => {
                     loaded_pipewire_filter_mode = CoordinationFilterMode::from_str(&row.1);
                 }
@@ -519,6 +547,18 @@ impl MusicCache {
             (
                 "pipewire_ducking_volume",
                 settings.pipewire_ducking_volume.to_string(),
+            ),
+            (
+                "desktop_aware_volume",
+                bool_setting(settings.desktop_aware_volume),
+            ),
+            (
+                "desktop_aware_volume_hold_secs",
+                settings.desktop_aware_volume_hold_secs.to_string(),
+            ),
+            (
+                "desktop_aware_volume_restore_secs",
+                settings.desktop_aware_volume_restore_secs.to_string(),
             ),
             (
                 "pipewire_filter_mode",

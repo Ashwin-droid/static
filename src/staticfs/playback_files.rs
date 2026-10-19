@@ -351,6 +351,23 @@ pub(crate) fn trigger_prev(ctx: &Ctx) -> FsResult<()> {
     send(ctx, &DaemonRequest::Previous)
 }
 
+/// playback/desktop_aware_volume (r): one line, "idle" or
+/// "<phase> comp=<dB> sink=<dB> remaining=<secs>".
+pub(crate) fn read_desktop_aware_volume(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
+    let snap = snapshot(ctx)?;
+    let Some(job) = snap.desktop_aware_volume else {
+        return Ok(format::scalar("idle"));
+    };
+    let mut line = format!(
+        "{} comp={:+.1}dB sink={:+.1}dB",
+        job.phase, job.comp_db, job.sink_delta_db
+    );
+    if let Some(remaining) = job.remaining_secs {
+        line.push_str(&format!(" remaining={remaining}s"));
+    }
+    Ok(format::scalar(&line))
+}
+
 /// playback/ducked (r). B5: "scalar \"true\"|\"false\" (new snapshot field)."
 pub(crate) fn read_ducked(ctx: &Ctx, _mode: FsMode) -> FsResult<Vec<u8>> {
     let snap = snapshot(ctx)?;

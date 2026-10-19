@@ -173,11 +173,26 @@ pub struct PlaybackSnapshot {
     pub ducked: bool,
     #[serde(default)]
     pub pipewire_pause_active: bool,
+    /// Desktop aware volume job in flight (None when idle).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_aware_volume: Option<DesktopAwareVolumeSnapshot>,
     /// A staticfs unmount is blocked by open handles and awaiting a
     /// close-anyway/wait decision (staticfs builds only; pending halt-auto
     /// pattern: GUI/TUI render controls from this, CLI/fs show nothing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staticfs_unmount_pending: Option<StaticfsUnmountPending>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DesktopAwareVolumeSnapshot {
+    /// interrupted | resuming | hold | restore | fade_out
+    pub phase: String,
+    /// Compensation currently applied to Static's output, in dB.
+    pub comp_db: f64,
+    /// How far the sink sits from its pre-interruption level, in dB.
+    pub sink_delta_db: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,6 +305,7 @@ impl Default for PlaybackSnapshot {
             sleep_after_current: false,
             ducked: false,
             pipewire_pause_active: false,
+            desktop_aware_volume: None,
             staticfs_unmount_pending: None,
         }
     }

@@ -975,6 +975,7 @@ pub(in crate::cli_tui) fn current_boolean_setting(settings: &AppSettings, key: &
         "seamless_listening" => settings.seamless_listening,
         "prefer_local_cache_on_playback" => settings.prefer_local_cache_on_playback,
         "pipewire_ducking_enabled" => settings.pipewire_ducking_enabled,
+        "desktop_aware_volume" => settings.desktop_aware_volume,
         "sponsorblock_enabled" => settings.sponsorblock_enabled,
         "staticfs_enabled" => settings.staticfs_enabled,
         _ => false,
@@ -1021,6 +1022,8 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
         }
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs as f64,
         "pipewire_ducking_volume" => settings.pipewire_ducking_volume,
+        "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs as f64,
+        "desktop_aware_volume_restore_secs" => settings.desktop_aware_volume_restore_secs as f64,
         _ => 0.0,
     }
 }
@@ -1103,6 +1106,18 @@ pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSetti
             min: 1.0,
             max: 30.0,
             step: 1.0,
+            integer: true,
+        }),
+        "desktop_aware_volume_hold_secs" => Some(NumericSettingMeta {
+            min: DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS as f64,
+            max: DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS as f64,
+            step: 15.0,
+            integer: true,
+        }),
+        "desktop_aware_volume_restore_secs" => Some(NumericSettingMeta {
+            min: DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS as f64,
+            max: DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS as f64,
+            step: 5.0,
             integer: true,
         }),
         "pipewire_ducking_volume" => Some(NumericSettingMeta {
@@ -1211,6 +1226,25 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
             "pipewire_ducking_volume",
             "PipeWire duck volume",
             "Temporary playback level while foreign audio is active.",
+        )?,
+        toggle_setting_field(
+            settings,
+            "desktop_aware_volume",
+            "Desktop aware volume",
+            "If you crank the system volume for quieter audio while Static is ducked or paused, \
+             Static comes back at its old loudness and later puts the sink back for you.",
+        ),
+        stepper_setting_field(
+            settings,
+            "desktop_aware_volume_hold_secs",
+            "Desktop aware hold",
+            "Uninterrupted playback before Static starts moving the sink back.",
+        )?,
+        stepper_setting_field(
+            settings,
+            "desktop_aware_volume_restore_secs",
+            "Desktop aware restore",
+            "How long the sink restore and the compensation fade take.",
         )?,
         filter_mode_setting_field(
             settings,

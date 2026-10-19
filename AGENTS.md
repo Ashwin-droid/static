@@ -57,6 +57,12 @@ Fills are ordinary queue entries inserted next to the current track, so in radio
 
 The pick samples the combined offline store (automatic, manual, and playlist downloads) weighted by offline score and the radio pick's artist/title repulsion. `Track::offline_fill` marks a fill per row, and every queue surface shows it: amber rows in the GUI and TUI, a suffix in `static queue get`, and the `offline_fill` origin in staticfs.
 
+## Desktop Aware Volume
+
+Desktop aware volume (`desktop_aware_volume`, off by default, needs PipeWire ducking on and wpctl) is daemon behavior in `src/desktop_volume.rs`: while coordination has Static ducked or paused, it samples the default sink; when Static comes back it applies a self-compensation multiplier (baseline minus the dB average of the last 30 s of the interruption, resume delay excluded) so loudness matches the pre-interruption level, holds, then slides the sink back to baseline while fading the compensation out together.
+
+Ground rules that must survive changes: the job is bound to the sink node it started on and a default-sink switch abandons it; once Static is alone, any sink change it did not write itself abandons it; abandoning only fades the compensation and never touches the sink; the hold/restore clocks only run while Static is actually playing alone; a user pause freezes the job (never abandons it) and a sink change made during the pause re-bases the compensation on resume. Downward cranks count too, so compensation can be positive. The compensation lives in the daemon's output-volume math next to the duck multiplier, not in dgain/xdgain.
+
 ## MPRIS And PipeWire Coordination
 
 Playback coordination is one of the most sensitive parts of the app.

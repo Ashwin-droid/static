@@ -2080,8 +2080,8 @@ brief audio blips.\n{}",
         ),
         "desktop_aware_volume" => "Desktop aware volume. While PipeWire coordination has Static \
 ducked or paused for other audio, Static watches the system sink volume. If you cranked the sink \
-for that quieter content, Static comes back with its own output compensated so it is as loud as \
-before the interruption; after `desktop_aware_volume_hold_secs` of uninterrupted playback it \
+for that quieter content, Static comes back with its own output compensated by the sink's \
+move (before vs. now) so it is as loud as before the interruption; after `desktop_aware_volume_hold_secs` of uninterrupted playback it \
 slides the sink back to its old level while fading the compensation out, so nothing audible \
 changes.\nGround rules: the job is tied to the sink node it started on (switching devices \
 abandons it); any sink change Static did not make itself abandons it; the hold clock only runs \

@@ -24,9 +24,6 @@ use std::collections::VecDeque;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// The cranked level is averaged over this much of the tail of the
-/// interruption (the resume delay is not part of it).
-const CRANK_AVERAGE_WINDOW: Duration = Duration::from_secs(30);
 /// Sink samples retained while idle, to pick a baseline from before the
 /// foreign stream first appeared.
 const BASELINE_HISTORY: Duration = Duration::from_secs(90);
@@ -76,10 +73,10 @@ pub struct DesktopVolumeInputs {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Phase {
-    /// Foreign audio active; collecting the cranked level.
-    Interrupted { samples: Vec<(Instant, f64)> },
+    /// Foreign audio active; nothing to do but watch the sink identity.
+    Interrupted,
     /// Foreign audio stopped; waiting for Static to come back (resume delay).
-    Resuming { crank_db: f64 },
+    Resuming,
     /// Static is back, compensated; waiting out the quiet hold.
     Hold {
         held: Duration,
@@ -183,8 +180,8 @@ impl DesktopAwareVolume {
     pub fn status(&self) -> Option<DesktopVolumeStatus> {
         if let Some(job) = &self.job {
             let (phase, remaining) = match &job.phase {
-                Phase::Interrupted { .. } => (DesktopVolumePhase::Interrupted, None),
-                Phase::Resuming { .. } => (DesktopVolumePhase::Resuming, None),
+                Phase::Interrupted => (DesktopVolumePhase::Interrupted, None),
+                Phase::Resuming => (DesktopVolumePhase::Resuming, None),
                 Phase::Hold { .. } => (DesktopVolumePhase::Hold, None),
                 Phase::Restore { .. } => (DesktopVolumePhase::Restore, None),
             };
@@ -243,12 +240,7 @@ impl DesktopAwareVolume {
             return;
         }
         match &mut job.phase {
-            Phase::Interrupted { samples } => {
-                if !sample.muted {
-                    samples.push((sample.at, sink_db(sample.volume)));
-                }
-            }
-            Phase::Resuming { .. } => {}
+            Phase::Interrupted | Phase::Resuming => {}
             Phase::Hold { .. } | Phase::Restore { .. } => {
                 if !job.watching {
                     // Frozen by a user pause: remember, re-base on resume.
@@ -304,18 +296,15 @@ impl DesktopAwareVolume {
         };
 
         match &mut job.phase {
-            Phase::Interrupted { samples } => {
+            Phase::Interrupted => {
                 if !inputs.foreign_active {
-                    let crank_db = crank_level_db(samples, inputs.now);
-                    job.phase = Phase::Resuming { crank_db };
+                    job.phase = Phase::Resuming;
                     return true;
                 }
             }
-            Phase::Resuming { crank_db } => {
+            Phase::Resuming => {
                 if inputs.foreign_active {
-                    job.phase = Phase::Interrupted {
-                        samples: Vec::new(),
-                    };
+                    job.phase = Phase::Interrupted;
                     return false;
                 }
                 // The compensation is applied EAGERLY, while Static is still
@@ -324,7 +313,10 @@ impl DesktopAwareVolume {
                 // already sees the compensated steady level. Computing it
                 // on the tick after the resume let the first ~40 ms play at
                 // the cranked level.
-                let crank_db = *crank_db;
+                //
+                // The goal is Static's loudness staying what it was, not
+                // matching the video, so the only inputs are the sink before
+                // the interruption and the sink now.
                 let current = self
                     .history
                     .back()
@@ -338,10 +330,8 @@ impl DesktopAwareVolume {
                 self.comp_db = if (current_db - job.baseline_db).abs() < MIN_DELTA_DB {
                     // The user already put the sink back: nothing to do.
                     0.0
-                } else if (crank_db - job.baseline_db).abs() < MIN_DELTA_DB {
-                    job.baseline_db - current_db
                 } else {
-                    job.baseline_db - crank_db
+                    job.baseline_db - current_db
                 };
                 self.fade_out = None;
                 if inputs.playing_alone {
@@ -360,9 +350,7 @@ impl DesktopAwareVolume {
             }
             Phase::Hold { held, last_tick } => {
                 if inputs.foreign_active {
-                    job.phase = Phase::Interrupted {
-                        samples: Vec::new(),
-                    };
+                    job.phase = Phase::Interrupted;
                     job.expected_sink = None;
                     job.watching = false;
                     job.paused_sink = None;
@@ -403,9 +391,7 @@ impl DesktopAwareVolume {
                 start_comp_db,
             } => {
                 if inputs.foreign_active {
-                    job.phase = Phase::Interrupted {
-                        samples: Vec::new(),
-                    };
+                    job.phase = Phase::Interrupted;
                     job.expected_sink = None;
                     job.watching = false;
                     job.paused_sink = None;
@@ -480,9 +466,7 @@ impl DesktopAwareVolume {
             expected_sink: None,
             watching: false,
             paused_sink: None,
-            phase: Phase::Interrupted {
-                samples: Vec::new(),
-            },
+            phase: Phase::Interrupted,
         });
     }
 
@@ -518,30 +502,6 @@ impl DesktopAwareVolume {
             self.comp_db = 0.0;
             self.fade_out = None;
         }
-    }
-}
-
-/// Average sink level over the last 30 s of the interruption. Samples are
-/// time-weighted so a 1 Hz poll and a jittery one agree.
-fn crank_level_db(samples: &[(Instant, f64)], end: Instant) -> f64 {
-    let window_start = end.checked_sub(CRANK_AVERAGE_WINDOW).unwrap_or(end);
-    let mut weighted = 0.0;
-    let mut weight = 0.0;
-    for (index, (at, db)) in samples.iter().enumerate() {
-        let next_at = samples.get(index + 1).map_or(end, |(next, _)| *next);
-        let from = (*at).max(window_start);
-        let to = next_at.min(end);
-        if to <= from {
-            continue;
-        }
-        let span = to.duration_since(from).as_secs_f64();
-        weighted += db * span;
-        weight += span;
-    }
-    if weight > 0.0 {
-        weighted / weight
-    } else {
-        samples.last().map_or(0.0, |(_, db)| *db)
     }
 }
 
@@ -675,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn compensation_lands_at_resume_from_the_last_thirty_seconds_average() {
+    fn compensation_is_baseline_minus_sink_at_resume() {
         let t0 = Instant::now();
         let mut machine = DesktopAwareVolume::default();
         run_canonical(&mut machine, t0);
@@ -701,15 +661,6 @@ mod tests {
         );
         assert!(machine.comp_gain() < 1.0);
         assert_eq!(machine.status().unwrap().phase, DesktopVolumePhase::Hold);
-    }
-
-    #[test]
-    fn crank_average_ignores_samples_older_than_thirty_seconds() {
-        let t0 = Instant::now();
-        let samples = vec![(t0, 0.0), (t0 + secs(50), -6.0), (t0 + secs(70), -12.0)];
-        // Window is [50, 80]: 20 s at -6, 10 s at -12.
-        let avg = crank_level_db(&samples, t0 + secs(80));
-        assert!((avg - -8.0).abs() < 1e-9, "{avg}");
     }
 
     #[test]

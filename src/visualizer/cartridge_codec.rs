@@ -191,24 +191,43 @@ pub fn decode(image: &DynamicImage) -> Result<Value> {
         (ratio - WIDTH as f64 / HEIGHT as f64).abs() < 0.005,
         "Keep the complete cartridge image, without cropping or borders"
     );
-    let matrix: YCrBrAMat = image
-        .resize_exact(WIDTH, HEIGHT, FilterType::Triangle)
-        .into_rgba32f()
-        .into();
-    let encoded = matrix
-        .add_padding()
-        .dwt()
-        .cut()
-        .extract_watermark_bits(CODE_BYTES * 8, &watermark_config())
-        .into_vec();
-    let decoded = reed_solomon::Decoder::new(ECC_BYTES)
-        .correct(&encoded, None)
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Cannot recover this cartridge: the image is unrecognised or too damaged"
-            )
-        })?;
-    unpack(decoded.data())
+    // The library votes every bit across Y, Cb and Cr. JPEG 4:2:0 plus a downscale
+    // wrecks the chroma votes and they outvote a nearly clean Y, while contrast edits
+    // do the reverse. Try each vote set and let Reed-Solomon plus the CRC pick.
+    let mut last_err =
+        anyhow::anyhow!("Cannot recover this cartridge: the image is unrecognised or too damaged");
+    for filter in [FilterType::Lanczos3, FilterType::Triangle] {
+        let matrix: YCrBrAMat = image
+            .resize_exact(WIDTH, HEIGHT, filter)
+            .into_rgba32f()
+            .into();
+        let blocks = matrix.add_padding().dwt().cut();
+        let single = |source: &Vec<Block>| {
+            let mut only = blocks.clone();
+            only.y_ll_blocks = source.clone();
+            only.cb_ll_blocks = source.clone();
+            only.cr_ll_blocks = source.clone();
+            only
+        };
+        for votes in [
+            blocks.clone(),
+            single(&blocks.y_ll_blocks),
+            single(&blocks.cb_ll_blocks),
+            single(&blocks.cr_ll_blocks),
+        ] {
+            let encoded = votes
+                .extract_watermark_bits(CODE_BYTES * 8, &watermark_config())
+                .into_vec();
+            let Ok(decoded) = reed_solomon::Decoder::new(ECC_BYTES).correct(&encoded, None) else {
+                continue;
+            };
+            match unpack(decoded.data()) {
+                Ok(value) => return Ok(value),
+                Err(err) => last_err = err,
+            }
+        }
+    }
+    Err(last_err)
 }
 
 pub fn decode_bytes(bytes: &[u8]) -> Result<Value> {
@@ -357,6 +376,21 @@ mod tests {
             Err(err) => failures.push(format!("twice JPEG: {err}")),
         }
         assert!(failures.is_empty(), "{failures:?}");
+    }
+    #[test]
+    fn reshared_fixture_recovers_from_luma_votes() {
+        // The v1 fixture shared again: Lanczos to 300 px wide, then libjpeg 4:2:0
+        // quality 75 (Pillow). The lost chroma outvoted an intact Y channel when all
+        // three channels voted together. This fixture must not be regenerated.
+        let expected: Value = serde_json::from_slice(include_bytes!(
+            "../../visualizer/tests/fixtures/cartridge-v1.json"
+        ))
+        .unwrap();
+        let recovered = decode_bytes(include_bytes!(
+            "../../visualizer/tests/fixtures/cartridge-v1-reshared.jpg"
+        ))
+        .unwrap();
+        assert_eq!(recovered, expected);
     }
     #[test]
     fn arbitrary_ecc_input_is_rejected_without_panicking() {

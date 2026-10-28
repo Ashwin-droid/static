@@ -28,6 +28,13 @@ use std::thread;
 use std::time::Duration;
 
 use zbus::MatchRule;
+
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        crate::app_log!($($arg)*);
+    }};
+}
+
 use zbus::blocking::{Connection, MessageIterator, Proxy};
 use zbus::zvariant::OwnedValue;
 

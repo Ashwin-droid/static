@@ -45,6 +45,7 @@ use crate::offline::{
 use crate::pipewire_monitor::PipeWireMonitor;
 use crate::pipewire_tap::{self, ForeignLevelTaps, LevelFollower};
 use crate::playback_engine::PlaybackEngine;
+use crate::session_lock::SessionLockMonitor;
 
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -293,6 +294,7 @@ struct DaemonState {
     peer_mpris: ExternalMprisCoordinator,
     mpris_halt_auto_resume: MprisHaltAutoResumeState,
     pipewire_monitor: PipeWireMonitor,
+    session_lock: SessionLockMonitor,
     pipewire_trigger_active: bool,
     pipewire_trigger_since: Option<Instant>,
     /// (node id, object serial) of streams past the trigger threshold that
@@ -1121,6 +1123,7 @@ pub fn run() -> Result<()> {
         peer_mpris: ExternalMprisCoordinator::new(),
         mpris_halt_auto_resume: MprisHaltAutoResumeState::Idle,
         pipewire_monitor: PipeWireMonitor::new(),
+        session_lock: SessionLockMonitor::new(),
         pipewire_trigger_active: false,
         pipewire_trigger_since: None,
         pipewire_trigger_nodes: Vec::new(),
@@ -2121,17 +2124,7 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             }
         }
         DaemonRequest::Pause => {
-            let result = if state.probe_context.is_some() {
-                restore_after_probe(state, false)
-            } else if cancel_pending_mpris_halt_auto_resume(state, "user pause") {
-                Ok(())
-            } else {
-                state.peer_mpris.clear_waiting();
-                clear_mpris_halt_auto_resume_pending(state);
-                pause_local_playback(state, PlaybackTransition::Immediate);
-                sync_mpris(state);
-                Ok(())
-            };
+            let result = pause_for_user_action(state, "user pause");
             match result {
                 Ok(()) => {
                     maybe_persist_playback_state(state, true);
@@ -2577,6 +2570,7 @@ fn maintain_playback(state: &mut DaemonState) {
         return;
     }
 
+    maybe_pause_for_session_lock(state);
     poll_external_mpris(state);
     poll_pipewire_streams(state);
     // Before any resume/unduck below, so the compensated steady level is
@@ -4462,6 +4456,54 @@ fn toggle_pause_for_user_action(state: &mut DaemonState) {
         pause_local_playback(state, PlaybackTransition::Immediate);
     }
     sync_mpris(state);
+}
+
+/// An explicit pause: it cancels any pending halt-auto resume and stops
+/// waiting on peer players, so coordination will not undo it.
+fn pause_for_user_action(state: &mut DaemonState, reason: &str) -> Result<()> {
+    if state.probe_context.is_some() {
+        return restore_after_probe(state, false);
+    }
+    if cancel_pending_mpris_halt_auto_resume(state, reason) {
+        return Ok(());
+    }
+    state.peer_mpris.clear_waiting();
+    clear_mpris_halt_auto_resume_pending(state);
+    pause_local_playback(state, PlaybackTransition::Immediate);
+    sync_mpris(state);
+    Ok(())
+}
+
+/// Session lock / screen blank pauses like a user pause, once per
+/// transition. Nothing here holds the pause: playing from the lock screen is
+/// the user's choice, and unlocking does not resume.
+fn maybe_pause_for_session_lock(state: &mut DaemonState) {
+    let Some(reason) = state.session_lock.take_trigger() else {
+        return;
+    };
+    if !should_pause_for_session_lock(
+        state.active_track.is_some() || state.pending_playback_start.is_some(),
+        is_logically_paused(state),
+        mpris_halt_auto_resume_is_pending(state),
+    ) {
+        return;
+    }
+    eprintln!("[SESSION] pausing playback: {reason}");
+    if let Err(err) = pause_for_user_action(state, &reason) {
+        eprintln!("[SESSION] failed to pause for {reason}: {err}");
+        return;
+    }
+    maybe_persist_playback_state(state, true);
+}
+
+fn should_pause_for_session_lock(
+    has_playback: bool,
+    logically_paused: bool,
+    mpris_halt_auto_pending: bool,
+) -> bool {
+    // A pending halt-auto resume would bring audio back behind the lock, so
+    // the lock cancels it even though the audio is already paused.
+    has_playback && (!logically_paused || mpris_halt_auto_pending)
 }
 
 fn resume_for_user_action(state: &mut DaemonState) {

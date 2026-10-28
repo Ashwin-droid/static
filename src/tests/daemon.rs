@@ -19,11 +19,11 @@ use super::{
     seamless_covers_advance, seamless_insert_slot_after_failed_target, seamless_pick,
     seamless_pick_weights, should_count_paused_idle_for_shutdown, should_desync_playback_start,
     should_emit_live_mpris_seeked_hint, should_evict_cache_after_startup_stall,
-    should_expose_mpris_halt_auto_sidechannel, should_resume_after_external_mpris_pause,
-    should_resume_after_pipewire_pause, should_retry_after_offline_cache_failure,
-    should_sync_live_mpris_position, should_wait_for_radio_extension_at_natural_end,
-    title_similarity, tracking_retry_delay, valid_requested_volume, volume_ramp_is_complete,
-    volume_ramp_value, weighted_index,
+    should_expose_mpris_halt_auto_sidechannel, should_pause_for_session_lock,
+    should_resume_after_external_mpris_pause, should_resume_after_pipewire_pause,
+    should_retry_after_offline_cache_failure, should_sync_live_mpris_position,
+    should_wait_for_radio_extension_at_natural_end, title_similarity, tracking_retry_delay,
+    valid_requested_volume, volume_ramp_is_complete, volume_ramp_value, weighted_index,
 };
 use crate::ipc::{ActiveTrackSnapshot, PlaybackSnapshot, RepeatMode};
 use crate::models::{Artist, Track};
@@ -1869,4 +1869,16 @@ fn seamless_pick_weights_favour_played_songs_and_keep_repulsion() {
     let baseline = seamless_pick_weights(&candidates[..1], &[0.0], &history);
     let negative = seamless_pick_weights(&candidates[..1], &[-3.0], &history);
     assert_eq!(baseline, negative);
+}
+
+#[test]
+fn session_lock_pauses_live_playback_once_and_cancels_pending_auto_resume() {
+    // Playing: pause.
+    assert!(should_pause_for_session_lock(true, false, false));
+    // Already paused by the user (or by an earlier lock edge): leave it.
+    assert!(!should_pause_for_session_lock(true, true, false));
+    // Paused but a halt-auto resume is pending: the lock must cancel it.
+    assert!(should_pause_for_session_lock(true, true, true));
+    // Nothing loaded: nothing to do.
+    assert!(!should_pause_for_session_lock(false, false, false));
 }

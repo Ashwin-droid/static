@@ -14,6 +14,7 @@ mod pipewire_monitor;
 mod pipewire_tap;
 mod playback_engine;
 mod player;
+mod session_lock;
 #[cfg(feature = "staticfs")]
 mod staticfs;
 mod ui;

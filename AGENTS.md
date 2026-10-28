@@ -63,6 +63,12 @@ Desktop aware volume (`desktop_aware_volume`, off by default, needs wpctl and ei
 
 Ground rules that must survive changes: the job is bound to the sink node it started on and a default-sink switch abandons it; once Static is alone, any sink change it did not write itself abandons it; abandoning only fades the compensation and never touches the sink; the hold/restore clocks only run while Static is actually playing alone; a user pause freezes the job (never abandons it) and a sink change made during the pause re-bases the compensation on resume. Downward cranks count too, so compensation can be positive. The compensation lives in the daemon's output-volume math next to the duck multiplier, not in dgain/xdgain.
 
+## Session Lock Pause
+
+Static pauses itself when the desktop session locks or the screen blanks (`src/session_lock.rs`). This is unconditional: there is deliberately no setting for it on any surface. The watcher listens for login1 `Lock`/`LockedHint`/`IdleHint` on the system bus and `ScreenSaver.ActiveChanged(true)` on the session bus, and the daemon drains the queued edges in its maintenance tick.
+
+The pause is edge-triggered and behaves exactly like a user pause (it cancels a pending halt-auto resume and stops waiting on peers). Nothing holds the pause: if the user presses Play from the lock screen that is their choice, and unlocking does not resume. Do not turn this into a level-held "locked means silent" state.
+
 ## MPRIS And PipeWire Coordination
 
 Playback coordination is one of the most sensitive parts of the app.

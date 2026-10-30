@@ -11,8 +11,11 @@
 //! - the sink is identified by node id; if the default sink changes, the job
 //!   is abandoned and only the compensation fades out (never touch another
 //!   device's volume);
-//! - once Static is alone again, any sink change we did not make ourselves
-//!   abandons the job (never fight the user);
+//! - once Static is alone again, a sink change we did not make ourselves is
+//!   absorbed, not fought: the compensation and the delta still to be undone
+//!   stay as they are, and the user's move shifts the end point by the same
+//!   amount (crank 10 -> 50, user bumps to 60 while playing: the restore
+//!   still drops 40 and lands on 20). Muting is the one touch that abandons;
 //! - the hold clock only runs while Static is actually playing unsuppressed.
 //!   A user pause freezes the job instead of abandoning it; a sink change
 //!   made during that pause re-bases the compensation when playback resumes.
@@ -95,13 +98,30 @@ enum Phase {
 struct Job {
     sink_node: u32,
     baseline_db: f64,
-    /// Sink level we expect to read back; anything else is a user touch.
+    /// Sink level we expect to read back; anything else is a user touch,
+    /// absorbed by shifting `baseline_db` along with it.
     expected_sink: Option<f64>,
     /// True while Static is playing alone, i.e. while touches count.
     watching: bool,
     /// Latest sink level seen while the job was frozen by a user pause.
     paused_sink: Option<f64>,
     phase: Phase,
+}
+
+impl Job {
+    /// The user moved the sink while Static was playing alone. The job is
+    /// cheeky about it: the crank delta it is undoing stays exactly what it
+    /// was, so the user's move is simply carried through to the end point.
+    /// Compensation is untouched; the baseline (and a running restore's
+    /// start) shift by the same dB the user moved.
+    fn absorb_touch(&mut self, moved: f64) {
+        let shift = sink_db(moved) - self.expected_sink.map_or(self.baseline_db, sink_db);
+        self.baseline_db += shift;
+        self.expected_sink = Some(moved);
+        if let Phase::Restore { start_sink_db, .. } = &mut self.phase {
+            *start_sink_db += shift;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,7 +157,6 @@ pub struct DesktopVolumeStatus {
     pub phase: DesktopVolumePhase,
     pub comp_db: f64,
     pub sink_delta_db: f64,
-    pub remaining: Option<Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -179,11 +198,11 @@ impl DesktopAwareVolume {
 
     pub fn status(&self) -> Option<DesktopVolumeStatus> {
         if let Some(job) = &self.job {
-            let (phase, remaining) = match &job.phase {
-                Phase::Interrupted => (DesktopVolumePhase::Interrupted, None),
-                Phase::Resuming => (DesktopVolumePhase::Resuming, None),
-                Phase::Hold { .. } => (DesktopVolumePhase::Hold, None),
-                Phase::Restore { .. } => (DesktopVolumePhase::Restore, None),
+            let phase = match &job.phase {
+                Phase::Interrupted => DesktopVolumePhase::Interrupted,
+                Phase::Resuming => DesktopVolumePhase::Resuming,
+                Phase::Hold { .. } => DesktopVolumePhase::Hold,
+                Phase::Restore { .. } => DesktopVolumePhase::Restore,
             };
             let sink_delta_db = job
                 .expected_sink
@@ -192,18 +211,17 @@ impl DesktopAwareVolume {
                 phase,
                 comp_db: self.comp_db,
                 sink_delta_db,
-                remaining,
             });
         }
         self.fade_out.map(|_| DesktopVolumeStatus {
             phase: DesktopVolumePhase::FadeOut,
             comp_db: self.comp_db,
             sink_delta_db: 0.0,
-            remaining: None,
         })
     }
 
-    /// Remaining hold/restore time, for status surfaces.
+    /// Remaining hold/restore time, for status surfaces (needs the settings,
+    /// so it lives apart from `status`).
     pub fn remaining(&self, inputs: &DesktopVolumeInputs) -> Option<Duration> {
         match self.job.as_ref().map(|job| &job.phase) {
             Some(Phase::Hold { held, .. }) => Some(inputs.hold.saturating_sub(*held)),
@@ -247,12 +265,16 @@ impl DesktopAwareVolume {
                     job.paused_sink = Some(sample.volume);
                     return;
                 }
-                let touched = sample.muted
-                    || job.expected_sink.is_some_and(|expected| {
-                        (sample.volume - expected).abs() > SINK_TOUCH_TOLERANCE
-                    });
-                if touched {
+                if sample.muted {
+                    // Nothing sensible to slide on a muted sink.
                     self.abandon();
+                    return;
+                }
+                let touched = job.expected_sink.is_some_and(|expected| {
+                    (sample.volume - expected).abs() > SINK_TOUCH_TOLERANCE
+                });
+                if touched {
+                    job.absorb_touch(sample.volume);
                 }
             }
         }
@@ -784,18 +806,136 @@ mod tests {
         assert_eq!(machine.status().unwrap().phase, DesktopVolumePhase::Hold);
     }
 
+    /// Drive a restore to completion from the current tick, feeding every
+    /// write back as the next sample. Returns the final sink level.
+    fn finish_restore(
+        machine: &mut DesktopAwareVolume,
+        t0: Instant,
+        t: &mut u64,
+        mut sink: f64,
+    ) -> f64 {
+        let mut last_comp = machine.comp_db();
+        for _ in 0..61 {
+            *t += 1;
+            machine.tick(&inputs(t0 + secs(*t)));
+            if let Some((node, volume)) = machine.take_pending_write() {
+                assert_eq!(node, 7);
+                assert!(
+                    volume <= sink + 1e-9,
+                    "sink must only move toward the end point"
+                );
+                sink = volume;
+            }
+            machine.observe_sample(Some(sample(7, sink, t0 + secs(*t))));
+            assert!(
+                machine.comp_db() >= last_comp - 1e-9,
+                "comp must only move toward 0 dB"
+            );
+            last_comp = machine.comp_db();
+        }
+        assert_eq!(machine.comp_db(), 0.0);
+        assert!(!machine.is_active());
+        sink
+    }
+
     #[test]
-    fn user_touching_the_sink_during_hold_abandons_and_fades_comp_out() {
+    fn user_touching_the_sink_during_hold_keeps_the_delta_and_shifts_the_end_point() {
+        let t0 = Instant::now();
+        let mut machine = DesktopAwareVolume::default();
+        run_canonical(&mut machine, t0);
+        let mut t = 240;
+        machine.tick(&inputs(t0 + secs(t)));
+        let comp = machine.comp_db();
+        assert!(comp < 0.0);
+
+        // User bumps the sink 0.60 -> 0.80 while Static plays alone: the job
+        // lives on, the compensation is untouched, and the remaining delta
+        // is still the original 0.30 -> 0.60 crank.
+        t += 1;
+        machine.observe_sample(Some(sample(7, 0.80, t0 + secs(t))));
+        let status = machine.status().unwrap();
+        assert_eq!(status.phase, DesktopVolumePhase::Hold);
+        assert_eq!(machine.comp_db(), comp);
+        let crank = sink_db(0.60) - sink_db(0.30);
+        assert!(
+            (status.sink_delta_db - crank).abs() < 1e-6,
+            "{}",
+            status.sink_delta_db
+        );
+        assert!(machine.take_pending_write().is_none(), "hold never writes");
+
+        // Wait out the hold at the new level, then the restore drops the
+        // sink by the crank delta from where the user left it.
+        for _ in 0..300 {
+            t += 1;
+            machine.tick(&inputs(t0 + secs(t)));
+            machine.observe_sample(Some(sample(7, 0.80, t0 + secs(t))));
+        }
+        assert_eq!(machine.status().unwrap().phase, DesktopVolumePhase::Restore);
+        let end = finish_restore(&mut machine, t0, &mut t, 0.80);
+        let expected_end = db_to_sink_volume(sink_db(0.80) - crank);
+        assert!(
+            (end - expected_end).abs() < 0.011,
+            "{end} vs {expected_end}"
+        );
+    }
+
+    #[test]
+    fn user_touching_the_sink_during_restore_continues_the_slide_from_the_new_level() {
+        let t0 = Instant::now();
+        let mut machine = DesktopAwareVolume::default();
+        run_canonical(&mut machine, t0);
+        let mut t = 240;
+        for _ in 0..=301 {
+            machine.tick(&inputs(t0 + secs(t)));
+            machine.observe_sample(Some(sample(7, 0.60, t0 + secs(t))));
+            t += 1;
+        }
+        assert_eq!(machine.status().unwrap().phase, DesktopVolumePhase::Restore);
+
+        // Slide for 20 s, feeding writes back.
+        let mut sink = 0.60;
+        for _ in 0..20 {
+            machine.tick(&inputs(t0 + secs(t)));
+            if let Some((_, volume)) = machine.take_pending_write() {
+                sink = volume;
+            }
+            machine.observe_sample(Some(sample(7, sink, t0 + secs(t))));
+            t += 1;
+        }
+        assert!(sink < 0.60 && sink > 0.30, "{sink}");
+        let comp_mid = machine.comp_db();
+        let delta_mid = machine.status().unwrap().sink_delta_db;
+
+        // Halfway down the user turns it down a further 0.10: comp and the
+        // remaining delta are untouched, the slide just continues lower.
+        let moved = sink - 0.10;
+        machine.observe_sample(Some(sample(7, moved, t0 + secs(t))));
+        let status = machine.status().unwrap();
+        assert_eq!(status.phase, DesktopVolumePhase::Restore);
+        assert_eq!(machine.comp_db(), comp_mid);
+        assert!((status.sink_delta_db - delta_mid).abs() < 1e-6);
+
+        let end = finish_restore(&mut machine, t0, &mut t, moved);
+        let expected_end = db_to_sink_volume(sink_db(moved) - delta_mid);
+        assert!(
+            (end - expected_end).abs() < 0.011,
+            "{end} vs {expected_end}"
+        );
+    }
+
+    #[test]
+    fn muting_the_sink_during_hold_abandons_and_fades_comp_out() {
         let t0 = Instant::now();
         let mut machine = DesktopAwareVolume::default();
         run_canonical(&mut machine, t0);
         machine.tick(&inputs(t0 + secs(240)));
-        let comp = machine.comp_db();
-        assert!(comp < 0.0);
+        assert!(machine.comp_db() < 0.0);
 
-        machine.observe_sample(Some(sample(7, 0.45, t0 + secs(241))));
+        let mut muted = sample(7, 0.60, t0 + secs(241));
+        muted.muted = true;
+        machine.observe_sample(Some(muted));
         assert_eq!(machine.status().unwrap().phase, DesktopVolumePhase::FadeOut);
-        assert!(machine.take_pending_write().is_none());
 
         for t in 241..=301 {
             machine.tick(&inputs(t0 + secs(t)));

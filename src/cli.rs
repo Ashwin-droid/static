@@ -2089,9 +2089,11 @@ for that quieter content, Static comes back with its own output compensated by t
 move (before vs. now) so it is as loud as before the interruption; after `desktop_aware_volume_hold_secs` of uninterrupted playback it \
 slides the sink back to its old level while fading the compensation out, so nothing audible \
 changes.\nGround rules: the job is tied to the sink node it started on (switching devices \
-abandons it); any sink change Static did not make itself abandons it; the hold clock only runs \
-while Static is actually playing alone. Abandoning only fades the compensation out and never \
-touches the sink. Requires `pipewire_ducking_enabled=true` and wpctl."
+abandons it); a sink change you make while Static plays alone is absorbed, not fought: the \
+compensation and the delta still to be undone stay the same and your move just shifts where \
+the sink ends up (muting abandons); the hold clock only runs while Static is actually playing \
+alone. Abandoning only fades the compensation out and never touches the sink. Requires \
+`pipewire_ducking_enabled=true` and wpctl."
             .to_string(),
         "desktop_aware_volume_hold_secs" => format!(
             "Uninterrupted playback Static waits for before it starts moving the sink back.\n{}",

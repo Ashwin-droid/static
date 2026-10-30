@@ -73,6 +73,9 @@ const PLAYBACK_VOLUME_RAMP_DURATION: Duration = Duration::from_secs(2);
 const PIPEWIRE_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const PIPEWIRE_VOLUME_RAMP_DURATION: Duration = Duration::from_millis(250);
 const DESKTOP_VOLUME_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// After a failed sink read (wpctl missing or erroring) retry this slowly
+/// instead of forking two dead children every second.
+const DESKTOP_VOLUME_SAMPLE_BACKOFF: Duration = Duration::from_secs(30);
 /// Connectivity cache freshness for the offline radio-shuffle advance fallback.
 /// Desktop has no synchronous connectivity oracle (Android parity: the port asks
 /// ConnectivityManager at advance time), so a background TCP probe against the
@@ -310,6 +313,8 @@ struct DaemonState {
     desktop_volume: DesktopAwareVolume,
     desktop_volume_io_in_flight: bool,
     last_desktop_volume_sample_at: Option<Instant>,
+    /// True after a sink read failed; stretches the sample interval.
+    desktop_volume_sink_unreadable: bool,
     ducked: bool,
     pipewire_pause_active: bool,
     pre_duck_volume: f64,
@@ -1136,6 +1141,7 @@ pub fn run() -> Result<()> {
         desktop_volume: DesktopAwareVolume::default(),
         desktop_volume_io_in_flight: false,
         last_desktop_volume_sample_at: None,
+        desktop_volume_sink_unreadable: false,
         ducked: false,
         pipewire_pause_active: false,
         pre_duck_volume: initial_volume,
@@ -2577,6 +2583,14 @@ fn handle_background_event(state: &mut DaemonState, event: BackgroundEvent) {
         }
         BackgroundEvent::SinkSampleReady { sample } => {
             state.desktop_volume_io_in_flight = false;
+            if sample.is_none() && !state.desktop_volume_sink_unreadable {
+                eprintln!(
+                    "[DESKTOP-VOLUME] cannot read the default sink (is wpctl installed?); \
+                     retrying every {}s",
+                    DESKTOP_VOLUME_SAMPLE_BACKOFF.as_secs()
+                );
+            }
+            state.desktop_volume_sink_unreadable = sample.is_none();
             let comp_before = state.desktop_volume.comp_gain();
             state.desktop_volume.observe_sample(sample);
             if !volumes_match(comp_before, state.desktop_volume.comp_gain()) {
@@ -6761,9 +6775,9 @@ fn desktop_volume_inputs(state: &DaemonState, now: Instant) -> DesktopVolumeInpu
     };
     DesktopVolumeInputs {
         now,
-        enabled: state.settings.desktop_aware_volume
-            && (state.settings.pipewire_ducking_enabled
-                || state.settings.other_mpris_mode.coordinates_peers()),
+        // PipeWire-only on purpose (matches the GUI toggle gating); MPRIS
+        // peer pauses still count as interruptions once it is on.
+        enabled: state.settings.desktop_aware_volume && state.settings.pipewire_ducking_enabled,
         foreign_active,
         suppressed,
         playing_alone: state.active_track.is_some()
@@ -6789,9 +6803,14 @@ fn tick_desktop_aware_volume(state: &mut DaemonState) {
         return;
     }
     let pending_write = state.desktop_volume.take_pending_write();
+    let interval = if state.desktop_volume_sink_unreadable {
+        DESKTOP_VOLUME_SAMPLE_BACKOFF
+    } else {
+        DESKTOP_VOLUME_SAMPLE_INTERVAL
+    };
     let due = state
         .last_desktop_volume_sample_at
-        .is_none_or(|last| last.elapsed() >= DESKTOP_VOLUME_SAMPLE_INTERVAL);
+        .is_none_or(|last| last.elapsed() >= interval);
     if pending_write.is_none() && !(due && state.desktop_volume.wants_samples(&inputs)) {
         return;
     }

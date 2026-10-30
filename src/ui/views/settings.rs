@@ -866,8 +866,9 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
                 "Desktop aware volume",
                 "If you crank the system volume for quieter audio while Static is ducked or \
                  paused, Static comes back at its old loudness and, after a quiet hold, slides \
-                 the sink back for you. It never touches a different output device and backs \
-                 off the moment you change the sink yourself.",
+                 the sink back for you. It never touches a different output device, and a \
+                 change you make yourself meanwhile is kept: the slide still undoes the same \
+                 amount, from wherever you left it.",
                 setting_toggle(
                     draft.desktop_aware_volume,
                     draft.pipewire_ducking_enabled,

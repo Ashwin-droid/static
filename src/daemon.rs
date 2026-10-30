@@ -1926,6 +1926,28 @@ fn handle_request(state: &mut DaemonState, request: DaemonRequest) -> DaemonResp
             }
             DaemonResponse::VisualizationFrame(state.player.visualization_frame(bands as usize))
         }
+        DaemonRequest::SetBandIsolation { isolation } => {
+            let isolation = match isolation {
+                Some(mut isolation) => {
+                    if !(8..=128).contains(&isolation.bands) {
+                        return DaemonResponse::Error(
+                            "Visualization bands must be between 8 and 128".into(),
+                        );
+                    }
+                    if isolation.selected.iter().any(|&b| b >= isolation.bands) {
+                        return DaemonResponse::Error(
+                            "Isolated band index is outside the band count".into(),
+                        );
+                    }
+                    isolation.selected.sort_unstable();
+                    isolation.selected.dedup();
+                    Some(isolation).filter(|i| !i.selected.is_empty())
+                }
+                None => None,
+            };
+            state.player.set_band_isolation(isolation);
+            DaemonResponse::State(state_snapshot(state))
+        }
         DaemonRequest::GetVisualizationSource {
             video_id,
             supports_memory,
@@ -6264,6 +6286,7 @@ fn persisted_playback_snapshot(state: &DaemonState) -> Option<PlaybackSnapshot> 
         duck: None,
         desktop_aware_volume: None,
         staticfs_unmount_pending: None,
+        band_isolation: state.player.band_isolation(),
     };
     rearm_track_repeat_loops_for_snapshot(&mut snapshot, &state.settings);
     Some(snapshot)
@@ -6338,6 +6361,7 @@ fn state_snapshot(state: &DaemonState) -> PlaybackSnapshot {
             .map(|busy_paths| crate::ipc::StaticfsUnmountPending { busy_paths }),
         #[cfg(not(feature = "staticfs"))]
         staticfs_unmount_pending: None,
+        band_isolation: state.player.band_isolation(),
     }
 }
 

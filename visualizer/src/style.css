@@ -27,6 +27,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .visualizer { position: relative; flex: 1; width: 100%; min-height: 160px; overflow: hidden; background: linear-gradient(to bottom, color-mix(in srgb, var(--graph-start) 6.2745%, transparent), color-mix(in srgb, var(--graph-end) 1.9608%, transparent)); }
 .visualizer canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
 .visualizer canvas.dragging { cursor: grabbing; }
+.visualizer canvas.painting { cursor: crosshair; }
+.isolation-hint { color: #fff; opacity: .9; }
 .gesture-hint { position: absolute; bottom: 9px; left: 20px; right: 20px; font-size: 10px; color: var(--primary); opacity: .55; pointer-events: none; user-select: none; }
 .touch-hint { display: none; }
 @media (pointer: coarse) { .mouse-hint { display: none; } .touch-hint { display: inline; } }
@@ -86,3 +88,24 @@ input[type=number], select { border: 1px solid color-mix(in srgb, var(--primary)
 
 .cartridge-import { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .cartridge-import input { max-width: 100%; font: inherit; }
+
+.isolate-controls { display: flex; flex-direction: column; gap: 12px; }
+.isolate-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.isolate-head h2 { margin-bottom: 5px; }
+.isolate-head p { opacity: .8; font-size: 12px; max-width: 60ch; }
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; flex-shrink: 0; font-size: 12px; }
+.switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.switch > span:first-of-type { position: relative; width: 38px; height: 22px; border-radius: 11px; background: #ffffff22; border: 1px solid #ffffff30; transition: background .15s; }
+.switch > span:first-of-type::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff; transition: transform .15s; }
+.switch input:checked + span { background: var(--primary); border-color: var(--primary); box-shadow: 0 0 10px color-mix(in srgb, var(--primary) 70%, transparent); }
+.switch input:checked + span::after { transform: translateX(16px); }
+.switch input:focus-visible + span { outline: 2px solid #fff; outline-offset: 2px; }
+.band-strip { display: flex; gap: 2px; height: 44px; padding: 6px; border-radius: 8px; background: #00000066; touch-action: none; user-select: none; }
+.band-strip button { flex: 1; min-width: 0; height: 100%; padding: 0; border: none; border-radius: 2px; background: var(--band); opacity: .18; transition: opacity .1s, box-shadow .1s; cursor: not-allowed; }
+.band-strip[data-enabled=true] button { cursor: pointer; }
+.band-strip[data-enabled=true] button.lit { opacity: 1; box-shadow: 0 0 8px var(--band), 0 0 2px #fff inset; }
+.band-strip[data-enabled=true] button.dark { opacity: .28; }
+.band-strip[data-enabled=true] button.dark:hover { opacity: .55; }
+.band-strip button:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+.isolate-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 11px; opacity: .85; }
+.isolate-actions { display: flex; gap: 6px; }

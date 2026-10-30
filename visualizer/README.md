@@ -32,6 +32,12 @@ The Camera panel is replaced by gestures on the visualiser itself:
 
 View movement runs outside React's render state. Cartridges capture the actual target, orbit angles and zoom distance from the frame they show.
 
+## Band isolation
+
+The **Isolate** tab turns the traces into tubes you can switch on and off. It is off by default so ordinary drags never touch playback. Once on, clicking a tube lights it and dragging across tubes paints a range; dragging on the backdrop still rotates. The strip of cells under the switch is the precise counterpart (hover a cell or tube for its frequency range), with All / None / Invert.
+
+Lit tubes glow and mirror into a glossy floor; dark tubes keep their tint but stop emitting. While at least one tube is lit, the daemon plays only those bands: it runs a 4096-point STFT on the output with the visualiser's own log-spaced band edges, so the slice you hear is exactly the slice you lit. Nothing lit means the whole song plays. Switching the mode off, or closing the visualiser, clears the isolation; the selection follows band-count changes by frequency. The traces keep showing the whole song, not the filtered output.
+
 ## Fullscreen
 
 Use the fullscreen button or F11 for a decoration-free view with the controls hidden. Drag, pan, pinch and scroll gestures remain active. The small sliders button in the upper-right corner reveals or hides the controls. Escape or F11 exits fullscreen and restores the regular layout.

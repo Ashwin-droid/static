@@ -12,7 +12,10 @@ export interface PlaybackSnapshot {
   max_volume: number;
   position_millis: number | null;
   duration_millis: number | null;
+  /** Bands the daemon is currently isolating; null plays everything. */
+  band_isolation: BandIsolation | null;
 }
+export interface BandIsolation { bands: number; selected: number[] }
 export interface AudioFrame {
   generation: number;
   sequence: number;
@@ -63,12 +66,20 @@ export function parseMessage(raw: unknown): ServerMessage | null {
             !(s.duration_millis === null || uint(s.duration_millis))) return null;
         const t = s.current_track;
         if (!(t === null || (record(t) && string(t.video_id) && string(t.title) && string(t.artist)))) return null;
+        const b = s.band_isolation;
+        let band_isolation: BandIsolation | null = null;
+        if (b !== undefined && b !== null) {
+          if (!record(b) || !uint(b.bands) || b.bands < MIN_BANDS || b.bands > MAX_BANDS || !Array.isArray(b.selected) ||
+              b.selected.length > b.bands || !b.selected.every(v => uint(v) && v < (b.bands as number))) return null;
+          band_isolation = { bands: b.bands, selected: b.selected as number[] };
+        }
         // Avoid retaining the daemon queue, artwork URLs or other unrelated snapshot data.
         return { type: 'state', state: {
           current_track: t === null ? null : { video_id: t.video_id as string, title: t.title as string, artist: t.artist as string },
           paused: s.paused, volume: s.volume, max_volume: s.max_volume,
           position_millis: s.position_millis as number | null,
           duration_millis: s.duration_millis as number | null,
+          band_isolation,
         } };
       }
       case 'error':
@@ -93,6 +104,8 @@ export class FrequencyHistory {
   generation: number | null = null;
   sequence = -1;
   revision = 0;
+  /** From the latest frame; band edges in Hz depend on it. */
+  sampleRate = 48_000;
   constructor(readonly bands: number, colors = presets[0].graphTheme) {
     if (!Number.isInteger(bands) || bands < MIN_BANDS || bands > MAX_BANDS) throw new RangeError('Bands must be 8 to 128');
     this.samples = Array.from({ length: bands }, () => new Float32Array(MAX_HISTORY));
@@ -124,6 +137,7 @@ export class FrequencyHistory {
     }
     if (frame.sequence <= this.sequence || frame.bands.length !== this.bands) return false;
     this.sequence = frame.sequence;
+    this.sampleRate = frame.sample_rate;
     if (paused) return false;
     if (colors) {
       this.lastLine1 = Number.parseInt(colors.line1.slice(1), 16);

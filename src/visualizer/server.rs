@@ -459,6 +459,11 @@ enum Command {
     Volume {
         value: f64,
     },
+    /// Light these bands (of `bands`) and play only them; empty plays everything.
+    Isolate {
+        bands: u32,
+        selected: Vec<u32>,
+    },
     Cartridge {
         id: String,
         video_id: String,
@@ -491,6 +496,16 @@ fn validate_command(command: &Command) -> Result<()> {
             value.is_finite() && (0.0..=5.0).contains(value),
             "Volume must be between 0 and 5"
         ),
+        Command::Isolate { bands, selected } => {
+            anyhow::ensure!(
+                (8..=128).contains(bands),
+                "Frequency bands must be between 8 and 128"
+            );
+            anyhow::ensure!(
+                selected.len() <= *bands as usize && selected.iter().all(|b| b < bands),
+                "Isolated bands must be below the band count"
+            );
+        }
         Command::Cartridge {
             id,
             video_id,
@@ -559,6 +574,8 @@ fn worker(
     let cover = super::theme::ThemeWorker::start(theme.clone()).ok();
     let mut client: Option<DaemonClient> = None;
     let mut bands = 64;
+    // The page owns the lit bands; closing it must not leave the daemon muted.
+    let mut isolating = false;
     let mut last_state = Instant::now() - Duration::from_secs(1);
     let mut next_connect = Instant::now();
     while !stop.load(Ordering::Acquire) && !server_stop.load(Ordering::Acquire) {
@@ -599,6 +616,13 @@ fn worker(
                     action: Transport::Previous,
                 } => daemon.previous(),
                 Command::Volume { value } => daemon.set_volume(value),
+                Command::Isolate { bands, selected } => {
+                    isolating = !selected.is_empty();
+                    daemon.set_band_isolation(
+                        (!selected.is_empty())
+                            .then_some(crate::ipc::BandIsolation { bands, selected }),
+                    )
+                }
                 Command::PlayCartridge { video_id } => {
                     daemon.resolve_and_play_radio(&crate::ipc::youtube_music_watch_url(&video_id))
                 }
@@ -641,6 +665,13 @@ fn worker(
             }
         }
         thread::sleep(FRAME_INTERVAL.saturating_sub(start.elapsed()));
+    }
+    if isolating {
+        if let Some(daemon) = client.as_ref() {
+            if let Err(err) = daemon.set_band_isolation(None) {
+                tracing::warn!(%err, "Could not clear band isolation on visualiser exit");
+            }
+        }
     }
 }
 

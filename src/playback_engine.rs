@@ -12,6 +12,7 @@ use gstreamer::prelude::*;
 use gstreamer_play as gst_play;
 
 mod audio_filter;
+mod band_isolation;
 mod dynamic_gain;
 mod gain_history;
 mod spectrum;
@@ -28,6 +29,7 @@ pub struct PlaybackEngine {
     inner: gst_play::Play,
     gain: Arc<Mutex<DynamicGain>>,
     spectrum: Arc<spectrum::Spectrum>,
+    isolation: Arc<Mutex<band_isolation::BandIsolator>>,
     visualization_uri: RefCell<Option<String>>,
     master_volume: Cell<f64>,
     paused: Cell<bool>,
@@ -46,7 +48,8 @@ impl PlaybackEngine {
         pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
         let gain = Arc::new(Mutex::new(DynamicGain::default()));
         let spectrum = Arc::new(spectrum::Spectrum::default());
-        let filter = audio_filter::build(gain.clone(), spectrum.clone())
+        let isolation = Arc::new(Mutex::new(band_isolation::BandIsolator::default()));
+        let filter = audio_filter::build(gain.clone(), spectrum.clone(), isolation.clone())
             .expect("Failed to build playback gain filter");
         pipeline.set_property("audio-filter", &filter);
         inner.set_volume(1.0);
@@ -133,6 +136,7 @@ impl PlaybackEngine {
             inner,
             gain,
             spectrum,
+            isolation,
             visualization_uri: RefCell::new(None),
             master_volume: Cell::new(1.0),
             paused: Cell::new(false),
@@ -235,12 +239,21 @@ impl PlaybackEngine {
         let cross_song = self.gain.lock().unwrap().cross_song_state();
         let replacement = Self::new();
         replacement.configure_gain(settings);
+        replacement.set_band_isolation(self.band_isolation());
         replacement
             .gain
             .lock()
             .unwrap()
             .restore_cross_song_state(cross_song);
         replacement
+    }
+
+    pub fn set_band_isolation(&self, isolation: Option<crate::ipc::BandIsolation>) {
+        self.isolation.lock().unwrap().set_selection(isolation);
+    }
+
+    pub fn band_isolation(&self) -> Option<crate::ipc::BandIsolation> {
+        self.isolation.lock().unwrap().selection()
     }
 
     pub fn visualization_frame(&self, bands: usize) -> crate::ipc::VisualizationFrame {

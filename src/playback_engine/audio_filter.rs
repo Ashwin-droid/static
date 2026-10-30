@@ -7,6 +7,7 @@ use std::sync::{
 use gst::{glib, prelude::*, subclass::prelude::*};
 use gstreamer as gst;
 
+use super::band_isolation::BandIsolator;
 use super::dynamic_gain::{DynamicGain, GainTarget};
 use super::spectrum::Spectrum;
 
@@ -67,6 +68,7 @@ mod imp {
     pub struct Lookahead {
         pub(super) processor: OnceLock<Arc<Mutex<DynamicGain>>>,
         pub(super) spectrum: OnceLock<Arc<Spectrum>>,
+        pub(super) isolation: OnceLock<Arc<Mutex<BandIsolator>>>,
         pending: Mutex<BufferedAudio>,
         flushing: AtomicBool,
         sink: gst::Pad,
@@ -83,6 +85,9 @@ mod imp {
             }
             if let Some(spectrum) = self.spectrum.get() {
                 spectrum.reset();
+            }
+            if let Some(isolation) = self.isolation.get() {
+                isolation.lock().unwrap().reset_stream();
             }
         }
 
@@ -126,10 +131,19 @@ mod imp {
                             .map_err(|_| gst::FlowError::Error)?;
                         processor.render(map.as_mut_slice(), block.target, upcoming);
                         processor.set_diagnostic_position(position);
+                        // The visualiser sees the whole song; isolation only
+                        // decides which of its bands reach the speakers.
                         self.spectrum
                             .get()
                             .unwrap()
                             .capture(map.as_slice(), rate as u32, channels);
+                        if let Some(isolation) = self.isolation.get() {
+                            isolation.lock().unwrap().process_bytes(
+                                map.as_mut_slice(),
+                                rate as u32,
+                                channels,
+                            );
+                        }
                     }
                     block.buffer
                 };
@@ -371,6 +385,7 @@ mod imp {
             Self {
                 processor: OnceLock::new(),
                 spectrum: OnceLock::new(),
+                isolation: OnceLock::new(),
                 pending: Mutex::new(BufferedAudio::default()),
                 flushing: AtomicBool::new(false),
                 sink,
@@ -450,6 +465,7 @@ glib::wrapper! {
 pub(super) fn build(
     processor: Arc<Mutex<DynamicGain>>,
     spectrum: Arc<Spectrum>,
+    isolation: Arc<Mutex<BandIsolator>>,
 ) -> Result<gst::Bin, glib::Error> {
     let bin = gst::Bin::new();
     let convert_in = gst::ElementFactory::make("audioconvert")
@@ -463,6 +479,7 @@ pub(super) fn build(
         .build();
     let _ = gain.imp().processor.set(processor);
     let _ = gain.imp().spectrum.set(spectrum);
+    let _ = gain.imp().isolation.set(isolation);
     let add_error = |e: glib::BoolError| glib::Error::new(gst::CoreError::Failed, &e.to_string());
     bin.add_many([&convert_in, gain.upcast_ref(), &convert_out])
         .map_err(add_error)?;
@@ -504,7 +521,12 @@ mod tests {
             });
         let spectrum = Arc::new(Spectrum::default());
         spectrum.frame(32, true);
-        let filter = build(processor, spectrum.clone()).unwrap();
+        let filter = build(
+            processor,
+            spectrum.clone(),
+            Arc::new(Mutex::new(BandIsolator::default())),
+        )
+        .unwrap();
         let pipeline = gst::Pipeline::new();
         let source = gst::ElementFactory::make("audiotestsrc")
             .property("num-buffers", 4i32)

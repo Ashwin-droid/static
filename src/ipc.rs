@@ -184,6 +184,17 @@ pub struct PlaybackSnapshot {
     /// pattern: GUI/TUI render controls from this, CLI/fs show nothing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staticfs_unmount_pending: Option<StaticfsUnmountPending>,
+    /// Visualiser band isolation in effect: only these bands (of `bands`
+    /// log-spaced ones) reach the speakers. None plays everything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub band_isolation: Option<BandIsolation>,
+}
+
+/// Frequency bands the visualiser lit; indices count from the lowest band.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BandIsolation {
+    pub bands: u32,
+    pub selected: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -321,6 +332,7 @@ impl Default for PlaybackSnapshot {
             duck: None,
             desktop_aware_volume: None,
             staticfs_unmount_pending: None,
+            band_isolation: None,
         }
     }
 }
@@ -383,6 +395,9 @@ pub enum DaemonRequest {
     },
     GetVisualizationFrame {
         bands: u32,
+    },
+    SetBandIsolation {
+        isolation: Option<BandIsolation>,
     },
     GetVisualizationSource {
         video_id: String,
@@ -956,6 +971,10 @@ impl DaemonClient {
         settings: GainCalibrationSettings,
     ) -> Result<PlaybackSnapshot> {
         Ok(self.try_state_request(&DaemonRequest::SetGainCalibration { settings })?)
+    }
+
+    pub fn set_band_isolation(&self, isolation: Option<BandIsolation>) -> Result<PlaybackSnapshot> {
+        self.transport_request(DaemonRequest::SetBandIsolation { isolation })
     }
 
     pub fn visualization_frame(&self, bands: u32) -> Result<VisualizationFrame> {

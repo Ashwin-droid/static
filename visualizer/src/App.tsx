@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { HardDrive, Music, Pause, Play, RotateCcw, SkipBack, SkipForward, Sliders, Volume2, Maximize, Minimize } from 'lucide-react';
+import { Flashlight, HardDrive, Music, Pause, Play, RotateCcw, SkipBack, SkipForward, Sliders, Volume2, Maximize, Minimize } from 'lucide-react';
+import { anyLit, bandHz, describeBand, formatHz, isolationKey, isolationOff, litIndices, paintRange, remapLit, type Isolation } from './isolation';
 import { Visualizer } from './Visualizer';
 import { initialCamera, type CameraControls } from './view-controls';
 import { readCartridge, type Cartridge } from './cartridge';
@@ -10,13 +11,16 @@ import { presets, type ThemePreset } from './themes';
 import { activeTheme, initialThemeSelection, selectTheme, type ThemeAction } from './theme-state';
 
 const initialState: PlaybackSnapshot = {
-  current_track: null, paused: true, volume: 1, max_volume: 1, position_millis: null, duration_millis: null,
+  current_track: null, paused: true, volume: 1, max_volume: 1, position_millis: null, duration_millis: null, band_isolation: null,
 };
 const tabs = [
   { id: 'audio', label: 'Audio', icon: Music },
+  { id: 'isolate', label: 'Isolate', icon: Flashlight },
   { id: 'config', label: 'Config', icon: Sliders },
   { id: 'cartridge', label: 'Cartridge', icon: HardDrive },
 ] as const;
+/** A reply older than this is stale; the daemon's own view wins again. */
+const ISOLATION_SETTLE_MS = 2000;
 type Tab = typeof tabs[number]['id'];
 const time = (ms: number | null) => ms === null ? '--:--' : `${Math.floor(ms / 60_000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
 
@@ -64,6 +68,53 @@ export function App() {
   const requestTimeout = useRef<ReturnType<typeof setTimeout>>();
   const [cartridge, setCartridge] = useState<Extract<ServerMessage, { type: 'cartridge_ready' }> | null>(null);
   const lastVolume = useRef(1);
+  const [isolation, setIsolation] = useState<Isolation>(() => isolationOff(30));
+  const isolationRef = useRef(isolation);
+  // Daemon truth and page edits meet here: what was last sent, and until when a
+  // snapshot that still shows the old selection should be ignored.
+  const isolationSent = useRef({ key: '', at: 0 });
+  const isolationTimer = useRef<ReturnType<typeof setTimeout>>();
+  const updateIsolation = (next: Isolation) => { isolationRef.current = next; setIsolation(next); };
+  const flushIsolation = () => {
+    if (isolationTimer.current !== undefined) clearTimeout(isolationTimer.current);
+    isolationTimer.current = undefined;
+    const { lit } = isolationRef.current;
+    const key = isolationKey(bandsRef.current, lit);
+    if (key === isolationSent.current.key) return;
+    if (connection.current?.send({ type: 'isolate', bands: bandsRef.current, selected: litIndices(lit) })) {
+      isolationSent.current = { key, at: performance.now() };
+    } else if (key !== '') setNotice('Static is disconnected. Lit tubes will not change playback until it reconnects.');
+  };
+  const scheduleIsolation = () => {
+    if (isolationTimer.current !== undefined) return;
+    isolationTimer.current = setTimeout(flushIsolation, 60);
+  };
+  const paintBands = (from: number, to: number, value: boolean) => {
+    const previous = isolationRef.current;
+    if (!previous.enabled) return;
+    updateIsolation({ ...previous, lit: paintRange(previous.lit, from, to, value) });
+    scheduleIsolation();
+  };
+  const setLit = (lit: boolean[]) => { updateIsolation({ ...isolationRef.current, lit }); flushIsolation(); };
+  const toggleIsolation = (enabled: boolean) => {
+    // Leaving the mode puts every band back; the daemon is told immediately.
+    updateIsolation({ enabled, lit: enabled ? isolationRef.current.lit : isolationRef.current.lit.map(() => false) });
+    flushIsolation();
+  };
+  const adoptIsolation = (remote: PlaybackSnapshot['band_isolation']) => {
+    const key = remote ? isolationKey(remote.bands, remote.bands > 0 ? Array.from({ length: remote.bands }, (_, i) => remote.selected.includes(i)) : []) : '';
+    const sent = isolationSent.current;
+    if (key === sent.key) { sent.at = 0; return; }
+    if (sent.at !== 0 && performance.now() - sent.at < ISOLATION_SETTLE_MS) return;
+    isolationSent.current = { key, at: 0 };
+    if (!remote) {
+      if (anyLit(isolationRef.current.lit)) updateIsolation({ ...isolationRef.current, lit: isolationRef.current.lit.map(() => false) });
+      return;
+    }
+    // Another page, or an earlier one, lit these: show them rather than silently playing a filtered song.
+    if (remote.bands !== bandsRef.current) applyBands(remote.bands, false);
+    updateIsolation({ enabled: true, lit: Array.from({ length: remote.bands }, (_, i) => remote.selected.includes(i)) });
+  };
 
   useEffect(() => {
     if (!host.current) return;
@@ -97,6 +148,7 @@ export function App() {
             stateRef.current = message.state;
             setState(message.state);
             changeTheme({ type: 'track', videoId: message.state.current_track?.video_id ?? null });
+            adoptIsolation(message.state.band_isolation);
             break;
           case 'theme': changeTheme({ type: 'cover', videoId: message.video_id, theme: message.theme }); break;
           case 'error':
@@ -117,6 +169,7 @@ export function App() {
       connection.current?.dispose();
       connection.current = null;
       if (requestTimeout.current !== undefined) clearTimeout(requestTimeout.current);
+      if (isolationTimer.current !== undefined) clearTimeout(isolationTimer.current);
     };
   }, []);
 
@@ -125,13 +178,17 @@ export function App() {
     if (!sent) setNotice('Static is disconnected. Reconnect before sending a command.');
     return sent;
   };
-  const changeBands = (value: number) => {
+  const applyBands = (value: number, syncIsolation: boolean) => {
     const next = Math.max(8, Math.min(128, Math.round(value)));
+    if (next === bandsRef.current) return;
     bandsRef.current = next;
     setBands(next);
     history.current = new FrequencyHistory(next, displayedTheme.current.graphTheme);
     if (status === 'connected') send({ type: 'configure', bands: next });
+    updateIsolation({ ...isolationRef.current, lit: remapLit(isolationRef.current.lit, next) });
+    if (syncIsolation) flushIsolation();
   };
+  const changeBands = (value: number) => applyBands(value, true);
   const changeVolume = (value: number) => {
     const safe = Math.max(0, Math.min(state.max_volume, value));
     if (safe > 0) lastVolume.current = safe;
@@ -198,7 +255,8 @@ export function App() {
       {status === 'unavailable' && <button onClick={() => location.reload()}>Retry</button>}
     </div>}
     <Visualizer historyRef={history} captureRef={capture} viewRef={view} restoreViewRef={restoreView} theme={theme}
-      displayedThemeRef={displayedTheme} onThemeFrame={paintTheme} lineSpacing={spacing} numBands={bands} />
+      displayedThemeRef={displayedTheme} onThemeFrame={paintTheme} lineSpacing={spacing} numBands={bands}
+      isolation={isolation} onPaint={paintBands} onPaintEnd={flushIsolation} />
     <section id="visualizer-controls" className="controls" aria-label="Visualiser controls" hidden={!showControls}>
       <div className="panel">
         <div className="tabs" role="tablist" aria-label="Controls">
@@ -225,6 +283,8 @@ export function App() {
               <output>{Math.round(state.volume * 100)}%</output>
             </div>
           </div>}
+          {tab === 'isolate' && <IsolatePanel isolation={isolation} bands={bands} sampleRate={history.current.sampleRate}
+            theme={theme} onToggle={toggleIsolation} onPaint={paintBands} onPaintEnd={flushIsolation} onSet={setLit} />}
           {tab === 'config' && <div className="config-controls">
             <div className="visual-settings"><h2>Visualiser settings</h2>
               <label htmlFor="spacing">Line spacing <output>{spacing.toFixed(1)}</output></label>
@@ -269,4 +329,83 @@ export function App() {
       {notice && <div className="notice" role="status"><span>{notice}</span><button aria-label="Dismiss message" onClick={() => setNotice(null)}>×</button></div>}
     </section>
   </main>;
+}
+
+interface IsolateProps {
+  isolation: Isolation;
+  bands: number;
+  sampleRate: number;
+  theme: ThemePreset;
+  onToggle: (enabled: boolean) => void;
+  onPaint: (from: number, to: number, value: boolean) => void;
+  onPaintEnd: () => void;
+  onSet: (lit: boolean[]) => void;
+}
+
+/** The precise counterpart to clicking tubes: one cell per band, paintable by dragging. */
+function IsolatePanel({ isolation, bands, sampleRate, theme, onToggle, onPaint, onPaintEnd, onSet }: IsolateProps) {
+  const strip = useRef<HTMLDivElement>(null);
+  const stroke = useRef<{ pointerId: number; value: boolean; last: number } | null>(null);
+  const litCount = isolation.lit.filter(Boolean).length;
+  const cellAt = (x: number, y: number) => {
+    const cell = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-band]');
+    return cell && strip.current?.contains(cell) ? Number(cell.dataset.band) : null;
+  };
+  const down = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!isolation.enabled || event.button !== 0) return;
+    const index = cellAt(event.clientX, event.clientY);
+    if (index === null) return;
+    event.preventDefault();
+    stroke.current = { pointerId: event.pointerId, value: !isolation.lit[index], last: index };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    onPaint(index, index, stroke.current.value);
+  };
+  const move = (event: React.PointerEvent<HTMLDivElement>) => {
+    const current = stroke.current;
+    if (!current || event.pointerId !== current.pointerId) return;
+    const index = cellAt(event.clientX, event.clientY);
+    if (index === null || index === current.last) return;
+    onPaint(current.last, index, current.value);
+    current.last = index;
+  };
+  const up = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!stroke.current || event.pointerId !== stroke.current.pointerId) return;
+    stroke.current = null;
+    try { event.currentTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
+    onPaintEnd();
+  };
+  const all = (value: boolean) => onSet(isolation.lit.map(() => value));
+  const [low] = bandHz(0, bands, sampleRate), [, high] = bandHz(bands - 1, bands, sampleRate);
+  return <div className="isolate-controls">
+    <div className="isolate-head">
+      <div><h2>Band isolation</h2>
+        <p>{isolation.enabled
+          ? litCount === 0 ? 'Every tube is lit, so the whole song plays. Light some to hear only those.' : `Only the ${litCount} lit ${litCount === 1 ? 'band reaches' : 'bands reach'} the speakers.`
+          : 'Off. Turn it on to pick frequency bands by clicking tubes; only lit tubes will play.'}</p></div>
+      <label className="switch"><input type="checkbox" role="switch" aria-label="Band isolation" checked={isolation.enabled} onChange={event => onToggle(event.target.checked)} /><span /><span className="switch-text">{isolation.enabled ? 'On' : 'Off'}</span></label>
+    </div>
+    <div ref={strip} className="band-strip" role="group" aria-label="Bands, low to high" data-enabled={isolation.enabled}
+      onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
+      {isolation.lit.map((lit, i) => {
+        const color = mixHex(theme.graphTheme.line1, theme.graphTheme.line2, bands <= 1 ? 0 : i / (bands - 1));
+        return <button key={i} type="button" data-band={i} className={lit ? 'lit' : 'dark'} disabled={!isolation.enabled}
+          aria-pressed={lit} title={describeBand(i, bands, sampleRate)} style={{ '--band': color } as React.CSSProperties}
+          onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onPaint(i, i, !lit); onPaintEnd(); } }} />;
+      })}
+    </div>
+    <div className="isolate-foot">
+      <span>{formatHz(low)}</span>
+      <div className="isolate-actions">
+        <button disabled={!isolation.enabled} onClick={() => all(true)}>All</button>
+        <button disabled={!isolation.enabled} onClick={() => all(false)}>None</button>
+        <button disabled={!isolation.enabled} onClick={() => onSet(isolation.lit.map(v => !v))}>Invert</button>
+      </div>
+      <span>{formatHz(high)}</span>
+    </div>
+  </div>;
+}
+
+function mixHex(a: string, b: string, t: number): string {
+  const channel = (offset: number) => Math.round(parseInt(a.slice(offset, offset + 2), 16) * (1 - t) + parseInt(b.slice(offset, offset + 2), 16) * t);
+  return `#${[1, 3, 5].map(offset => channel(offset).toString(16).padStart(2, '0')).join('')}`;
 }

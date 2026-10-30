@@ -62,6 +62,7 @@ fn persisted_playback_state_round_trips_through_database() {
         duck: None,
         desktop_aware_volume: None,
         staticfs_unmount_pending: None,
+        band_isolation: None,
     };
     let persisted = PersistedPlaybackState {
         snapshot,

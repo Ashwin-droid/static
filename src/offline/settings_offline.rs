@@ -93,6 +93,10 @@ pub const PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS: u32 = 30;
 /// Duck amounts: 0.0 leaves the music untouched, 1.0 silences it.
 pub const PIPEWIRE_DUCKING_AMOUNT_MIN: f64 = 0.0;
 pub const PIPEWIRE_DUCKING_AMOUNT_MAX: f64 = 1.0;
+/// Gain back: how long the music takes to climb from the loud duck to the
+/// quiet duck (and out of the duck). The CLI also accepts 0 and longer values.
+pub const PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS: u32 = 1;
+pub const PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS: u32 = 30;
 pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS: u32 = 0;
 pub const DESKTOP_AWARE_VOLUME_HOLD_UI_MAX_SECS: u32 = 1800;
 pub const DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS: u32 = 1;
@@ -136,6 +140,8 @@ pub struct AppSettings {
     pub pipewire_ducking_min: f64,
     /// Duck amount while the foreign audio is loud (most ducking).
     pub pipewire_ducking_max: f64,
+    /// Seconds for the duck to climb back; deepening is always instant.
+    pub pipewire_ducking_gain_back_secs: u32,
     pub desktop_aware_volume: bool,
     pub desktop_aware_volume_hold_secs: u32,
     pub desktop_aware_volume_restore_secs: u32,
@@ -185,6 +191,7 @@ impl Default for AppSettings {
             pipewire_ducking_threshold_secs: 5,
             pipewire_ducking_min: 0.3,
             pipewire_ducking_max: 0.85,
+            pipewire_ducking_gain_back_secs: 5,
             desktop_aware_volume: false,
             desktop_aware_volume_hold_secs: 300,
             desktop_aware_volume_restore_secs: 60,
@@ -388,6 +395,13 @@ impl MusicCache {
                         PIPEWIRE_DUCKING_AMOUNT_MAX,
                     );
                 }
+                "pipewire_ducking_gain_back_secs" => {
+                    settings.pipewire_ducking_gain_back_secs = parse_u32_setting_at_least(
+                        &row.1,
+                        settings.pipewire_ducking_gain_back_secs,
+                        0,
+                    );
+                }
                 "desktop_aware_volume" => {
                     settings.desktop_aware_volume =
                         parse_bool_setting(&row.1, settings.desktop_aware_volume);
@@ -563,6 +577,10 @@ impl MusicCache {
             (
                 "pipewire_ducking_max",
                 settings.pipewire_ducking_max.to_string(),
+            ),
+            (
+                "pipewire_ducking_gain_back_secs",
+                settings.pipewire_ducking_gain_back_secs.to_string(),
             ),
             (
                 "desktop_aware_volume",

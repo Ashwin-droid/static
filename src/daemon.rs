@@ -307,7 +307,6 @@ struct DaemonState {
     duck_level: LevelFollower,
     /// Current dynamic duck amount (0 = untouched, 1 = silent).
     duck_amount: f64,
-    last_duck_slew_at: Option<Instant>,
     pipewire_quiet_since: Option<Instant>,
     last_pipewire_poll_at: Option<Instant>,
     desktop_volume: DesktopAwareVolume,
@@ -1135,7 +1134,6 @@ pub fn run() -> Result<()> {
         duck_taps: ForeignLevelTaps::default(),
         duck_level: LevelFollower::default(),
         duck_amount: 0.0,
-        last_duck_slew_at: None,
         pipewire_quiet_since: Some(Instant::now()),
         last_pipewire_poll_at: None,
         desktop_volume: DesktopAwareVolume::default(),
@@ -1173,6 +1171,19 @@ pub fn run() -> Result<()> {
                     sync_mpris(&state.borrow());
                 }
                 Err(err) => eprintln!("[MPRIS] failed to initialize daemon bridge: {err}"),
+            }
+        });
+    }
+
+    {
+        // Louder foreign audio ducks as soon as a tap measures it, not on the
+        // next maintenance tick.
+        let state = state.clone();
+        let wake = state.borrow().duck_taps.wake();
+        glib::spawn_future_local(async move {
+            loop {
+                wake.notified().await;
+                apply_duck_on_arrival(&mut state.borrow_mut());
             }
         });
     }
@@ -6869,27 +6880,51 @@ fn pipewire_duck_output_volume(state: &DaemonState) -> f64 {
     (state.pre_duck_volume * (1.0 - state.duck_amount.clamp(0.0, 1.0))).clamp(0.0, 5.0)
 }
 
+fn pipewire_duck_gain_back(settings: &AppSettings) -> Duration {
+    Duration::from_secs(settings.pipewire_ducking_gain_back_secs.into())
+}
+
 /// Follow the foreign streams' loudness and derive the current duck amount.
-/// With no live tap (pw-record missing, stream gone) the duck sits at the
-/// maximum: when we cannot hear the call, assume someone is talking.
-fn update_dynamic_duck(state: &mut DaemonState) {
+/// Louder audio deepens the duck at once; quieter audio lets it climb back
+/// over the gain-back time. With no live tap (capture unavailable, stream
+/// gone) the duck sits at the maximum: when we cannot hear the call, assume
+/// someone is talking. Returns false while the first tap is still
+/// connecting and there is no level yet, so the caller leaves volume alone.
+fn update_dynamic_duck(state: &mut DaemonState) -> bool {
     state.duck_taps.sync(&state.pipewire_trigger_nodes);
     let now = Instant::now();
+    let instant_dbfs = match state.duck_taps.combined_level_dbfs(now) {
+        Some(instant_dbfs) => instant_dbfs,
+        // Hold rather than jump to the maximum and then have to climb back.
+        None if state.duck_taps.connecting(now) => return state.duck_level.has_level(),
+        None => pipewire_tap::LOUD_DBFS,
+    };
     let (min_duck, max_duck) = pipewire_tap::ordered_ducks(
         state.settings.pipewire_ducking_min,
         state.settings.pipewire_ducking_max,
     );
-    state.duck_amount = match state.duck_taps.combined_level_dbfs(now) {
-        Some(instant_dbfs) => {
-            let level = state.duck_level.update(instant_dbfs, now);
-            pipewire_tap::duck_amount_for_level(level, min_duck, max_duck)
-        }
-        None => max_duck,
-    };
+    let gain_back = pipewire_duck_gain_back(&state.settings);
+    let level = state.duck_level.update(instant_dbfs, now, gain_back);
+    state.duck_amount = pipewire_tap::duck_amount_for_level(level, min_duck, max_duck);
+    true
+}
+
+/// A tap heard the foreign audio get louder: duck now instead of on the next
+/// maintenance tick.
+fn apply_duck_on_arrival(state: &mut DaemonState) {
+    if !state.ducked
+        || state.shutting_down.get()
+        || !pipewire_unduck_can_replace_volume_ramp(state.volume_ramp)
+    {
+        return;
+    }
+    if update_dynamic_duck(state) {
+        state.volume_ramp = None;
+        state.player.set_volume(steady_output_volume(state));
+    }
 }
 
 fn stop_dynamic_duck(state: &mut DaemonState) {
-    state.last_duck_slew_at = None;
     if !state.duck_taps.is_empty() {
         state.duck_taps.clear();
     }
@@ -6910,28 +6945,6 @@ fn set_logical_volume(state: &mut DaemonState, volume: f64) {
         state.volume_ramp = None;
         state.player.set_volume(steady_output_volume(state));
     }
-}
-
-/// Time constant for the dynamic duck's volume slew.
-const DUCK_SLEW_TAU: Duration = Duration::from_millis(150);
-
-/// Move the player volume one tick toward `target` with an exponential slew.
-fn slew_player_volume(state: &mut DaemonState, target: f64) {
-    let now = Instant::now();
-    let dt = state.last_duck_slew_at.map_or(0.04, |last| {
-        now.saturating_duration_since(last).as_secs_f64()
-    });
-    state.last_duck_slew_at = Some(now);
-    let current = state.player.volume();
-    let target = target.clamp(0.0, 5.0);
-    if (target - current).abs() < 0.002 {
-        state.player.set_volume(target);
-        return;
-    }
-    let coefficient = 1.0 - (-dt / DUCK_SLEW_TAU.as_secs_f64()).exp();
-    state
-        .player
-        .set_volume(current + (target - current) * coefficient);
 }
 
 fn start_volume_ramp(state: &mut DaemonState, target_volume: f64) {
@@ -7138,7 +7151,13 @@ fn maybe_unduck_for_pipewire(state: &mut DaemonState) {
     if state.ducked && desired != PipeWireSuppressionMode::Duck {
         state.ducked = false;
         if pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
-            start_volume_ramp(state, steady_output_volume(state));
+            // Coming out of the duck is a gain back too.
+            start_volume_ramp_with_completion(
+                state,
+                steady_output_volume(state),
+                pipewire_duck_gain_back(&state.settings),
+                VolumeRampCompletion::None,
+            );
         }
     }
 
@@ -7176,19 +7195,20 @@ fn maybe_duck_for_pipewire(state: &mut DaemonState) {
     }
     match desired {
         PipeWireSuppressionMode::Duck => {
-            update_dynamic_duck(state);
+            let has_level = update_dynamic_duck(state);
             if !state.ducked {
                 state.pre_duck_volume = logical_volume(state);
                 state.ducked = true;
             }
-            // Do not fight a pause fade that is already in flight.
-            if !pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
+            // Do not fight a pause fade that is already in flight, and leave
+            // an unduck ramp alone until the first tap has a level.
+            if !has_level || !pipewire_unduck_can_replace_volume_ramp(state.volume_ramp) {
                 return;
             }
-            // The target moves every tick while the foreign level moves, so a
-            // restarted ramp would never make progress. Slew directly instead.
+            // The duck amount already carries the timing (instant drop,
+            // gain-back climb), so the volume follows it directly.
             state.volume_ramp = None;
-            slew_player_volume(state, steady_output_volume(state));
+            state.player.set_volume(steady_output_volume(state));
         }
         PipeWireSuppressionMode::Pause => {
             if !state.pipewire_pause_active {

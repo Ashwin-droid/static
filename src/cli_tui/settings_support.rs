@@ -1023,6 +1023,7 @@ pub(in crate::cli_tui) fn current_numeric_setting_value(settings: &AppSettings, 
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs as f64,
         "pipewire_ducking_min" => settings.pipewire_ducking_min,
         "pipewire_ducking_max" => settings.pipewire_ducking_max,
+        "pipewire_ducking_gain_back_secs" => settings.pipewire_ducking_gain_back_secs as f64,
         "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs as f64,
         "desktop_aware_volume_restore_secs" => settings.desktop_aware_volume_restore_secs as f64,
         _ => 0.0,
@@ -1106,6 +1107,12 @@ pub(in crate::cli_tui) fn numeric_setting_meta(key: &str) -> Option<NumericSetti
         "pipewire_ducking_threshold_secs" => Some(NumericSettingMeta {
             min: 1.0,
             max: 30.0,
+            step: 1.0,
+            integer: true,
+        }),
+        "pipewire_ducking_gain_back_secs" => Some(NumericSettingMeta {
+            min: PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS as f64,
+            max: PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS as f64,
             step: 1.0,
             integer: true,
         }),
@@ -1233,6 +1240,12 @@ pub(in crate::cli_tui) fn build_tui_settings_sections(
             "pipewire_ducking_max",
             "PipeWire duck (loud)",
             "How much to duck while the foreign audio is loud, e.g. a voice in a call.",
+        )?,
+        stepper_setting_field(
+            settings,
+            "pipewire_ducking_gain_back_secs",
+            "PipeWire duck gain back",
+            "Ducking deeper is instant. Seconds to climb back from the loud to the quiet duck.",
         )?,
         toggle_setting_field(
             settings,

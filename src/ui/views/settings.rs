@@ -34,7 +34,8 @@ use crate::offline::{
     DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
     OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_AMOUNT_MAX,
-    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
     PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
     PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
     sanitize_coordination_filter_entries,
@@ -88,6 +89,7 @@ pub enum SettingNumber {
     PipewireDuckingThresholdSecs,
     PipewireDuckingMin,
     PipewireDuckingMax,
+    PipewireDuckingGainBackSecs,
     DesktopAwareVolumeHoldSecs,
     DesktopAwareVolumeRestoreSecs,
 }
@@ -745,6 +747,13 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
     let threshold_enabled = draft.pipewire_ducking_enabled && threshold_cli_note.is_none();
 
     let duck_enabled = draft.pipewire_ducking_enabled && !draft.pipewire_pause_mode.is_enabled();
+    let gain_back_cli_note = cli_only_spin_note(
+        draft.pipewire_ducking_gain_back_secs,
+        PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS,
+        PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS,
+        "pipewire_ducking_gain_back_secs",
+    );
+    let gain_back_enabled = duck_enabled && gain_back_cli_note.is_none();
 
     let desktop_hold_cli_note = cli_only_spin_note(
         draft.desktop_aware_volume_hold_secs,
@@ -860,6 +869,18 @@ fn coordination_card<'a>(state: &'a State, draft: &'a AppSettings) -> Element<'a
                     draft.pipewire_ducking_max,
                     duck_enabled,
                     SettingNumber::PipewireDuckingMax,
+                ),
+            ),
+            settings_row_with_note(
+                "PipeWire duck gain back",
+                "Ducking deeper is instant the moment the foreign audio gets louder. This is how \
+                 long the music takes to climb back from the loud duck to the quiet duck, and \
+                 out of the duck when the other audio ends.",
+                gain_back_cli_note,
+                stepper(
+                    SettingNumber::PipewireDuckingGainBackSecs,
+                    draft.pipewire_ducking_gain_back_secs as f64,
+                    gain_back_enabled,
                 ),
             ),
             settings_row(
@@ -1446,6 +1467,12 @@ fn number_meta(number: SettingNumber) -> (f64, f64, f64, usize) {
             PIPEWIRE_DUCKING_AMOUNT_MAX,
             0.05,
             2,
+        ),
+        SettingNumber::PipewireDuckingGainBackSecs => (
+            PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS as f64,
+            PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS as f64,
+            1.0,
+            0,
         ),
         SettingNumber::DesktopAwareVolumeHoldSecs => (
             DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS as f64,
@@ -2123,6 +2150,9 @@ fn number_value(settings: &AppSettings, number: SettingNumber) -> f64 {
         }
         SettingNumber::PipewireDuckingMin => settings.pipewire_ducking_min,
         SettingNumber::PipewireDuckingMax => settings.pipewire_ducking_max,
+        SettingNumber::PipewireDuckingGainBackSecs => {
+            settings.pipewire_ducking_gain_back_secs as f64
+        }
         SettingNumber::DesktopAwareVolumeHoldSecs => settings.desktop_aware_volume_hold_secs as f64,
         SettingNumber::DesktopAwareVolumeRestoreSecs => {
             settings.desktop_aware_volume_restore_secs as f64
@@ -2161,6 +2191,9 @@ fn set_number(settings: &mut AppSettings, number: SettingNumber, value: f64) {
         }
         SettingNumber::PipewireDuckingMin => settings.pipewire_ducking_min = value,
         SettingNumber::PipewireDuckingMax => settings.pipewire_ducking_max = value,
+        SettingNumber::PipewireDuckingGainBackSecs => {
+            settings.pipewire_ducking_gain_back_secs = value.round() as u32
+        }
         SettingNumber::DesktopAwareVolumeHoldSecs => {
             settings.desktop_aware_volume_hold_secs = value.round() as u32
         }

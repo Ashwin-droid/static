@@ -34,6 +34,21 @@ fn config_set_clamps_dynamic_duck_amounts() {
 }
 
 #[test]
+fn config_set_accepts_wide_dynamic_duck_gain_back() {
+    let mut settings = AppSettings::default();
+    assert_eq!(settings.pipewire_ducking_gain_back_secs, 5);
+
+    apply_config_value(&mut settings, "pipewire_ducking_gain_back_secs", "0").unwrap();
+    assert_eq!(settings.pipewire_ducking_gain_back_secs, 0);
+
+    apply_config_value(&mut settings, "pipewire_ducking_gain_back_secs", "120").unwrap();
+    assert_eq!(settings.pipewire_ducking_gain_back_secs, 120);
+
+    assert!(apply_config_value(&mut settings, "pipewire_ducking_gain_back_secs", "2.5").is_err());
+    assert_eq!(settings.pipewire_ducking_gain_back_secs, 120);
+}
+
+#[test]
 fn config_set_supports_coordination_filter_modes_and_lists() {
     let mut settings = AppSettings::default();
 

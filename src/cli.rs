@@ -24,7 +24,8 @@ use crate::offline::{
     DESKTOP_AWARE_VOLUME_HOLD_UI_MIN_SECS, DESKTOP_AWARE_VOLUME_RESTORE_UI_MAX_SECS,
     DESKTOP_AWARE_VOLUME_RESTORE_UI_MIN_SECS, MusicCache, OTHER_MPRIS_HALT_AUTO_RESUME_UI_MAX_SECS,
     OTHER_MPRIS_HALT_AUTO_RESUME_UI_MIN_SECS, PIPEWIRE_DUCKING_AMOUNT_MAX,
-    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS,
+    PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS, PIPEWIRE_DUCKING_THRESHOLD_UI_MAX_SECS,
     PIPEWIRE_DUCKING_THRESHOLD_UI_MIN_SECS, PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MAX_SECS,
     PIPEWIRE_PAUSE_HALT_AUTO_RESUME_UI_MIN_SECS, coordination_filter_contains,
     sanitize_coordination_filter_entries,
@@ -1814,6 +1815,10 @@ pub(crate) const CONFIG_SPECS: &[ConfigSpec] = &[
         kind: ConfigKind::F64,
     },
     ConfigSpec {
+        name: "pipewire_ducking_gain_back_secs",
+        kind: ConfigKind::U32,
+    },
+    ConfigSpec {
         name: "desktop_aware_volume",
         kind: ConfigKind::Bool,
     },
@@ -2121,8 +2126,9 @@ alone. Abandoning only fades the compensation out and never touches the sink. Re
 `pipewire_pause_mode=off`, Static taps the foreign streams and ducks in proportion to how loud \
 they are: this amount applies while they are quiet (at or below {QUIET_DBFS:.0} dBFS short-term), \
 `pipewire_ducking_max` while they are loud (at or above {LOUD_DBFS:.0} dBFS), with a CSS-style \
-ease-in-out curve between. `0.3` means play at 70% of the original level, `0` means do not lower \
-it at all.\nRange: {:.1}-{:.1}.",
+ease-in-out curve between. Louder foreign audio deepens the duck at once; quieter audio lets it \
+climb back over `pipewire_ducking_gain_back_secs`. `0.3` means play at 70% of the original level, \
+`0` means do not lower it at all.\nRange: {:.1}-{:.1}.",
             PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX
         ),
         "pipewire_ducking_max" => format!(
@@ -2130,6 +2136,20 @@ it at all.\nRange: {:.1}-{:.1}.",
 voice in a call). `0.85` means play at 15% of the original level, `1` means silence. See \
 `pipewire_ducking_min`.\nRange: {:.1}-{:.1}.",
             PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX
+        ),
+        "pipewire_ducking_gain_back_secs" => format!(
+            "Dynamic ducking gain back. Ducking deeper is always instant, the moment the foreign \
+audio gets louder; this is how long the music takes to climb back from the loud duck \
+(`pipewire_ducking_max`) to the quiet duck (`pipewire_ducking_min`), along the same ease-in-out \
+curve. Smaller climbs take proportionally less. Coming out of the duck when the foreign stream \
+ends ramps back over the same time. `0` snaps straight back.\n{}",
+            advanced_cli_range_note(
+                &format!(
+                    "{}-{} seconds",
+                    PIPEWIRE_DUCKING_GAIN_BACK_UI_MIN_SECS, PIPEWIRE_DUCKING_GAIN_BACK_UI_MAX_SECS
+                ),
+                "any integer >= 0"
+            )
         ),
         "pipewire_filter_mode" => "Switches how `pipewire_filter_list` is interpreted.\nValues:\n  - \
 `blacklist`: coordinate with every current foreign PipeWire stream except listed identifiers.\n  - \
@@ -2221,6 +2241,7 @@ pub(crate) fn format_config_value(settings: &AppSettings, name: &str) -> Result<
         "pipewire_ducking_threshold_secs" => settings.pipewire_ducking_threshold_secs.to_string(),
         "pipewire_ducking_min" => settings.pipewire_ducking_min.to_string(),
         "pipewire_ducking_max" => settings.pipewire_ducking_max.to_string(),
+        "pipewire_ducking_gain_back_secs" => settings.pipewire_ducking_gain_back_secs.to_string(),
         "desktop_aware_volume" => yes_no_bool(settings.desktop_aware_volume),
         "desktop_aware_volume_hold_secs" => settings.desktop_aware_volume_hold_secs.to_string(),
         "desktop_aware_volume_restore_secs" => {
@@ -2316,6 +2337,9 @@ pub(crate) fn apply_config_value(
         "pipewire_ducking_max" => {
             settings.pipewire_ducking_max =
                 parse_f64(trimmed)?.clamp(PIPEWIRE_DUCKING_AMOUNT_MIN, PIPEWIRE_DUCKING_AMOUNT_MAX)
+        }
+        "pipewire_ducking_gain_back_secs" => {
+            settings.pipewire_ducking_gain_back_secs = parse_u32(trimmed)?
         }
         "desktop_aware_volume" => settings.desktop_aware_volume = parse_bool(trimmed)?,
         "desktop_aware_volume_hold_secs" => {

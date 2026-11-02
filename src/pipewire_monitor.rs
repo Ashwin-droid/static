@@ -24,7 +24,7 @@ pub struct PipeWireMonitor {
 #[derive(Debug, Clone)]
 pub struct PipeWireStreamInfo {
     pub node_id: u32,
-    /// `object.serial`: what `pw-record --target` and pipewire-pulse index by.
+    /// `object.serial`: what `target.object` and pipewire-pulse index by.
     pub object_serial: Option<u32>,
     pub first_seen: Instant,
     pub client_id: Option<String>,

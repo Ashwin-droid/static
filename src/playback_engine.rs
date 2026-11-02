@@ -19,6 +19,19 @@ mod spectrum;
 
 use dynamic_gain::{Config as GainConfig, DynamicGain};
 
+// Audio that is already past the gain filter, waiting for the speakers:
+// every volume change (ducking above all) lands this late, so keep it short.
+// Download/seek buffering and decoder queues sit upstream of the gain and are
+// unaffected.
+/// playsink's `aqueue` sits right after the audio filter and runs full at
+/// GStreamer's default 1 s.
+const AUDIO_QUEUE_MAX_TIME_NS: u64 = 100_000_000;
+/// The sink's ring buffer, default 200 ms. Through pipewire-pulse 80 ms asks
+/// for a 30 ms node latency; 60 ms asked for 20 ms, which pulled the whole
+/// PipeWire graph down to a 512 quantum.
+const AUDIO_SINK_BUFFER_TIME_US: i64 = 80_000;
+const AUDIO_SINK_LATENCY_TIME_US: i64 = 10_000;
+
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         crate::app_log!($($arg)*);
@@ -46,6 +59,14 @@ impl PlaybackEngine {
         let inner = gst_play::Play::new(None::<gst_play::PlayVideoRenderer>);
         let pipeline = inner.pipeline();
         pipeline.set_property("ring-buffer-max-size", 200u64 * 1024 * 1024);
+        // Fires for playsink's queue and the real sink autoaudiosink picks,
+        // before either starts.
+        pipeline.connect("element-setup", false, |args| {
+            if let Some(element) = args.get(1).and_then(|arg| arg.get::<gst::Element>().ok()) {
+                shorten_post_gain_buffers(&element);
+            }
+            None
+        });
         let gain = Arc::new(Mutex::new(DynamicGain::default()));
         let spectrum = Arc::new(spectrum::Spectrum::default());
         let isolation = Arc::new(Mutex::new(band_isolation::BandIsolator::default()));
@@ -293,6 +314,25 @@ fn atomic_nanos_to_clock_time(nanos: &AtomicU64) -> Option<ClockTime> {
     (nanos != u64::MAX).then(|| ClockTime::from_nseconds(nanos))
 }
 
+fn shorten_post_gain_buffers(element: &gst::Element) {
+    let Some(factory) = element.factory() else {
+        return;
+    };
+    if factory.name() == "queue" && element.name() == "aqueue" {
+        element.set_property("max-size-time", AUDIO_QUEUE_MAX_TIME_NS);
+        return;
+    }
+    let klass = factory.klass();
+    if klass.contains("Sink")
+        && klass.contains("Audio")
+        && element.has_property_with_type("buffer-time", i64::static_type())
+        && element.has_property_with_type("latency-time", i64::static_type())
+    {
+        element.set_property("buffer-time", AUDIO_SINK_BUFFER_TIME_US);
+        element.set_property("latency-time", AUDIO_SINK_LATENCY_TIME_US);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +456,44 @@ mod tests {
                 next.stop();
             })
             .unwrap();
+    }
+
+    #[test]
+    fn post_gain_buffers_are_shortened_and_other_elements_are_left_alone() {
+        gst::init().unwrap();
+        let queue = gst::ElementFactory::make("queue")
+            .name("aqueue")
+            .build()
+            .unwrap();
+        shorten_post_gain_buffers(&queue);
+        assert_eq!(
+            queue.property::<u64>("max-size-time"),
+            AUDIO_QUEUE_MAX_TIME_NS
+        );
+        let other_queue = gst::ElementFactory::make("queue")
+            .name("vqueue")
+            .build()
+            .unwrap();
+        let default_time = other_queue.property::<u64>("max-size-time");
+        shorten_post_gain_buffers(&other_queue);
+        assert_eq!(other_queue.property::<u64>("max-size-time"), default_time);
+
+        let Ok(sink) = gst::ElementFactory::make("pulsesink").build() else {
+            return; // plugin not installed here
+        };
+        shorten_post_gain_buffers(&sink);
+        assert_eq!(
+            sink.property::<i64>("buffer-time"),
+            AUDIO_SINK_BUFFER_TIME_US
+        );
+        assert_eq!(
+            sink.property::<i64>("latency-time"),
+            AUDIO_SINK_LATENCY_TIME_US
+        );
+
+        let source = gst::ElementFactory::make("pulsesrc").build().unwrap();
+        let default_buffer = source.property::<i64>("buffer-time");
+        shorten_post_gain_buffers(&source);
+        assert_eq!(source.property::<i64>("buffer-time"), default_buffer);
     }
 }

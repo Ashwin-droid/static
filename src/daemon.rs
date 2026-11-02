@@ -5153,7 +5153,26 @@ fn ensure_client_loaded(state: &mut DaemonState) -> Result<Arc<NetworkState>> {
     Ok(client)
 }
 
+/// Frontends move the storage root themselves and then ask for a reload, so the
+/// root may have changed or its database may have been replaced underneath the
+/// open connection. A failed keyring read keeps the open cache rather than
+/// falling back to the default root.
+fn reopen_cache(state: &mut DaemonState) {
+    let storage_root = match crate::network::try_get_storage_root() {
+        Ok(storage_root) => storage_root,
+        Err(err) => {
+            eprintln!("[STATICD] keeping the open music cache, keyring read failed: {err}");
+            return;
+        }
+    };
+    match MusicCache::new_with_storage_root(storage_root.as_deref()) {
+        Ok(cache) => state.cache = cache,
+        Err(err) => eprintln!("[STATICD] failed to reopen the music cache: {err}"),
+    }
+}
+
 fn reload_settings(state: &mut DaemonState) {
+    reopen_cache(state);
     match state.cache.load_settings() {
         Ok(settings) => {
             let volume_limit_lowered = settings.max_volume() < state.settings.max_volume();

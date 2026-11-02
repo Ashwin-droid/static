@@ -159,3 +159,59 @@ fn scored_offline_tracks_cover_the_whole_store_and_skip_missing_files() {
 
     let _ = fs::remove_dir_all(base);
 }
+
+#[test]
+fn migrating_out_of_a_read_only_root_copies_everything_and_leaves_the_source() {
+    let base = std::env::temp_dir().join(format!("static-cache-test-{}", Uuid::new_v4()));
+    let old_root = base.join("old");
+    let new_root = base.join("new");
+    let old_raw = old_root.to_string_lossy().to_string();
+
+    let cache = MusicCache::new_with_storage_root(Some(&old_raw)).expect("cache init");
+    cache
+        .record_play("video123", "Title", "Artist", None, 60)
+        .expect("record play");
+    cache
+        .store_audio("video123", b"audio bytes", None)
+        .expect("store audio");
+    drop(cache);
+
+    set_tree_read_only(&old_root, true);
+    let migrated = MusicCache::new_with_storage_root(Some(&old_raw)).and_then(|mut cache| {
+        cache.migrate_storage_root(&new_root.to_string_lossy())?;
+        Ok(cache)
+    });
+    set_tree_read_only(&old_root, false);
+    let cache = migrated.expect("migrate out of a read-only root");
+
+    assert_eq!(cache.base_dir(), new_root.as_path());
+    assert_eq!(
+        cache.get_track_meta("video123"),
+        Some(("Title".to_string(), "Artist".to_string()))
+    );
+    assert_eq!(
+        cache.get_cached_audio("video123"),
+        Some(new_root.join("offline/video123.audio"))
+    );
+    assert!(old_root.join("data.db").exists());
+    assert!(old_root.join("offline/video123.audio").exists());
+
+    let _ = fs::remove_dir_all(base);
+}
+
+fn set_tree_read_only(path: &std::path::Path, read_only: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let is_dir = path.is_dir();
+    if is_dir {
+        for entry in fs::read_dir(path).expect("read dir") {
+            set_tree_read_only(&entry.expect("dir entry").path(), read_only);
+        }
+    }
+    let mode = match (is_dir, read_only) {
+        (true, true) => 0o555,
+        (true, false) => 0o755,
+        (false, true) => 0o444,
+        (false, false) => 0o644,
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set permissions");
+}

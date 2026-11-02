@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
 
 use super::store_offline::MusicCache;
 
@@ -30,13 +29,18 @@ impl MusicCache {
         let old_temp_dir = self.temp_dir.clone();
 
         let (new_offline_dir, new_art_dir, new_temp_dir) = Self::ensure_storage_layout(&new_base)?;
-        let new_db_path = new_base.join("data.db");
 
+        // The old root is only ever read: it can be a read-only mount (an NTFS
+        // partition after an unclean Windows shutdown). Files it won't let go of
+        // are copied, and the database is snapshotted and rewritten on the new side.
         move_dir_contents(&old_art_dir, &new_art_dir)?;
         move_dir_contents(&old_offline_dir, &new_offline_dir)?;
         move_dir_contents(&old_temp_dir, &new_temp_dir)?;
 
-        self.db.execute(
+        snapshot_database(&self.db, &new_base)?;
+        let db =
+            Self::open_database(&new_base).context("Failed to open migrated cache database")?;
+        db.execute(
             "UPDATE offline
              SET audio_path = REPLACE(audio_path, ?1, ?2),
                  art_path = CASE
@@ -51,7 +55,7 @@ impl MusicCache {
             ],
         )?;
 
-        self.db.execute(
+        db.execute(
             "UPDATE offline_playlists
              SET thumbnail_url = CASE
                  WHEN thumbnail_url IS NULL THEN NULL
@@ -63,28 +67,24 @@ impl MusicCache {
             ],
         )?;
 
-        let placeholder = Connection::open_in_memory().context("Failed to prepare DB migration")?;
-        let old_db = std::mem::replace(&mut self.db, placeholder);
-        match old_db.close() {
-            Ok(()) => {}
-            Err((conn, err)) => {
-                self.db = conn;
-                return Err(err).context("Failed to close cache database before migration");
-            }
+        // Saved queues carry artwork and audio paths under the old root too; the
+        // daemon creates this table lazily.
+        let has_playback_state: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'playback_state')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_playback_state {
+            db.execute(
+                "UPDATE playback_state SET payload = REPLACE(payload, ?1, ?2)",
+                rusqlite::params![
+                    format!("{}/", old_base.display()),
+                    format!("{}/", new_base.display()),
+                ],
+            )?;
         }
 
-        copy_file_contents(&old_db_path, &new_db_path)?;
-        match Self::open_database(&new_base) {
-            Ok(db) => {
-                self.db = db;
-            }
-            Err(err) => {
-                self.db = Self::open_database(&old_base)
-                    .context("Failed to reopen original cache database after migration error")?;
-                return Err(err).context("Failed to open migrated cache database");
-            }
-        }
-
+        self.db = db;
         self.base_dir = new_base;
         self.offline_dir = new_offline_dir;
         self.art_dir = new_art_dir;
@@ -123,26 +123,25 @@ fn move_dir_contents(from: &Path, to: &Path) -> Result<()> {
             Ok(_) => {}
             Err(_) => {
                 std::fs::copy(&source, &destination)?;
-                std::fs::remove_file(&source)?;
+                // A read-only source keeps its copy.
+                let _ = std::fs::remove_file(&source);
             }
         }
     }
     Ok(())
 }
 
-fn copy_file_contents(from: &Path, to: &Path) -> Result<()> {
-    if !from.exists() || from == to {
-        return Ok(());
+/// Writes a consistent copy of `db` to `base/data.db` without writing to `db`'s
+/// own file, replacing whatever database the new root already had.
+fn snapshot_database(db: &rusqlite::Connection, base: &Path) -> Result<()> {
+    let staged = base.join("data.db.migrating");
+    let _ = std::fs::remove_file(&staged);
+    db.execute("VACUUM INTO ?1", [staged.to_string_lossy().as_ref()])
+        .context("Failed to copy the cache database into the new root")?;
+    // A leftover journal would be replayed into the new file on open.
+    for stale in ["data.db-journal", "data.db-wal", "data.db-shm"] {
+        let _ = std::fs::remove_file(base.join(stale));
     }
-
-    if let Some(parent) = to.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if to.exists() {
-        let _ = std::fs::remove_file(to);
-    }
-
-    std::fs::copy(from, to)?;
+    std::fs::rename(&staged, base.join("data.db"))?;
     Ok(())
 }

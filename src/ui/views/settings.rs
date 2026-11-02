@@ -2371,6 +2371,8 @@ fn apply_storage_root_task(app: &mut App) -> Task<Message> {
             } else {
                 crate::network::store_storage_root(&raw).map_err(|err| err.to_string())?;
             }
+            // The daemon keeps its own connection to the old database.
+            crate::player::notify_daemon_settings_changed();
             Ok(LoadedRoots {
                 storage_root: crate::network::get_storage_root()
                     .filter(|root| !root.trim().is_empty()),

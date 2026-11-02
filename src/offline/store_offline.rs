@@ -20,10 +20,21 @@ pub struct MusicCache {
 pub(super) const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 
 impl MusicCache {
+    #[cfg(not(test))]
     fn default_base_dir() -> PathBuf {
         std::env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .join("Music/Static")
+    }
+
+    /// Tests must never see the user's library: opening a cache at a temp root
+    /// while a real default data.db exists "migrates" it, which moves the live
+    /// data.db and offline files into the test's root and deletes the originals.
+    #[cfg(test)]
+    fn default_base_dir() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("static-test-default-root-{}", std::process::id()))
             .join("Music/Static")
     }
 

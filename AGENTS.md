@@ -112,6 +112,8 @@ Tracking bugs should be investigated with runtime evidence. A successful local p
 
 Offline cache and storage-root behavior are part of the product, not incidental persistence. Moving storage roots, cache management, listen-again behavior, prefetching, and local playback preference should be handled carefully because they affect both startup and playback.
 
+A storage-root move only ever reads the old root, because it can be a read-only mount (an NTFS partition after an unclean Windows shutdown): files it won't let go of are copied, and the database is snapshotted with `VACUUM INTO` and rewritten on the new side. The frontend that moved it then asks the daemon to reload, and the reload reopens the daemon's cache; without that the daemon keeps writing to the old, deleted database until it restarts.
+
 ## UI Parity
 
 The GUI and TUI should feel like two views over the same app, not separate products.
@@ -144,6 +146,8 @@ Known limits are intentional: no per-play event log exists, so time-bucketed sta
 ## Testing And Validation
 
 This is a Rust project with module-local tests. The crate is binary-oriented, so do not assume a conventional library-test layout.
+
+Tests must never see the user's library. Opening a cache at a temp root while a real default `data.db` exists counts as a storage move, and the move empties the live library into the test's temp root, which the test then deletes. Under `cfg(test)` the default root therefore points at a per-process temp dir. Never write off "cache init" test failures as flaky: that was exactly this wipe, twice.
 
 Use focused checks for the area changed, then broader formatting/tests when the change has behavioral risk. Daemon coordination, radio queue semantics, settings parsing, and UI parity helpers deserve tests because small state mistakes can be hard to see manually.
 

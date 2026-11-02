@@ -742,6 +742,10 @@ impl InteractiveTui {
             store_storage_root(&trimmed)?;
             self.status_line = format!("Moved Static storage to {}.", shorten(&trimmed, 40));
         }
+        // The daemon keeps its own connection to the old database.
+        if let Ok(snapshot) = self.client.reload_settings() {
+            self.apply_snapshot(snapshot);
+        }
         self.refresh_settings_view();
         Ok(())
     }

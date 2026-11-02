@@ -71,6 +71,12 @@ pub fn get_storage_root() -> Option<String> {
     get_secret(KEYRING_STORAGE_ROOT).ok().flatten()
 }
 
+/// Like `get_storage_root`, but a failed keyring read stays an error instead of
+/// looking like "no override".
+pub fn try_get_storage_root() -> Result<Option<String>, SecretStoreError> {
+    get_secret(KEYRING_STORAGE_ROOT)
+}
+
 pub fn delete_storage_root() {
     let _ = delete_secret(KEYRING_STORAGE_ROOT);
 }
